@@ -315,14 +315,26 @@ merge_one() {
 # ------------------------------------------------------------------- drain --
 
 merged=0 failed=0 landed=0 n=0
+# Issues this drain has already handled, on any path. The queue query rides
+# GitHub's search index, which is eventually consistent and lags this run's
+# own label writes — an issue relabelled seconds ago can still come back, and
+# acting on it again fails it twice with a second identical comment. The
+# first unseen issue is the queue's real head; nothing but repeats is a
+# drained queue.
+seen=" "
 while (( n < MAX_DRAIN )); do
   # Re-queried every pass: our own last merge moved main, and a run that
   # finished while we waited belongs at the back of this same drain.
-  issue="$(gh issue list -R "$ORIGIN" --search "label:ready-to-merge sort:created-asc" \
+  queue="$(gh issue list -R "$ORIGIN" --search "label:ready-to-merge sort:created-asc" \
              --state open --json number --limit 50 2>/dev/null \
-           | jq -r '.[0].number // empty')" \
+           | jq -r '.[].number')" \
     || die "$REPO: could not list ready-to-merge issues — aborting the run"
+  issue=""
+  for q in $queue; do
+    [[ "$seen" == *" $q "* ]] || { issue="$q"; break; }
+  done
   [[ -n "$issue" ]] || break
+  seen="$seen$issue "
 
   n=$(( n + 1 ))
   FAIL=""
