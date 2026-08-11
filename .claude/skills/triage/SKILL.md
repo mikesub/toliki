@@ -62,3 +62,39 @@ not "is broken".
 - Lead with a one-line verdict: "N need you, M look stuck" — or the all-clear.
 - Then only the non-empty sections, grouped per repo. Each item: issue link,
   title, one-line cause, next action.
+
+## Fixer prompts
+
+For each **`failed`** item, follow the next-action line with a fenced code
+block holding a copy-ready prompt: the user pastes it into a fresh session
+opened in that repo's *local clone* to fix the failure. The prompt must be
+self-contained — the fixer session has none of this brief's context — and must
+leave the landing to the merge worker. Compose it on this shape, adapting step
+1 to the actual cause (a red check or CI timeout needs a code fix, not a
+rebase):
+
+```
+You are fixing a failed epic in <owner/repo>. First verify with `git remote -v`
+that this clone matches — stop if it doesn't.
+
+Issue #<N> "<title>" failed at the merge gate: <one-line cause>. The change
+itself is complete on PR #<P> (branch <epic/N-...>).
+
+1. git fetch, then rebase <branch> onto origin/main, resolving conflicts so
+   both the epic's intent and what has since landed on main survive.
+2. Run `npm run verify` in the affected packages until green.
+3. Push the branch with --force-with-lease.
+4. Swap labels on issue #<N>: remove `failed`, add `ready-to-merge`. Do NOT
+   merge the PR yourself — the merge worker owns merge order and lands it
+   after re-checking on the true base.
+<Anything the issue's own comments flag as still owed — a deferred eval run,
+a manual step — goes here as an extra numbered step or note.>
+```
+
+Two boundaries:
+
+- When several `failed` items share a repo, say so above the blocks and advise
+  running one fixer at a time: each landed PR moves `main`, which can
+  re-conflict the others' fresh rebases.
+- **`ready-to-review` items get no prompt** — the label means a human decides;
+  a fixer session has nothing to fix until that decision is made.
