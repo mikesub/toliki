@@ -75,8 +75,18 @@ fi
 # Ticks must not overlap. Two dispatchers reading capacity at the same moment
 # would each see the same free slots and both fill them; launch.sh's own count
 # can't prevent that, because both would pass it before either created a
-# session. A tick that finds the lock held exits quietly — the next one is
-# five minutes away and the queue is still there.
+# session. A tick that finds the lock held exits quietly — the next one is a
+# minute away and the queue is still there.
+#
+# Whoever holds this fd holds the lock, and fd 9 survives fork/exec — so every
+# launch below closes it (`9>&-`). Without that, `tmux new-session` on a host
+# with no tmux server yet STARTS one, and the daemon it leaves behind inherits
+# fd 9 and holds this lock for as long as any session lives. The dispatcher then
+# locks itself out of its own queue for the length of an epic, logging a
+# perfectly calm "previous tick still running" every minute while no tick has
+# been running at all — and because it only bites when the tick is the one that
+# starts the server, it hides completely on any host that already had a session
+# open.
 exec 9>"${TMPDIR:-/tmp}/harness-dispatch.lock"
 if ! flock -n 9; then
   say "previous tick still running — skipping"
@@ -191,7 +201,9 @@ for entry in "${ORDER[@]}"; do
 
   say "  #$num ($repo): launching '$session'"
   set +e
-  "$LAUNCH" --repo "$repo" --message "/epic #$num"
+  # 9>&- so the tmux server this may start cannot inherit the tick lock; see
+  # the flock comment above for what that costs when it leaks.
+  "$LAUNCH" --repo "$repo" --message "/epic #$num" 9>&-
   rc=$?
   set -e
   case "$rc" in
