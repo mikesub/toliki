@@ -349,4 +349,13 @@ done
 if (( n >= MAX_DRAIN )); then
   say "$REPO: stopped at the $MAX_DRAIN-PR cap with work still queued — investigate before the next tick"
 fi
-say "$REPO: drain done — $merged merged, $failed failed$( (( landed )) && printf ', %s already landed' "$landed" || true)"
+# Only when something actually happened. An empty drain is the overwhelmingly
+# common case — one tick per repo per minute, ~4k lines a day of "0 merged, 0
+# failed" — and that is not merely noise: it buries the real entries so deep
+# that a `tail` of this log cannot reach them, which is exactly how /triage is
+# told to explain a stuck ready-to-merge. A log that is unreadable at the
+# moment it matters is worse than a short one. Cron liveness is unaffected:
+# dispatch.sh and reap.sh still log every tick to their own files.
+if (( merged || failed || landed )); then
+  say "$REPO: drain done — $merged merged, $failed failed$( (( landed )) && printf ', %s already landed' "$landed" || true)"
+fi
