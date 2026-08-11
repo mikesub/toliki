@@ -85,27 +85,27 @@ not "is broken".
 ## Fixer prompts
 
 For each **`failed`** item, follow the next-action line with a fenced code
-block holding a copy-ready prompt: the user pastes it into a fresh session
-opened in that repo's *local clone* to fix the failure. The prompt must be
-self-contained — the fixer session has none of this brief's context — and must
-leave the landing to the merge worker. Compose it on this shape, adapting step
-1 to the actual cause (a red check or CI timeout needs a code fix, not a
-rebase):
+block holding a copy-ready prompt. The user pastes it into a fresh session
+opened on a **new worktree of that repo's own clone**, so the prompt carries
+no repo identity, no clone check and no orientation — the session is already
+in the right place. What it must carry is what that session cannot see: the
+issue, the cause, the PR and the branch, and the boundary that the merge
+worker owns the landing. Keep it terse; the fixer is an agent, not a runbook
+reader. Compose it on this shape, adapting step 1 to the actual cause (a red
+check or CI timeout needs a code fix, not a rebase):
 
 ```
-You are fixing a failed epic in <owner/repo>. First verify with `git remote -v`
-that this clone matches — stop if it doesn't.
+Issue #<N> "<title>" failed at the merge gate: <one-line cause>. The change is
+complete on PR #<P> (branch <epic/N-...>).
 
-Issue #<N> "<title>" failed at the merge gate: <one-line cause>. The change
-itself is complete on PR #<P> (branch <epic/N-...>).
+1. Rebase <branch> on fresh origin/main, resolving conflicts so both the epic's
+   intent and what has since landed survive.
+2. `npm run verify` in the affected packages until green.
+3. Push with --force-with-lease.
+4. Swap labels on #<N>: remove `failed`, add `ready-to-merge`.
 
-1. git fetch, then rebase <branch> onto origin/main, resolving conflicts so
-   both the epic's intent and what has since landed on main survive.
-2. Run `npm run verify` in the affected packages until green.
-3. Push the branch with --force-with-lease.
-4. Swap labels on issue #<N>: remove `failed`, add `ready-to-merge`. Do NOT
-   merge the PR yourself — the merge worker owns merge order and lands it
-   after re-checking on the true base.
+Do NOT merge the PR yourself — the merge worker owns merge order and lands it
+after re-checking on the true base.
 <Anything the issue's own comments flag as still owed — a deferred eval run,
 a manual step — goes here as an extra numbered step or note.>
 ```
