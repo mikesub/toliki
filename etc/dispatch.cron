@@ -55,3 +55,19 @@ PATH=/home/ubuntu/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/
 * * * * * ubuntu /home/ubuntu/toliki/bin/dispatch.sh >> /home/ubuntu/dispatch.log 2>&1
 * * * * * ubuntu /home/ubuntu/toliki/bin/reap.sh >> /home/ubuntu/reap.log 2>&1
 * * * * * ubuntu /home/ubuntu/toliki/bin/merge-tick.sh >> /home/ubuntu/merge.log 2>&1
+
+# The fourth line is NOT part of the "all three or none" contract above, and the
+# distinction is worth keeping straight: those three are one mechanism and each
+# one missing breaks the other two. This one is an observer. It starts nothing,
+# frees nothing and merges nothing, so a box running it alone is just an idle box
+# keeping a log — it is host hygiene, the same class as the logrotate config and
+# the docker GC policy, and it can be dropped or added without touching the
+# pipeline's behavior.
+#
+# It earns its minute because MAX_PARALLEL_EPICS can only be raised honestly by
+# watching a real drain, and the failures that decide the ceiling are conditional
+# — the real-DB tier booting a Supabase stack under an already-loaded box, or
+# several epics reaching their review fan-out together. Both are invisible to a
+# snapshot taken by hand after the fact. Read it back with bin/resource-report.sh
+# (default: last 24h); the sampler costs ~0.4s and appends one line per tick.
+* * * * * ubuntu /home/ubuntu/toliki/bin/resource-log.sh >> /home/ubuntu/resource-log.err 2>&1

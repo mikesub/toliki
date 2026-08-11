@@ -21,7 +21,19 @@
 # missingok: the logs only exist once etc/dispatch.cron is installed, which is
 # a deliberate manual step — this config must be harmless on a box that hasn't
 # taken it.
-/home/ubuntu/dispatch.log /home/ubuntu/reap.log /home/ubuntu/merge.log {
+# resource.log is the odd one out: it is JSONL written by the sampler itself, not
+# a cron redirect, and bin/resource-report.sh parses it. Its cron line therefore
+# sends stdout/stderr to a SEPARATE resource-log.err — a stray warning landing in
+# the data file would make the report choke on a line that is not JSON. Both are
+# listed here so neither grows without bound. It is the biggest of the five
+# (~1 MB/day, one line a minute), which is still nothing against six rotations.
+#
+# One consequence of monthly rotation worth knowing before it surprises someone:
+# the report reads only the CURRENT file, so a 24h query run just after a
+# rotation sees a short window. It is not silent about it — the header prints the
+# sample count and the real first/last timestamps — but the answer is thinner
+# than it looks, so reach for the rotated file directly on those days.
+/home/ubuntu/dispatch.log /home/ubuntu/reap.log /home/ubuntu/merge.log /home/ubuntu/resource.log /home/ubuntu/resource-log.err {
 	monthly
 	rotate 6
 	compress
