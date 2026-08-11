@@ -3,8 +3,11 @@
 # stock daily logrotate run picks it up from there, no timer of our own.
 #
 # Monthly on purpose: the concern is unbounded growth, not disk pressure — a
-# month of five-minute ticks is tens of MB. Six compressed rotations ≈ half a
-# year of history.
+# month of one-minute ticks across three repos is ~25 MB uncompressed (dispatch
+# ~4 lines a tick, merge ~3, reap ~2), and six compressed rotations ≈ half a
+# year of history. That survived the move from five-minute to one-minute ticks
+# with room to spare; what a month of them costs is skimmability, not disk, so
+# reach for grep rather than a shorter rotation if these get hard to read.
 #
 # No copytruncate: nothing holds these files open — each cron tick appends via
 # its own >> and exits, so rename-and-recreate loses no lines (the next tick's

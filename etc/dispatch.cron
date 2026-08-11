@@ -1,5 +1,5 @@
-# Harness dispatcher, reaper, and merge worker — one tick each, every 5
-# minutes. Install with:
+# Harness dispatcher, reaper, and merge worker — one tick each, every minute.
+# Install with:
 #
 #   sudo install -m 0644 /home/ubuntu/toliki/etc/dispatch.cron /etc/cron.d/harness-dispatch
 #
@@ -17,15 +17,34 @@
 # Still NOT installed by bin/provision.sh: turning the box autonomous is a
 # deliberate act, not a side effect of provisioning it.
 #
-# The interval is far shorter than an epic takes on purpose — a tick that finds
-# no capacity or nothing ready costs two gh calls and exits, so polling often
-# just means a freed slot refills quickly. Overlap is handled by flock inside
-# dispatch.sh and merge-worker.sh, not by the interval. Reap is offset off
-# dispatch's minutes so a sweep isn't killing sessions in the instant a tick is
-# counting them; that only costs a tick of latency either way, but the logs
-# stay readable. The merge tick gets its own offset for the same reason.
-# merge-tick.sh (not merge-worker.sh directly) is what keeps the repo list out
-# of this file: it fans one worker out per repo in etc/repos.conf.
+# The interval is far shorter than an epic takes on purpose — an idle tick is
+# one gh call per repo and exits in a second or two, so polling often just means
+# a freed slot refills quickly. Measured on a 3-repo host: dispatch and merge
+# ~2s, reap ~5s (it also does a git ls-remote per repo for claim refs). At one
+# tick a minute that is a few percent of one core and well under 10% of both the
+# 5000/hour REST budget and the 30/minute search cap.
+#
+# All three run at the same period deliberately. Dispatch cannot use a slot that
+# reap has not freed yet, so a fast dispatch beside a slow reap just moves the
+# queue's bottleneck rather than removing it — at MAX_PARALLEL_EPICS the box
+# would still only turn over at the reaper's pace. Merge is the third link in
+# the same chain: an issue blocked_by another stays unlaunchable until that
+# blocker's PR lands and closes it, so merge latency is dependency latency.
+#
+# They used to be offset off each other's minutes so a sweep was not killing
+# sessions in the instant a tick was counting them. At a one-minute period there
+# is no offset left to give (cron's floor is the minute), and the collision the
+# offset avoided is now cheaper than it was: the worst case is that dispatch
+# counts a session reap is about to kill, reads the host as full, and skips one
+# launch — recovered on the next tick a minute later, where it used to cost
+# five. Reap only ever kills sessions whose issue already went terminal and sat
+# untouched for TERMINAL_SETTLE_MINUTES, so there is no race against a live run.
+# Real overlap is still handled by flock inside dispatch.sh and merge-worker.sh,
+# not by the interval; note a merge that runs long (it waits on CI, ~30 min cap)
+# makes every tick behind it log "still draining" until it finishes, which is
+# reporting, not a fault. merge-tick.sh (not merge-worker.sh directly) is what
+# keeps the repo list out of this file: it fans one worker out per repo in
+# etc/repos.conf.
 #
 # cron hands a job PATH=/usr/bin:/bin and nothing else, which has neither
 # claude (~/.local/bin, see provision.sh) nor node's global bins. Without this
@@ -33,6 +52,6 @@
 # `dead (at bash prompt)` in `./remote-control.sh ls` — the same symptom as the
 # workspace-trust trap, from a completely different cause.
 PATH=/home/ubuntu/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-*/5 * * * * ubuntu /home/ubuntu/toliki/bin/dispatch.sh >> /home/ubuntu/dispatch.log 2>&1
-2-59/5 * * * * ubuntu /home/ubuntu/toliki/bin/reap.sh >> /home/ubuntu/reap.log 2>&1
-4-59/5 * * * * ubuntu /home/ubuntu/toliki/bin/merge-tick.sh >> /home/ubuntu/merge.log 2>&1
+* * * * * ubuntu /home/ubuntu/toliki/bin/dispatch.sh >> /home/ubuntu/dispatch.log 2>&1
+* * * * * ubuntu /home/ubuntu/toliki/bin/reap.sh >> /home/ubuntu/reap.log 2>&1
+* * * * * ubuntu /home/ubuntu/toliki/bin/merge-tick.sh >> /home/ubuntu/merge.log 2>&1
