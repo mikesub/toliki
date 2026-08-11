@@ -21,6 +21,17 @@ the machine-local `etc/repos.conf` it loads is the registry — `REPO_ORIGINS`
 decides which repos get checked (every entry, always), and `SSH_HOST` is how
 the host is reached. No other repo list exists.
 
+**Source it under bash explicitly** — `lib.sh` locates itself via
+`BASH_SOURCE`, and this shell is zsh, where that is empty:
+
+```
+bash -c 'source etc/lib.sh && printf "%s\n" "${REPO_ORIGINS[@]}"'
+```
+
+A bare `source etc/lib.sh` now fails with a message naming the cause; whatever
+it says, **never `cp etc/repos.conf.template etc/repos.conf`** — that file is
+gitignored and machine-local, and the copy destroys the real registry.
+
 ## 1. Needs a decision (all open issues, however old)
 
 Per repo, via `gh -R <owner/repo>`:
@@ -50,12 +61,20 @@ not "is broken".
 
 ## 3. Host half (one ssh, read-only)
 
-- Sessions with status (`./remote-control.sh ls`). For each **dead** session,
-  `tmux capture-pane -p -t <name> -S -60` — the scrollback is the only record
-  of why claude exited; summarize it in a line.
-- `~/reap.log` and `~/merge.log` are diagnostics, not a sweep: consult their
-  recent tails to explain an item flagged above (a stuck `ready-to-merge`, a
-  session reap is leaving alone), not as a section of their own.
+- Sessions with status (`./remote-control.sh ls`). Run it **locally, from the
+  harness checkout — never wrapped in `ssh`**: the script sshes to `SSH_HOST`
+  itself, so sending it to the host makes the host try to resolve that alias
+  and fail with `Temporary failure in name resolution`. That wording invites a
+  flaky-DNS reading; it is not one, and no number of retries will change it.
+  (`ssh $SSH_HOST 'tmux ls'` is the direct equivalent, and does go over ssh.)
+  For each **dead** session, `tmux capture-pane -p -t <name> -S -60` — the
+  scrollback is the only record of why claude exited; summarize it in a line.
+- `~/reap.log` and `~/merge.log` are diagnostics, not a sweep. Read a tail
+  **only to explain an item already flagged above** (a stuck `ready-to-merge`,
+  a session reap is leaving alone). Nothing flagged ⇒ skip them entirely:
+  there is no finding for them to serve, and they are never a section of their
+  own. When you do tail one, search it (`grep`) for the repo or issue at hand
+  rather than reading the last N lines — the recent tail is mostly ticks.
 
 ## The brief
 
