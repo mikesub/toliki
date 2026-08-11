@@ -49,6 +49,12 @@ CLAIM_GRACE_HOURS="${CLAIM_GRACE_HOURS:-6}"
 TERMINAL_SETTLE_MINUTES="${TERMINAL_SETTLE_MINUTES:-5}"
 
 DRY_RUN=0
+NEEDS_HUMAN=0
+
+# Every line carries the sweep's UTC timestamp (ts is in etc/lib.sh).
+say()  { echo "$(ts) [reap] $*"; }
+# Anything reported here ends the run non-zero, so cron surfaces it.
+warn() { echo "$(ts) [reap] $*" >&2; NEEDS_HUMAN=1; }
 
 usage() {
   cat <<EOF
@@ -73,23 +79,18 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
     -n|--dry-run) DRY_RUN=1; shift ;;
-    *) echo "[reap] unknown argument '$1'" >&2; usage >&2; exit 1 ;;
+    *) warn "unknown argument '$1'"; usage >&2; exit 1 ;;
   esac
 done
 
 NOW="$(date +%s)"
-NEEDS_HUMAN=0
 KILLED=0
 DELETED=0
-
-say()  { echo "[reap] $*"; }
-# Anything reported here ends the run non-zero, so cron surfaces it.
-warn() { echo "[reap] $*" >&2; NEEDS_HUMAN=1; }
 
 # Without gh every issue query fails closed and the sweep could only ever
 # report — say so once, up front, rather than once per session.
 if ! gh auth status >/dev/null 2>&1; then
-  echo "[reap] gh is not authenticated — run: gh auth login" >&2
+  warn "gh is not authenticated — run: gh auth login"
   exit 1
 fi
 

@@ -25,6 +25,11 @@ LAUNCH="$HERE/launch.sh"
 QUEUE_LIMIT=20                       # candidates fetched per repo per tick
 EXIT_AT_CAPACITY=3                   # launch.sh's "host is full" code
 
+# Everything this script prints goes through these two, so each line carries
+# the UTC timestamp of the tick that wrote it (ts is in etc/lib.sh).
+say()  { echo "$(ts) [dispatch] $*"; }
+warn() { echo "$(ts) [dispatch] $*" >&2; }
+
 usage() {
   cat <<EOF
 Usage: $0 [-r <repo>] [-n|--dry-run]
@@ -50,20 +55,20 @@ while [[ $# -gt 0 ]]; do
     -n|--dry-run) DRY_RUN=1; shift ;;
     -r|--repo)
       if [[ $# -lt 2 ]]; then
-        echo "[dispatch] $1 requires a value" >&2
+        warn "$1 requires a value"
         exit 1
       fi
       ONLY_REPO="$2"; shift 2 ;;
     -r=*|--repo=*) ONLY_REPO="${1#*=}"; shift ;;
     *)
-      echo "[dispatch] unknown argument '$1'" >&2
+      warn "unknown argument '$1'"
       usage >&2
       exit 1 ;;
   esac
 done
 
 if [[ -n "$ONLY_REPO" ]] && ! repo_path "$ONLY_REPO" >/dev/null; then
-  echo "[dispatch] unknown repo '$ONLY_REPO' (known: $(repo_names | tr '\n' ' '))" >&2
+  warn "unknown repo '$ONLY_REPO' (known: $(repo_names | tr '\n' ' '))"
   exit 1
 fi
 
@@ -74,7 +79,7 @@ fi
 # five minutes away and the queue is still there.
 exec 9>"${TMPDIR:-/tmp}/harness-dispatch.lock"
 if ! flock -n 9; then
-  echo "[dispatch] previous tick still running — skipping"
+  say "previous tick still running — skipping"
   exit 0
 fi
 
@@ -101,11 +106,11 @@ unblocked() {
   local path="$1" n="$2" open
   if ! open="$(cd "$path" && gh api "repos/{owner}/{repo}/issues/$n/dependencies/blocked_by" \
                  --jq '[.[] | select(.state == "open") | .number] | join(",")' 2>&1)"; then
-    echo "[dispatch]   #$n: blocked_by query failed, skipping — $open" >&2
+    warn "  #$n: blocked_by query failed, skipping — $open"
     return 1
   fi
   if [[ -n "$open" ]]; then
-    echo "[dispatch]   #$n: blocked by $open"
+    say "  #$n: blocked by $open"
     return 1
   fi
   return 0
@@ -118,24 +123,24 @@ for repo in $(repo_names); do
   [[ -z "$ONLY_REPO" || "$repo" == "$ONLY_REPO" ]] || continue
   path="$(repo_path "$repo")"
   if [[ ! -d "$path/.git" ]]; then
-    echo "[dispatch] $repo: no checkout at $path — run bin/provision.sh" >&2
+    warn "$repo: no checkout at $path — run bin/provision.sh"
     continue
   fi
   # A repo whose queue can't be read is reported and passed over; the other
   # repos still get their tick.
   if ! nums="$(queue "$path" | tr '\n' ' ')"; then
-    echo "[dispatch] $repo: queue query failed, skipping this repo" >&2
+    warn "$repo: queue query failed, skipping this repo"
     continue
   fi
   nums="${nums% }"
-  echo "[dispatch] $repo: ${nums:-none} ready"
+  say "$repo: ${nums:-none} ready"
   [[ -n "$nums" ]] || continue
   QUEUE_REPO+=("$repo")
   QUEUE_NUMS+=("$nums")
 done
 
 if [[ ${#QUEUE_REPO[@]} -eq 0 ]]; then
-  echo "[dispatch] nothing ready"
+  say "nothing ready"
   exit 0
 fi
 
@@ -172,19 +177,19 @@ for entry in "${ORDER[@]}"; do
   # "already running" — harmless, but it burns the tick on an issue that is
   # already being built instead of moving down the queue.
   if tmux has-session -t "$session" 2>/dev/null; then
-    echo "[dispatch]   #$num ($repo): session '$session' exists, skipping"
+    say "  #$num ($repo): session '$session' exists, skipping"
     continue
   fi
 
   unblocked "$path" "$num" || continue
 
   if (( DRY_RUN )); then
-    echo "[dispatch]   #$num ($repo): would launch '$session'"
+    say "  #$num ($repo): would launch '$session'"
     LAUNCHED=$((LAUNCHED + 1))
     continue
   fi
 
-  echo "[dispatch]   #$num ($repo): launching '$session'"
+  say "  #$num ($repo): launching '$session'"
   set +e
   "$LAUNCH" --repo "$repo" --message "/epic #$num"
   rc=$?
@@ -192,7 +197,7 @@ for entry in "${ORDER[@]}"; do
   case "$rc" in
     0) LAUNCHED=$((LAUNCHED + 1)) ;;
     "$EXIT_AT_CAPACITY")
-      echo "[dispatch] host at capacity — ending tick with $LAUNCHED launched"
+      say "host at capacity — ending tick with $LAUNCHED launched"
       exit 0 ;;
     1)
       # launch.sh's usage/config code. Nothing about it is specific to this
@@ -200,19 +205,19 @@ for entry in "${ORDER[@]}"; do
       # the rest of the queue would just log the same error twenty times and
       # still end in the "tick done" line, which on cron reads as a healthy
       # dispatcher. Stop loudly instead.
-      echo "[dispatch] launch.sh rejected its configuration — aborting tick" >&2
+      warn "launch.sh rejected its configuration — aborting tick"
       exit 1 ;;
     *)
       # Issue-specific failure (a dirty checkout, a pull conflict): report it
       # and keep going, but the tick is not clean, so don't exit 0 on it.
-      echo "[dispatch]   #$num ($repo): launch failed (exit $rc), continuing" >&2
+      warn "  #$num ($repo): launch failed (exit $rc), continuing"
       FAILED=$((FAILED + 1)) ;;
   esac
 done
 
 if (( DRY_RUN )); then
-  echo "[dispatch] dry run: $LAUNCHED would launch (capacity not simulated)"
+  say "dry run: $LAUNCHED would launch (capacity not simulated)"
   exit 0
 fi
-echo "[dispatch] tick done, $LAUNCHED launched, $FAILED failed"
+say "tick done, $LAUNCHED launched, $FAILED failed"
 (( FAILED == 0 ))

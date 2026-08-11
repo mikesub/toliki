@@ -39,6 +39,11 @@ CI_POLL="${MERGE_CI_POLL:-20}"
 # bug, and a run that hits it says so rather than looking like a clean drain.
 MAX_DRAIN=20
 
+# Every line carries the run's UTC timestamp (ts is in etc/lib.sh).
+say()  { printf '%s [merge] %s\n' "$(ts)" "$*"; }
+# Infrastructure died: stop the whole drain, label nothing, let cron retry.
+die()  { printf '%s [merge] %s\n' "$(ts)" "$*" >&2; exit 1; }
+
 usage() {
   cat <<EOF
 Usage: $0 [-r <repo>]
@@ -55,27 +60,21 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
     -r|--repo)
-      if [[ $# -lt 2 ]]; then echo "[merge] $1 requires a value" >&2; exit 1; fi
+      if [[ $# -lt 2 ]]; then die "$1 requires a value"; fi
       REPO="$2"; shift 2 ;;
     -r=*|--repo=*) REPO="${1#*=}"; shift ;;
-    *) echo "[merge] unexpected argument '$1'" >&2; usage >&2; exit 1 ;;
+    *) usage >&2; die "unexpected argument '$1'" ;;
   esac
 done
 
 if ! PROJECT="$(repo_path "$REPO")"; then
-  echo "[merge] unknown repo '$REPO' (known: $(repo_names | tr '\n' ' '))" >&2
-  exit 1
+  die "unknown repo '$REPO' (known: $(repo_names | tr '\n' ' '))"
 fi
 # The gh slug rather than the clone's cwd: every gh call is explicit about which
 # repo it targets, so the worker is not one `cd` away from acting on the wrong one.
 if ! ORIGIN="$(repo_origin "$REPO")"; then
-  echo "[merge] repo '$REPO' has no entry in REPO_ORIGINS — add one to etc/repos.conf" >&2
-  exit 1
+  die "repo '$REPO' has no entry in REPO_ORIGINS — add one to etc/repos.conf"
 fi
-
-say()  { printf '[merge] %s\n' "$*"; }
-# Infrastructure died: stop the whole drain, label nothing, let cron retry.
-die()  { printf '[merge] %s\n' "$*" >&2; exit 1; }
 
 for tool in git gh jq flock; do
   command -v "$tool" >/dev/null 2>&1 || die "$tool is not installed — run bin/provision.sh"

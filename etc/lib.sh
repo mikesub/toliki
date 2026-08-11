@@ -83,3 +83,10 @@ slugify() {
 
 # Single-quote-escape a string for a shell command line.
 sq() { local s="${1//\'/\'\\\'\'}"; printf "'%s'" "$s"; }
+
+# UTC timestamp for log lines ("2026-08-11T09:45:02Z"). The cron-driven scripts
+# prefix every line with it via their say/warn helpers: three jobs append to
+# the same logs every five minutes, and an untimestamped line can't answer
+# which tick wrote it — or against which version of the script. Keep the flags
+# portable: the host's coreutils is uutils, not GNU.
+ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
