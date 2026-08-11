@@ -1,0 +1,29 @@
+# Rotation for the harness cron logs — the three appenders in etc/dispatch.cron.
+# bin/provision.sh installs this at /etc/logrotate.d/harness-logs; Ubuntu's
+# stock daily logrotate run picks it up from there, no timer of our own.
+#
+# Monthly on purpose: the concern is unbounded growth, not disk pressure — a
+# month of five-minute ticks is tens of MB. Six compressed rotations ≈ half a
+# year of history.
+#
+# No copytruncate: nothing holds these files open — each cron tick appends via
+# its own >> and exits, so rename-and-recreate loses no lines (the next tick's
+# >> recreates the file). A merge-worker still draining across the rotation
+# keeps appending to the renamed file through its open fd; delaycompress leaves
+# that newest rotation uncompressed for one cycle so those lines land intact.
+#
+# su: logrotate runs as root and refuses to rotate files in a directory
+# writable by a non-root user (/home/ubuntu) unless told which user to act as.
+#
+# missingok: the logs only exist once etc/dispatch.cron is installed, which is
+# a deliberate manual step — this config must be harmless on a box that hasn't
+# taken it.
+/home/ubuntu/dispatch.log /home/ubuntu/reap.log /home/ubuntu/merge.log {
+	monthly
+	rotate 6
+	compress
+	delaycompress
+	missingok
+	notifempty
+	su ubuntu ubuntu
+}

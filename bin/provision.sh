@@ -47,6 +47,8 @@ fi
 NODE_MAJOR=24                       # CI pins 24; the host must match it
 DOCKER_CONFIG_SRC="$HERE/../etc/docker-daemon.json"
 DOCKER_CONFIG_DST="/etc/docker/daemon.json"
+LOGROTATE_SRC="$HERE/../etc/harness-logs.logrotate"
+LOGROTATE_DST="/etc/logrotate.d/harness-logs"
 # Where etc/docker-daemon.json was vendored FROM is machine-local knowledge:
 # GC_UPSTREAM_REPO/GC_UPSTREAM_REL in etc/repos.conf, empty when no upstream
 # is being tracked (the provenance check below then skips).
@@ -305,6 +307,34 @@ else
   # those means daemon.json did not load, whatever the write reported.
   blocked "GC policy NOT live — buildx reports defaults, not the 168h/2GiB/10GiB rules"
   grep -A6 'GC Policy' <<<"$GC_POLICY" | sed 's/^/           /' || true
+fi
+
+# ------------------------------------------------- harness log rotation ------
+#
+# etc/dispatch.cron appends ~26k lines a day across ~/dispatch.log, ~/reap.log
+# and ~/merge.log, and nothing else trims them. Installed by provisioning —
+# unlike etc/dispatch.cron itself, which stays a manual step because installing
+# it is what turns the box autonomous — because rotation changes nothing about
+# how the pipeline behaves: it's host hygiene, the same class as the docker GC
+# policy above. missingok inside the config keeps it harmless on a box where
+# the cron file was never installed and the logs don't exist yet.
+
+say "harness log rotation"
+apt_install logrotate
+if [[ -f "$LOGROTATE_DST" ]] && cmp -s "$LOGROTATE_SRC" "$LOGROTATE_DST"; then
+  ok "$LOGROTATE_DST already matches etc/harness-logs.logrotate"
+# Parse-check the SOURCE first (as with daemon.json): logrotate skips a file it
+# can't parse and rotates everything else, so a broken config wouldn't break
+# rotation loudly — our logs would just quietly never rotate again.
+elif ! $SUDO logrotate -d "$LOGROTATE_SRC" >/dev/null 2>&1; then
+  blocked "etc/harness-logs.logrotate fails 'logrotate -d' — not installing it; $LOGROTATE_DST left as it was"
+else
+  if [[ -f "$LOGROTATE_DST" ]]; then
+    warn "$LOGROTATE_DST differs from etc/harness-logs.logrotate; replacing it"
+    diff -u "$LOGROTATE_DST" "$LOGROTATE_SRC" | sed 's/^/           /' || true
+  fi
+  $SUDO install -m 0644 "$LOGROTATE_SRC" "$LOGROTATE_DST"
+  changed "installed $LOGROTATE_DST (monthly, 6 rotations kept, compressed)"
 fi
 
 # ------------------------------------------------------------ supabase CLI --
