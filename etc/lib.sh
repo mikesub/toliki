@@ -5,9 +5,28 @@
 # repos.conf is gitignored and seeded from etc/repos.conf.template.
 # Keep everything here side-effect-free.
 
+# BASH_SOURCE is a bash-ism, and this file locates itself with nothing else.
+# zsh leaves it empty, so `dirname ""` yields "." and _LIB_DIR silently becomes
+# the CALLER'S CWD instead of this file's directory — the registry check below
+# then fires from the wrong path and reports a file that is sitting right
+# there. That misreads as "your registry is missing", whose fix is to copy the
+# template OVER a gitignored, machine-local file with no way back. Every script
+# here is bash, but the laptop's interactive shell (and so any ad-hoc
+# `source etc/lib.sh` from a tool or a prompt) is zsh. Refuse rather than guess.
+if [[ -z "${BASH_SOURCE[0]:-}" ]]; then
+  echo "etc/lib.sh: \${BASH_SOURCE[0]} is empty — this is not bash (zsh/sh)," >&2
+  echo "so this file cannot locate itself. Re-run under bash:" >&2
+  echo "  bash -c 'source etc/lib.sh && ...'" >&2
+  exit 1
+fi
 _LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ ! -f "$_LIB_DIR/repos.conf" ]]; then
-  echo "etc/repos.conf not found — create your local registry first:" >&2
+  # Name the path that was checked. Unqualified, this message's other reading
+  # is "the registry is missing" — and acting on that means clobbering a
+  # registry that a bad lookup simply failed to find.
+  echo "registry not found at $_LIB_DIR/repos.conf" >&2
+  echo "If that path looks wrong, the lookup is at fault, not the file." >&2
+  echo "Otherwise create your local registry first:" >&2
   echo "  cp etc/repos.conf.template etc/repos.conf   # then edit it" >&2
   exit 1
 fi
