@@ -1,6 +1,7 @@
 ---
 name: triage
 description: Surface everything stuck in the epic pipeline — failed and review-waiting issues, stuck queue states, dead sessions — across all registered repos. Use when the user asks what got stuck, what needs them, or for a pipeline status check when sitting down to work.
+model: sonnet
 ---
 
 Produce the operator's sit-down brief: everything that needs a human and
