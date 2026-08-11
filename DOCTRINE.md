@@ -58,6 +58,17 @@ from memory.
 - **No project rules here.** Compliance, deploy policy, conventions live in
   each project's own `CLAUDE.md` and `.claude/rules/`; the harness asserts
   only what is universal.
+- **No shared-resource guards here**, though the harness does assert the
+  constraint that makes them necessary: a verify run owns its worktree and
+  nothing else, and it runs concurrently with other worktrees and other repos
+  on one box. Guarding what it reaches outside — fixed ports, container names,
+  `/tmp` paths, shared fixtures — stays in the project. There is nothing to
+  centralize: the tier is invoked by an agent mid-session, not by any harness
+  script, so the only thing the harness could lock is a whole session, which
+  gives back exactly the parallelism it exists to provide. And the project has
+  to stay correct where the harness doesn't exist — CI, a laptop — which a
+  guard living in `toliki` cannot do. The constraint is universal, so it is
+  stated here; the guard is local, so it is written there.
 
 ## From Yegge's *The Shape of Things to Come* (Aug 2026)
 
