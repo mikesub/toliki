@@ -321,12 +321,19 @@ fi
 
 say "harness log rotation"
 apt_install logrotate
+# The parse check can't run on the checkout's own file: logrotate (3.22 makes
+# both errors, not warnings) refuses any config that is group/other-writable
+# OR not owned by root, and the clone's copy is ubuntu-owned 0664 courtesy of
+# the host's umask. So check a root-owned 0644 temp copy — the exact ownership
+# and mode the install below gives the real one.
+LR_CHECK="$(mktemp)"
+$SUDO install -m 0644 -o root -g root "$LOGROTATE_SRC" "$LR_CHECK"
 if [[ -f "$LOGROTATE_DST" ]] && cmp -s "$LOGROTATE_SRC" "$LOGROTATE_DST"; then
   ok "$LOGROTATE_DST already matches etc/harness-logs.logrotate"
-# Parse-check the SOURCE first (as with daemon.json): logrotate skips a file it
-# can't parse and rotates everything else, so a broken config wouldn't break
-# rotation loudly — our logs would just quietly never rotate again.
-elif ! $SUDO logrotate -d "$LOGROTATE_SRC" >/dev/null 2>&1; then
+# Parse-check before installing (as with daemon.json): logrotate skips a file
+# it can't parse and rotates everything else, so a broken config wouldn't
+# break rotation loudly — our logs would just quietly never rotate again.
+elif ! $SUDO logrotate -d "$LR_CHECK" >/dev/null 2>&1; then
   blocked "etc/harness-logs.logrotate fails 'logrotate -d' — not installing it; $LOGROTATE_DST left as it was"
 else
   if [[ -f "$LOGROTATE_DST" ]]; then
@@ -336,6 +343,7 @@ else
   $SUDO install -m 0644 "$LOGROTATE_SRC" "$LOGROTATE_DST"
   changed "installed $LOGROTATE_DST (monthly, 6 rotations kept, compressed)"
 fi
+$SUDO rm -f "$LR_CHECK"   # root-owned in sticky /tmp, so plain rm can't
 
 # ------------------------------------------------------------ supabase CLI --
 
