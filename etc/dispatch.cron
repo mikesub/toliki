@@ -1,0 +1,38 @@
+# Harness dispatcher, reaper, and merge worker — one tick each, every 5
+# minutes. Install with:
+#
+#   sudo install -m 0644 /home/ubuntu/toliki/etc/dispatch.cron /etc/cron.d/harness-dispatch
+#
+# All three lines, or none. Dispatching without reaping fills the box and stops:
+# a finished epic idles at the claude prompt and still counts against
+# MAX_PARALLEL_EPICS, so the host quietly runs out of slots with nothing
+# running. Reaping without dispatching frees slots nothing then claims. And
+# dispatching without merging stalls the last mile: every clean epic parks at
+# `ready-to-merge` with an open PR nothing lands, so the fleet keeps building
+# against a main that never advances. The two blockers this file used to name —
+# that unfreed slot and the stale claim ref a dead run leaves — are both answered by
+# bin/reap.sh, which is why the reap line is here rather than a note saying it
+# should be.
+#
+# Still NOT installed by bin/provision.sh: turning the box autonomous is a
+# deliberate act, not a side effect of provisioning it.
+#
+# The interval is far shorter than an epic takes on purpose — a tick that finds
+# no capacity or nothing ready costs two gh calls and exits, so polling often
+# just means a freed slot refills quickly. Overlap is handled by flock inside
+# dispatch.sh and merge-worker.sh, not by the interval. Reap is offset off
+# dispatch's minutes so a sweep isn't killing sessions in the instant a tick is
+# counting them; that only costs a tick of latency either way, but the logs
+# stay readable. The merge tick gets its own offset for the same reason.
+# merge-tick.sh (not merge-worker.sh directly) is what keeps the repo list out
+# of this file: it fans one worker out per repo in etc/repos.conf.
+#
+# cron hands a job PATH=/usr/bin:/bin and nothing else, which has neither
+# claude (~/.local/bin, see provision.sh) nor node's global bins. Without this
+# line the session launches, the pane can't find `claude`, and it shows up as
+# `dead (at bash prompt)` in `./remote-control.sh ls` — the same symptom as the
+# workspace-trust trap, from a completely different cause.
+PATH=/home/ubuntu/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+*/5 * * * * ubuntu /home/ubuntu/toliki/bin/dispatch.sh >> /home/ubuntu/dispatch.log 2>&1
+2-59/5 * * * * ubuntu /home/ubuntu/toliki/bin/reap.sh >> /home/ubuntu/reap.log 2>&1
+4-59/5 * * * * ubuntu /home/ubuntu/toliki/bin/merge-tick.sh >> /home/ubuntu/merge.log 2>&1

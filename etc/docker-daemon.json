@@ -1,0 +1,12 @@
+{
+  "live-restore": true,
+  "builder": {
+    "gc": {
+      "enabled": true,
+      "policy": [
+        { "reservedSpace": "2GB", "filter": ["unused-for=168h"] },
+        { "maxUsedSpace": "10GB", "all": true }
+      ]
+    }
+  }
+}

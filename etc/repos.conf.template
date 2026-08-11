@@ -1,0 +1,63 @@
+# Machine-local registry + naming config for the harness. Copy this file to
+# etc/repos.conf on each machine (laptop and host) and edit the values —
+# repos.conf is gitignored, so your registry never lands in the repo. It is
+# sourced as bash (via etc/lib.sh, which also holds the shared helpers), so
+# keep it side-effect-free: variable assignments only.
+
+# Repos the harness can launch sessions in, as <name>=<absolute path on the
+# host>. The first entry is the default when -r/--repo isn't given. To add a
+# repo: add a line here AND one to REPO_ORIGINS below, re-run bin/provision.sh
+# on the host to clone it, then run `claude` once in the clone over ssh to
+# accept the workspace-trust dialog (see CLAUDE.md — skipping that makes every
+# session in it die instantly and look started).
+# A plain array rather than `declare -A` so this stays portable to bash 3.2
+# (macOS) and the order is stable for usage/error text.
+REPOS=(
+  myapp=/home/ubuntu/myapp
+)
+
+# Where each repo is cloned FROM, as <name>=<owner/repo> GitHub slugs — only
+# provision.sh reads this, and it clones with `gh repo clone`, which carries
+# the host's gh credentials (so private repos across owners all work).
+REPO_ORIGINS=(
+  myapp=your-github-user/myapp
+)
+
+# Where this control repo is cloned on the host. remote-control.sh invokes
+# bin/launch.sh under this path over ssh; provision.sh clones the repo here.
+HOST_CONTROL_DIR="/home/ubuntu/toliki"
+
+# ssh destination of the host, as remote-control.sh (laptop-side) dials it.
+# An alias from your ~/.ssh/config or anything ssh accepts (user@host).
+SSH_HOST="vps"
+
+# Pool of short session names to cycle through when `start` is called without
+# a name or message. Checked per-repo, so myapp-alpha and otherapp-alpha can
+# coexist.
+NAMES=(alpha bravo charlie delta echo foxtrot golf hotel)
+
+# Longest session name we'll derive from a message before truncating.
+NAME_MAX_LEN=40
+
+# How many claude sessions may run on the host at once — the host's slot
+# budget, enforced in bin/launch.sh (see the comment at its capacity check for
+# why there and not in dispatch.sh). Counts every *running* session, whoever
+# started it: a session idling at a shell prompt holds its name but no load,
+# so it doesn't count, and an interactive session does, because it is load
+# like any other.
+#
+# Size it against the box, not against the queue: workflow concurrency is
+# min(16, cores-2), so each epic session is a claude process plus up to that
+# many agents. On 6 vCPU / 11 GiB, 2 means ~10 processes at full tilt. Start
+# low and raise it after watching a full queue drain — an under-full box just
+# drains slower, whereas contention is expensive to tell apart from a
+# pipeline bug.
+MAX_PARALLEL_EPICS=2
+
+# Optional: where etc/docker-daemon.json (the Docker build-cache GC policy
+# provision.sh installs) is vendored FROM, so provisioning can warn when the
+# copy drifts from its source of truth. Leave empty to skip the check; set
+# GC_UPSTREAM_REPO to a name from REPOS and GC_UPSTREAM_REL to the path of
+# the daemon.json inside that repo.
+GC_UPSTREAM_REPO=""
+GC_UPSTREAM_REL=""
