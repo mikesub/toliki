@@ -81,11 +81,16 @@ fi
 # The `ready` queue for one repo, oldest first. gh runs inside the clone so it
 # resolves the GitHub repo from that checkout's own origin — which is why this
 # script never reads REPO_ORIGINS. Same query as the /epic skill's queue walk:
-# in-progress and failed are excluded because a run already owns those.
+# in-progress and failed are excluded because a run already owns those, and the
+# two terminal success labels are excluded because prepare's label swap is
+# best-effort — a stale `ready` can survive beside ready-to-merge/-review, and
+# searched by `ready` alone that finished issue would be re-picked every tick,
+# each launch burning a spawn that exits via the pipeline's already-claimed
+# guard, with nothing in the logs looking wrong.
 queue() {
   local path="$1"
   (cd "$path" && gh issue list \
-      --search 'label:ready -label:in-progress -label:failed sort:created-asc' \
+      --search 'label:ready -label:in-progress -label:failed -label:ready-to-merge -label:ready-to-review sort:created-asc' \
       --state open --limit "$QUEUE_LIMIT" --json number --jq '.[].number')
 }
 

@@ -18,9 +18,9 @@ Request: $ARGUMENTS
 
 1. **Resolve the issue number.**
    - **Given in the request** (e.g. `#42` → `42`): use it, whatever labels it carries.
-   - **Not given — claim from the queue.** `/spec` files each finished spec with the `ready` label; take the oldest one that is not already claimed and not blocked:
+   - **Not given — claim from the queue.** `/spec` files each finished spec with the `ready` label; take the oldest one that is not already claimed, not blocked, and not already finished (the terminal labels are excluded because the pipeline's label swap is best-effort — a stale `ready` can survive beside one, and that issue must not re-enter the queue):
      ```
-     gh issue list --search "label:ready -label:in-progress -label:failed sort:created-asc" --state open --json number,title --limit 20
+     gh issue list --search "label:ready -label:in-progress -label:failed -label:ready-to-merge -label:ready-to-review sort:created-asc" --state open --json number,title --limit 20
      ```
      Walk the list oldest-first and take the **first issue with no open blockers** — check each with `gh api repos/{owner}/{repo}/issues/<N>/dependencies/blocked_by --jq '[.[] | select(.state == "open") | .number]'` and skip any that returns a non-empty list (leave its `ready` label alone; it re-enters the queue once unblocked). If the query returns nothing, or every candidate is blocked, say the queue is empty and stop — do not fall back to unlabelled issues.
 

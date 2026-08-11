@@ -57,7 +57,8 @@ Usage: $0 [-n|--dry-run]
 Sweeps the host once and exits:
   1. kills the tmux session of every <repo>-epic-<N> whose issue has reached a
      terminal state (labelled ready-to-merge/ready-to-review/failed, or closed)
-     and has sat still for \$TERMINAL_SETTLE_MINUTES (${TERMINAL_SETTLE_MINUTES}m), and flags —
+     and has sat still for \$TERMINAL_SETTLE_MINUTES (${TERMINAL_SETTLE_MINUTES}m; a closed issue
+     skips the wait — merged is delivered), and flags —
      without killing — any whose claude died before it got there, because the
      pane's scrollback is the only record of why.
   2. deletes every epic/<N>-* ref on origin whose tip is still the claim commit
@@ -154,9 +155,11 @@ else
     # so missing it would leak a slot on every clean epic. A closed issue is
     # the backstop for a PR that merged before this sweep noticed.
     terminal=0
+    needs_settle=1
     reason=""
     if [[ "$state" == "CLOSED" ]]; then
       terminal=1
+      needs_settle=0    # merged and delivered — see the settle comment below
       reason="issue #$issue closed"
     elif [[ ",$labels," == *,ready-to-merge,* ]]; then
       terminal=1
@@ -171,7 +174,14 @@ else
 
     # Let it settle: see TERMINAL_SETTLE_MINUTES. An unparseable timestamp is
     # treated as "not settled" — fail closed, and the next sweep tries again.
-    if (( terminal )); then
+    # CLOSED skips the wait entirely: the settle clock keys on the issue's
+    # last edit, and the merge worker's own writes (the label drop, the
+    # Closes #N close) are exactly what reset it — so waiting here only
+    # delays cleanup of work that is already merged and delivered. The window
+    # exists for the LABEL states, where ship applies ready-to-review before
+    # it has finished writing; a closed issue's session has nothing left to
+    # finish.
+    if (( terminal && needs_settle )); then
       updated_ts="$(date -u -d "$updated" +%s 2>/dev/null || date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$updated" +%s 2>/dev/null || echo 0)"
       settled_min=$(( (NOW - updated_ts) / 60 ))
       if (( updated_ts == 0 )) || (( settled_min < TERMINAL_SETTLE_MINUTES )); then
