@@ -18,9 +18,17 @@ set -euo pipefail
 # at a time inside a run. Across repos there is nothing to serialize — separate
 # mains — so each repo gets its own invocation and its own lock.
 #
-# It never fixes anything. A rebase conflict, a red check, or a failed merge
-# flips the issue to `failed` with a comment naming which, and the drain moves
-# on to the next PR. A human resolves it.
+# It never exercises judgment, and the one thing it fixes is proved rather
+# than guessed: a rebase conflict whose EVERY hunk is mechanical — both sides
+# only added at the same point (empty base), or exactly one side edited base
+# lines the other merely added around — is resolved by construction in
+# bin/merge-autoresolve.sh, verified by literal line containment before
+# anything is pushed, and then gated by CI on the rebased head like any other
+# rebase. No model, no session; a single hunk where both sides touched the
+# same lines declines the whole PR. Everything else stays unfixed: a judgment
+# conflict, a red check, or a failed merge flips the issue to `failed` with a
+# comment naming which, and the drain moves on to the next PR. A human
+# resolves it.
 #
 # Infrastructure failures (fetch, gh API) abort the run instead of labelling
 # anything: cron retries on the next tick, and a network hiccup must never
@@ -51,7 +59,10 @@ Usage: $0 [-r <repo>]
 Merges every open PR whose issue carries \`ready-to-merge\`, oldest issue first,
 one at a time, into $DEFAULT_REPO's main (or -r <repo>: $(repo_names | tr '\n' ' ')).
 Each PR is rebased onto the current origin/main and its CI re-run before it
-merges. Anything that fails leaves the PR open and flips its issue to \`failed\`.
+merges. A rebase conflict whose hunks are all mechanical (both sides added at
+the same point, or one side edited base lines the other only added around) is
+auto-resolved, containment-verified and CI-gated; anything else that fails
+leaves the PR open and flips its issue to \`failed\`.
 Exits 0 doing nothing if another invocation for the same repo is still running.
 EOF
 }
@@ -133,6 +144,28 @@ EOF
   gh issue edit "$issue" -R "$ORIGIN" \
     --remove-label ready-to-merge --add-label failed >/dev/null 2>&1 \
     || say "$REPO: could not relabel #$issue"
+}
+
+# An auto-resolved conflict is recorded on the issue, not only in this log:
+# the resolution rewrote lines nobody reviewed, so the audit trail — which
+# files, which hunks, which class — has to live where a human will look.
+# Best-effort like mark_failed's comment; the merge itself is not held on it.
+record_autoresolve() {
+  local issue="$1" details="$2"
+  gh issue comment "$issue" -R "$ORIGIN" --body-file - <<EOF || say "$REPO: could not comment on #$issue"
+🤖 merge-worker auto-resolved a rebase conflict
+- repo: $REPO
+- pr: $PR_URL
+
+Rebasing onto origin/main conflicted, and every hunk was mechanical — no
+judgment involved, so none was exercised:
+
+$(sed 's/^/- /' <<<"$details")
+
+The resolution was verified by literal line containment (every line of both
+sides survived) before anything was pushed, and CI re-runs on the rebased
+head before the merge.
+EOF
 }
 
 # ------------------------------------------------------------------- checks --
@@ -264,10 +297,19 @@ merge_one() {
   git -C "$WT" checkout -f --detach --quiet "$head" \
     || die "$REPO: could not check out $head — aborting the run"
 
-  if ! git -C "$WT" rebase origin/main >/dev/null 2>&1; then
-    git -C "$WT" rebase --abort >/dev/null 2>&1 || true
-    FAIL="rebase of $branch onto origin/main conflicted"
-    return 1
+  # diff3 markers on purpose: they carry the base section, which is what lets
+  # merge-autoresolve.sh tell "both sides added here" from "both sides edited
+  # the same lines" when the rebase stops.
+  if ! git -C "$WT" -c merge.conflictStyle=diff3 rebase origin/main >/dev/null 2>&1; then
+    local resolution
+    if resolution="$("$HERE/merge-autoresolve.sh" "$WT" 2>&1)"; then
+      say "$REPO: PR #$pr rebase conflicted; every hunk was mechanical - auto-resolved"
+      record_autoresolve "$issue" "$resolution"
+    else
+      git -C "$WT" rebase --abort >/dev/null 2>&1 || true
+      FAIL="rebase of $branch onto origin/main conflicted; not auto-resolvable: $(head -n 1 <<<"$resolution")"
+      return 1
+    fi
   fi
   rebased="$(git -C "$WT" rev-parse HEAD)"
 
