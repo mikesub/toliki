@@ -139,6 +139,12 @@ ${comment.split('\n').map(l => '   ' + l).join('\n')}
 3. Relabel — ready-to-review, NEVER ready-to-merge: whether this PR may merge unattended was a gate computed before the conflict existed, and a rewritten resolution resets that to "a human glances". \`gh label create ready-to-review --color 0E8A16 --description "epic-run finished; PR is open and awaiting review" 2>/dev/null || true\`, then \`gh issue edit ${issue} --remove-label in-progress --remove-label needs-judgment --add-label ready-to-review\`. Leave fix-attempted/fix-retried in place — the ladder deliberately does not reset. Then verify: \`gh issue view ${issue} --json labels --jq '[.labels[].name]'\` must contain ready-to-review and neither in-progress nor needs-judgment.
 Return: pushed, labelled (true only if step 3's verification held), note (any error text).`,
 
+  // What happens next is the LADDER's call, never the phase's — so it is a
+  // field of the block (`- next:`), not a paragraph after it. #272 shipped it
+  // as a trailing paragraph, the agent read that as narration and dropped it,
+  // and the operator saw a first-attempt decline with no notice that a retry
+  // was already queued. Keep every disposition claim inside the block; a
+  // `reason` string states what broke, never who picks it up.
   blocked: (issue, phase, reason, prUrl, attempt) => {
     const ladder = attempt >= 2
       ? 'This was the RETRY (fix-attempted and fix-retried are both on the issue), so the fixer is done with it: resolve by hand, or strip the two fix-* labels to grant another round.'
@@ -147,14 +153,13 @@ Return: pushed, labelled (true only if step 3's verification held), note (any er
       : 'The attempt ladder was not reached, so dispatch will relaunch the fixer on its next tick.'
     return `The autonomous fix-conflict run hit a blocker and must report it on GitHub, then stop. Do this and nothing else:
 1. If a rebase is in progress, abort it: \`git rebase --abort 2>/dev/null || true\` — the worktree must not be left mid-rebase for the next run to trip over. Do not commit or push anything.
-2. Post a comment on issue #${issue} whose body starts with EXACTLY this (fill the values; keep the first line and field names verbatim):
+2. Post a comment on issue #${issue} whose body is EXACTLY this block and nothing else — every value is already filled in, so copy all five lines verbatim, add nothing and drop nothing:
 
 🤖 fix-conflict blocked
 - phase: ${phase}
 - reason: ${reason}
 - pr: ${prUrl || 'not resolved'}
-
-${ladder}
+- next: ${ladder}
 
 Post it with \`gh issue comment ${issue} --body-file -\`, feeding the body via a heredoc on stdin.
 3. Flip the start-signal back to failed: \`gh label create failed --color B60205 --description "epic-run stopped at a blocker; needs human attention" 2>/dev/null || true\`, then \`gh issue edit ${issue} --remove-label in-progress --add-label failed 2>/dev/null || true\`. Leave needs-judgment and the fix-* labels exactly as they are — needs-judgment keeps the issue in the fixer queue and the ladder labels are what bound the retries.
@@ -366,7 +371,7 @@ try {
   const v = await agent(PROMPTS.verify(pkgList),
     { label: 'verify', phase: 'Verify', agentType: 'coder', model: MECHANICAL, schema: VERIFY_SCHEMA })
   if (!v) return await fail('verify', 'the verify agent produced no result — an unverified resolution must not ship.')
-  if (!v.green) return await fail('verify', `npm run verify is red after the resolution (${v.detail}) — the fixer never fixes code, so this waits for a human.`)
+  if (!v.green) return await fail('verify', `npm run verify is red after the resolution (${v.detail}) — the fixer never fixes code, so nothing was pushed and the PR branch is untouched.`)
   log(`Verify: green — ${v.detail}`)
 
   // ───────────────────────── Adversarial check ─────────────────────────
