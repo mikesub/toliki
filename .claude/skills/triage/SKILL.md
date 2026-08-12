@@ -36,10 +36,22 @@ gitignored and machine-local, and the copy destroys the real registry.
 
 Per repo, via `gh -R <owner/repo>`:
 
-- **`failed`** — read the newest 🤖 comment for the cause and check the PR's
-  state (`mergeable` says if a conflict is still live). Report: one-line cause,
-  PR link, and what finishing takes — typically *fix the cause, push, swap
-  `failed` → `ready-to-merge`; the merge worker lands it from there*.
+- **`failed`** — first check for `needs-judgment` beside it, which changes who
+  owns the issue:
+  - `needs-judgment` **without** `fix-retried`: the automated fixer owns it —
+    dispatch launches (or relaunches) a fixer session on its own, so this is
+    not a decision item. Mention it under "stuck in the machine" only if it
+    has sat unchanged for over ~1h (then check sessions and `~/dispatch.log`
+    for why the fixer walk isn't picking it up).
+  - `needs-judgment` **with** `fix-retried`: the fixer's attempt ladder is
+    exhausted — a real decision item. Read the newest 🤖 fix-conflict comment;
+    the human either resolves by hand or strips `fix-attempted` +
+    `fix-retried` to grant the fixer another round.
+  - plain `failed`: read the newest 🤖 comment for the cause and check the
+    PR's state (`mergeable` says if a conflict is still live). Report:
+    one-line cause, PR link, and what finishing takes — typically *fix the
+    cause, push, swap `failed` → `ready-to-merge`; the merge worker lands it
+    from there*.
 - **`ready-to-review`** — read the deferred/summary comment and extract the
   actual decision the human is being asked to make, not the whole list.
 

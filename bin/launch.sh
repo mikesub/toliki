@@ -16,7 +16,7 @@ source "$HERE/../etc/lib.sh"
 
 usage() {
   cat <<EOF
-Usage: $0 [session-name] [-m <message>] [-r <repo>]
+Usage: $0 [session-name] [-m <message>] [-r <repo>] [--check-capacity]
 
 Creates a detached tmux session running claude in the named repo (default:
 $DEFAULT_REPO). Name resolution when no name is given: with -m, the session is
@@ -25,12 +25,16 @@ otherwise the first pool name free for the repo: ${NAMES[*]}
 If the session already exists, reports whether claude is still running in it
 and changes nothing (it never relaunches into a live session, and doesn't pull).
 Refuses with exit 3 when $MAX_PARALLEL_EPICS sessions are already running.
+--check-capacity answers ONLY that last question (exit 0 below the cap, 3 at
+it) and starts nothing — dispatch.sh probes it before work it would otherwise
+have to undo, so the counting stays in this one script.
 EOF
 }
 
 SESSION=""
 MESSAGE=""
 HAVE_MESSAGE=0
+CHECK_CAPACITY=0
 REPO="$DEFAULT_REPO"
 
 POSITIONAL=()
@@ -66,6 +70,10 @@ while [[ $# -gt 0 ]]; do
       REPO="${1#*=}"
       shift
       ;;
+    --check-capacity)
+      CHECK_CAPACITY=1
+      shift
+      ;;
     *)
       POSITIONAL+=("$1")
       shift
@@ -99,6 +107,34 @@ running_count() {
   done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null || true)
   printf '%s' "$n"
 }
+
+# The cap check itself, shared by the probe below and the real launch: validate
+# the config, count, refuse with exit 3 at the cap. One function so a probe can
+# never disagree with the launch that follows it.
+#
+# Unset or non-numeric is a hard error, never an implied "no limit" — a cap
+# that quietly evaporates when its config is missing is worse than no cap,
+# because the box is then unprotected by something you believe is protecting it.
+capacity_gate() {
+  if [[ ! "${MAX_PARALLEL_EPICS:-}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[launch] MAX_PARALLEL_EPICS must be a positive integer, got '${MAX_PARALLEL_EPICS:-<unset>}' — fix etc/repos.conf" >&2
+    exit 1
+  fi
+  RUNNING="$(running_count)"
+  if (( RUNNING >= MAX_PARALLEL_EPICS )); then
+    echo "[launch] at capacity ($RUNNING/$MAX_PARALLEL_EPICS running)${SESSION:+ — not starting '$SESSION'}" >&2
+    exit 3
+  fi
+  echo "[launch] capacity $RUNNING/$MAX_PARALLEL_EPICS"
+}
+
+# --check-capacity: answer the cap question and stop — no naming, no pull, no
+# session. dispatch.sh probes this before its fixer-walk label swap, so a full
+# host costs zero label writes instead of a swap it must immediately revert.
+if [[ $CHECK_CAPACITY -eq 1 ]]; then
+  capacity_gate
+  exit 0
+fi
 
 # First pool name with no existing tmux session for this repo (running or dead).
 pick_free_name() {
@@ -155,20 +191,7 @@ fi
 # is the only version that can't be bypassed. It sits after the has-session
 # check on purpose: reporting on a session that already exists starts nothing,
 # so it must not be refused for capacity.
-#
-# Unset or non-numeric is a hard error, never an implied "no limit" — a cap
-# that quietly evaporates when its config is missing is worse than no cap,
-# because the box is then unprotected by something you believe is protecting it.
-if [[ ! "${MAX_PARALLEL_EPICS:-}" =~ ^[1-9][0-9]*$ ]]; then
-  echo "[launch] MAX_PARALLEL_EPICS must be a positive integer, got '${MAX_PARALLEL_EPICS:-<unset>}' — fix etc/repos.conf" >&2
-  exit 1
-fi
-RUNNING="$(running_count)"
-if (( RUNNING >= MAX_PARALLEL_EPICS )); then
-  echo "[launch] at capacity ($RUNNING/$MAX_PARALLEL_EPICS running) — not starting '$SESSION'" >&2
-  exit 3
-fi
-echo "[launch] capacity $RUNNING/$MAX_PARALLEL_EPICS"
+capacity_gate
 
 echo "[launch] pulling latest main in $PROJECT"
 git -C "$PROJECT" pull --rebase

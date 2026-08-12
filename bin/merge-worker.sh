@@ -27,8 +27,11 @@ set -euo pipefail
 # rebase. No model, no session; a single hunk where both sides touched the
 # same lines declines the whole PR. Everything else stays unfixed: a judgment
 # conflict, a red check, or a failed merge flips the issue to `failed` with a
-# comment naming which, and the drain moves on to the next PR. A human
-# resolves it.
+# comment naming which, and the drain moves on to the next PR. The one nuance
+# is WHO resolves it: a judgment-class decline (exit 4 from merge-autoresolve)
+# also gets the `needs-judgment` label, which is the fixer queue — dispatch
+# launches a session that resolves those hunks under an adversarial gate and
+# lands the issue ready-to-review. Every other failure waits for a human.
 #
 # Infrastructure failures (fetch, gh API) abort the run instead of labelling
 # anything: cron retries on the next tick, and a network hiccup must never
@@ -61,8 +64,10 @@ one at a time, into $DEFAULT_REPO's main (or -r <repo>: $(repo_names | tr '\n' '
 Each PR is rebased onto the current origin/main and its CI re-run before it
 merges. A rebase conflict whose hunks are all mechanical (both sides added at
 the same point, or one side edited base lines the other only added around) is
-auto-resolved, containment-verified and CI-gated; anything else that fails
-leaves the PR open and flips its issue to \`failed\`.
+auto-resolved, containment-verified and CI-gated; a conflict that needs
+judgment flips its issue to \`failed\` plus \`needs-judgment\` (the fixer queue
+dispatch drains); anything else that fails leaves the PR open and flips its
+issue to plain \`failed\`.
 Exits 0 doing nothing if another invocation for the same repo is still running.
 EOF
 }
@@ -125,25 +130,45 @@ ensure_worktree() {
 
 FAIL=""     # why this PR could not be merged; consumed by mark_failed
 PR_URL=""   # the PR merge_one last looked at, so a failure report can name it
+NEEDS_JUDGMENT=0   # the decline was judgment-class (merge-autoresolve exit 4)
 
 mark_failed() {
-  local issue="$1" pr_url="$2" reason="$3"
+  local issue="$1" pr_url="$2" reason="$3" next
   say "$REPO: #$issue -> failed ($reason)"
+  if (( NEEDS_JUDGMENT )); then
+    # This class does not wait for a human: `needs-judgment` is the fixer
+    # queue, and dispatch launches a session against it on its next tick.
+    next="The PR is open and NOT merged; the change itself is complete. The conflict
+needs judgment, so this issue is queued for an automated fixer session:
+dispatch launches one that resolves the judgment hunks under an adversarial
+gate, re-verifies, and lands the issue ready-to-review. Nothing to do unless
+it comes back failed again with the fixer's own blocker comment."
+  else
+    next="The PR is open and NOT merged; the change itself is complete. Fix the cause
+above and merge it by hand — the worker does not retry, and re-running /epic on
+this issue will skip it while the PR is open."
+  fi
   gh issue comment "$issue" -R "$ORIGIN" --body-file - <<EOF || say "$REPO: could not comment on #$issue"
 🤖 merge-worker blocked
 - repo: $REPO
 - pr: $pr_url
 - reason: $reason
 
-The PR is open and NOT merged; the change itself is complete. Fix the cause
-above and merge it by hand — the worker does not retry, and re-running /epic on
-this issue will skip it while the PR is open.
+$next
 EOF
   gh label create failed -R "$ORIGIN" --color B60205 \
     --description "epic-run stopped at a blocker; needs human attention" >/dev/null 2>&1 || true
-  gh issue edit "$issue" -R "$ORIGIN" \
-    --remove-label ready-to-merge --add-label failed >/dev/null 2>&1 \
-    || say "$REPO: could not relabel #$issue"
+  if (( NEEDS_JUDGMENT )); then
+    gh label create needs-judgment -R "$ORIGIN" --color D93F0B \
+      --description "rebase conflict needs judgment — queued for an automated fixer session" >/dev/null 2>&1 || true
+    gh issue edit "$issue" -R "$ORIGIN" \
+      --remove-label ready-to-merge --add-label failed --add-label needs-judgment >/dev/null 2>&1 \
+      || say "$REPO: could not relabel #$issue"
+  else
+    gh issue edit "$issue" -R "$ORIGIN" \
+      --remove-label ready-to-merge --add-label failed >/dev/null 2>&1 \
+      || say "$REPO: could not relabel #$issue"
+  fi
 }
 
 # An auto-resolved conflict is recorded on the issue, not only in this log:
@@ -236,6 +261,7 @@ wait_for_ci() {
 merge_one() {
   local issue="$1" pr branch head rebased state
   PR_URL=""
+  NEEDS_JUDGMENT=0
 
   pr="$(gh pr list -R "$ORIGIN" --state open --json number,headRefName --limit 100 2>/dev/null \
         | jq -r --arg pfx "epic/$issue-" '[.[] | select(.headRefName | startswith($pfx))][0].number // empty')" \
@@ -301,13 +327,21 @@ merge_one() {
   # merge-autoresolve.sh tell "both sides added here" from "both sides edited
   # the same lines" when the rebase stops.
   if ! git -C "$WT" -c merge.conflictStyle=diff3 rebase origin/main >/dev/null 2>&1; then
-    local resolution
-    if resolution="$("$HERE/merge-autoresolve.sh" "$WT" 2>&1)"; then
+    local resolution arc=0
+    resolution="$("$HERE/merge-autoresolve.sh" "$WT" 2>&1)" || arc=$?
+    if (( arc == 0 )); then
       say "$REPO: PR #$pr rebase conflicted; every hunk was mechanical - auto-resolved"
       record_autoresolve "$issue" "$resolution"
     else
       git -C "$WT" rebase --abort >/dev/null 2>&1 || true
-      FAIL="rebase of $branch onto origin/main conflicted; not auto-resolvable: $(head -n 1 <<<"$resolution")"
+      # Exit 4 is the judgment class — mark_failed adds `needs-judgment` on
+      # top of `failed`, which is what dispatch's fixer walk queries.
+      if (( arc == 4 )); then
+        NEEDS_JUDGMENT=1
+        FAIL="rebase of $branch onto origin/main conflicted; needs judgment: $(head -n 1 <<<"$resolution")"
+      else
+        FAIL="rebase of $branch onto origin/main conflicted; not auto-resolvable: $(head -n 1 <<<"$resolution")"
+      fi
       return 1
     fi
   fi

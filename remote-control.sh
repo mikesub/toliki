@@ -35,6 +35,11 @@ Commands:
   epic <ref>               Shorthand for: start -m "/epic #<ref>". Auto-named from
                            the message (e.g. "epic 63" -> session myapp-epic-63). A
                            ref that already starts with # isn't doubled.
+  fix <ref>                Shorthand for: start epic-<ref> -m "/fix-conflict #<ref>"
+                           — the manual override for dispatch's needs-judgment
+                           fixer walk. The explicit name keeps the session on the
+                           <repo>-epic-<N> pattern (reap sweeps only that shape;
+                           the message alone would slugify to fix-conflict-<ref>).
   <name> [-m msg]          Shorthand for: start <name> [-m msg]
 
   -m, --message <msg>      Initial prompt to send to claude (start/restart only).
@@ -42,8 +47,8 @@ Commands:
                            is non-interactive and would exit immediately). Also
                            names the session when no explicit name is given.
   -r, --repo <name>        Repo to run in: $(repo_names | tr '\n' ' ')(default: $DEFAULT_REPO).
-                           Applies to start/restart/stop/epic; ls and stop-all are
-                           host-wide. Every session is named <repo>-<name>, so
+                           Applies to start/restart/stop/epic/fix; ls and stop-all
+                           are host-wide. Every session is named <repo>-<name>, so
                            "epic 63 -r otherapp" -> otherapp-epic-63. Names are given
                            short (epic-63) or full (otherapp-epic-63) interchangeably.
 EOF
@@ -115,24 +120,35 @@ else
       ACTION="stop"                        # `rm` is an alias for stop
       SESSIONS=("${POSITIONAL[@]:1}")       # stop takes one or more session names
       ;;
-    epic)
+    epic|fix)
       # `epic <ref>` == `start -m "/epic #<ref>"`; session auto-derives to <repo>-epic-<ref>.
+      # `fix <ref>` == `start epic-<ref> -m "/fix-conflict #<ref>"`: the explicit
+      # session name is load-bearing — reap's sweep and dispatch's session checks
+      # know only the <repo>-epic-<N> shape, and a fixer left on a slug-derived
+      # name would idle in a slot forever with nothing able to reclaim it.
+      CMD="${POSITIONAL[0]}"
       REF="${POSITIONAL[1]:-}"
       if [[ -z "$REF" ]]; then
-        echo "[control] epic requires an issue reference, e.g. $0 epic 63" >&2
+        echo "[control] $CMD requires an issue reference, e.g. $0 $CMD 63" >&2
         exit 1
       fi
       if [[ -n "${POSITIONAL[2]:-}" ]]; then
-        echo "[control] epic takes a single issue reference" >&2
+        echo "[control] $CMD takes a single issue reference" >&2
         exit 1
       fi
       if [[ $HAVE_MESSAGE -eq 1 ]]; then
-        echo "[control] -m/--message can't be combined with the epic shortcut" >&2
+        echo "[control] -m/--message can't be combined with the $CMD shortcut" >&2
         exit 1
       fi
       ACTION="start"
       HAVE_MESSAGE=1
-      MESSAGE="/epic #${REF#\#}"   # strip a leading # so we don't double it
+      REF="${REF#\#}"              # strip a leading # so we don't double it
+      if [[ "$CMD" == "fix" ]]; then
+        SESSION="epic-$REF"
+        MESSAGE="/fix-conflict #$REF"
+      else
+        MESSAGE="/epic #$REF"
+      fi
       ;;
     *)
       SESSION="${POSITIONAL[0]}"   # bare <name> is shorthand for: start <name>
@@ -148,7 +164,7 @@ fi
 
 # ls and stop-all are host-wide, so a repo would be meaningless there.
 if [[ $HAVE_REPO -eq 1 && "$ACTION" != "start" && "$ACTION" != "restart" && "$ACTION" != "stop" ]]; then
-  echo "[control] --repo only applies to start/restart/stop/epic" >&2
+  echo "[control] --repo only applies to start/restart/stop/epic/fix" >&2
   exit 1
 fi
 

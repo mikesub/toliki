@@ -6,8 +6,9 @@ set -euo pipefail
 # origin/main just stopped on conflicts, and resolves the stop IFF every hunk
 # in every conflicted file is mechanical — both sides only added at the same
 # point (empty base), or exactly one side edited base lines the other merely
-# added around. One hunk needing judgment declines the whole run; deciding
-# stays a human's job.
+# added around. One hunk needing judgment declines the whole run (exit 4);
+# deciding stays a judge's job — the fixer session dispatch launches for a
+# `needs-judgment` issue, which re-enters here with --partial, or a human.
 #
 # Every resolution is verified before it is staged: a literal line-containment
 # check that every line of both sides survived into the resolved file (minus
@@ -15,13 +16,29 @@ set -euo pipefail
 # because the cheap alternative — pick a side and let the tests vote — is
 # blind here: dropping the other side's added test block fails nothing.
 #
-# Usage: merge-autoresolve.sh <worktree>
+# Usage: merge-autoresolve.sh [--partial] <worktree>
 #
 #   exit 0  every conflict was mechanical: resolved, verified, staged, and the
 #           rebase continued to completion. Stdout carries one report line per
 #           hunk ("<file>: hunk N: ...") for the caller's audit comment.
-#   exit 1  declined. The FIRST stdout line says why; the rebase is left in
-#           place so the caller can inspect, and the caller owns the abort.
+#   exit 1  declined for a non-judgment reason (can't parse, symlink/submodule,
+#           delete/modify, marker-shaped tracked content, containment broke).
+#           The FIRST stdout line says why; the rebase is left in place so the
+#           caller can inspect, and the caller owns the abort.
+#   exit 4  declined because some hunk NEEDS JUDGMENT — both sides edited the
+#           same base lines, both kept the base and added around it, or the
+#           edit's placement is ambiguous. Distinct so merge-worker.sh can
+#           label the issue `needs-judgment`, which is the fixer queue.
+#
+# --partial (the fixer session's entry point) changes what a judgment hunk
+# means: instead of declining the run, each file's MECHANICAL hunks are
+# resolved in place under the same containment gate, and its judgment hunks
+# are left marked exactly as git wrote them — markers, base section and all.
+# Files left holding no markers are staged; files still marked stay unmerged
+# for the caller to settle. The rebase is NEVER continued in this mode, even
+# when nothing needed judgment — the caller owns it. Exit 0 on success, 1 on
+# the same non-judgment declines as above (4 never fires: judgment is the
+# expected case, not a decline).
 #
 # Standalone on purpose: no lib.sh, no repos.conf, no gh, no ssh — it touches
 # only the worktree it is given, so tests can drive it against a throwaway
@@ -30,15 +47,19 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AWK_LIB="$HERE/merge-resolve.awk"
 
+PARTIAL=0
+if [[ "${1:-}" == "--partial" ]]; then
+  PARTIAL=1; shift
+fi
 WT="${1:-}"
 if [[ -z "$WT" || ! -d "$WT" ]]; then
-  echo "usage: $0 <worktree>"; exit 1
+  echo "usage: $0 [--partial] <worktree>"; exit 1
 fi
 git -C "$WT" rev-parse --git-dir >/dev/null 2>&1 || { echo "$WT is not a git worktree"; exit 1; }
 
 # The one-line reason is the first thing printed, so the caller can lift it
-# straight into a failure comment.
-fail() { printf '%s\n' "$1"; exit 1; }
+# straight into a failure comment. Optional second arg picks the exit code.
+fail() { printf '%s\n' "$1"; exit "${2:-1}"; }
 
 # --git-path answers relative to the worktree unless already absolute.
 git_path() {
@@ -95,7 +116,7 @@ for p in "${paths[@]}"; do
   # write can never be checked against stale content.
   rm -f "$resolved"
   rc=0
-  awk -v mode=resolve -v out="$resolved" \
+  awk -v mode=resolve -v partial="$PARTIAL" -v out="$resolved" \
       -v ours_label="origin/main" -v theirs_label="the PR" \
       -f "$AWK_LIB" "$WT/$p" >"$report" 2>&1 || rc=$?
   if (( rc != 0 )); then
@@ -103,13 +124,19 @@ for p in "${paths[@]}"; do
     # its diagnostic on the last line instead.
     why="$(awk '/needs judgment/ { print; exit }' "$report")"
     [[ -n "$why" ]] || why="$(tail -n 1 "$report")"
+    # rc 1 is exactly the judgment class (and can only fire in full mode —
+    # partial hands those hunks off instead). Exit 4 is what merge-worker.sh
+    # keys the `needs-judgment` label on; every other decline stays 1.
+    if (( rc == 1 )); then
+      fail "$p ${why:-conflict needs judgment}" 4
+    fi
     fail "$p ${why:-conflict is not mechanical}"
   fi
 
   # The decisive gate, and deliberately a separate pass with none of the
   # resolver's positional logic: multiset line containment of the candidate
   # against a re-classification of the still-marked file.
-  if ! awk -v mode=check -f "$AWK_LIB" "$WT/$p" "$resolved" >"$tmp/check" 2>&1; then
+  if ! awk -v mode=check -v partial="$PARTIAL" -f "$AWK_LIB" "$WT/$p" "$resolved" >"$tmp/check" 2>&1; then
     fail "$p: auto-resolution dropped content it had no license to drop ($(head -n 1 "$tmp/check"))"
   fi
 
@@ -127,11 +154,27 @@ for p in "${paths[@]}"; do
   fi
 
   cat "$resolved" > "$WT/$p"   # cat > keeps the file's mode, mv would not
-  git -C "$WT" add -- "$p"
+  # In partial mode a file that still carries markers stays UNMERGED — staging
+  # it would tell git its judgment hunks are settled when a judge hasn't seen
+  # them yet. The grep is unambiguous here: the pre-gate above already declined
+  # any file whose own content is marker-shaped.
+  if (( PARTIAL )) && grep -qE "$MARKER_RE" "$WT/$p"; then
+    :
+  else
+    git -C "$WT" add -- "$p"
+  fi
   while IFS= read -r line; do
     all_reports="$all_reports$p: $line"$'\n'
   done < "$report"
 done
+
+# Partial mode settles text and nothing else: judgment hunks may remain marked
+# in place, and even a stop that turned out fully mechanical is left for the
+# caller to --continue — whoever asked for a partial answer owns the rebase.
+if (( PARTIAL )); then
+  printf '%s' "$all_reports"
+  exit 0
+fi
 
 # The original commit message stands — there is nothing to edit.
 GIT_EDITOR=true git -C "$WT" rebase --continue >/dev/null 2>&1 \

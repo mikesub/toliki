@@ -234,6 +234,62 @@ run_resolve "$TMP/ambiguous-run"
 assert_rc "ambiguous-run: declines" 1 "$RC"
 assert_contains "ambiguous-run: says why" "appears more than once in the additive side" "$REPORT"
 
+# ----------------------------------------------------------------- partial --
+
+# Partial mode (the fixer session's rung): mechanical hunks resolve exactly as
+# in full mode, judgment hunks are handed off instead of declining the file —
+# re-emitted byte-intact, markers, base section and all, so the judge
+# downstream sees exactly what git wrote.
+run_partial() {  # <marked-file> -> RC, REPORT; resolution lands in $RES
+  rm -f "$RES"; RC=0
+  REPORT="$(awk -v mode=resolve -v partial=1 -v out="$RES" -f "$AWK_LIB" "$1" 2>&1)" || RC=$?
+}
+run_check_partial() {  # <marked-file> <candidate> -> RC, OUTPUT
+  RC=0
+  OUTPUT="$(awk -v mode=check -v partial=1 -f "$AWK_LIB" "$1" "$2" 2>&1)" || RC=$?
+}
+
+run_partial "$TMP/mixed"
+assert_rc "partial: mixed file resolves" 0 "$RC"
+assert_eq "partial: mechanical hunk resolved, judgment hunk byte-intact" \
+"ours-a
+theirs-a
+mid
+<<<<<<< HEAD
+ours-rewrite
+||||||| b
+old-line
+=======
+theirs-rewrite
+>>>>>>> x" "$(cat "$RES")"
+assert_contains "partial: reports the mechanical hunk" "hunk 1: both sides added" "$REPORT"
+assert_contains "partial: reports the judgment hand-off" \
+  "hunk 2: needs judgment - both sides edited the same base lines - left marked in place" "$REPORT"
+run_check_partial "$TMP/mixed" "$RES"
+assert_rc "partial: containment passes on its own resolution" 0 "$RC"
+
+# An all-judgment file must come back byte-identical to its input.
+run_partial "$TMP/both-rewrote"
+assert_rc "partial: all-judgment file resolves" 0 "$RC"
+if cmp -s "$TMP/both-rewrote" "$RES"; then
+  ok "partial: all-judgment file reproduced byte-exact"
+else
+  nok "partial: all-judgment file reproduced byte-exact"
+fi
+
+# The partial containment gate must catch tampering with either share: a line
+# dropped from a MECHANICAL resolution, and a judgment block that was touched
+# (half-resolved, base section edited) — the byte-intact contract.
+run_partial "$TMP/mixed"
+grep -v 'theirs-a' "$RES" > "$TMP/p-dropped"
+run_check_partial "$TMP/mixed" "$TMP/p-dropped"
+assert_rc "partial containment: dropped mechanical line detected" 3 "$RC"
+run_partial "$TMP/mixed"
+sed 's/^old-line$/edited-base/' "$RES" > "$TMP/p-touched"
+run_check_partial "$TMP/mixed" "$TMP/p-touched"
+assert_rc "partial containment: touched judgment block detected" 3 "$RC"
+assert_contains "partial containment: names the dropped base line" "dropped 1 x: old-line" "$OUTPUT"
+
 # ------------------------------------------------------------- containment --
 
 # A resolution that silently dropped one side's line. This is the exact
@@ -395,13 +451,102 @@ git -C "$REPO" commit -qam main-side
 
 if stop_on_conflict; then ok "judge: rebase stops on conflict"; else nok "judge: rebase did not conflict"; fi
 RC=0; OUT="$("$AUTORESOLVE" "$REPO" 2>&1)" || RC=$?
-assert_rc "judge: autoresolve declines" 1 "$RC"
+assert_rc "judge: autoresolve declines with the judgment code" 4 "$RC"
 assert_contains "judge: first line names file and cause" "f.txt hunk 1: needs judgment" "$(head -n 1 <<<"$OUT")"
 if [[ -d "$REPO/.git/rebase-merge" ]]; then
   ok "judge: rebase left in place for the caller's abort"
 else
   nok "judge: rebase left in place for the caller's abort"
 fi
+git -C "$REPO" rebase --abort >/dev/null 2>&1 || true
+
+# --partial against a real rebase stop: one file mixes a mechanical hunk with
+# a judgment hunk, a second file is purely mechanical. The mechanical share is
+# resolved (and the fully-settled file staged), the judgment hunk stays marked
+# exactly as git wrote it, and the rebase is left in progress for the caller —
+# who then finishes it the way the fixer session would.
+mkrepo pe2e
+cat > "$REPO/mixed.txt" <<'EOF'
+a1
+a2
+a3
+POINT
+b1
+b2
+b3
+change-me
+c1
+c2
+c3
+EOF
+printf 'one\ntwo\nthree\n' > "$REPO/mech.txt"
+git -C "$REPO" add -A && git -C "$REPO" commit -qm base
+git -C "$REPO" checkout -qb feature
+printf 'a1\na2\na3\nPOINT\nFEAT\nb1\nb2\nb3\nfeature-version\nc1\nc2\nc3\n' > "$REPO/mixed.txt"
+printf 'one\ntwo\nFEAT-M\nthree\n' > "$REPO/mech.txt"
+git -C "$REPO" commit -qam feat
+git -C "$REPO" checkout -q main
+printf 'a1\na2\na3\nPOINT\nMAIN\nb1\nb2\nb3\nmain-version\nc1\nc2\nc3\n' > "$REPO/mixed.txt"
+printf 'one\ntwo\nMAIN-M\nthree\n' > "$REPO/mech.txt"
+git -C "$REPO" commit -qam main-side
+
+if stop_on_conflict; then ok "partial-e2e: rebase stops on conflict"; else nok "partial-e2e: rebase did not conflict"; fi
+RC=0; OUT="$("$AUTORESOLVE" --partial "$REPO" 2>&1)" || RC=$?
+assert_rc "partial-e2e: exits 0 with judgment hunks left" 0 "$RC"
+if [[ -d "$REPO/.git/rebase-merge" || -d "$REPO/.git/rebase-apply" ]]; then
+  ok "partial-e2e: rebase left in progress for the caller"
+else
+  nok "partial-e2e: rebase left in progress for the caller"
+fi
+assert_eq "partial-e2e: mechanical file fully resolved" \
+"one
+two
+MAIN-M
+FEAT-M
+three" "$(cat "$REPO/mech.txt")"
+assert_eq "partial-e2e: only the judgment file stays unmerged" "mixed.txt" \
+  "$(git -C "$REPO" diff --name-only --diff-filter=U)"
+assert_contains "partial-e2e: mechanical hunk resolved inside the mixed file" "MAIN
+FEAT" "$(cat "$REPO/mixed.txt")"
+assert_contains "partial-e2e: judgment hunk still marked" "<<<<<<< HEAD" "$(cat "$REPO/mixed.txt")"
+assert_contains "partial-e2e: marker block carries the base section" "|||||||" "$(cat "$REPO/mixed.txt")"
+assert_contains "partial-e2e: ours side inside the markers" "main-version" "$(cat "$REPO/mixed.txt")"
+assert_contains "partial-e2e: theirs side inside the markers" "feature-version" "$(cat "$REPO/mixed.txt")"
+assert_contains "partial-e2e: report hands the judgment hunk off" "needs judgment" "$OUT"
+assert_contains "partial-e2e: report covers the mechanical share" "both sides added" "$OUT"
+
+# Finish the stop the way the fixer would: settle the judgment hunk by hand,
+# stage, continue — proving partial left a continuable rebase behind.
+awk '/^<<<<<<< /{skip=1; print "merged-version"; next} /^>>>>>>> /{skip=0; next} skip{next} {print}' \
+  "$REPO/mixed.txt" > "$TMP/pe2e-settled"
+cat "$TMP/pe2e-settled" > "$REPO/mixed.txt"
+git -C "$REPO" add mixed.txt
+GIT_EDITOR=true git -C "$REPO" rebase --continue >/dev/null 2>&1 || true
+if [[ -d "$REPO/.git/rebase-merge" || -d "$REPO/.git/rebase-apply" ]]; then
+  nok "partial-e2e: hand-settled rebase continues to completion"
+else
+  ok "partial-e2e: hand-settled rebase continues to completion"
+fi
+assert_eq "partial-e2e: exactly one commit on top of main" "1" "$(git -C "$REPO" rev-list --count main..HEAD)"
+
+# A rebase in progress with NO unmerged paths (a predecessor's leftover state,
+# or everything already staged) must decline with a distinct first line — the
+# fixer's prepare keys on it rather than improvising. Reuse the pe2e stop:
+# stage the still-marked file, then ask for a partial resolve of nothing.
+mkrepo leftover
+printf 'keep\nchange-me\n' > "$REPO/f.txt"
+git -C "$REPO" add -A && git -C "$REPO" commit -qm base
+git -C "$REPO" checkout -qb feature
+printf 'keep\nfeature-version\n' > "$REPO/f.txt"
+git -C "$REPO" commit -qam feat
+git -C "$REPO" checkout -q main
+printf 'keep\nmain-version\n' > "$REPO/f.txt"
+git -C "$REPO" commit -qam main-side
+if stop_on_conflict; then ok "leftover: rebase stops on conflict"; else nok "leftover: rebase did not conflict"; fi
+git -C "$REPO" add f.txt   # clears the unmerged entries; the rebase state remains
+RC=0; OUT="$("$AUTORESOLVE" --partial "$REPO" 2>&1)" || RC=$?
+assert_rc "leftover: partial declines" 1 "$RC"
+assert_contains "leftover: names the state distinctly" "rebase stopped without unmerged paths" "$OUT"
 git -C "$REPO" rebase --abort >/dev/null 2>&1 || true
 
 # Delete/modify: no stage 2, nothing two-sided to merge — declined before the

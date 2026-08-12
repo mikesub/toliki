@@ -32,13 +32,23 @@
 #       positional-logic-free, so a resolver emission bug fails here rather
 #       than being reproduced here.
 #
+#   -v partial=1   the third mode, as an axis on the two above: a judgment
+#       hunk stops being a decline and becomes a hand-off. resolve re-emits
+#       its ENTIRE marker block — markers, base section and all — byte-intact
+#       into the output, so a downstream judge sees exactly the hunk git
+#       wrote, with nothing pre-chewed; check expects those same raw block
+#       lines verbatim, so a resolution that touched a judgment hunk (or
+#       half-resolved one) fails containment. Mechanical hunks keep exactly
+#       the full-mode behaviour and the full-mode guarantee.
+#
 #   -v ours_label=... -v theirs_label=...  name the sides in report text
 #       (merge-worker passes "origin/main" and "the PR").
 #
-# Exit: 0 mechanical/verified; 1 some hunk needs judgment; 2 malformed input
-# (not diff3 markers, EOF inside a hunk, or no markers at all); 3 containment
-# failed; 4 usage. Every non-zero exit is a decline — the caller falls back to
-# today's behaviour, never merges a partial answer.
+# Exit: 0 mechanical/verified; 1 some hunk needs judgment (never with
+# partial=1, where judgment is expected content, not a decline); 2 malformed
+# input (not diff3 markers, EOF inside a hunk, or no markers at all); 3
+# containment failed; 4 usage. Every non-zero exit is a decline — the caller
+# falls back to today's behaviour, never merges a partial answer.
 
 BEGIN {
   if (mode != "resolve" && mode != "check") {
@@ -94,7 +104,7 @@ function run_at(side, n,   i, j, hit, pos) {
   return (runs == 1) ? pos : 0
 }
 
-function end_hunk(   i, opos, tpos, oruns, truns, cls) {
+function end_hunk(   i, opos, tpos, oruns, truns, cls, why) {
   opos = 0; tpos = 0; oruns = 0; truns = 0
   if (bn == 0) cls = "both-added"
   else {
@@ -108,11 +118,23 @@ function end_hunk(   i, opos, tpos, oruns, truns, cls) {
   if (cls == "") {
     judgment++
     if (oruns > 0 && truns > 0)
-      print "hunk " hunks ": needs judgment - both sides kept the base and added around it, so merge order is a choice"
+      why = "both sides kept the base and added around it, so merge order is a choice"
     else if (oruns > 1 || truns > 1)
-      print "hunk " hunks ": needs judgment - the base run appears more than once in the additive side, so the edit's placement is ambiguous"
+      why = "the base run appears more than once in the additive side, so the edit's placement is ambiguous"
     else
-      print "hunk " hunks ": needs judgment - both sides edited the same base lines"
+      why = "both sides edited the same base lines"
+    if (!partial) {
+      print "hunk " hunks ": needs judgment - " why
+      return
+    }
+    # Partial: hand the hunk off rather than declining the file. raw[] holds
+    # the block exactly as read — marker lines included — so what the judge
+    # downstream sees is what git wrote, byte for byte.
+    print "hunk " hunks ": needs judgment - " why " - left marked in place"
+    for (i = 1; i <= rn; i++) {
+      if (mode == "resolve") print raw[i] > out
+      else expected[raw[i]]++
+    }
     return
   }
 
@@ -157,12 +179,16 @@ FNR == 1 && NR > 1 {
 
 in_resolution { actual[$0]++; next }
 
+# raw[] mirrors the current hunk verbatim — every line from '<<<<<<<' through
+# '>>>>>>>' inclusive — for partial mode's byte-intact hand-off of judgment
+# hunks. Collected unconditionally: hunks are small and one branch fewer.
 S == "ctx" {
-  if (is_ours($0)) { S = "ours"; on = 0; bn = 0; tn = 0; hunks++ }
+  if (is_ours($0)) { S = "ours"; on = 0; bn = 0; tn = 0; hunks++; rn = 0; raw[++rn] = $0 }
   else keep($0)
   next
 }
 S == "ours" {
+  raw[++rn] = $0
   if (is_base($0)) S = "base"
   else if (is_sep($0)) {
     # merge-style markers hide the base section, and an absent base is not an
@@ -175,12 +201,14 @@ S == "ours" {
   next
 }
 S == "base" {
+  raw[++rn] = $0
   if (is_sep($0)) S = "theirs"
   else if (is_ours($0) || is_base($0) || is_end($0)) bad_marker()
   else base[++bn] = $0
   next
 }
 S == "theirs" {
+  raw[++rn] = $0
   if (is_end($0)) { end_hunk(); S = "ctx" }
   else if (is_ours($0) || is_base($0) || is_sep($0)) bad_marker()
   else theirs[++tn] = $0
@@ -191,7 +219,7 @@ END {
   if (fatal) exit fatal
   if (S != "ctx") { print "input ends inside a conflict hunk"; exit 2 }
   if (hunks == 0) { print "no conflict markers found"; exit 2 }
-  if (judgment)   exit 1
+  if (judgment && !partial) exit 1
   if (mode == "resolve") exit 0
 
   bad = 0

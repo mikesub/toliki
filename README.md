@@ -18,6 +18,10 @@ rebases, re-verifies and lands them. You write specs; the box does the rest.
    cleared, lands unattended) or `ready-to-review` (a human decides).
 4. **`bin/merge-worker.sh`** (cron) — one PR at a time per repo: rebase onto
    current main, wait for checks to re-run on the rebased head, squash-merge.
+   Mechanical rebase conflicts it resolves itself under a line-containment
+   gate; a conflict that needs judgment is labeled for **`/fix-conflict`**, a
+   dispatched fixer session that resolves it under an adversarial check and
+   returns the PR for human review.
 5. **`bin/reap.sh`** (cron) — frees what finished runs leave behind (idle
    sessions, stale claim refs), so the slot budget keeps rotating.
 
