@@ -26,18 +26,36 @@ standalone `Bug` report whose fix waits on a refactor. Reach for it whenever one
 issue gates another: the `/epic` queue queries dependencies and skips a blocked
 issue rather than burning a run on it.
 
+## Relating without gating: a plain `#N` cross-reference
+
+A link that carries no ordering — a follow-up and the issue it came out of, two
+issues worth reading together — is a plain `#N` mention in the body, which
+GitHub records as a cross-reference on that issue's timeline.
+
+GitHub's own **"relates to"** relationship (issue sidebar → Relationships → *Add
+relates to*) is precisely what that link means, and a human should reach for it.
+The pipeline can't: it entered public preview on 2026-08-07 **UI-only** — no
+REST path, no GraphQL field or mutation, no timeline event type, no `gh`
+subcommand — so there is nothing for a scripted run to call. Re-check when it
+leaves preview; the cross-reference is the stand-in until then, not a rejection
+of it.
+
+Do **not** substitute `blocked_by` — that would hold the queue back on work
+nobody is waiting for — and do not invent a label for it.
+
 ## Allowed primitives — do not extend
 
-Use **only** flat issues, `blocked_by` dependencies, and GitHub's native `Bug`
-issue type (an org-level primitive, distinct from labels — it marks the
-standalone bug track, filed by `/bugreport`; never `Task`/`Feature` types for
-roadmap issues). No custom fields, no status taxonomies.
+Use **only** flat issues, `blocked_by` dependencies, `#N` cross-references (plus
+the "relates to" relationship where a human is driving the UI), and GitHub's
+native `Bug` issue type (an org-level primitive, distinct from labels — it marks
+the standalone bug track, filed by `/bugreport`; never `Task`/`Feature` types
+for roadmap issues). No custom fields, no status taxonomies.
 
 **Do not create labels by hand.** The entire label namespace belongs to the
 pipeline's lifecycle (`ready` → `in-progress` → `ready-to-merge` /
-`ready-to-review` / `failed`, plus `deferred` on follow-ups), which is defined
-in the shared harness's `workflows/epic-run.js` and `bin/merge-worker.sh` and is
-its own source of truth — don't re-enumerate the states here. No `area:*`, `type:*`, `track:*`, or `priority:*`
+`ready-to-review` / `failed`), which is defined in the shared harness's
+`workflows/epic-run.js` and `bin/merge-worker.sh` and is its own source of truth
+— don't re-enumerate the states here. No `area:*`, `type:*`, `track:*`, or `priority:*`
 scheme. The one label you ever apply is **`ready`, at filing**: it is the build
 queue, and a spec issue is filed carrying it and nothing else.
 
@@ -57,6 +75,11 @@ gh issue list --state open
 
 # File a spec issue into the build queue
 gh issue create --title "<title>" --body "<spec>" --label ready
+
+# Relate without gating: the `#<other>` in the body is the whole mechanism.
+gh issue create --title "<title>" --body "<spec>
+
+Follow-up to #<other>"
 
 # Order constraint: <blocked> is blocked_by <blocker>.
 # GOTCHA: the dependency API keys on the issue's DB `id` (`.id`), NOT its `number`.
