@@ -35,7 +35,12 @@ set -euo pipefail
 #
 # Infrastructure failures (fetch, gh API) abort the run instead of labelling
 # anything: cron retries on the next tick, and a network hiccup must never
-# write `failed` onto an issue whose PR is perfectly fine.
+# write `failed` onto an issue whose PR is perfectly fine. Queries abort on any
+# error, since a query that failed carries no verdict to record. The merge
+# itself cannot — a merge gh genuinely refuses IS this PR's verdict — so it
+# classifies the error text instead (transient_gh_error) and aborts only on an
+# infrastructure signature; likewise the read-back that confirms the merge,
+# where a failed read is not evidence the merge did not happen.
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/../etc/lib.sh"
@@ -54,6 +59,22 @@ MAX_DRAIN=20
 say()  { printf '%s [merge] %s\n' "$(ts)" "$*"; }
 # Infrastructure died: stop the whole drain, label nothing, let cron retry.
 die()  { printf '%s [merge] %s\n' "$(ts)" "$*" >&2; exit 1; }
+
+# Every other gh call here fails closed by aborting, because a query that
+# errors carries no verdict. The write calls cannot do that blindly — a merge
+# gh genuinely refuses is a real decline the issue must record — so they
+# classify instead, and this is the classifier. It reads the error TEXT because
+# exit status cannot tell "GitHub is down" from "GitHub said no": both are 1.
+# Deliberately generous, since the two mistakes are not symmetric — calling a
+# real refusal transient costs one wasted tick that re-runs and reports it
+# properly, while calling an outage a refusal writes `failed` onto a PR that
+# was fine and takes a human to undo. Seen live during the 2026-08-17 incident:
+# a 503 on `gh pr merge` failed an issue whose PR was perfectly mergeable, and
+# only a second 503 on the relabel kept the verdict from sticking.
+transient_gh_error() {
+  printf '%s' "$1" | grep -qiE \
+    'HTTP (408|429|5[0-9][0-9])|no server is currently available|bad gateway|service unavailable|gateway time-?out|server error|timed? ?out|timeout|connection (reset|refused|closed)|could not resolve host|network is unreachable|temporary failure|unexpected EOF|TLS handshake|deadline exceeded'
+}
 
 usage() {
   cat <<EOF
@@ -368,12 +389,30 @@ merge_one() {
   # yields one), so --squash preserves its message and its `Closes #N`.
   # No other flags, ever: --admin would merge past the gates this whole script
   # exists to honour, and GitHub deletes the remote branch itself on merge.
-  if ! gh pr merge "$pr" -R "$ORIGIN" --squash >/dev/null 2>&1; then
-    FAIL="squash-merge of PR #$pr failed after its checks passed"
+  local merge_err merge_rc=0
+  merge_err="$(gh pr merge "$pr" -R "$ORIGIN" --squash 2>&1)" || merge_rc=$?
+  if (( merge_rc != 0 )); then
+    # A refusal is this PR's verdict; an outage is nobody's. Aborting leaves
+    # the label on, so the next tick re-runs the whole merge — and if this call
+    # actually landed before the error reached us, that tick finds the merged
+    # PR through the already-delivered branch above and settles the label there.
+    if transient_gh_error "$merge_err"; then
+      die "$REPO: squash-merge of PR #$pr hit a transient GitHub error — aborting the run, the next tick retries ($(head -n 1 <<<"$merge_err"))"
+    fi
+    FAIL="squash-merge of PR #$pr failed after its checks passed: $(head -n 1 <<<"$merge_err")"
     return 1
   fi
 
-  state="$(gh pr view "$pr" -R "$ORIGIN" --json state --jq .state 2>/dev/null)" || state="?"
+  # Confirm the merge rather than trust the exit status — but a read-back that
+  # FAILS is not evidence the merge did not happen, and mid-incident it is the
+  # likeliest outcome. Guessing here is how a landed PR gets its issue marked
+  # `failed`, so don't: abort and let the next tick reconcile it as above.
+  local state_out state_rc=0
+  state_out="$(gh pr view "$pr" -R "$ORIGIN" --json state --jq .state 2>&1)" || state_rc=$?
+  if (( state_rc != 0 )); then
+    die "$REPO: PR #$pr reported merged but reading its state back failed — aborting the run, the next tick reconciles it ($(head -n 1 <<<"$state_out"))"
+  fi
+  state="$state_out"
   if [[ "$state" != "MERGED" ]]; then
     FAIL="gh pr merge reported success but PR #$pr is $state, not MERGED"
     return 1

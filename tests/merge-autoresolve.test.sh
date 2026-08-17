@@ -234,6 +234,85 @@ run_resolve "$TMP/ambiguous-run"
 assert_rc "ambiguous-run: declines" 1 "$RC"
 assert_contains "ambiguous-run: says why" "appears more than once in the additive side" "$REPORT"
 
+# Empty base, but theirs OPENS DEEPER than ours: keeping both would make
+# theirs' opening lines children of ours' last element rather than its
+# siblings. Every line survives, so containment sees nothing wrong — this is
+# the shape that reached main on 2026-08-17 (vms PR #61), where a `## Done`
+# entry closed by origin/main silently adopted the PR's continuation bullets
+# and the repo's own hygiene tests caught what the merge gate could not.
+cat > "$TMP/graft" <<'EOF'
+## Done
+
+<<<<<<< HEAD
+- [x] item from main, issue #57, 6c4f382
+|||||||
+=======
+  - source: continuation belonging to the PR's own item
+    still the same bullet
+- [x] the PR's item
+>>>>>>> x
+EOF
+
+run_resolve "$TMP/graft"
+assert_rc "graft: declines" 1 "$RC"
+assert_contains "graft: says why" "opens deeper" "$REPORT"
+assert_contains "graft: names the nesting it refused" "would nest it under" "$REPORT"
+
+# The guard is one-directional and must stay that way. Ours opening deeper is
+# NOT a graft: ours follows the same context its author wrote it after, and
+# theirs opens at top level, so it binds to nothing of ours.
+cat > "$TMP/graft-inverse" <<'EOF'
+<<<<<<< HEAD
+  - a sub-bullet from main
+|||||||
+=======
+- [x] a top-level item from the PR
+>>>>>>> x
+EOF
+
+run_resolve "$TMP/graft-inverse"
+assert_rc "graft-inverse: resolves" 0 "$RC"
+assert_eq "graft-inverse: ours then theirs, untouched" \
+"  - a sub-bullet from main
+- [x] a top-level item from the PR" "$(cat "$RES")"
+
+# Equal opening depth is the common indented case — two methods added to the
+# same class body, two entries under the same heading — and stays mechanical.
+# Over-declining here would hand the fixer work it has no judgment to apply.
+cat > "$TMP/graft-siblings" <<'EOF'
+class Thing:
+<<<<<<< HEAD
+    def from_main(self):
+        return 1
+|||||||
+=======
+    def from_the_pr(self):
+        return 2
+>>>>>>> x
+EOF
+
+run_resolve "$TMP/graft-siblings"
+assert_rc "graft-siblings: resolves" 0 "$RC"
+assert_contains "graft-siblings: reports both-added" "both sides added here" "$REPORT"
+run_check "$TMP/graft-siblings" "$RES"
+assert_rc "graft-siblings: containment passes" 0 "$RC"
+
+# A blank first line is not an opening depth. Ours opens on its first line
+# with content, not on the whitespace above it.
+cat > "$TMP/graft-blank" <<'EOF'
+<<<<<<< HEAD
+
+- [x] item from main
+|||||||
+=======
+  - a deeper continuation from the PR
+>>>>>>> x
+EOF
+
+run_resolve "$TMP/graft-blank"
+assert_rc "graft-blank: declines past the blank line" 1 "$RC"
+assert_contains "graft-blank: says why" "opens deeper" "$REPORT"
+
 # ----------------------------------------------------------------- partial --
 
 # Partial mode (the fixer session's rung): mechanical hunks resolve exactly as
@@ -267,6 +346,16 @@ assert_contains "partial: reports the judgment hand-off" \
   "hunk 2: needs judgment - both sides edited the same base lines - left marked in place" "$REPORT"
 run_check_partial "$TMP/mixed" "$RES"
 assert_rc "partial: containment passes on its own resolution" 0 "$RC"
+
+# The graft class has to reach the fixer like any other judgment hunk: handed
+# off byte-intact, not quietly concatenated because its base is empty.
+run_partial "$TMP/graft"
+assert_rc "partial: graft hunk resolves" 0 "$RC"
+assert_contains "partial: graft hunk handed off" "opens deeper" "$REPORT"
+assert_contains "partial: graft hand-off says it was left marked" "left marked in place" "$REPORT"
+assert_contains "partial: graft block keeps its markers" "<<<<<<< HEAD" "$(cat "$RES")"
+run_check_partial "$TMP/graft" "$RES"
+assert_rc "partial: graft containment passes" 0 "$RC"
 
 # An all-judgment file must come back byte-identical to its input.
 run_partial "$TMP/both-rewrote"
@@ -458,6 +547,63 @@ if [[ -d "$REPO/.git/rebase-merge" ]]; then
 else
   nok "judge: rebase left in place for the caller's abort"
 fi
+git -C "$REPO" rebase --abort >/dev/null 2>&1 || true
+
+# The graft, end to end and in its natural habitat: a backlog list where main
+# moved an item to `## Done` while the PR was adding its own entry plus the
+# sub-bullets of the item main just closed. Both sides only ADD, so the base
+# is empty and every line survives concatenation — the gate that caught this
+# on 2026-08-17 was the project's own hygiene test, one merge too late.
+# It must decline with 4, not 1: this needs judgment, so it belongs in the
+# fixer queue rather than parked on a human.
+mkrepo graft-e2e
+cat > "$REPO/backlog.md" <<'EOF'
+## Done
+
+<!-- completed items get moved here with sha + one-line outcome -->
+
+## Next
+EOF
+git -C "$REPO" add -A && git -C "$REPO" commit -qm base
+git -C "$REPO" checkout -qb feature
+cat > "$REPO/backlog.md" <<'EOF'
+## Done
+
+<!-- completed items get moved here with sha + one-line outcome -->
+  - source: the address item's own notes, still pending
+    and its second line
+- [x] dropdown fix, issue #59, aaaa111
+
+## Next
+EOF
+git -C "$REPO" commit -qam feat
+git -C "$REPO" checkout -q main
+cat > "$REPO/backlog.md" <<'EOF'
+## Done
+
+<!-- completed items get moved here with sha + one-line outcome -->
+- [x] work address, issue #57, 6c4f382
+
+## Next
+EOF
+git -C "$REPO" commit -qam main-side
+
+if stop_on_conflict; then ok "graft-e2e: rebase stops on conflict"; else nok "graft-e2e: rebase did not conflict"; fi
+RC=0; OUT="$("$AUTORESOLVE" "$REPO" 2>&1)" || RC=$?
+assert_rc "graft-e2e: declines with the judgment code, not a plain failure" 4 "$RC"
+assert_contains "graft-e2e: first line names file and cause" "backlog.md" "$(head -n 1 <<<"$OUT")"
+assert_contains "graft-e2e: says what it refused" "opens deeper" "$OUT"
+assert_contains "graft-e2e: the sha line never became a mid-item line" "<<<<<<<" "$(cat "$REPO/backlog.md")"
+git -C "$REPO" rebase --abort >/dev/null 2>&1 || true
+
+# The same stop under --partial: the fixer's entry point hands the hunk over
+# marked rather than settling it, and leaves the file unmerged.
+if stop_on_conflict; then ok "graft-e2e: rebase stops again for partial" ; else nok "graft-e2e: rebase did not conflict"; fi
+RC=0; OUT="$("$AUTORESOLVE" --partial "$REPO" 2>&1)" || RC=$?
+assert_rc "graft-e2e: partial exits 0 with the hunk handed off" 0 "$RC"
+assert_contains "graft-e2e: partial reports the hand-off" "left marked in place" "$OUT"
+assert_eq "graft-e2e: partial leaves the file unmerged" "backlog.md" \
+  "$(git -C "$REPO" diff --name-only --diff-filter=U)"
 git -C "$REPO" rebase --abort >/dev/null 2>&1 || true
 
 # --partial against a real rebase stop: one file mixes a mechanical hunk with

@@ -7,7 +7,12 @@
 #
 #   both-added   The base section is EMPTY: neither side touched existing
 #                lines, each added different content at the same point. The
-#                resolution is every line of both sides, ours then theirs.
+#                resolution is every line of both sides, ours then theirs —
+#                but only while theirs opens no deeper than ours does. A
+#                deeper-opening second block would be nested UNDER the first
+#                by the concatenation itself, which is a placement neither
+#                side wrote and which line containment cannot see, so that
+#                shape is judgment (see end_hunk).
 #   one-sided    The base is non-empty but exactly ONE side reproduces it
 #                verbatim as a contiguous run — that side is purely additive,
 #                and only pulled the base into the hunk by adding adjacent
@@ -104,10 +109,49 @@ function run_at(side, n,   i, j, hit, pos) {
   return (runs == 1) ? pos : 0
 }
 
-function end_hunk(   i, opos, tpos, oruns, truns, cls, why) {
-  opos = 0; tpos = 0; oruns = 0; truns = 0
-  if (bn == 0) cls = "both-added"
-  else {
+# Leading-whitespace width of the first non-blank line of side[1..n]; -1 when
+# the side has none. A tab counts as one, which is enough for the only
+# question asked of it — "does this block open deeper than that one" — and
+# keeps the comparison honest for a file indented either way. Mixing the two
+# within one hunk can misjudge the width, but only ever toward declining a
+# hunk the guard could have kept, which is the safe direction: a false decline
+# goes to the fixer, a false accept goes to main.
+function open_indent(side, n,   i, l, w, c) {
+  for (i = 1; i <= n; i++) {
+    l = side[i]
+    w = 0
+    while (w < length(l)) {
+      c = substr(l, w + 1, 1)
+      if (c != " " && c != "\t") return w
+      w++
+    }
+    # All whitespace (or empty): no content to place, so keep looking.
+  }
+  return -1
+}
+
+function end_hunk(   i, opos, tpos, oruns, truns, cls, why, oi, ti) {
+  opos = 0; tpos = 0; oruns = 0; truns = 0; why = ""
+  if (bn == 0) {
+    cls = "both-added"
+    # Empty base makes the LINES obvious — both sides' — but not their
+    # NESTING, and concatenation decides that silently. It is structurally
+    # neutral only while the second block opens at the level the first one
+    # opened at: siblings land beside each other. A second block that opens
+    # DEEPER opens as a child of whatever the first block ended with, so it
+    # is reparented onto content its author never saw — and the first block's
+    # last element silently acquires a continuation. Containment cannot see
+    # it (every line is present, exactly once) and neither can a test that
+    # only reads lines, which is precisely why it has to be caught here.
+    # Nesting nobody wrote is a choice, and choices are judgment.
+    oi = open_indent(ours, on)
+    ti = open_indent(theirs, tn)
+    if (oi >= 0 && ti > oi) {
+      cls = ""
+      why = "both sides added here, but " theirs_label " opens deeper than " ours_label \
+            " (indent " ti " vs " oi "), so keeping both would nest it under " ours_label
+    }
+  } else {
     opos = run_at(ours, on);   oruns = runs
     tpos = run_at(theirs, tn); truns = runs
     if (opos && truns == 0)      cls = "ours-additive"
@@ -117,12 +161,15 @@ function end_hunk(   i, opos, tpos, oruns, truns, cls, why) {
 
   if (cls == "") {
     judgment++
-    if (oruns > 0 && truns > 0)
-      why = "both sides kept the base and added around it, so merge order is a choice"
-    else if (oruns > 1 || truns > 1)
-      why = "the base run appears more than once in the additive side, so the edit's placement is ambiguous"
-    else
-      why = "both sides edited the same base lines"
+    # Empty unless classification already said why (the both-added graft).
+    if (why == "") {
+      if (oruns > 0 && truns > 0)
+        why = "both sides kept the base and added around it, so merge order is a choice"
+      else if (oruns > 1 || truns > 1)
+        why = "the base run appears more than once in the additive side, so the edit's placement is ambiguous"
+      else
+        why = "both sides edited the same base lines"
+    }
     if (!partial) {
       print "hunk " hunks ": needs judgment - " why
       return

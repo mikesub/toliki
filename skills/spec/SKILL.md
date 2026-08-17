@@ -1,7 +1,6 @@
 ---
 name: spec
 description: Interactively author a complete, build-ready spec and file it as a GitHub issue — the one human gate before the autonomous `/epic` pipeline. Use when starting a new epic/feature that needs design clarification before any code is written.
-disable-model-invocation: true
 ---
 
 You author a **build-ready spec** together with the user and file it as a GitHub issue — one per independently deliverable slice of the work. This is the single human gate: the issue body becomes the **definition of done** that the later `/epic #NN` pipeline builds against and is blind-reviewed against. You define *what* to build here — not architecture, not code.
