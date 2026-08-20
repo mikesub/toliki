@@ -306,5 +306,46 @@ assert_eq "no adversarial check ran" 0 "$(calls fix-check)"
 assert_contains "it still verified before shipping" "$RUN_OUT" 'Verify: green'
 assert_contains "RESULT records that no judgment was exercised" "$RUN_OUT" '"resolvedHunks":0'
 
+# ───────────────────── defect grouping (restatements across files) ─────────────────────
+# Five blind lenses reporting one fault is the design working — it is how #66's migration
+# bug was caught five times over — but triage must not then fix and gate that fault five
+# times. The skeptic links restatements with sameDefectAs; the script unions them into
+# defects and tells triage, WITHOUT dropping any finding.
+printf '\ngrouping: restatements across files become one defect for triage\n'
+GROUP="$TMP/fixtures-group"
+cp -R "$BASE" "$GROUP"
+# Three lenses, three DIFFERENT files, one underlying fault — the shape file-clustering missed.
+fixture "$GROUP" lens-correctness '{"findings":[{"title":"Unusable schedule does not block submit","severity":"Critical","confidence":90,"location":"src/dialog.tsx:40","problem":"Submit stays enabled.","fix":"Block it.","gate":"unit test"}]}'
+fixture "$GROUP" lens-simplicity '{"findings":[{"title":"Block gate tests the wrong condition","severity":"Important","confidence":85,"location":"src/gate.ts:12","problem":"Checks null, not empty.","fix":"Check emptiness.","gate":"unit test"}]}'
+fixture "$GROUP" lens-seam '{"findings":[{"title":"Test asserts the wrong guard","severity":"Important","confidence":80,"location":"src/gate.test.ts:8","problem":"Encodes the wrong rule.","fix":"Assert emptiness.","gate":"unit test"}]}'
+# One batch (3 findings < MAX_BATCH), so the skeptic can see all three: 2 and 3 restate 1.
+fixture "$GROUP" verify '{"verdicts":[
+  {"index":1,"real":true,"confidence":90,"reasoning":"Confirmed."},
+  {"index":2,"real":true,"confidence":88,"reasoning":"Same fault as 1.","sameDefectAs":1},
+  {"index":3,"real":true,"confidence":85,"reasoning":"Same fault as 1.","sameDefectAs":1}]}'
+run_pipeline "$EPIC_RUN" "$GROUP" --issue 42 --session myapp-epic-42
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_contains "one batch, not one per file" "$RUN_OUT" "in 1 batch(es)"
+assert_contains "the tally keeps BOTH counts" "$RUN_OUT" "3 confirmed by adversarial verification, which are 1 distinct defect(s)"
+TRIAGE_PROMPT="$(cat "$STATE_DIR/triage.0.prompt")"
+assert_contains "triage is told they are one defect" "$TRIAGE_PROMPT" "SAME underlying defect"
+assert_contains "grouping lists every finding, losing none" "$TRIAGE_PROMPT" "Block gate tests the wrong condition"
+assert_contains "...including the third" "$TRIAGE_PROMPT" "Test asserts the wrong guard"
+assert_contains "the grouping is advisory, not an order" "$TRIAGE_PROMPT" "hint, not an instruction"
+
+# A link the skeptic did not make must not invent a group — distinct faults stay distinct.
+printf '\ngrouping: unlinked findings stay separate defects\n'
+NOGROUP="$TMP/fixtures-nogroup"
+cp -R "$GROUP" "$NOGROUP"
+fixture "$NOGROUP" verify '{"verdicts":[
+  {"index":1,"real":true,"confidence":90,"reasoning":"Confirmed."},
+  {"index":2,"real":true,"confidence":88,"reasoning":"Distinct fault."},
+  {"index":3,"real":true,"confidence":85,"reasoning":"Distinct fault."}]}'
+run_pipeline "$EPIC_RUN" "$NOGROUP" --issue 42 --session myapp-epic-42
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_not_contains "no defect collapsing is claimed" "$RUN_OUT" "distinct defect(s)"
+TRIAGE_PROMPT="$(cat "$STATE_DIR/triage.0.prompt")"
+assert_not_contains "and triage is told nothing about groups" "$TRIAGE_PROMPT" "SAME underlying defect"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

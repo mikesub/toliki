@@ -177,7 +177,7 @@ Read the relevant code and \`${diffCmd}\`. Do NOT open anything under \`.epics/\
 
 Return exactly ${findings.length} verdict${findings.length === 1 ? '' : 's'} — one per finding — with \`index\` set to that finding's number above (${findings.length === 1 ? '1' : `1-${findings.length}`}).${findings.length > 1 ? `
 
-These were reported independently by different review lenses, so several may be one defect restated in different words. Judge each on its own merits: if two are the same defect, say so in the reasoning and let them stand or fall together — do NOT mark one not-real merely because it overlaps another.` : ''}`,
+These were reported independently by different review lenses, so several may be one defect restated in different words — often pointing at DIFFERENT files (the component, the gate that guards it, its test, the doc describing it) while describing one underlying fault that one fix resolves. Judge each on its own merits: if two are the same defect, set \`sameDefectAs\` on the LATER one to the earlier one's number and let them stand or fall together — do NOT mark one not-real merely because it overlaps another. Only group findings ONE fix would genuinely resolve together; two distinct bugs that happen to sit in the same function are NOT the same defect.` : ''}`,
 
   reviewWrite: (dir, confirmedJson, unconfirmedJson) =>
 `Write ${dir}/review.md from the review results below.
@@ -194,11 +194,11 @@ ${unconfirmedJson}
 
 Then update ${dir}/epic.md (phase: review → done, phase log). Do not fix anything.`,
 
-  triage: (dir, finish, pkgs) =>
+  triage: (dir, finish, pkgs, grouping) =>
 `Triage phase, autonomous (NO user sign-off). Read ${dir}/review.md and the diff. Apply fixes for the CONFIRMED findings only, highest severity first — NEVER act on anything under "## Unconfirmed — not fixed" (those were refuted; they are listed for human eyes only). For every finding you fix, also add the automated check that would catch its whole CLASS, not just the instance in front of you — a test, a type, a lint rule, or a shared helper that makes the footgun impossible — so the gate fails on any recurrence. Every review finding is a missing gate. Where this project's CLAUDE.md states its own harden-the-gate rule, follow that wording; this instruction stands on its own where it does not.
 When the check that would catch a class is NOT expressible as a test/type/lint but is a convention (a rule about how to write something, a footgun only a human would know to avoid), amend the constitution instead — but only THIS project's own: the relevant section of its CLAUDE.md, or the path-scoped \`.claude/rules/*.md\` covering the code in question, in the file's existing voice and length. Those are the only two places you may write a rule. The skills, agents and this pipeline are shared harness files that live outside this repo and are used by other projects: a rule that belongs to one of them is out of scope for an epic, so do NOT edit or recreate one — record it as DEFERRED in ${dir}/epic.md's phase log, stating the rule you would have written and which harness file it belongs in, and leave the harness untouched. A class with no gate at all is the outcome to avoid — a written rule beats nothing, and a deferred note beats a silent gap. Note any such amendment or deferral in ${dir}/epic.md's phase log so it surfaces in the PR body.
 If a finding is genuinely too risky or expensive to fix safely without a human decision, DO NOT guess — leave it, and record it as deferred (with why) in ${dir}/epic.md's phase log so the summary surfaces it.
-After fixes, re-run \`npm run verify\` in each touched package (this repo's packages: ${pkgs}) until green.
+${grouping}After fixes, re-run \`npm run verify\` in each touched package (this repo's packages: ${pkgs}) until green.
 ${finish}
 Update ${dir}/epic.md (phase: review→triaged). Return:
 - status: a short summary — which findings were fixed, which were deferred and why, and the final verify result.
@@ -409,6 +409,10 @@ const VERDICT_SCHEMA = {
           real: { type: 'boolean', description: 'true only if the finding genuinely holds against the code' },
           confidence: { type: 'number', description: '0-100' },
           reasoning: { type: 'string' },
+          sameDefectAs: {
+            type: 'number',
+            description: 'OPTIONAL. When this finding is the SAME underlying defect as an earlier finding in this batch — one fix resolves both — the 1-based index of that earlier finding. Omit when the finding stands on its own. Never point forward or at itself.',
+          },
         },
       },
     },
@@ -641,14 +645,22 @@ try {
   // skeptics, each re-reading the same diff to re-confirm it. One skeptic per file pays that cost once and can
   // see the claims are one defect — a call the per-finding verifiers each had to make blind. Verdicts stay PER
   // FINDING: clustering changes who judges, never what survives.
+  // Batches are sized, NOT keyed by file. Keying by file was the first version of this and it only caught
+  // restatements that happen to land in the same file; on #69 one defect ("a parseable-but-unusable schedule
+  // renders no rate fields and does not block submit") arrived from four lenses pointing at a component, a
+  // gate, a test and a doc — four files, so four skeptics, none of whom could see it was one defect. Three
+  // more of that run's findings were a second defect split the same way: 18 findings, ~9 real defects.
+  //
+  // Grouping aggressively is safe BECAUSE it is routing rather than gating — a verdict is still returned per
+  // finding, so the worst a bad batch can do is give one skeptic some unrelated context. The cap keeps that
+  // honest: past ~8 findings a single reviewer's attention is the thing being diluted, so split rather than
+  // pile on. Sorting by file first keeps genuinely related findings adjacent when a split does happen.
   const fileOf = f => (f.location || '').trim().replace(/:\s*\d+(?:\s*-\s*\d+)?\s*$/, '') || '(unspecified)'
-  const clusters = new Map()
-  for (const f of uniqueReviews) {
-    const k = fileOf(f)
-    if (!clusters.has(k)) clusters.set(k, [])
-    clusters.get(k).push(f)
-  }
-  log(`Review: ${reviews.length} raw finding(s) across ${LENSES.length} lenses; adversarially verifying ${uniqueReviews.length} in ${clusters.size} file batch(es).`)
+  const MAX_BATCH = 8
+  const ordered = [...uniqueReviews].sort((a, b) => fileOf(a).localeCompare(fileOf(b)))
+  const batches = []
+  for (let i = 0; i < ordered.length; i += MAX_BATCH) batches.push(ordered.slice(i, i + MAX_BATCH))
+  log(`Review: ${reviews.length} raw finding(s) across ${LENSES.length} lenses; adversarially verifying ${uniqueReviews.length} in ${batches.length} batch(es) of up to ${MAX_BATCH}.`)
 
   // Adversarial verify: an independent skeptic tries to REFUTE each finding before it counts. Refuted /
   // low-confidence findings are NOT silently dropped — they land in review.md's "Unconfirmed" section for
@@ -659,22 +671,57 @@ try {
     finding: f,
     verdict: { real: false, confidence: 0, reasoning: 'Batched verifier returned no verdict for this finding — recorded as unconfirmed rather than dropped. Re-check by hand.' },
   })
-  const verdicts = (await parallel([...clusters.entries()].map(([loc, group]) => () =>
+  const verdicts = (await parallel(batches.map((group, bi) => () =>
     agent(PROMPTS.verify(group, DIFF),
-      { label: `verify:${loc}`, phase: 'Review', agentType: 'reviewer', model: ADJUDICATE, schema: VERDICT_SCHEMA },
+      { label: `verify:${bi + 1}/${batches.length}`, phase: 'Review', agentType: 'reviewer', model: ADJUDICATE, schema: VERDICT_SCHEMA },
     ).then(v => group.map((f, i) => {
       const got = v && Array.isArray(v.verdicts) ? v.verdicts.find(x => Number(x.index) === i + 1) : null
-      return got && typeof got.real === 'boolean' ? { finding: f, verdict: got } : noVerdict(f)
+      if (!got || typeof got.real !== 'boolean') return noVerdict(f)
+      // sameDefectAs is 1-based WITHIN this batch; resolve it to the actual finding while the
+      // batch is still in scope. Ignore a self-reference or an out-of-range index rather than
+      // trusting it — a bad link would silently merge unrelated defects.
+      const k = Number(got.sameDefectAs)
+      const twin = Number.isInteger(k) && k >= 1 && k <= group.length ? group[k - 1] : null
+      return { finding: f, verdict: got, twin: twin && twin !== f ? twin : null }
     })).catch(() => group.map(noVerdict)),
   ))).flat().filter(Boolean)
 
-  const verified = verdicts.filter(r => r.verdict.real && r.verdict.confidence >= 75).map(r => r.finding)
+  const confirmedRecs = verdicts.filter(r => r.verdict.real && r.verdict.confidence >= 75)
+  const verified = confirmedRecs.map(r => r.finding)
   const unconfirmed = verdicts.filter(r => !(r.verdict.real && r.verdict.confidence >= 75))
     .map(r => ({ ...r.finding, verdict: r.verdict }))
 
+  // Collapse the confirmed findings into DEFECTS — the things a fix addresses — using the links the
+  // skeptics returned. Five lenses reporting one fault is the design working (it is how #66's migration
+  // bug was caught five times over), but handing triage five items makes it fix and gate the same thing
+  // five times, and triage is the longest phase in the run.
+  //
+  // This is presentation, never a filter: every finding still reaches triage, grouped, and the grouping
+  // is advisory — triage is told to split a group back apart if the findings are actually distinct. So a
+  // wrong link costs a sentence of explanation, never an unfixed bug. Union-find over the links, since a
+  // chain (3→2, 2→1) has to land in one group.
+  const parent = new Map(verified.map(f => [f, f]))
+  const root = f => { while (parent.get(f) !== f) { parent.set(f, parent.get(parent.get(f))); f = parent.get(f) } return f }
+  for (const r of confirmedRecs) {
+    if (!r.twin || !parent.has(r.twin)) continue      // twin was refuted, or never confirmed
+    const a = root(r.finding), b = root(r.twin)
+    if (a !== b) parent.set(a, b)
+  }
+  const defectMap = new Map()
+  for (const f of verified) {
+    const k = root(f)
+    if (!defectMap.has(k)) defectMap.set(k, [])
+    defectMap.get(k).push(f)
+  }
+  const defects = [...defectMap.values()]
+
   // The one line of the review that has to outlive the worktree. review.md is gitignored and the PR body is
   // told to skip the refuted findings, so without this tally in the PR nothing records they were ever raised.
-  const reviewTally = `${reviews.length} raw finding(s) across ${LENSES.length} blind lenses → ${verified.length} confirmed by adversarial verification, ${unconfirmed.length} refuted`
+  // Both numbers stay in the tally on purpose. Reporting only the defect count would read as a WEAKER
+  // review than actually happened — the raw count is the only durable record that N independent lenses
+  // converged on the same fault, and review.md dies with the worktree.
+  const grouped = defects.length < verified.length ? `, which are ${defects.length} distinct defect(s)` : ''
+  const reviewTally = `${reviews.length} raw finding(s) across ${LENSES.length} blind lenses → ${verified.length} confirmed by adversarial verification${grouped}, ${unconfirmed.length} refuted`
   log(`Review: ${reviewTally}.`)
 
   // Write review.md from the surviving findings (+ the unconfirmed record).
@@ -689,7 +736,14 @@ try {
   let triageStatus = 'No confirmed findings — nothing to triage.'
   let triageDeferred = []
   if (verified.length) {
-    const triaged = await agent(PROMPTS.triage(dir, checkpoint('triage'), pkgList()),
+    // Advisory grouping: the same defect, found by several lenses, arrives as several findings. Naming the
+    // groups lets triage fix and gate once instead of once per restatement — while every finding is still
+    // listed, and triage is told to split a group it disagrees with rather than silently honour it.
+    const multi = defects.filter(g => g.length > 1)
+    const grouping = multi.length
+      ? `\nSeveral findings are the SAME underlying defect, reported by different review lenses looking at different files. An independent verifier grouped them; one fix and one gate should resolve each group, so do NOT fix or gate the same fault once per finding:\n${multi.map((g, i) => `- Defect ${i + 1}:\n${g.map(f => `  - "${f.title}" (${f.location})`).join('\n')}`).join('\n')}\nThis grouping is a hint, not an instruction: if the findings in a group are genuinely distinct faults needing separate fixes, treat them separately and say so in your status. Every finding above must still end up either fixed or reported as deferred.\n`
+      : ''
+    const triaged = await agent(PROMPTS.triage(dir, checkpoint('triage'), pkgList(), grouping),
       { label: 'triage:fix', phase: 'Triage', agentType: 'coder', schema: TRIAGE_SCHEMA },
     )
     // Fail closed: a dead triage agent leaves confirmed findings in an unknown state — some fixed, some not,
