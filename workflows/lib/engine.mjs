@@ -21,6 +21,7 @@
 // them, which is why runtime.mjs forwards signals through terminateAll().
 
 import { spawn } from 'node:child_process'
+import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 
@@ -137,21 +138,67 @@ function execute({ bin, args, prompt, cwd, timeoutMs, onStart }) {
 // output validated. The CLI runs its OWN retry loop against the schema first
 // and only then gives up with error_max_structured_output_retries — so the
 // respawn in runtime.mjs is a second, outer layer, not the only one.
+// Charters live in the harness's own agents/ directory — read from the canonical
+// file rather than through the ~/.claude/agents symlinks, so a pipeline run does
+// not depend on user-level wiring that only interactive sessions need.
+const AGENTS_DIR = new URL('../../agents/', import.meta.url)
+const charterCache = new Map()
+
+function loadCharter(agentType) {
+  if (charterCache.has(agentType)) return charterCache.get(agentType)
+  const file = new URL(`${agentType}.md`, AGENTS_DIR)
+  let raw
+  try {
+    raw = readFileSync(file, 'utf8')
+  } catch (e) {
+    throw new Error(`agent charter "${agentType}" could not be read at ${file.pathname}: ${e.message}. Refusing to run the step uncharted — architect and reviewer rely on this for their tool restrictions.`)
+  }
+  const m = raw.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n([\s\S]*)$/)
+  if (!m) throw new Error(`agent charter "${agentType}" has no frontmatter block — refusing to run the step uncharted.`)
+  const [, front, body] = m
+  const toolsLine = front.split(/\r?\n/).find(l => l.startsWith('tools:'))
+  const tools = toolsLine
+    ? toolsLine.slice('tools:'.length).split(',').map(t => t.trim()).filter(Boolean)
+    : []
+  const charter = { body: body.trim(), tools }
+  if (!charter.body) throw new Error(`agent charter "${agentType}" has an empty body — refusing to run the step uncharted.`)
+  charterCache.set(agentType, charter)
+  return charter
+}
+
 const claudeEngine = {
   name: 'claude',
   bin: process.env.CLAUDE_BIN || 'claude',
 
   buildArgs({ agentType, model, effort, schema }) {
     const args = ['-p', '--output-format', 'json', '--dangerously-skip-permissions']
-    // Charter + tool restrictions come from the shared agents/ registry, which
-    // setup.sh/provision.sh symlink into ~/.claude/agents on both machines.
-    // This is what keeps `architect` unable to write files and `reviewer`
-    // unable to patch what it is judging. Verified to bind in print mode, and
-    // to fail LOUDLY when it cannot: an unknown agent name exits with
-    // "--agent '<x>' not found. Available agents: …" rather than running on
-    // without the restrictions — which is the only acceptable failure mode for
-    // something whose whole job is to take tools away.
-    if (agentType) args.push('--agent', agentType)
+    // Charter + tool restrictions, applied as a system prompt plus an explicit
+    // tool list rather than with `--agent <name>`.
+    //
+    // `--agent` SILENTLY DISABLES `--json-schema`. Measured on 2026-08-20
+    // against claude in print mode: the same call that returns
+    // structured_output {"n":7,"w":"seven"} without --agent returns
+    // structured_output null and a prose result with `--agent coder`. The
+    // named agent's own output contract replaces the schema's, and nothing
+    // reports it — the run just gets no structured payload, which is what
+    // failed vms#66's prepare phase. Every stage that matters here carries a
+    // schema, so --agent is unusable for this pipeline.
+    //
+    // Reading the charter from agents/*.md keeps the SAME two guarantees the
+    // --agent path had: the charter body reaches the model, and the tool list
+    // is enforced (architect/reviewer have no Write/Edit, so they cannot patch
+    // what they judge). It also fails LOUDLY on a missing or malformed file
+    // instead of running on without the restrictions, which is the only
+    // acceptable failure mode for something whose whole job is to take tools
+    // away.
+    if (agentType) {
+      const { body, tools } = loadCharter(agentType)
+      args.push('--append-system-prompt', body)
+      // One comma-separated argument, never `--tools A B C`: the flag is
+      // variadic, so a space-separated list would swallow the flags that
+      // follow it here.
+      if (tools.length) args.push('--tools', tools.join(','))
+    }
     // No --model = the CLI's configured default. That is the port of the old
     // workflow's "stages not listed in the tier table inherit the session model".
     if (model) args.push('--model', model)

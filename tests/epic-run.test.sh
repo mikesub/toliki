@@ -27,6 +27,11 @@ nok() { FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$1"; }
 assert_rc() { # name want got
   if [[ "$2" == "$3" ]]; then ok "$1"; else nok "$1 (want rc $2, got $3)"; fi
 }
+assert_not_contains() {
+  if [[ "$2" != *"$3"* ]]; then ok "$1"; else
+    nok "$1"; printf '       unexpectedly present: %s\n' "$3"
+  fi
+}
 assert_contains() { # name haystack needle
   if [[ "$2" == *"$3"* ]]; then ok "$1"; else
     nok "$1"
@@ -50,7 +55,11 @@ mkdir -p "$TMP/bin"
 cat > "$TMP/bin/claude" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
-printf '%s\n' "$*" >> "$STUB_LOG"
+# One line per call: the charter arrives via --append-system-prompt and is
+# multi-line, so squeeze whitespace or a single call would span many lines and
+# break every assertion that greps this log.
+printf '%s\n' "$*" | tr '\n' ' ' | tr -s ' ' >> "$STUB_LOG"
+printf '\n' >> "$STUB_LOG"
 prompt="$(cat)"
 
 key=unknown
@@ -157,9 +166,17 @@ assert_eq "no blocker was posted" 0 "$(calls blocked)"
 assert_eq "all five lenses ran" 5 "$(( $(calls lens-correctness) + $(calls lens-simplicity) + $(calls lens-seam) + $(calls lens-acceptance) + $(calls lens-security) ))"
 # Tiering and charters are invisible in production until they bill; assert them here.
 ARGV="$(cat "$RUN_LOG")"
-assert_contains "prepare runs the mechanical tier as coder" "$ARGV" "--agent coder --model sonnet"
-assert_contains "design runs the strong tier as architect" "$ARGV" "--agent architect --model fable"
-assert_contains "the adversarial verifier runs the strong tier as reviewer" "$ARGV" "--agent reviewer --model fable"
+# Charters ride in as --append-system-prompt + an explicit --tools list, never
+# as --agent: `--agent` silently disables --json-schema (measured 2026-08-20),
+# which is what broke vms#66's prepare. Asserting the ABSENCE of --agent is the
+# regression guard; asserting the tool lists is the safety property that flag
+# used to provide.
+assert_not_contains "no stage uses --agent (it would void --json-schema)" "$ARGV" "--agent "
+assert_contains "prepare runs the mechanical tier" "$ARGV" "--model sonnet"
+assert_contains "prepare is chartered as coder (Write/Edit allowed)" "$ARGV" "Bash,Glob,Grep,Read,Edit,Write,"
+assert_contains "design runs the strong tier" "$ARGV" "--model fable"
+assert_contains "architect and reviewer cannot write" "$ARGV" "--tools Glob,Grep,Read,"
+assert_contains "the reviewer charter reaches the model" "$ARGV" "Review code against project guidelines"
 assert_contains "schemas are enforced by the engine" "$ARGV" "--json-schema"
 assert_contains "permissions are pre-granted for autonomy" "$ARGV" "--dangerously-skip-permissions"
 
