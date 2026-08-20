@@ -474,6 +474,37 @@ while IFS= read -r repo; do
   fi
 done < <(repo_names)
 
+# ------------------------------------------------ merged-branch auto-delete --
+#
+# reap.sh's worktree pass proves a run is DELIVERED by the absence of any
+# `epic/<N>-*` ref on origin: prepare pushes its claim ref before doing any
+# work and Ship force-pushes to that same ref, so no ref means no work anyone
+# could still want. That proof silently stops holding when a repo keeps merged
+# branches — the ref outlives the merge forever, so the worktree is never
+# collected and every issue the box builds leaves a checkout and its
+# node_modules behind. It fails SAFE (nothing is wrongly deleted), which is
+# exactly why it needs reporting: the leak is invisible until a disk fills.
+#
+# Checked, never set: turning it on rewrites how a repo handles every PR,
+# including ones no pipeline opened, so it stays a human's decision — the same
+# rule as the gh/trust/bypass gates. A warning rather than a blocker, because
+# the box is fully functional without it.
+if [[ $HAVE_GH_AUTH -eq 1 ]]; then
+  while IFS= read -r repo; do
+    if ! origin="$(repo_origin "$repo")"; then
+      continue                              # already reported by the clone step
+    fi
+    setting="$(gh repo view "$origin" --json deleteBranchOnMerge --jq .deleteBranchOnMerge 2>/dev/null || echo '')"
+    case "$setting" in
+      true)  ok "$repo deletes merged branches (reap can collect delivered worktrees)" ;;
+      false) warn "$repo keeps merged branches — reap.sh will never collect its worktrees under \$EPIC_WORKTREE_ROOT. Turn on Settings -> General -> 'Automatically delete head branches' for $origin, or delete each epic/<N>-* ref by hand after it merges" ;;
+      *)     note "$repo: could not read deleteBranchOnMerge for $origin (needs repo admin scope) — if merged branches linger there, reap cannot collect its worktrees" ;;
+    esac
+  done < <(repo_names)
+else
+  note "skipping the merged-branch auto-delete check (needs gh auth)"
+fi
+
 # ------------------------------------------------ docker GC config provenance --
 #
 # etc/docker-daemon.json is a COPY of whatever GC_UPSTREAM_REPO/GC_UPSTREAM_REL
