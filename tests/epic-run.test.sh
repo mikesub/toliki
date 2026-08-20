@@ -385,6 +385,13 @@ assert_contains "it names the phase and the session" "$GH" "epic-run"
 assert_contains "and the session name" "$GH" "myapp-epic-42"
 assert_contains "the last write reports the outcome" "$GH" "queued for the merge worker"
 
+# GitHub renders every bare #N as that issue/PR's TITLE, so numbering findings
+# "#1, #2, #3" in the PR body splices three unrelated PR titles into the review
+# section — which is exactly what shipped on vms#69's PR before this rule.
+SHIP_PROMPT="$(cat "$STATE_DIR/ship.0.prompt")"
+assert_contains "ship is told not to number anything with a bare #N" "$SHIP_PROMPT" "Never write a bare"
+assert_contains "and told what GitHub does with one" "$SHIP_PROMPT" "renders it as that issue or PR"
+
 printf '\nstatus comment: a blocked run says so on the issue\n'
 DEAD="$TMP/fixtures-deadlens"
 cp -R "$BASE" "$DEAD"
