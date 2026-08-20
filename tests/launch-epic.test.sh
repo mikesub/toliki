@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Exercises bin/launch.sh's two launch shapes against stub binaries. Hermetic:
+# stub `tmux` and `node` on PATH record their argv instead of doing anything,
+# `git` is REAL but only ever touches throwaway repos created under mktemp, and
+# a throwaway etc/repos.conf points at those. No ssh, no live host, no session.
+#
+# What it holds: the pane line and the worktree. Those two are where a mistake
+# is invisible until production — a session that launches the wrong script, or
+# one whose worktree scrub eats node_modules, both look like a successful
+# launch right up until the run behaves strangely an hour later.
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+PASS=0
+FAIL=0
+ok() { PASS=$((PASS + 1)); printf '  ok   %s\n' "$1"; }
+nok() { FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$1"; }
+assert_rc() { if [[ "$2" == "$3" ]]; then ok "$1"; else nok "$1 (want rc $2, got $3)"; fi; }
+assert_contains() {
+  if [[ "$2" == *"$3"* ]]; then ok "$1"; else
+    nok "$1"; printf '       missing: %s\n' "$3"; printf '%s\n' "$2" | sed 's/^/         /' | head -20
+  fi
+}
+assert_not_contains() { if [[ "$2" != *"$3"* ]]; then ok "$1"; else nok "$1 (unexpectedly present: $3)"; fi; }
+assert_file() { if [[ -e "$2" ]]; then ok "$1"; else nok "$1 (missing: $2)"; fi; }
+assert_no_file() { if [[ ! -e "$2" ]]; then ok "$1"; else nok "$1 (unexpectedly present: $2)"; fi; }
+
+# ───────────────────────── the fake host ─────────────────────────
+mkdir -p "$TMP/bin"
+
+# tmux: records every invocation; `has-session` always fails (nothing running),
+# so launch.sh always takes the create path. list-sessions/list-panes answer
+# empty so the capacity count sees an idle box.
+cat > "$TMP/bin/tmux" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$TMUX_LOG"
+case "${1:-}" in
+  has-session) exit 1 ;;
+  list-sessions|list-panes) exit 0 ;;
+esac
+exit 0
+STUB
+
+# node/claude: never actually run — the pane line is typed via send-keys, which
+# the tmux stub only records. These exist so a bug that EXECUTES them directly
+# fails loudly instead of reaching the real binaries.
+for b in node claude; do
+  cat > "$TMP/bin/$b" <<STUB
+#!/usr/bin/env bash
+printf 'UNEXPECTED direct execution of $b: %s\n' "\$*" >> "\$TMUX_LOG"
+exit 97
+STUB
+  chmod +x "$TMP/bin/$b"
+done
+chmod +x "$TMP/bin/tmux"
+
+# A throwaway clone with an origin, so `git pull --rebase` and `worktree add` work.
+UPSTREAM="$TMP/upstream.git"
+CLONE="$TMP/clone"
+git init -q --bare -b main "$UPSTREAM"
+git -c init.defaultBranch=main clone -q "$UPSTREAM" "$CLONE" 2>/dev/null
+git -C "$CLONE" config user.email t@example.com
+git -C "$CLONE" config user.name Test
+git -C "$CLONE" config commit.gpgsign false
+mkdir -p "$CLONE/frontend"
+printf '{}\n' > "$CLONE/frontend/package.json"
+git -C "$CLONE" add -A
+git -C "$CLONE" commit -qm "initial"
+git -C "$CLONE" push -q -u origin main 2>/dev/null
+
+# A repos.conf pointing only at the throwaway clone, so nothing can resolve to
+# a real checkout. lib.sh sources it from beside itself, so the harness is
+# copied wholesale into TMP rather than mutated in place.
+HARNESS="$TMP/harness"
+mkdir -p "$HARNESS"
+cp -R "$ROOT/bin" "$ROOT/etc" "$ROOT/workflows" "$HARNESS/"
+cat > "$HARNESS/etc/repos.conf" <<EOF
+REPOS=( testrepo=$CLONE )
+REPO_ORIGINS=( testrepo=owner/testrepo )
+HOST_CONTROL_DIR="$HARNESS"
+SSH_HOST="unused"
+NAMES=(alpha bravo)
+NAME_MAX_LEN=40
+MAX_PARALLEL_EPICS=2
+EOF
+LAUNCH="$HARNESS/bin/launch.sh"
+WT_ROOT="$TMP/worktrees"
+
+RUN_OUT=""
+RUN_RC=0
+TMUX_LOG_FILE=""
+run_launch() {
+  TMUX_LOG_FILE="$TMP/tmux.$RANDOM.log"
+  : > "$TMUX_LOG_FILE"
+  RUN_RC=0
+  RUN_OUT="$(
+    PATH="$TMP/bin:$PATH" \
+    TMUX_LOG="$TMUX_LOG_FILE" \
+    EPIC_WORKTREE_ROOT="$WT_ROOT" \
+    HOME="$TMP/home" \
+    bash "$LAUNCH" "$@" 2>&1
+  )" || RUN_RC=$?
+}
+tmux_log() { cat "$TMUX_LOG_FILE"; }
+
+printf '\nlaunch --epic: worktree + orchestrator pane line\n'
+run_launch --epic 63 --repo testrepo
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_contains "session is named <repo>-epic-<N>" "$(tmux_log)" "new-session -d -s testrepo-epic-63"
+assert_contains "the pane starts in the worktree" "$(tmux_log)" "-c $WT_ROOT/testrepo/testrepo-epic-63"
+assert_contains "the repo tag is set" "$(tmux_log)" "set-option -t testrepo-epic-63 @repo testrepo"
+assert_contains "the pane runs the epic orchestrator" "$(tmux_log)" "workflows/epic-run.mjs' --issue 63"
+assert_contains "the session name is threaded through" "$(tmux_log)" "--session 'testrepo-epic-63'"
+assert_not_contains "no interactive claude is launched" "$(tmux_log)" "--remote-control"
+assert_file "the worktree exists" "$WT_ROOT/testrepo/testrepo-epic-63/frontend/package.json"
+
+printf '\nlaunch --fix: same session shape, fixer script\n'
+run_launch --fix '#63' --repo testrepo
+assert_rc "exits 0 (and strips the leading #)" 0 "$RUN_RC"
+assert_contains "session is still <repo>-epic-<N>" "$(tmux_log)" "new-session -d -s testrepo-epic-63"
+assert_contains "the pane runs the fixer orchestrator" "$(tmux_log)" "workflows/fix-run.mjs' --issue 63"
+
+printf '\nlaunch --epic: a reused worktree is scrubbed but keeps ignored files\n'
+WT="$WT_ROOT/testrepo/testrepo-epic-63"
+mkdir -p "$WT/frontend/node_modules/left-pad" "$WT/.epics/63-slug"
+printf 'installed\n' > "$WT/frontend/node_modules/left-pad/index.js"
+printf '# phase log\n' > "$WT/.epics/63-slug/epic.md"
+printf 'node_modules/\n.epics/\n' > "$WT/.gitignore"
+printf 'uncommitted junk\n' > "$WT/frontend/scratch.ts"     # untracked, NOT ignored
+git -C "$WT" add .gitignore && git -C "$WT" -c user.email=t@e.com -c user.name=T -c commit.gpgsign=false commit -qm "ignore rules"
+run_launch --epic 63 --repo testrepo
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_contains "it reports the reuse" "$RUN_OUT" "reusing worktree"
+assert_file "node_modules survives the scrub" "$WT/frontend/node_modules/left-pad/index.js"
+assert_file ".epics/ survives the scrub (resume appends to epic.md)" "$WT/.epics/63-slug/epic.md"
+assert_no_file "untracked non-ignored junk is cleaned" "$WT/frontend/scratch.ts"
+
+printf '\nlaunch: the interactive path is unchanged\n'
+run_launch --repo testrepo -m "look at the logs"
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_contains "it launches interactive claude" "$(tmux_log)" "claude --remote-control testrepo-look-at-the-logs --dangerously-skip-permissions --worktree testrepo-look-at-the-logs"
+assert_contains "the message is passed as a positional prompt" "$(tmux_log)" "'look at the logs'"
+assert_contains "the pane starts in the clone, not a pipeline worktree" "$(tmux_log)" "-c $CLONE"
+
+printf '\nlaunch: conflicting flags are refused\n'
+run_launch --epic 63 --fix 64 --repo testrepo
+assert_rc "--epic with --fix exits 1" 1 "$RUN_RC"
+assert_contains "and says why" "$RUN_OUT" "mutually exclusive"
+
+run_launch --epic 63 -m "hello" --repo testrepo
+assert_rc "--epic with -m exits 1" 1 "$RUN_RC"
+assert_contains "and says why" "$RUN_OUT" "takes no -m"
+
+run_launch --epic 63 somename --repo testrepo
+assert_rc "--epic with an explicit name exits 1" 1 "$RUN_RC"
+assert_contains "and says why" "$RUN_OUT" "derives its own session name"
+
+run_launch --epic not-a-number --repo testrepo
+assert_rc "a non-numeric issue exits 1" 1 "$RUN_RC"
+assert_contains "and says why" "$RUN_OUT" "takes an issue number"
+
+printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
+[[ "$FAIL" -eq 0 ]]

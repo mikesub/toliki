@@ -2,31 +2,43 @@
 set -euo pipefail
 
 # Runs ON the host, from cron. Frees what a finished or dead epic leaves behind:
-# the idle tmux session still holding a slot, and the stale claim ref still
-# holding the head of the queue. Reads GitHub, kills tmux sessions and deletes
-# claim refs on origin — it never launches anything and never touches a repo's
-# working tree. Keep it free of any ssh/laptop assumptions (like launch.sh).
+# the tmux session still holding the issue's name, the stale claim ref still
+# holding the head of the queue, and the worktree of a run whose work has
+# already landed. Reads GitHub, kills tmux sessions, deletes claim refs on
+# origin and removes delivered worktrees — it never launches anything and never
+# touches a repo's own clone. Keep it free of any ssh/laptop assumptions (like
+# launch.sh).
 #
-# It exists because neither thing frees itself:
-#   * launch.sh starts claude with a positional prompt, not `-p` (which would
-#     run the prompt and exit, tearing the detached session down), so a session
-#     whose epic has finished sits alive and idle at the claude prompt forever
-#     — and MAX_PARALLEL_EPICS counts it, so a couple of them stop dispatch.
+# It exists because none of the three frees itself:
+#   * A finished run leaves its tmux session behind. The orchestrator process
+#     does exit when the pipeline ends — so the SLOT frees itself, which was not
+#     true of the interactive sessions this replaced — but the session keeps its
+#     NAME, and that name is what dispatch's has-session checks read: until the
+#     session is gone, the issue it names cannot be dispatched again. A run that
+#     ended in a skip or a blocker is exactly the one that needs relaunching.
 #   * epic-run's prepare CLAIMS the issue (pushes epic/<N>-<slug> to origin)
 #     before it labels it in-progress, so a run that dies in between leaves the
 #     issue `ready` at the head of the queue behind a ref every later run
 #     refuses — and nothing reports it.
+#   * launch.sh creates a worktree per run and reuses it on a relaunch, but
+#     removes one only to replace it. Every issue the box has ever built would
+#     otherwise keep a checkout and its node_modules on disk forever.
 #
 # The run itself no longer merges (bin/merge-worker.sh does, later), so a
 # session is finished while its issue is still OPEN. The done signal is
 # therefore the label — ready-to-merge, ready-to-review or failed — and not the
 # issue closing, which happens long after the slot should have been freed.
 #
-# Reaping is deliberately conservative in both passes: it only ever kills
+# Reaping is deliberately conservative in every pass: it only ever kills
 # sessions named <repo>-epic-<N> (pool-named and hand-made sessions are the
-# user's own work and are never candidates), and it only ever deletes a ref
-# whose tip is a claim commit, which is precisely the case where no work is
-# being lost. Anything it could not check is left alone and reported.
+# user's own work and are never candidates), it only ever deletes a ref whose
+# tip is a claim commit, and it only ever removes a worktree whose branch is
+# already gone from origin — each of which is precisely the case where no work
+# is being lost. Anything it could not check is left alone and reported.
+#
+# One thing it deliberately does NOT clean up: agent processes orphaned by a
+# run that was SIGKILLed. Those are reported for a human instead — see the
+# comment at that check for why killing them is a different class of act.
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/../etc/lib.sh"
@@ -48,6 +60,13 @@ CLAIM_GRACE_HOURS="${CLAIM_GRACE_HOURS:-6}"
 # edits for a few minutes" cleanly separates finished from still-finishing.
 TERMINAL_SETTLE_MINUTES="${TERMINAL_SETTLE_MINUTES:-5}"
 
+# How long a delivered run's worktree is kept before pass 3 removes it. Not a
+# correctness bound — the branch being gone from origin is what proves the work
+# is delivered — but a deliberate margin: disk is cheap, an operator opening
+# yesterday's worktree to read what a run did is not, and a relaunch within the
+# window reuses the checkout instead of re-cloning and re-installing it.
+WORKTREE_GRACE_HOURS="${WORKTREE_GRACE_HOURS:-24}"
+
 DRY_RUN=0
 NEEDS_HUMAN=0
 
@@ -65,13 +84,18 @@ Sweeps the host once and exits:
      terminal state (labelled ready-to-merge/ready-to-review/failed, or closed)
      and has sat still for \$TERMINAL_SETTLE_MINUTES (${TERMINAL_SETTLE_MINUTES}m; a closed issue
      skips the wait — merged is delivered), and flags —
-     without killing — any whose claude died before it got there, because the
+     without killing — any whose process died before it got there, because the
      pane's scrollback is the only record of why.
   2. deletes every epic/<N>-* ref on origin whose tip is still the claim commit
      and that no live session is working, older than \$CLAIM_GRACE_HOURS (${CLAIM_GRACE_HOURS}h).
+  3. removes every pipeline worktree whose issue no longer has ANY epic branch
+     on origin (so its work is delivered), that has no tmux session of its own,
+     older than \$WORKTREE_GRACE_HOURS (${WORKTREE_GRACE_HOURS}h).
+It also flags — never kills — agent processes left running by a SIGKILLed run.
 
 -n reports what it would do and changes nothing. Exits non-zero when something
-needs a human: a flagged session, or a check that could not be made.
+needs a human: a flagged session, orphaned agents, or a check that could not be
+made.
 EOF
 }
 
@@ -86,6 +110,11 @@ done
 NOW="$(date +%s)"
 KILLED=0
 DELETED=0
+PRUNED=0
+# Filled by pass 2, read by pass 3: which repos' origin-ref listings succeeded,
+# and every issue that still has an epic branch on origin.
+REFS_OK=""
+ORIGIN_EPICS=""
 
 # Without gh every issue query fails closed and the sweep could only ever
 # report — say so once, up front, rather than once per session.
@@ -94,7 +123,7 @@ if ! gh auth status >/dev/null 2>&1; then
   exit 1
 fi
 
-# "<repo>/<issue>" for every epic session with claude still alive in it. A DEAD
+# "<repo>/<issue>" for every epic session with its process still alive. A DEAD
 # session deliberately doesn't land here: its ref is exactly what pass 2 is for.
 LIVE_EPICS=""
 
@@ -108,8 +137,8 @@ else
   while IFS= read -r session; do
     [[ -n "$session" ]] || continue
 
-    # The @repo tag launch.sh sets is authoritative — claude's worktree moves
-    # the pane's cwd, and a hand-made session has no tag at all.
+    # The @repo tag launch.sh sets is authoritative — a session's cwd is its
+    # own worktree, not the clone, and a hand-made session has no tag at all.
     repo="$(tmux show-options -t "$session" -qv @repo 2>/dev/null || true)"
     if [[ -z "$repo" ]]; then
       repo="$(repo_of_session "$session" 2>/dev/null || true)"
@@ -202,9 +231,13 @@ else
     elif (( alive )); then
       say "$session: working issue #$issue, leaving alone"
     else
-      # Died mid-run: never killed, because capture-pane is the only place the
-      # error still exists, and the issue never reached a state that says why.
-      warn "$session: claude exited at a $pane prompt but issue #$issue is not terminal (labels: ${labels:-none}) — diagnose: tmux capture-pane -p -t $session -S -60"
+      # Ended without reaching a terminal label: never killed, because
+      # capture-pane is the only place the reason still exists, and the issue
+      # never reached a state that says why. Two shapes land here — a run that
+      # genuinely died, and a run that exited by refusing (an issue claimed
+      # elsewhere, an open PR already delivering it). Both want the same thing:
+      # a human reading the scrollback, which the RESULT line ends with.
+      warn "$session: its process exited at a $pane prompt but issue #$issue is not terminal (labels: ${labels:-none}) — diagnose: tmux capture-pane -p -t $session -S -60"
     fi
   done <<<"$SESSIONS"
 fi
@@ -222,6 +255,18 @@ while IFS= read -r repo; do
     warn "$repo: could not list epic refs on origin: $refs"
     continue
   fi
+  # Record that this listing SUCCEEDED before anything else can skip the repo —
+  # pass 3 reads it as "origin's epic refs are known for this repo", and an
+  # empty listing is a legitimate answer (every branch merged). A repo whose
+  # query failed above never reaches here, so pass 3 leaves its worktrees alone
+  # instead of reading a missing ref as permission to delete.
+  REFS_OK+="$repo"$'\n'
+  while IFS=$'\t' read -r _sha ref; do
+    [[ -n "${ref:-}" ]] || continue
+    b="${ref#refs/heads/}"; r="${b#epic/}"
+    ORIGIN_EPICS+="$repo/${r%%-*}"$'\n'
+  done <<<"$refs"
+
   [[ -n "$refs" ]] || continue
 
   while IFS=$'\t' read -r sha ref; do
@@ -276,12 +321,113 @@ while IFS= read -r repo; do
   done <<<"$refs"
 done < <(repo_names)
 
+# ───────────────────────── Pass 3: finished worktrees ─────────────────────────
+#
+# launch.sh creates a worktree per pipeline run and reuses it on a relaunch;
+# nothing else ever removes one, so without this pass every issue the box has
+# ever built leaves a checkout plus its node_modules on disk forever. (`git
+# worktree prune` does NOT do this — it clears administrative entries for
+# directories that are already gone, which is the opposite direction.)
+#
+# The safety argument is the same shape as pass 2's, and it leans on the same
+# fact: prepare pushes its claim ref to origin BEFORE doing any work, and Ship
+# force-pushes to that same ref. So a run that got anywhere at all has a branch
+# on origin, and **no `epic/<N>-*` ref on origin means no work exists that
+# anyone could still want** — either the PR merged and GitHub deleted the
+# branch, or the run died before its claim, which is before it wrote anything.
+# Three further guards, because deleting a directory is not undoable:
+#   * only paths matching <root>/<repo>/<repo>-epic-<N> for a REGISTERED repo,
+#   * only when no tmux session by that name exists at all (running or dead —
+#     a dead one's scrollback is still the record of why it died),
+#   * only when the repo's ref listing above actually succeeded, and
+#   * only after WORKTREE_GRACE_HOURS, so nothing recent is ever touched.
+# Removal goes through `git worktree remove`, not `rm -rf`, so the clone's
+# administrative data stays consistent with the disk.
+
+WORKTREE_ROOT="${EPIC_WORKTREE_ROOT:-$HOME/.epic-worktrees}"
+if [[ -d "$WORKTREE_ROOT" ]]; then
+  ALL_SESSIONS="$(tmux list-sessions -F '#{session_name}' 2>/dev/null || true)"
+  while IFS= read -r repo; do
+    [[ "$REFS_OK" == *"$repo"$'\n'* ]] || continue
+    repo_wt_dir="$WORKTREE_ROOT/$repo"
+    [[ -d "$repo_wt_dir" ]] || continue
+    path="$(repo_path "$repo")"
+
+    for wt in "$repo_wt_dir"/*; do
+      [[ -d "$wt" ]] || continue
+      session="$(basename "$wt")"
+      short="${session#"$repo"-}"
+      [[ "$short" =~ ^epic-([0-9]+)$ ]] || continue
+      issue="${BASH_REMATCH[1]}"
+
+      if grep -qxF "$session" <<<"$ALL_SESSIONS"; then
+        continue
+      fi
+      if [[ "$ORIGIN_EPICS" == *"$repo/$issue"$'\n'* ]]; then
+        continue
+      fi
+
+      mtime="$(stat -c %Y "$wt" 2>/dev/null || stat -f %m "$wt" 2>/dev/null || echo 0)"
+      if [[ ! "$mtime" =~ ^[0-9]+$ ]] || (( mtime == 0 )); then
+        warn "$repo: could not read the age of $wt, leaving alone"
+        continue
+      fi
+      age_h=$(( (NOW - mtime) / 3600 ))
+      if (( age_h < WORKTREE_GRACE_HOURS )); then
+        continue
+      fi
+
+      if (( DRY_RUN )); then
+        say "would remove worktree $wt (issue #$issue delivered, no session, ${age_h}h old)"
+      else
+        if ! err="$(git -C "$path" worktree remove --force "$wt" 2>&1)"; then
+          warn "$repo: could not remove worktree $wt: $err"
+          continue
+        fi
+        say "removed worktree $wt (issue #$issue delivered, ${age_h}h old)"
+      fi
+      PRUNED=$((PRUNED + 1))
+    done
+  done < <(repo_names)
+fi
+
+# ───────────────────────── Orphaned agent processes ─────────────────────────
+#
+# Reported, never killed. A pipeline run spawns each phase as its own process
+# GROUP so a timeout can take an `npm run verify` tree with it; the orchestrator
+# forwards signals so a normal `stop` sweeps them too. What it cannot cover is
+# its own SIGKILL or the OOM killer — those leave agents running under no
+# session at all. They are invisible to MAX_PARALLEL_EPICS (which counts tmux
+# panes, not processes), so the box can sit loaded past its budget while the
+# harness reads it as idle.
+#
+# Not killed here for two reasons: a long verify tier looks exactly like a
+# hung one from the outside, and every other thing this script kills is proved
+# finished by a label or a commit — an orphan is proved by neither. So it is
+# surfaced for a human, which is what a non-zero exit is for.
+# The pattern is anchored on purpose. A loose `claude .*-p` also matches an
+# INTERACTIVE session, whose command line carries --dangerously-skip-permissions
+# — so it would warn about a healthy session every sweep. Only an agent process
+# has `-p` as its first argument.
+if ORPHANS="$(pgrep -af '(^|/)claude -p( |$)' 2>/dev/null)"; then
+  ORPHAN_N=0
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    ORPHAN_N=$((ORPHAN_N + 1))
+  done <<<"$ORPHANS"
+  # Only meaningful when no pipeline session is live to own them: with a run in
+  # flight, every one of these is simply its current phase.
+  if (( ORPHAN_N > 0 )) && [[ -z "$LIVE_EPICS" ]]; then
+    warn "$ORPHAN_N agent process(es) are running with no live pipeline session — likely orphaned by a killed run. Inspect with: pgrep -af 'claude .*-p'"
+  fi
+fi
+
 # ───────────────────────── Report ─────────────────────────
 
 if (( DRY_RUN )); then
-  say "dry run: would kill $KILLED session(s), delete $DELETED stale claim(s)"
+  say "dry run: would kill $KILLED session(s), delete $DELETED stale claim(s), remove $PRUNED worktree(s)"
 else
-  say "killed $KILLED session(s), deleted $DELETED stale claim(s)"
+  say "killed $KILLED session(s), deleted $DELETED stale claim(s), removed $PRUNED worktree(s)"
 fi
 
 exit "$NEEDS_HUMAN"

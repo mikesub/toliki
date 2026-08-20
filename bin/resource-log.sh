@@ -50,12 +50,19 @@ psi_total() { # $1=cpu|memory|io  $2=some|full
 
 meminfo() { awk -v k="$1:" '$1==k {print $2; exit}' /proc/meminfo 2>/dev/null || true; }
 
-# utime+stime for a pid, in jiffies. The comm field can contain spaces AND
-# parentheses, so everything up to the LAST ')' is discarded before counting
-# fields — the standard way to parse /proc/pid/stat without tripping on a
-# process named "(evil) (".
+# utime+stime for a pid, PLUS the same for its reaped children (cutime+cstime),
+# in jiffies. The comm field can contain spaces AND parentheses, so everything
+# up to the LAST ')' is discarded before counting fields — the standard way to
+# parse /proc/pid/stat without tripping on a process named "(evil) (".
+#
+# The child fields are what make this number mean anything for a pipeline run:
+# the orchestrator itself burns almost nothing, and every phase's real work
+# happens in an agent process it spawns and waits for. Those only land here
+# once they exit — an agent still running is counted host-wide (load, /proc/stat)
+# but not yet attributed to its epic, so a live spike shows up in the totals
+# before it shows up per-session.
 pid_cpu_jiffies() {
-  awk '{ s=$0; sub(/^.*\) /,"",s); n=split(s,f," "); print f[12]+f[13] }' \
+  awk '{ s=$0; sub(/^.*\) /,"",s); n=split(s,f," "); print f[12]+f[13]+f[14]+f[15] }' \
     "/proc/$1/stat" 2>/dev/null || true
 }
 pid_rss_kb() {
@@ -72,15 +79,28 @@ RUNNABLE="${PROCS%%/*}"
 
 read -r _ CU CN CS CI CIO CIRQ CSIRQ CSTEAL _ < /proc/stat
 
-# Epic sessions, and the CPU each has burned. Derived from the claude command
-# line rather than from tmux because --remote-control <name> carries the session
-# name AND gives us the pid in the same pass; it also matches what the cap
-# actually counts (a pane sitting at a dead shell holds a tmux name but no
-# process, and costs nothing). Cumulative jiffies again, so the report can
-# attribute a spike to the epic that caused it.
+# Epic sessions, and the CPU each has burned. Derived from the command line
+# rather than from tmux because the session name is carried right there in argv
+# AND gives us the pid in the same pass; it also matches what the cap actually
+# counts (a pane sitting at a dead shell holds a tmux name but no process, and
+# costs nothing). Cumulative jiffies again, so the report can attribute a spike
+# to the epic that caused it.
+#
+# Two markers, because there are two kinds of session: a pipeline run is a node
+# orchestrator carrying `--session <name>`, an interactive session is claude
+# carrying `--remote-control <name>`. The orchestrator match is pinned to the
+# script path so an unrelated `--session` on some other command line can't
+# invent an epic. The agents an orchestrator spawns carry neither marker, so
+# they are never double-counted as sessions of their own.
 EPICS_JSON="$(
   ps -eo pid=,args= 2>/dev/null |
-  awk '{ for (i=1;i<=NF;i++) if ($i=="--remote-control") { print $1, $(i+1); break } }' |
+  awk '{
+         if ($0 ~ /workflows\/(epic|fix)-run\.mjs/) {
+           for (i=1;i<=NF;i++) if ($i=="--session") { print $1, $(i+1); break }
+         } else {
+           for (i=1;i<=NF;i++) if ($i=="--remote-control") { print $1, $(i+1); break }
+         }
+       }' |
   while read -r pid sess; do
     printf '{"session":"%s","pid":%s,"cpu_jiffies":%s,"rss_kb":%s}\n' \
       "$sess" "$pid" "$(n "$(pid_cpu_jiffies "$pid")")" "$(n "$(pid_rss_kb "$pid")")"

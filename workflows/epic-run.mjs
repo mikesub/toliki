@@ -1,18 +1,35 @@
-export const meta = {
-  name: 'epic-run',
-  description: 'Autonomous issue-to-PR delivery pipeline: prepare → architect → code → review → triage → ship, no sign-offs. Args: { issue: <N> } (issue-driven: preflight [closed/blocked_by] → branch epic/<N>-<slug> off origin/main and claim it by pushing the ref (atomic; a run that loses the race skips), resuming an existing branch when one is left over → checkpoint commits after code/triage → squashed single-commit PR at ship + blocker-comment → merge gate labels the issue ready-to-merge when nothing was deferred, ready-to-review when a human must decide) or { slug } / a slug string (manual: builds on the current tree, no git). The run never merges: bin/merge-worker.sh in the harness repo drains ready-to-merge serially per repo. Issue mode writes requirements.md from the issue body; slug mode needs .epics/<slug>/requirements.md to already exist.',
-  phases: [
-    { title: 'Prepare', detail: 'preflight (closed? blocked_by?) → fetch → branch off origin/main and claim the ref on origin, or resume existing → requirements.md → discover packages → deps → start-signals (in-progress label, self-assign)' },
-    { title: 'Architect', detail: 'one design pass, then transcribe it to architecture.md', model: 'fable' },
-    { title: 'Code', detail: 'tests → implementation → npm run verify gate (every discovered package) → checkpoint commit' },
-    { title: 'Review', detail: 'blind review (5 lenses incl. acceptance + security) + adversarial verify → review.md' },
-    { title: 'Triage', detail: 'auto-apply confirmed fixes, re-verify, checkpoint commit' },
-    { title: 'Ship', detail: 'squash to one commit (Closes #N), push, open PR, flip in-progress → ready-to-review, then promote to ready-to-merge if the merge gate is clear — or post a blocker comment (in-progress → failed)' },
-  ],
-}
+#!/usr/bin/env node
+// epic-run — autonomous issue-to-PR delivery: prepare → architect → code →
+// review → triage → ship, no sign-offs.
+//
+// Issue mode (`--issue N`): preflight (closed? blocked_by?) → branch
+// epic/<N>-<slug> off origin/main and claim it by pushing the ref (atomic; a
+// run that loses the race skips), resuming an existing branch when one is left
+// over → checkpoint commits after code/triage → squashed single-commit PR at
+// ship + blocker-comment → merge gate labels the issue ready-to-merge when
+// nothing was deferred, ready-to-review when a human must decide.
+// Manual mode (`--slug S`): builds on the current tree, no git; needs
+// .epics/<slug>/requirements.md to already exist.
+//
+// The run never merges: bin/merge-worker.sh drains ready-to-merge serially per
+// repo. Each phase below is one engine process (see lib/engine.mjs); this file
+// names no vendor.
+
+import { agent, parallel, phase, log, initRuntime } from './lib/runtime.mjs'
+import { parseArgs, finish, UsageError, EXIT } from './lib/cli.mjs'
+
+const USAGE = `Usage: epic-run.mjs (--issue <N> | --slug <slug>) [--session <name>]
+
+  --issue <N>    GitHub issue to build: branch, implement, review, open a PR
+  --slug <slug>  manual mode: build on the current tree from an existing
+                 .epics/<slug>/requirements.md, no git and no PR
+  --session      name for log lines (the tmux session bin/launch.sh created)
+
+Exit: 0 shipped or held for review, 1 usage/crash, 2 skipped, 3 blocked.
+The final line is RESULT <json>.`
 
 // ───────────────────────── Discovery ─────────────────────────
-// This workflow is shared across projects with different shapes (frontend+backend, frontend+worker),
+// This pipeline is shared across projects with different shapes (frontend+backend, frontend+worker),
 // so the package list cannot be hardcoded here. It is also deliberately NOT configured: a config file
 // would restate what each repo already states in its own package.json, and would go stale the moment a
 // repo changed shape. The repo is the source of truth; the pipeline reads it.
@@ -62,7 +79,7 @@ const PROMPTS = {
       Creating a ref on origin is a compare-and-swap, so that push IS the lock that stops two runs on different machines building this issue at once. The empty commit is what makes it one: both runs branch from the same origin/main, so pushing HEAD as-is would be a no-op update the server accepts from BOTH ("Everything up-to-date", exit 0) and neither would notice. The unique message gives each run a distinct commit, so the loser's push is a genuine non-fast-forward and is REJECTED. The commit is empty (it changes no files, so it never appears in a diff) and Ship squashes it away.
       If the push is rejected, another run claimed this issue in the last instant: set refused="claimed by another run" and return. Do NOT retry it, do NOT force it, and do NOT pick a different slug to get around it — losing this race is the mechanism working.
 5. Signal on GitHub that autonomous work has started (the guards passed, so signal NOW, before the slow deps step). These are best-effort — if one fails, note it and continue; do NOT abort the run:
-   a. Label swap, as ONE \`gh issue edit\`. First make sure every label the swap touches exists — \`gh label create\` is idempotent, run each with \`2>/dev/null || true\`: \`in-progress\` (color FBCA04, "Actively being worked by epic-run"), \`ready-to-merge\` (0E8A16, "epic-run finished; PR open and gates cleared — queued for bin/merge-worker.sh"), \`ready-to-review\` (0E8A16, "epic-run finished; PR is open and awaiting review"), \`failed\` (B60205, "epic-run stopped at a blocker; needs human attention"). Then the swap itself: \`gh issue edit ${issue} --add-label in-progress --remove-label ready --remove-label ready-to-merge --remove-label ready-to-review --remove-label failed\`. ONE combined call deliberately, never an add call plus a separate strip call: the swap is best-effort, and two calls allow a lossy half-success — the add lands, the strip silently fails, and the issue is left carrying \`ready\` beside a terminal label, where the dispatch queue would re-pick it every tick. If the edit fails, do NOT abort — but do NOT swallow it either: include a \`- prepare: label swap failed: <error>\` line in the phase log when you write epic.md (step 6), so the failure surfaces in the PR body instead of vanishing. Dropping \`ready\` is what removes the issue from the \`/epic\` no-arg queue — leave it on and a finished issue gets picked up and rebuilt. Dropping \`ready-to-merge\` matters just as much in the other direction: it is the merge worker's queue, and a stale one left on an issue this run is rebuilding points that worker at a PR that is being rewritten under it.
+   a. Label swap, as ONE \`gh issue edit\`. First make sure every label the swap touches exists — \`gh label create\` is idempotent, run each with \`2>/dev/null || true\`: \`in-progress\` (color FBCA04, "Actively being worked by epic-run"), \`ready-to-merge\` (0E8A16, "epic-run finished; PR open and gates cleared — queued for bin/merge-worker.sh"), \`ready-to-review\` (0E8A16, "epic-run finished; PR is open and awaiting review"), \`failed\` (B60205, "epic-run stopped at a blocker; needs human attention"). Then the swap itself: \`gh issue edit ${issue} --add-label in-progress --remove-label ready --remove-label ready-to-merge --remove-label ready-to-review --remove-label failed\`. ONE combined call deliberately, never an add call plus a separate strip call: the swap is best-effort, and two calls allow a lossy half-success — the add lands, the strip silently fails, and the issue is left carrying \`ready\` beside a terminal label, where the dispatch queue would re-pick it every tick. If the edit fails, do NOT abort — but do NOT swallow it either: include a \`- prepare: label swap failed: <error>\` line in the phase log when you write epic.md (step 6), so the failure surfaces in the PR body instead of vanishing. Dropping \`ready\` is what removes the issue from the dispatch queue — leave it on and a finished issue gets picked up and rebuilt. Dropping \`ready-to-merge\` matters just as much in the other direction: it is the merge worker's queue, and a stale one left on an issue this run is rebuilding points that worker at a PR that is being rewritten under it.
    b. Self-assign: \`gh issue edit ${issue} --add-assignee @me\`.
    Do NOT post a comment — the label and the assignment are the start signal; the issue gets a comment only for deferred work and for a blocker.
 6. Create \`.epics/<slug>/\` (gitignored) and write \`.epics/<slug>/requirements.md\` = the issue body VERBATIM as the definition of done, prefixed with a line \`Issue: #${issue}\`. Also write \`.epics/<slug>/epic.md\` (fresh; on a resume where it already exists, keep it and append a phase-log line \`- prepare: resumed\`):
@@ -76,7 +93,7 @@ const PROMPTS = {
    - prepare: done
 7. Discover the layout. The downstream verify gate runs in exactly the packages you report here, so under-reporting silently removes a gate rather than failing loudly.
 ${DISCOVERY}
-8. Ensure deps are present in EVERY package you discovered in step 7 — the \`npm run verify\` gate downstream is INVALID without them. In EACH package: if \`node_modules\` is missing, run \`npm ci\`; if it exists but the lockfile changed between the worktree's original checkout and the new base — \`git diff --quiet $BASE HEAD -- <package>/package-lock.json\` exits non-zero — ALSO run \`npm ci\` (the worktree-create hook installed against the old base). Otherwise skip: \`npm ci\` always wipes node_modules first, so a blind re-run is minutes of dead time.
+8. Ensure deps are present in EVERY package you discovered in step 7 — the \`npm run verify\` gate downstream is INVALID without them. In EACH package: if \`node_modules\` is missing, run \`npm ci\`; if it exists but the lockfile changed between this worktree's original checkout and the new base — \`git diff --quiet $BASE HEAD -- <package>/package-lock.json\` exits non-zero — ALSO run \`npm ci\` (the worktree was created from the clone's HEAD, which may predate this base). Otherwise skip: \`npm ci\` always wipes node_modules first, so a blind re-run is minutes of dead time.
 Return: slug, branch (epic/<slug>), alreadyExists, resumed, refused (only when refusing), packages from step 7, and requirement = the full verbatim contents of the requirements.md you wrote.`,
 
   architectDesign: (dir) =>
@@ -84,7 +101,7 @@ Return: slug, branch (epic/<slug>), alreadyExists, resumed, refused (only when r
 
 Ground the design in the real codebase: find how similar features here are already built and reuse their module boundaries, abstractions, and helpers. Default to the pragmatic path that fits existing patterns; introduce a new abstraction only when the requirements make its longevity worth the cost, and say so explicitly when you do.
 
-Return via StructuredOutput — populate every field, do not cram everything into one:
+Your output is schema-enforced JSON — populate every field, do not cram everything into one:
 - approach: a SHORT name for the design (3-6 words), used as its audit label.
 - rationale: 2-4 sentences on the core idea and why it fits this codebase.
 - steps: ordered build steps (one string per step); note which are independent vs. must serialize because they touch the same files.
@@ -179,7 +196,7 @@ Then update ${dir}/epic.md (phase: review → done, phase log). Do not fix anyth
 
   triage: (dir, finish, pkgs) =>
 `Triage phase, autonomous (NO user sign-off). Read ${dir}/review.md and the diff. Apply fixes for the CONFIRMED findings only, highest severity first — NEVER act on anything under "## Unconfirmed — not fixed" (those were refuted; they are listed for human eyes only). For every finding you fix, also add the automated check that would catch its whole CLASS, not just the instance in front of you — a test, a type, a lint rule, or a shared helper that makes the footgun impossible — so the gate fails on any recurrence. Every review finding is a missing gate. Where this project's CLAUDE.md states its own harden-the-gate rule, follow that wording; this instruction stands on its own where it does not.
-When the check that would catch a class is NOT expressible as a test/type/lint but is a convention (a rule about how to write something, a footgun only a human would know to avoid), amend the constitution instead — but only THIS project's own: the relevant section of its CLAUDE.md, or the path-scoped \`.claude/rules/*.md\` covering the code in question, in the file's existing voice and length. Those are the only two places you may write a rule. The skills, agents and this workflow are shared harness files that live outside this repo and are used by other projects: a rule that belongs to one of them is out of scope for an epic, so do NOT edit or recreate one — record it as DEFERRED in ${dir}/epic.md's phase log, stating the rule you would have written and which harness file it belongs in, and leave the harness untouched. A class with no gate at all is the outcome to avoid — a written rule beats nothing, and a deferred note beats a silent gap. Note any such amendment or deferral in ${dir}/epic.md's phase log so it surfaces in the PR body.
+When the check that would catch a class is NOT expressible as a test/type/lint but is a convention (a rule about how to write something, a footgun only a human would know to avoid), amend the constitution instead — but only THIS project's own: the relevant section of its CLAUDE.md, or the path-scoped \`.claude/rules/*.md\` covering the code in question, in the file's existing voice and length. Those are the only two places you may write a rule. The skills, agents and this pipeline are shared harness files that live outside this repo and are used by other projects: a rule that belongs to one of them is out of scope for an epic, so do NOT edit or recreate one — record it as DEFERRED in ${dir}/epic.md's phase log, stating the rule you would have written and which harness file it belongs in, and leave the harness untouched. A class with no gate at all is the outcome to avoid — a written rule beats nothing, and a deferred note beats a silent gap. Note any such amendment or deferral in ${dir}/epic.md's phase log so it surfaces in the PR body.
 If a finding is genuinely too risky or expensive to fix safely without a human decision, DO NOT guess — leave it, and record it as deferred (with why) in ${dir}/epic.md's phase log so the summary surfaces it.
 After fixes, re-run \`npm run verify\` in each touched package (this repo's packages: ${pkgs}) until green.
 ${finish}
@@ -268,7 +285,7 @@ Return confirmation that the comment was posted and the label was swapped to fai
 }
 
 // ───────────────────────── Config ─────────────────────────
-// Stage model tiering. Everything not listed here inherits the session model.
+// Stage model tiering. Everything not listed here runs on the engine's own configured default model.
 // MECHANICAL — the prompt is a fully-specified procedure with no judgment call: transport, transcription,
 // scripted git/gh. Deliberately NOT applied to ship:pr (weighs the project's own legal/compliance trigger
 // where it has one, and decides which deferrals become filed issues) or any code/review/triage stage.
@@ -281,8 +298,11 @@ Return confirmation that the comment was posted and the label was swapped to fai
 // ADJUDICATE — the adversarial verifier is the last judgment before triage AUTO-APPLIES a fix with no human
 // sign-off, so a wrong "real" here becomes a committed change and a wrong "not real" buries a live bug. It
 // runs once per file cluster (a handful of spawns), not once per lens, which is what makes upgrading it cheap.
-// The five finders stay at session tier deliberately: they drive recall, and more cheap finders beat fewer
+// The five finders stay at the default tier deliberately: they drive recall, and more cheap finders beat fewer
 // expensive ones. If recall proves weak, add a sixth lens rather than upgrading the existing five.
+//
+// These are model names, not engines: every stage runs on the default engine (lib/engine.mjs) unless a
+// stage also passes `engine`. That is the seam a second vendor plugs into — per stage, not per pipeline.
 const MECHANICAL = 'sonnet'
 const DESIGN = 'fable'
 const ADJUDICATE = 'fable'
@@ -428,36 +448,27 @@ const HANDOFF_SCHEMA = {
 }
 
 // ───────────────────────── Args & mode ─────────────────────────
-// Issue mode ({ issue }): self-contained — branch, build, ship a PR, or post a blocker comment.
-// Slug mode ({ slug } / string): manual — build on the current tree from an existing requirements.md, no git.
-// Coerce the shapes callers commonly pass so a stringified object / "#N" doesn't silently become a slug.
-let a = args
-if (typeof a === 'string') {
-  const s = a.trim()
-  const m = s.match(/^#?(\d+)$/)
-  if (m) a = { issue: Number(m[1]) }                                   // "81" / "#81" → issue mode
-  else if (s.startsWith('{') || s.startsWith('[')) {                    // stringified JSON → parse to real shape
-    try { a = JSON.parse(s) } catch {
-      return { error: `epic-run: args looks like JSON but did not parse (${s}). Pass a real object { issue: <N> } or { slug }, not a string.` }
-    }
+// Issue mode (--issue N): self-contained — branch, build, ship a PR, or post a blocker comment.
+// Slug mode (--slug S): manual — build on the current tree from an existing requirements.md, no git.
+let ARGS
+try {
+  ARGS = parseArgs(process.argv.slice(2), { allowSlug: true, usage: USAGE })
+} catch (e) {
+  if (e instanceof UsageError) {
+    process.stderr.write((e.message ? `epic-run: ${e.message}\n\n` : '') + e.usage + '\n')
+    process.exit(e.message ? EXIT.ERROR : EXIT.OK)
   }
+  throw e
 }
-const issue = a && typeof a === 'object' ? a.issue : undefined
-let slug = typeof a === 'string' ? a : (a && a.slug)
+initRuntime({ scriptName: 'epic-run', sessionName: ARGS.session })
+
+const issue = ARGS.issue
+let slug = ARGS.slug
 const gitMode = issue != null
-
-// Loud-fail on a slug that is almost certainly a fat-fingered issue arg — never silently skip git/ship.
-if (!gitMode && typeof slug === 'string' && (slug.includes('"issue"') || slug.includes('issue:') || /^#?\d+$/.test(slug))) {
-  return { error: `epic-run: got slug "${slug}" but this looks like an issue reference. For issue mode pass a real object: { issue: <N> }.` }
-}
-
-if (!gitMode && (!slug || typeof slug !== 'string')) {
-  return { error: 'epic-run needs { issue: <N> } (issue-driven) or { slug } / a slug string with .epics/<slug>/requirements.md already present.' }
-}
 
 // In git mode the blocker path posts a comment on the issue; in slug mode it just returns the error.
 // blockerPosted guards the double-post: fail() can be re-entered when the blocked agent itself throws
-// (e.g. budget exhaustion) and the outer catch calls fail() again.
+// (e.g. the engine dying), and the outer catch calls fail() again.
 // openPr is set once ship succeeds: a block after that point must not tell the reader to resume a branch
 // whose work is already delivered by an open PR.
 let currentPhase = 'prepare'
@@ -500,6 +511,7 @@ const applyDiscovery = (d) => {
 // How the package list reads inside a prompt: "frontend/, backend/".
 const pkgList = () => packages.map(p => (p === '.' ? 'the repo root' : `${p}/`)).join(', ')
 
+async function main() {
 try {
   // ───────────────────────── Phase 0: Prepare (issue mode only) ─────────────────────────
   if (gitMode) {
@@ -539,7 +551,7 @@ try {
 
   // The spec is fed inline to the blind reviewers so they never need to enter .epics/<slug>/ (where
   // epic.md/architecture.md/etc. would anchor them). Issue mode gets it straight from Prepare's output;
-  // manual mode has no Prepare, so one agent reads the file (the workflow itself has no FS access).
+  // manual mode has no Prepare, so one agent reads the file (the orchestrator itself has no FS access to it).
   if (!gitMode) {
     const reqRes = await agent(PROMPTS.readRequirement(dir),
       { label: 'read:requirement', phase: 'Architect', agentType: 'coder', model: MECHANICAL, effort: 'low', schema: REQ_SCHEMA })
@@ -764,3 +776,6 @@ try {
 } catch (e) {
   return await fail(currentPhase, (e && e.message) || String(e))
 }
+}
+
+process.exit(finish(await main()))

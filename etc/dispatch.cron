@@ -3,10 +3,10 @@
 #
 #   sudo install -m 0644 /home/ubuntu/toliki/etc/dispatch.cron /etc/cron.d/harness-dispatch
 #
-# All three lines, or none. Dispatching without reaping fills the box and stops:
-# a finished epic idles at the claude prompt and still counts against
-# MAX_PARALLEL_EPICS, so the host quietly runs out of slots with nothing
-# running. Reaping without dispatching frees slots nothing then claims. And
+# All three lines, or none. Dispatching without reaping stalls the queue: a
+# finished run's tmux session keeps its name, and dispatch skips any issue that
+# still has one, so issues that ended in a skip or a blocker are never
+# re-offered. Reaping without dispatching frees slots nothing then claims. And
 # dispatching without merging stalls the last mile: every clean epic parks at
 # `ready-to-merge` with an open PR nothing lands, so the fleet keeps building
 # against a main that never advances. The two blockers this file used to name —
@@ -47,10 +47,12 @@
 # etc/repos.conf.
 #
 # cron hands a job PATH=/usr/bin:/bin and nothing else, which has neither
-# claude (~/.local/bin, see provision.sh) nor node's global bins. Without this
-# line the session launches, the pane can't find `claude`, and it shows up as
-# `dead (at bash prompt)` in `./remote-control.sh ls` — the same symptom as the
-# workspace-trust trap, from a completely different cause.
+# claude (~/.local/bin, see provision.sh) nor node's global bins. This line has
+# to carry BOTH: node is the pane's own process (the pipeline orchestrator) and
+# claude is every agent it spawns, resolved through the same inherited PATH.
+# Without it the session launches, the pane can't find its command, and it
+# shows up as `dead (at bash prompt)` in `./remote-control.sh ls` — the same
+# symptom as the workspace-trust trap, from a completely different cause.
 PATH=/home/ubuntu/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 * * * * * ubuntu /home/ubuntu/toliki/bin/dispatch.sh >> /home/ubuntu/dispatch.log 2>&1
 * * * * * ubuntu /home/ubuntu/toliki/bin/reap.sh >> /home/ubuntu/reap.log 2>&1

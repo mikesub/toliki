@@ -39,16 +39,16 @@ NAMES=(alpha bravo charlie delta echo foxtrot golf hotel)
 # Longest session name we'll derive from a message before truncating.
 NAME_MAX_LEN=40
 
-# How many claude sessions may run on the host at once — the host's slot
+# How many sessions may run on the host at once — the host's slot
 # budget, enforced in bin/launch.sh (see the comment at its capacity check for
 # why there and not in dispatch.sh). Counts every *running* session, whoever
 # started it: a session idling at a shell prompt holds its name but no load,
 # so it doesn't count, and an interactive session does, because it is load
 # like any other.
 #
-# Size it against the box, not against the queue: workflow concurrency is
-# min(16, cores-2), so each epic session is a claude process plus up to that
-# many agents. On 6 vCPU / 11 GiB, 2 means ~10 processes at full tilt. Start
+# Size it against the box, not against the queue: the orchestrator's own
+# concurrency gate is min(16, cores-2) agent processes, so each pipeline
+# session is one cheap node process plus up to that many agents. On 6 vCPU / 11 GiB, 2 means ~10 processes at full tilt. Start
 # low and raise it after watching a full queue drain — an under-full box just
 # drains slower, whereas contention is expensive to tell apart from a
 # pipeline bug.

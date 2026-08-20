@@ -1,9 +1,14 @@
 # toliki
 
-A self-hosted Claude Code harness that turns GitHub issues into merged PRs unattended.
-A VPS runs detached `claude` sessions in tmux; cron drains the issue queue, runs one
+A self-hosted coding-agent harness that turns GitHub issues into merged PRs unattended.
+A VPS runs detached pipelines in tmux; cron drains the issue queue, runs one
 autonomous "epic" per issue to an open green PR, and a serial merge worker
 rebases, re-verifies and lands them. You write specs; the box does the rest.
+
+The pipeline is a plain Node script that spawns one headless agent process per
+phase behind a small engine adapter, so which coding agent runs a phase is a
+per-stage setting rather than an architecture. Today that adapter is Claude
+Code's `claude -p`.
 
 ## The loop
 
@@ -13,20 +18,24 @@ rebases, re-verifies and lands them. You write specs; the box does the rest.
 2. **`bin/dispatch.sh`** (cron, on the VPS) — walks each repo's `ready` queue
    and launches a tmux session per unblocked issue, up to the host's slot
    budget.
-3. **`/epic`** (inside the session) — claims the issue, architects, implements
-   with TDD, reviews, and ends at an open PR with `ready-to-merge` (gates
+3. **`workflows/epic-run.mjs`** (the session's pane) — claims the issue,
+   architects, implements with TDD, reviews under five blind lenses plus an
+   adversarial verifier, and ends at an open PR with `ready-to-merge` (gates
    cleared, lands unattended) or `ready-to-review` (a human decides).
 4. **`bin/merge-worker.sh`** (cron) — one PR at a time per repo: rebase onto
    current main, wait for checks to re-run on the rebased head, squash-merge.
    Mechanical rebase conflicts it resolves itself under a line-containment
-   gate; a conflict that needs judgment is labeled for **`/fix-conflict`**, a
-   dispatched fixer session that resolves it under an adversarial check and
+   gate; a conflict that needs judgment is labeled for **`fix-run.mjs`**, a
+   dispatched fixer run that resolves it under an adversarial check and
    returns the PR for human review.
 5. **`bin/reap.sh`** (cron) — frees what finished runs leave behind (idle
    sessions, stale claim refs), so the slot budget keeps rotating.
 
-The operator watches from a laptop with `./remote-control.sh ls` and connects
-to any session via the Claude Code Desktop app's remote control. Everything
+The operator watches from a laptop with `./remote-control.sh ls`, and reads a
+run with `tmux attach` / `capture-pane` — the pane carries its phase log and a
+final `RESULT` line. (Interactive sessions, started by hand, still connect via
+the Claude Code Desktop app's remote control; pipeline runs have no such
+channel, by design — the only mid-run lever is kill.) Everything
 else is scripts — no daemon, no database, no web UI; GitHub issues, labels and
 refs are the entire state store.
 
@@ -71,8 +80,10 @@ gh repo clone mikesub/toliki && cd toliki
   that were considered and rejected, with reasons.
 - **`CLAUDE.md`** — how every piece actually works, including the operational
   traps that only show up when you run it.
-- **`skills/`, `agents/`, `workflows/`** — the shared Claude Code content the
-  pipeline runs on (`/spec`, `/epic`, the epic-run workflow, the subagents).
+- **`workflows/`** — the two pipelines and the small runtime they sit on
+  (the engine adapter, the concurrency gate, structured-output validation).
+- **`skills/`, `agents/`** — the shared content: `/spec` (the human gate), the
+  agent charters each phase runs under, and the manual entry points.
 
 ## Caveats
 

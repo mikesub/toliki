@@ -139,9 +139,9 @@ done
 
 # ------------------------------------------------------ CLAUDE_HARNESS_DIR --
 
-# The /epic skill loads workflows/epic-run.js through this; it's the one
-# settings value that differs per machine. Merged with jq into whatever
-# settings.json already holds — never rewritten wholesale.
+# The /epic and /fix-conflict skills resolve workflows/*-run.mjs through this;
+# it's the one settings value that differs per machine. Merged with jq into
+# whatever settings.json already holds — never rewritten wholesale.
 say "CLAUDE_HARNESS_DIR"
 SETTINGS="$HOME/.claude/settings.json"
 if [[ ! -f "$SETTINGS" ]]; then

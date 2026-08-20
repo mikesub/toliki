@@ -12,12 +12,20 @@ from memory.
 - **`/spec`** — an interactive design conversation that ends as GitHub issues,
   each a complete definition of done, labeled `ready`. The only human gate in
   the system.
-- **Build** — cron dispatches one detached Claude Code session per unblocked
-  `ready` issue. The session runs a deterministic workflow: architecture →
-  red-green TDD → review → triage → an open, green PR. The issue body is the
-  only requirement the run is judged against; nobody answers follow-up
-  questions at 3 a.m., so a spec that needs clarification is a spec that
-  fails.
+- **Build** — cron dispatches one detached run per unblocked `ready` issue: a
+  plain Node orchestrator that walks a fixed sequence — architecture →
+  red-green TDD → review → triage → an open, green PR — spawning one
+  short-lived headless agent process per phase. The issue body is the only
+  requirement the run is judged against; nobody answers follow-up questions at
+  3 a.m., so a spec that needs clarification is a spec that fails.
+- **The pipeline outlives its engine.** Every phase is a process behind one
+  adapter, so which vendor's CLI runs a phase is a per-stage value, not an
+  architecture. That is worth the orchestration we now own outright (a
+  concurrency gate, timeouts, signal forwarding — a few hundred lines, under
+  test): the alternative was writing the pipeline twice, once per vendor, and
+  watching the copies drift. It also moves the deterministic half — the merge
+  gate, the fail-closed branches — out of a vendor's runtime and into ordinary
+  code we can run in a test harness.
 - **Review** — blind and adversarial. Five lenses judge the diff against the
   issue body alone, barred from the builder's notes; every finding goes to a
   skeptic instructed to refute it; survivors are auto-fixed, refuted ones
@@ -40,7 +48,11 @@ from memory.
 
 - **No steering.** A run is a script, not a conversation; the only lever is
   kill. A run that needs nudging is nearly always a spec that needed another
-  round of questions.
+  round of questions. This is now structural rather than merely discouraged: a
+  pipeline session holds no interactive agent, so there is no input channel to
+  type into. The cost is knowing: watching a run means reading its pane, not
+  attaching to it from a phone. Traded on purpose — see "Steerable live
+  workers" below, which this only sharpens.
 - **No model gates.** Whether a PR merges is counted in code from structured
   values. A model asked "should this merge?" while holding a finished PR can
   talk itself past a slow gate.

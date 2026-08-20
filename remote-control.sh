@@ -22,25 +22,29 @@ usage() {
 Usage: $0 <command> [session-name] [-m <message>] [-r <repo>]
 
 Commands:
-  start [name] [-m msg]    Start a session. Name resolution when no name given:
-                           with -m, the session is named after the message
-                           (slugified, e.g. "/epic #42" -> "$DEFAULT_REPO-epic-42");
-                           otherwise auto-picks the first pool name free for the
-                           repo: ${NAMES[*]}
+  start [name] [-m msg]    Start an interactive claude session. Name resolution
+                           when no name given: with -m, the session is named
+                           after the message (slugified); otherwise auto-picks
+                           the first pool name free for the repo: ${NAMES[*]}
                            With -m, sends <msg> to claude as its initial prompt.
   stop <name>...           Stop the named session(s). (alias: rm)
   restart <name> [-m msg]  Restart the named session (optionally re-prompting).
+                           Refuses on a <repo>-epic-<N> session: use epic/fix.
   stop-all                 Stop every tmux session on the host.
   ls                       List all sessions with their repo and running/dead status.
-  epic <ref>               Shorthand for: start -m "/epic #<ref>". Auto-named from
-                           the message (e.g. "epic 63" -> session myapp-epic-63). A
-                           ref that already starts with # isn't doubled.
-  fix <ref>                Shorthand for: start epic-<ref> -m "/fix-conflict #<ref>"
-                           — the manual override for dispatch's needs-judgment
-                           fixer walk. The explicit name keeps the session on the
-                           <repo>-epic-<N> pattern (reap sweeps only that shape;
-                           the message alone would slugify to fix-conflict-<ref>).
+  epic <ref>               Run the epic pipeline on an issue, as session
+                           <repo>-epic-<ref>. The manual override for dispatch's
+                           ready queue. A ref starting with # isn't doubled.
+  fix <ref>                Run the conflict fixer on a needs-judgment issue —
+                           the manual override for dispatch's fixer walk. Same
+                           session name as dispatch would use, which is what
+                           keeps it visible to reap and to the next tick.
   <name> [-m msg]          Shorthand for: start <name> [-m msg]
+
+  Note: epic/fix sessions run the pipeline directly (a node orchestrator that
+  spawns one headless agent per phase), so they have no Remote Control channel
+  to attach to. Watch one with: ssh <host> 'tmux attach -t <name>' — or read it
+  after the fact with 'tmux capture-pane -p -t <name> -S -200'.
 
   -m, --message <msg>      Initial prompt to send to claude (start/restart only).
                            Passed as claude's positional prompt, not -p (which
@@ -61,6 +65,8 @@ MESSAGE=""
 HAVE_MESSAGE=0
 REPO=""
 HAVE_REPO=0
+PIPELINE=""   # "epic" or "fix" when the epic/fix shortcut was used
+REF=""
 
 # Pull optional -m/--message and -r/--repo (any position) out of the args.
 POSITIONAL=()
@@ -121,11 +127,10 @@ else
       SESSIONS=("${POSITIONAL[@]:1}")       # stop takes one or more session names
       ;;
     epic|fix)
-      # `epic <ref>` == `start -m "/epic #<ref>"`; session auto-derives to <repo>-epic-<ref>.
-      # `fix <ref>` == `start epic-<ref> -m "/fix-conflict #<ref>"`: the explicit
-      # session name is load-bearing — reap's sweep and dispatch's session checks
-      # know only the <repo>-epic-<N> shape, and a fixer left on a slug-derived
-      # name would idle in a slot forever with nothing able to reclaim it.
+      # `epic <ref>` == `start --epic <ref>`, `fix <ref>` == `start --fix <ref>`.
+      # Both produce exactly the session dispatch would have: launch.sh derives
+      # the <repo>-epic-<N> name itself, which is what makes a manual launch
+      # visible to dispatch's has-session checks and reclaimable by reap.
       CMD="${POSITIONAL[0]}"
       REF="${POSITIONAL[1]:-}"
       if [[ -z "$REF" ]]; then
@@ -141,14 +146,8 @@ else
         exit 1
       fi
       ACTION="start"
-      HAVE_MESSAGE=1
+      PIPELINE="$CMD"
       REF="${REF#\#}"              # strip a leading # so we don't double it
-      if [[ "$CMD" == "fix" ]]; then
-        SESSION="epic-$REF"
-        MESSAGE="/fix-conflict #$REF"
-      else
-        MESSAGE="/epic #$REF"
-      fi
       ;;
     *)
       SESSION="${POSITIONAL[0]}"   # bare <name> is shorthand for: start <name>
@@ -214,11 +213,15 @@ case "$ACTION" in
     # Each arg is shell-quoted with sq() since ssh mashes the remote command
     # into one string and hands it to the remote shell.
     REMOTE="$LAUNCH --repo $(sq "$REPO")"
-    if [[ -n "$SESSION" ]]; then
-      REMOTE+=" $(sq "$SESSION")"
-    fi
-    if [[ $HAVE_MESSAGE -eq 1 ]]; then
-      REMOTE+=" --message $(sq "$MESSAGE")"
+    if [[ -n "$PIPELINE" ]]; then
+      REMOTE+=" --$PIPELINE $(sq "$REF")"
+    else
+      if [[ -n "$SESSION" ]]; then
+        REMOTE+=" $(sq "$SESSION")"
+      fi
+      if [[ $HAVE_MESSAGE -eq 1 ]]; then
+        REMOTE+=" --message $(sq "$MESSAGE")"
+      fi
     fi
     ssh "$HOST" "$REMOTE"
     ;;
@@ -241,6 +244,17 @@ done
 EOF
     ;;
   restart)
+    # A pipeline session's name says which issue it is but not whether it was
+    # an epic or a fixer, and restarting it as an interactive claude would
+    # silently produce something else entirely — a live session in the epic's
+    # worktree that nothing is driving. Name the two real intentions instead.
+    if [[ $HAVE_MESSAGE -eq 0 && "$SESSION" =~ -epic-([0-9]+)$ ]]; then
+      N="${BASH_REMATCH[1]}"
+      echo "[control] '$SESSION' is a pipeline session — 'restart' can't tell an epic from a fixer." >&2
+      echo "[control] Relaunch it explicitly:  $0 stop $SESSION && $0 epic $N   (or: $0 fix $N)" >&2
+      echo "[control] Or just stop it: dispatch relaunches an unfinished issue on its next tick." >&2
+      exit 1
+    fi
     "$0" stop "$SESSION"
     if [[ $HAVE_MESSAGE -eq 1 ]]; then
       "$0" start "$SESSION" --repo "$REPO" --message "$MESSAGE"

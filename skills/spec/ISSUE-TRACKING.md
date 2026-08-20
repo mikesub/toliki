@@ -54,7 +54,7 @@ for roadmap issues). No custom fields, no status taxonomies.
 **Do not create labels by hand.** The entire label namespace belongs to the
 pipeline's lifecycle (`ready` → `in-progress` → `ready-to-merge` /
 `ready-to-review` / `failed`), which is defined in the shared harness's
-`workflows/epic-run.js` and `bin/merge-worker.sh` and is its own source of truth
+`workflows/epic-run.mjs` and `bin/merge-worker.sh` and is its own source of truth
 — don't re-enumerate the states here. No `area:*`, `type:*`, `track:*`, or `priority:*`
 scheme. The one label you ever apply is **`ready`, at filing**: it is the build
 queue, and a spec issue is filed carrying it and nothing else.

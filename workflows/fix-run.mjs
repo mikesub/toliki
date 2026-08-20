@@ -1,14 +1,27 @@
-export const meta = {
-  name: 'fix-run',
-  description: 'Judgment-conflict fixer for a finished epic PR (dispatch launches it for `needs-judgment` issues; /fix-conflict #N is the entry point). Rebases the PR onto current origin/main, lets the deterministic rung settle every mechanical hunk (merge-autoresolve.sh --partial, containment-gated), has a model resolve ONLY the hunks left marked — stating what each side intended and how both survive, escalating instead of guessing — re-runs npm run verify, has a blind adversarial agent try to refute the resolution, force-pushes, and lands the issue ready-to-review, never ready-to-merge. Attempt ladder in labels: fix-attempted, then fix-retried (one retry); exhausted → refuses and stays failed. Args: { issue: <N> }.',
-  phases: [
-    { title: 'Prepare', detail: 'preflight (labels, ladder, open PR) → ladder + in-progress labels → detach at the PR head → rebase onto origin/main (diff3) → partial autoresolve settles the mechanical hunks → discover packages, deps' },
-    { title: 'Resolve', detail: 'model resolves the judgment hunks only — states both sides\' intents, shows both surviving, or escalates; rebase --continue', model: 'fable' },
-    { title: 'Verify', detail: 'npm run verify in every discovered package — a red verify fails the run, the fixer never fixes code' },
-    { title: 'Check', detail: 'blind adversarial agent, refute-by-default: does the rebased result really preserve both sides\' intents?', model: 'fable' },
-    { title: 'Ship', detail: 'push --force-with-lease → audit comment on the issue → failed/needs-judgment → ready-to-review (promotion to ready-to-merge stays a human\'s)' },
-  ],
-}
+#!/usr/bin/env node
+// fix-run — judgment-conflict fixer for a finished epic PR (dispatch launches
+// it for `needs-judgment` issues; `--issue N` is the only argument).
+//
+// Rebases the PR onto current origin/main, lets the deterministic rung settle
+// every mechanical hunk (merge-autoresolve.sh --partial, containment-gated),
+// has a model resolve ONLY the hunks left marked — stating what each side
+// intended and how both survive, escalating instead of guessing — re-runs
+// npm run verify, has a blind adversarial agent try to refute the resolution,
+// force-pushes, and lands the issue ready-to-review, never ready-to-merge.
+// Attempt ladder in labels: fix-attempted, then fix-retried (one retry);
+// exhausted → refuses and stays failed.
+
+import { agent, phase, log, initRuntime } from './lib/runtime.mjs'
+import { HARNESS_DIR } from './lib/engine.mjs'
+import { parseArgs, finish, UsageError, EXIT } from './lib/cli.mjs'
+
+const USAGE = `Usage: fix-run.mjs --issue <N> [--session <name>]
+
+  --issue <N>  the needs-judgment issue whose PR hit the conflict
+  --session    name for log lines (the tmux session bin/launch.sh created)
+
+Exit: 0 fixed, 1 usage/crash, 2 skipped, 3 blocked.
+The final line is RESULT <json>.`
 
 // ───────────────────────── Why this exists ─────────────────────────
 // bin/merge-worker.sh resolves rebase conflicts only when EVERY hunk is
@@ -23,11 +36,17 @@ export const meta = {
 // the landing is ready-to-review — a human glances, but the work is done.
 
 // ───────────────────────── Discovery ─────────────────────────
-// Same one-line contract as epic-run.js: a package is a directory whose
+// Same one-line contract as epic-run.mjs: a package is a directory whose
 // package.json declares `scripts.verify`; the repo is the source of truth.
 const DISCOVERY =
 `Discover this repository's layout — do NOT assume any particular shape or set of packages. Read package.json files to answer; look at the repo root and each directory one level below it, skipping node_modules.
 - \`packages\`: every directory whose package.json declares a \`scripts.verify\` entry, as repo-relative paths with no trailing slash (e.g. ["frontend","backend"]); use "." for the repo root itself. This is the exact set the downstream \`npm run verify\` gate runs in, so a package you miss is a package that is never verified.`
+
+// The deterministic rung, by absolute path. Resolved from this file's own
+// location rather than from an environment variable: the orchestrator knows
+// where the harness is, and a prompt that depends on the engine's shell
+// carrying a particular env var is a dependency the next engine may not have.
+const AUTORESOLVE = `${HARNESS_DIR}/bin/merge-autoresolve.sh`
 
 // ───────────────────────── Prompts ─────────────────────────
 const PROMPTS = {
@@ -63,7 +82,7 @@ const PROMPTS = {
    c. \`git checkout -f --detach <prHead>\` (force: a reused worktree may sit on stale state; everything real is committed).
    d. mergeBase=$(git merge-base <prHead> origin/main). mainIssues = issue numbers in \`git log --format=%b <mergeBase>..origin/main\` matching 'Closes #<n>' (unique, sorted) — each squash-merged PR carries one, and those issue bodies are the intent record for main's side of the conflict.
    e. \`git -c merge.conflictStyle=diff3 rebase origin/main\`. If it COMPLETES with no stop: cleanRebase=true, skip to step 5 (report="", markedFiles=[]).
-      If it stops on conflict: run \`"$CLAUDE_HARNESS_DIR/bin/merge-autoresolve.sh" --partial "$(git rev-parse --show-toplevel)"\` and capture stdout+exit code. Non-zero exit → the conflict has a shape the fixer does not own (symlink/delete-modify/marker-shaped/unparseable): set gitBlocked="partial autoresolve declined: <its first output line>" and return. Zero → report=its stdout (one line per hunk, mechanical and judgment alike; keep it verbatim), markedFiles = \`git diff --name-only --diff-filter=U\` (the files still holding diff3 markers).
+      If it stops on conflict: run \`${AUTORESOLVE} --partial "$(git rev-parse --show-toplevel)"\` and capture stdout+exit code. Non-zero exit → the conflict has a shape the fixer does not own (symlink/delete-modify/marker-shaped/unparseable): set gitBlocked="partial autoresolve declined: <its first output line>" and return. Zero → report=its stdout (one line per hunk, mechanical and judgment alike; keep it verbatim), markedFiles = \`git diff --name-only --diff-filter=U\` (the files still holding diff3 markers).
       If markedFiles is EMPTY (the conflict turned fully mechanical since the merge worker saw it — main moved): \`GIT_EDITOR=true git rebase --continue\`; if the rebase is then still in progress, gitBlocked="more than one commit conflicted — an epic branch holds exactly one" and return.
    f. Do NOT touch the content inside any conflict markers, do NOT stage marked files, do NOT continue a rebase that still has marked files — the Resolve phase owns that.
 5. Discover the layout (needed for the verify gate later):
@@ -168,7 +187,7 @@ Return confirmation that the comment was posted and the label was swapped to fai
 }
 
 // ───────────────────────── Config ─────────────────────────
-// Same tiering rationale as epic-run.js. MECHANICAL runs the fully-scripted
+// Same tiering rationale as epic-run.mjs. MECHANICAL runs the fully-scripted
 // stages. RESOLVE is the judgment core — the entire reason a model is in the
 // loop — and ADJUDICATE is the last gate before a rewritten merge ships to a
 // force-push, so both get the strong model.
@@ -245,21 +264,18 @@ const SHIP_SCHEMA = {
 }
 
 // ───────────────────────── Args ─────────────────────────
-let a = args
-if (typeof a === 'string') {
-  const s = a.trim()
-  const m = s.match(/^#?(\d+)$/)
-  if (m) a = { issue: Number(m[1]) }
-  else if (s.startsWith('{') || s.startsWith('[')) {
-    try { a = JSON.parse(s) } catch {
-      return { error: `fix-run: args looks like JSON but did not parse (${s}). Pass a real object { issue: <N> }.` }
-    }
+let ARGS
+try {
+  ARGS = parseArgs(process.argv.slice(2), { allowSlug: false, usage: USAGE })
+} catch (e) {
+  if (e instanceof UsageError) {
+    process.stderr.write((e.message ? `fix-run: ${e.message}\n\n` : '') + e.usage + '\n')
+    process.exit(e.message ? EXIT.ERROR : EXIT.OK)
   }
+  throw e
 }
-const issue = a && typeof a === 'object' ? a.issue : undefined
-if (issue == null) {
-  return { error: 'fix-run needs { issue: <N> } — the needs-judgment issue whose PR hit the conflict.' }
-}
+initRuntime({ scriptName: 'fix-run', sessionName: ARGS.session })
+const issue = ARGS.issue
 
 // ───────────────────────── Blocker path ─────────────────────────
 // Same shape as epic-run's fail(): comment the blocker, restore the terminal
@@ -317,6 +333,7 @@ const buildComment = (prep, resolutions, verifyDetail, check) => {
 }
 
 // ───────────────────────── Pipeline ─────────────────────────
+async function main() {
 try {
   phase('Prepare')
   const prep = await agent(PROMPTS.prepare(issue),
@@ -422,3 +439,6 @@ try {
 } catch (e) {
   return await fail(currentPhase, (e && e.message) || String(e))
 }
+}
+
+process.exit(finish(await main()))

@@ -4,7 +4,11 @@ description: Autonomous issue-to-PR delivery: `/epic #N` builds a `/spec`-author
 disable-model-invocation: true
 ---
 
-You launch the autonomous `epic-run` pipeline for a spec issue (authored earlier via `/spec`). **No human gates** — it runs to an open PR queued for unattended merge, an open PR it deliberately held for review, or a blocker comment, then exits. Built for non-interactive use (`claude -p "/epic #42" --worktree`).
+You launch the autonomous `epic-run` pipeline for a spec issue (authored earlier via `/spec`). **No human gates** — it runs to an open PR queued for unattended merge, an open PR it deliberately held for review, or a blocker comment, then exits.
+
+The pipeline is a plain Node orchestrator (`workflows/epic-run.mjs`) that spawns one headless agent process per phase — architecture → red-green TDD → blind review → triage → ship. It is not a workflow inside your session: you start it, it runs to completion on its own, and you report what it returned.
+
+**On the VPS this skill is not involved at all** — `bin/dispatch.sh` launches `bin/launch.sh --epic N`, which runs the same orchestrator directly in a tmux pane. This skill is the manual, laptop-side entry point.
 
 The issue carries state, not commentary: a run self-assigns and applies the `in-progress` label (dequeuing `ready` and clearing any prior `ready-to-merge`/`ready-to-review`/`failed`), and the only comments it ever posts are `🤖 deferred / not done` at ship (when anything was deferred — the PR body points at it and records nothing else) and `🤖 epic-run blocked` on a blocker. How the change was built — approach, verify status, review outcome — lives in the PR body, written from `summary.md`. Work happens on `epic/<N>-<slug>`, branched off a freshly fetched `origin/main` and pushed to origin immediately — that push is the run's **claim** on the issue, and because creating a ref is atomic it is what makes it safe to run epics in parallel (the labels are the readable signal; the ref is the lock). The code and triage phases each end in a local checkpoint commit (durable across an interrupted run, not pushed), and Ship squashes the branch into one commit (`Closes #N`), pushes, opens the PR, and flips `in-progress` to `ready-to-review`. A block instead commits any WIP, pushes the branch, and flips `in-progress` to `failed`. (These labels are automation-managed — never set or cleared by hand.)
 
@@ -28,15 +32,23 @@ Request: $ARGUMENTS
 
    Claiming is the pipeline's job, not yours: prepare pushes the `epic/<N>-<slug>` ref to origin before doing any work, and creating a ref is atomic, so exactly one of two racing runs gets it and the other refuses. Do **not** try to reserve an issue yourself by editing labels — the `ready` → `in-progress` swap prepare does is reporting, not the lock, and a second run reaching it a moment later would read the stale value anyway.
 
-2. **Launch the workflow.** The pipeline script lives in the shared harness repo, not this project: run the Workflow tool with `scriptPath: "$CLAUDE_HARNESS_DIR/workflows/epic-run.js"` — resolve the env var to an absolute path first (`echo "$CLAUDE_HARNESS_DIR"`; it's set per machine in `~/.claude/settings.json` env). Pass args `{ issue: <N> }` and let it run to completion. It owns the whole pipeline autonomously, with no sign-offs; on any blocker it comments on issue #<N> and stops instead of shipping.
+2. **Launch the pipeline.** It lives in the shared harness repo, not this project. Resolve the env var to an absolute path first (`echo "$CLAUDE_HARNESS_DIR"`; it's set per machine in `~/.claude/settings.json` env), then run:
 
-3. **Report the outcome and exit.** When the workflow returns:
+   ```
+   node "$CLAUDE_HARNESS_DIR/workflows/epic-run.mjs" --issue <N>
+   ```
+
+   Run it with Bash **`run_in_background: true`** — an epic takes far longer than the Bash tool's foreground timeout. Poll its output until the process exits. It owns the whole pipeline autonomously, with no sign-offs; on any blocker it comments on issue #<N> and stops instead of shipping.
+
+   It streams a timestamped phase log, and its **last line is `RESULT <json>`** — that JSON is what you report from. The exit code summarizes it: `0` shipped or held, `2` skipped, `3` blocked, `1` a usage error or crash.
+
+3. **Report the outcome and exit.** Read the `RESULT` JSON:
    - **Queued for merge** (`readyToMerge: true`): report the PR URL and `git diff origin/main...HEAD --stat`, and say the issue is now `ready-to-merge` — `bin/merge-worker.sh` rebases it, re-runs its CI and merges it outside this session. Do **not** merge it yourself and do **not** wait for it; if it fails there, the issue turns up as `failed` with a comment, not here.
    - **Held for review** (`prUrl` with `mergeSkipped`): report the PR URL and the `mergeSkipped` reason verbatim — the pipeline deliberately left a human decision on the table, so the PR stays `ready-to-review` and out of the merge queue. Merging is the user's step. Do **not** merge it yourself.
    - **Skipped** (`skipped: true`): nothing ran and nothing changed. The reason is one of: another run claimed the issue first, an open PR already delivers it, the issue is closed, open `blocked_by` dependencies, or a resume conflict. What you do next depends on where the issue came from:
      - **Queue mode** (you chose it in step 1, no number was given): do **not** stop. Go back to the candidate list and launch the next unblocked issue, the same way you skip a blocked candidate in step 1 — a lost claim race should cost one iteration, not an idle slot. Report each skip and its reason as you go, and when the list runs out, say the queue is empty and stop.
      - **Number given explicitly:** relay the reason and stop. The user asked for that specific issue, so there is no next candidate to try.
-   - **Blocked:** report the phase and reason (already commented on the issue; branch pushed if any commits exist). A block that carries a PR URL means the change itself is complete and open but something after it failed — say so, and never merge it or push a fix from here. Do **not** retry automatically.
+   - **Blocked** (`blocked: true`): report the phase and reason (already commented on the issue; branch pushed if any commits exist). A block that carries a PR URL means the change itself is complete and open but something after it failed — say so, and never merge it or push a fix from here. Do **not** retry automatically.
 
 ## Recovery
 
@@ -48,4 +60,6 @@ A run that died *before its first checkpoint* is the exception, because its bran
 git push origin --delete epic/<N>-<slug>
 ```
 
-Reaping those is the reaper's job (`bin/reap.sh` in the control repo, second pass) — it deletes any `epic/<N>-*` ref still tipped by its claim commit once no live session is working the issue, which puts the issue back in the queue; the command above is how you release one without waiting for its next sweep. A run that already opened a PR is the exception: a re-run skips the issue entirely (an open PR already delivers it), so that PR has to be finished by hand — including one the merge worker flipped to `failed`, unless it also carries `needs-judgment` (then the `/fix-conflict` fixer owns it; see that skill). (Separately, the workflow has a manual `{ slug }` mode that builds on the current tree with no git — see its meta description.)
+Reaping those is the reaper's job (`bin/reap.sh` in the control repo, second pass) — it deletes any `epic/<N>-*` ref still tipped by its claim commit once no live session is working the issue, which puts the issue back in the queue; the command above is how you release one without waiting for its next sweep. A run that already opened a PR is the exception: a re-run skips the issue entirely (an open PR already delivers it), so that PR has to be finished by hand — including one the merge worker flipped to `failed`, unless it also carries `needs-judgment` (then the `/fix-conflict` fixer owns it; see that skill).
+
+**Manual mode.** `node "$CLAUDE_HARNESS_DIR/workflows/epic-run.mjs" --slug <slug>` builds on the current tree from an existing `.epics/<slug>/requirements.md` — no git, no PR, everything left in the working tree. That is the only way to run the pipeline against work that has no issue behind it.

@@ -226,7 +226,7 @@ for repo in $(repo_names); do
     set +e
     # </dev/null: nothing in launch.sh should ever read the tick's stdin;
     # 9>&- as in the ready walk below.
-    "$LAUNCH" "epic-$num" --repo "$repo" --message "/fix-conflict #$num" </dev/null 9>&-
+    "$LAUNCH" --fix "$num" --repo "$repo" </dev/null 9>&-
     rc=$?
     set -e
     if (( rc != 0 )); then
@@ -362,7 +362,7 @@ for entry in "${ORDER[@]}"; do
   set +e
   # 9>&- so the tmux server this may start cannot inherit the tick lock; see
   # the flock comment above for what that costs when it leaks.
-  "$LAUNCH" --repo "$repo" --message "/epic #$num" 9>&-
+  "$LAUNCH" --epic "$num" --repo "$repo" 9>&-
   rc=$?
   set -e
   case "$rc" in

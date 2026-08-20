@@ -3,9 +3,19 @@ set -euo pipefail
 
 # Runs ON the host. The single launch primitive: resolves the session name,
 # enforces the host's slot budget, pulls the repo, creates the detached tmux
-# session, tags it with its repo and starts claude inside it. remote-control.sh
-# calls this over ssh; bin/dispatch.sh (host-side, cron) calls it directly —
-# keep it free of any ssh/laptop assumptions.
+# session, tags it with its repo and starts the run inside it.
+# remote-control.sh calls this over ssh; bin/dispatch.sh (host-side, cron)
+# calls it directly — keep it free of any ssh/laptop assumptions.
+#
+# Two kinds of session, and they run different things:
+#   --epic N / --fix N   a pipeline run: this script creates the git worktree
+#                        and the pane runs workflows/{epic,fix}-run.mjs, which
+#                        spawns one headless agent process per phase. No
+#                        interactive session wraps it, so there is no
+#                        --remote-control channel to attach to — watch it with
+#                        `tmux attach` / `capture-pane`, same as diagnosing one.
+#   everything else      an interactive claude session (pool names, -m), with
+#                        Remote Control and its own --worktree, unchanged.
 #
 # Exit codes: 0 launched (or the session already existed), 1 usage/config
 # error, 3 refused because the host is at MAX_PARALLEL_EPICS. 3 is separate
@@ -17,13 +27,21 @@ source "$HERE/../etc/lib.sh"
 usage() {
   cat <<EOF
 Usage: $0 [session-name] [-m <message>] [-r <repo>] [--check-capacity]
+       $0 --epic <N> [-r <repo>]
+       $0 --fix <N>  [-r <repo>]
 
-Creates a detached tmux session running claude in the named repo (default:
-$DEFAULT_REPO). Name resolution when no name is given: with -m, the session is
-named after the message (slugified, e.g. "/epic #42" -> "$DEFAULT_REPO-epic-42");
-otherwise the first pool name free for the repo: ${NAMES[*]}
-If the session already exists, reports whether claude is still running in it
-and changes nothing (it never relaunches into a live session, and doesn't pull).
+Creates a detached tmux session in the named repo (default: $DEFAULT_REPO).
+
+--epic/--fix run the autonomous pipeline: the session is named <repo>-epic-<N>,
+this script creates its git worktree under \${EPIC_WORKTREE_ROOT:-\$HOME/.epic-worktrees},
+and the pane runs workflows/epic-run.mjs (or fix-run.mjs) there. They take no
+session name and no -m — both are derived from the issue number.
+
+Without them the session is an interactive claude. Name resolution when no name
+is given: with -m, the session is named after the message (slugified); otherwise
+the first pool name free for the repo: ${NAMES[*]}
+If the session already exists, reports whether its process is still running and
+changes nothing (it never relaunches into a live session, and doesn't pull).
 Refuses with exit 3 when $MAX_PARALLEL_EPICS sessions are already running.
 --check-capacity answers ONLY that last question (exit 0 below the cap, 3 at
 it) and starts nothing — dispatch.sh probes it before work it would otherwise
@@ -36,6 +54,8 @@ MESSAGE=""
 HAVE_MESSAGE=0
 CHECK_CAPACITY=0
 REPO="$DEFAULT_REPO"
+MODE=""       # "" = interactive claude; "epic" or "fix" = a pipeline run
+ISSUE=""
 
 POSITIONAL=()
 while [[ $# -gt 0 ]]; do
@@ -74,6 +94,34 @@ while [[ $# -gt 0 ]]; do
       CHECK_CAPACITY=1
       shift
       ;;
+    --epic|--fix|--epic=*|--fix=*)
+      # One leading '#' is stripped so `--epic #42` and `--epic 42` agree.
+      case "$1" in
+        --epic*) want="epic" ;;
+        *)       want="fix" ;;
+      esac
+      if [[ -n "$MODE" ]]; then
+        echo "[launch] --epic and --fix are mutually exclusive" >&2
+        exit 1
+      fi
+      MODE="$want"
+      if [[ "$1" == *=* ]]; then
+        ISSUE="${1#*=}"
+        shift
+      else
+        if [[ $# -lt 2 ]]; then
+          echo "[launch] $1 requires an issue number" >&2
+          exit 1
+        fi
+        ISSUE="$2"
+        shift 2
+      fi
+      ISSUE="${ISSUE#\#}"
+      if [[ ! "$ISSUE" =~ ^[0-9]+$ ]]; then
+        echo "[launch] --$MODE takes an issue number, got '$ISSUE'" >&2
+        exit 1
+      fi
+      ;;
     *)
       POSITIONAL+=("$1")
       shift
@@ -86,6 +134,23 @@ if [[ ${#POSITIONAL[@]} -gt 1 ]]; then
   exit 1
 fi
 SESSION="${POSITIONAL[0]:-}"
+
+# A pipeline run owns its own naming: the session name IS the issue, because
+# every other part of the harness (dispatch's has-session checks, reap's sweep,
+# the resource sampler) keys on the <repo>-epic-<N> shape. Letting a caller
+# name one differently is how a run ends up unreapable, so it is refused rather
+# than accommodated.
+if [[ -n "$MODE" ]]; then
+  if [[ -n "$SESSION" ]]; then
+    echo "[launch] --$MODE derives its own session name; drop the '$SESSION' argument" >&2
+    exit 1
+  fi
+  if [[ $HAVE_MESSAGE -eq 1 ]]; then
+    echo "[launch] --$MODE takes no -m (the pipeline gets its issue from the flag)" >&2
+    exit 1
+  fi
+  SESSION="epic-$ISSUE"
+fi
 
 if ! PROJECT="$(repo_path "$REPO")"; then
   echo "[launch] unknown repo '$REPO' (known: $(repo_names | tr '\n' ' '))" >&2
@@ -175,7 +240,7 @@ if tmux has-session -t "$SESSION" 2>/dev/null; then
   current="$(tmux list-panes -t "$SESSION" -F '#{pane_current_command}' | head -n1)"
   case "$current" in
     bash|zsh|sh|dash)
-      echo "[launch] session '$SESSION' exists but claude isn't running (pane at a $current prompt) — restart it (from the laptop): ./remote-control.sh restart $SESSION" ;;
+      echo "[launch] session '$SESSION' exists but its process isn't running (pane at a $current prompt) — restart it (from the laptop): ./remote-control.sh restart $SESSION" ;;
     *)
       echo "[launch] session '$SESSION' already running (pane: $current)" ;;
   esac
@@ -195,23 +260,67 @@ capacity_gate
 
 echo "[launch] pulling latest main in $PROJECT"
 git -C "$PROJECT" pull --rebase
-echo "[launch] creating session '$SESSION' in $PROJECT"
-tmux new-session -d -s "$SESSION" -c "$PROJECT"
-# Tag the session with its repo so `ls` can report it regardless of where
-# claude's worktree later moves the pane's cwd.
+
+# Where the pane starts, and what it runs there. Interactive sessions start in
+# the clone and let claude make its own worktree; a pipeline run gets one made
+# here, because the thing it launches is a plain node process with no opinion
+# about git.
+CWD="$PROJECT"
+if [[ -n "$MODE" ]]; then
+  WT="${EPIC_WORKTREE_ROOT:-$HOME/.epic-worktrees}/$REPO/$SESSION"
+  if [[ -d "$WT" ]] && git -C "$WT" rev-parse --git-dir >/dev/null 2>&1; then
+    # Reuse: session name == worktree name, so a relaunch (a retried fixer, a
+    # resumed epic) lands back in its predecessor's tree. Scrub the transient
+    # state a killed run leaves — a half-finished rebase makes every later step
+    # fail on cleanup instead of retrying, and a dirty tree trips the resume
+    # guard's rebase. NOT `clean -x`: the ignored files are node_modules (an
+    # `npm ci` per relaunch) and .epics/<slug>/, whose epic.md the resume path
+    # appends to. Committed work is untouched — that is what checkpoints are.
+    echo "[launch] reusing worktree $WT"
+    git -C "$WT" rebase --abort >/dev/null 2>&1 || true
+    git -C "$WT" merge --abort >/dev/null 2>&1 || true
+    git -C "$WT" reset --hard >/dev/null 2>&1 || true
+    git -C "$WT" clean -fd >/dev/null 2>&1 || true
+  else
+    rm -rf "$WT"
+    mkdir -p "$(dirname "$WT")"
+    # Prune first: a worktree removed by hand leaves an administrative entry
+    # that makes `worktree add` refuse the same path.
+    git -C "$PROJECT" worktree prune
+    echo "[launch] creating worktree $WT"
+    # Detached: the pipeline's own prepare phase decides which branch to be on
+    # (fresh claim or resume), and a worktree holding that branch already would
+    # be the one thing its resume guard reads as a live competitor.
+    git -C "$PROJECT" worktree add --detach "$WT" HEAD
+  fi
+  CWD="$WT"
+fi
+
+echo "[launch] creating session '$SESSION' in $CWD"
+tmux new-session -d -s "$SESSION" -c "$CWD"
+# Tag the session with its repo so `ls` can report it regardless of where the
+# pane's cwd later moves.
 tmux set-option -t "$SESSION" @repo "$REPO"
 
-# The session name is threaded through --remote-control and --worktree so it's
-# identifiable in the Desktop app and reusable across restarts; session name ==
-# worktree name is a deliberate invariant. The initial prompt (if any) is
-# appended as a positional arg, quoted for the pane's shell. NOTE: positional,
-# not `-p` — `-p` is print/non-interactive mode, which would run the prompt
-# then exit and tear the detached session down.
-LINE="claude --remote-control $SESSION --dangerously-skip-permissions --worktree $SESSION"
-if [[ $HAVE_MESSAGE -eq 1 && -n "$MESSAGE" ]]; then
-  LINE+=" $(sq "$MESSAGE")"
+if [[ -n "$MODE" ]]; then
+  # The pipeline. --session is both the log prefix and the marker
+  # bin/resource-log.sh counts epics by, so it is not decoration.
+  SCRIPT="$HERE/../workflows/$([[ "$MODE" == epic ]] && echo epic-run.mjs || echo fix-run.mjs)"
+  LINE="node $(sq "$SCRIPT") --issue $ISSUE --session $(sq "$SESSION")"
+else
+  # An interactive session. The name is threaded through --remote-control and
+  # --worktree so it's identifiable in the Desktop app and reusable across
+  # restarts; session name == worktree name is a deliberate invariant. The
+  # initial prompt (if any) is appended as a positional arg, quoted for the
+  # pane's shell. NOTE: positional, not `-p` — `-p` is print/non-interactive
+  # mode, which would run the prompt then exit and tear the session down.
+  LINE="claude --remote-control $SESSION --dangerously-skip-permissions --worktree $SESSION"
+  if [[ $HAVE_MESSAGE -eq 1 && -n "$MESSAGE" ]]; then
+    LINE+=" $(sq "$MESSAGE")"
+  fi
 fi
 # Typed into a shell via send-keys (rather than run as tmux new-session's
-# command) so the pane survives claude exiting: `ls` reports it as dead and
-# capture-pane can still show the error scrollback.
+# command) so the pane survives the process exiting: `ls` reports it as dead,
+# and capture-pane can still show the scrollback — which for a pipeline run is
+# the whole phase log and its final RESULT line.
 tmux send-keys -t "$SESSION" -- "$LINE" Enter

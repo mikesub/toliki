@@ -583,8 +583,10 @@ for d in skills agents; do
 done
 
 # CLAUDE_HARNESS_DIR is the one value that differs between laptop and host; the
-# /epic skill loads workflows/epic-run.js through it. Merged with jq into
-# whatever settings.json already holds — never rewritten wholesale.
+# /epic and /fix-conflict skills resolve workflows/*-run.mjs through it. (The
+# host's own pipeline runs never read it — launch.sh passes the script path
+# directly — but a hand-run skill session on the box would.) Merged with jq
+# into whatever settings.json already holds — never rewritten wholesale.
 SETTINGS="$HOME/.claude/settings.json"
 if [[ ! -f "$SETTINGS" ]]; then
   printf '{}\n' > "$SETTINGS"
