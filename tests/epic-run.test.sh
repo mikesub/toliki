@@ -102,6 +102,24 @@ exit 9
 STUB
 chmod +x "$TMP/bin/claude"
 
+# Stub `gh` too: the orchestrator writes a live status comment on the issue, and
+# that is a real subprocess. Without this the suite would shell out to the host's
+# gh — harmless (a temp dir is no repo, so it errors and the status disables
+# itself) but no longer hermetic, which is the property that makes these safe to
+# run on the live box. Logging argv here also makes the comment's create-once,
+# edit-after behaviour assertable.
+cat > "$TMP/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${STUB_GH_LOG:-/dev/null}"
+# `gh issue comment` prints the new comment's URL; the id in it is what every
+# later edit is addressed to.
+if [[ "${1:-}" == "issue" && "${2:-}" == "comment" ]]; then
+  printf 'https://github.com/o/r/issues/42#issuecomment-999001\n'
+fi
+exit 0
+STUB
+chmod +x "$TMP/bin/gh"
+
 # A success envelope carrying structured output, exactly the shape the CLI's
 # own result schema describes (see lib/engine.mjs).
 fixture() { # dir key structured-json
@@ -139,8 +157,10 @@ run_pipeline() { # script fixtures-dir args...
   local script="$1" fixtures="$2"; shift 2
   local state="$TMP/state.$RANDOM"
   RUN_LOG="$TMP/argv.$RANDOM"
+  GH_LOG="$TMP/gh.$RANDOM"
   mkdir -p "$state"
   : > "$RUN_LOG"
+  : > "$GH_LOG"
   RUN_RC=0
   RUN_OUT="$(
     cd "$TMP" && \
@@ -149,6 +169,7 @@ run_pipeline() { # script fixtures-dir args...
     STUB_FIXTURES="$fixtures" \
     STUB_STATE="$state" \
     STUB_LOG="$RUN_LOG" \
+    STUB_GH_LOG="$GH_LOG" \
     node "$script" "$@" 2>&1
   )" || RUN_RC=$?
   STATE_DIR="$state"
@@ -346,6 +367,35 @@ assert_rc "exits 0" 0 "$RUN_RC"
 assert_not_contains "no defect collapsing is claimed" "$RUN_OUT" "distinct defect(s)"
 TRIAGE_PROMPT="$(cat "$STATE_DIR/triage.0.prompt")"
 assert_not_contains "and triage is told nothing about groups" "$TRIAGE_PROMPT" "SAME underlying defect"
+
+# ───────────────────── the issue's live status comment ─────────────────────
+# The label says WHICH state an issue is in; this says whether the run is alive
+# and where it got to — the one question that otherwise needs ssh + capture-pane.
+# It must be posted ONCE and edited thereafter: a comment per phase is the thing
+# that made per-phase commentary not worth having.
+printf '\nstatus comment: posted once, edited in place, ends with the outcome\n'
+run_pipeline "$EPIC_RUN" "$BASE" --issue 42 --session myapp-epic-42
+assert_rc "exits 0" 0 "$RUN_RC"
+GH="$(cat "$GH_LOG")"
+CREATES="$(grep -c '^issue comment 42' "$GH_LOG" || true)"
+EDITS="$(grep -c 'issues/comments/999001' "$GH_LOG" || true)"
+assert_eq "exactly one comment is created" "1" "$CREATES"
+if [[ "$EDITS" -ge 1 ]]; then ok "later updates edit that comment ($EDITS)"; else nok "later updates edit that comment (got $EDITS)"; fi
+assert_contains "it names the phase and the session" "$GH" "epic-run"
+assert_contains "the last write reports the outcome" "$GH" "queued for the merge worker"
+
+printf '\nstatus comment: a blocked run says so on the issue\n'
+DEAD="$TMP/fixtures-deadlens"
+cp -R "$BASE" "$DEAD"
+printf '1' > "$DEAD/lens-security.rc"; printf '1' > "$DEAD/lens-security.0.rc"; printf '1' > "$DEAD/lens-security.1.rc"
+run_pipeline "$EPIC_RUN" "$DEAD" --issue 42 --session myapp-epic-42
+GH="$(cat "$GH_LOG")"
+assert_contains "the status comment records the block" "$GH" "blocked"
+
+printf '\nstatus comment: slug mode never touches the issue\n'
+mkdir -p "$TMP/slugrun/.epics/42-add-widget"
+run_pipeline "$EPIC_RUN" "$BASE" --slug 42-add-widget
+assert_eq "no gh calls at all" "0" "$(wc -l < "$GH_LOG" | tr -d ' ')"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

@@ -11,9 +11,10 @@
 // Attempt ladder in labels: fix-attempted, then fix-retried (one retry);
 // exhausted → refuses and stays failed.
 
-import { agent, phase, log, initRuntime } from './lib/runtime.mjs'
+import { agent, phase, log, initRuntime, onPhase, onLog } from './lib/runtime.mjs'
 import { HARNESS_DIR } from './lib/engine.mjs'
 import { parseArgs, finish, UsageError, EXIT } from './lib/cli.mjs'
+import { initStatus, statusPhase, statusNote, statusFinish } from './lib/status.mjs'
 
 const USAGE = `Usage: fix-run.mjs --issue <N> [--session <name>]
 
@@ -275,6 +276,12 @@ try {
   throw e
 }
 initRuntime({ scriptName: 'fix-run', sessionName: ARGS.session })
+// The issue's live status comment mirrors the pane's narration: the label says
+// WHICH state the issue is in, this says whether the run is alive and where it
+// got to. Issue mode only — slug mode has no issue to report on.
+initStatus({ issue: ARGS.issue, session: ARGS.session, phases: ['Prepare', 'Resolve', 'Verify', 'Check', 'Ship'] })
+onPhase(statusPhase)
+onLog(statusNote)
 const issue = ARGS.issue
 
 // ───────────────────────── Blocker path ─────────────────────────
@@ -441,4 +448,8 @@ try {
 }
 }
 
-process.exit(finish(await main()))
+const RESULT = await main()
+// Best effort, and awaited so the edit lands before the process goes: this is the
+// last thing the issue page will show until a human or the merge worker acts.
+await statusFinish(RESULT?.blocked ? `**blocked** at ${RESULT.phase}: ${RESULT.reason}` : RESULT?.skipped ? `**skipped**: ${RESULT.reason}` : RESULT?.readyToReview ? `**done** — ${RESULT.prUrl} is ready-to-review` : '**finished**')
+process.exit(finish(RESULT))

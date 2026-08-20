@@ -15,8 +15,9 @@
 // repo. Each phase below is one engine process (see lib/engine.mjs); this file
 // names no vendor.
 
-import { agent, parallel, phase, log, initRuntime } from './lib/runtime.mjs'
+import { agent, parallel, phase, log, initRuntime, onPhase, onLog } from './lib/runtime.mjs'
 import { parseArgs, finish, UsageError, EXIT } from './lib/cli.mjs'
+import { initStatus, statusPhase, statusNote, statusFinish } from './lib/status.mjs'
 
 const USAGE = `Usage: epic-run.mjs (--issue <N> | --slug <slug>) [--session <name>]
 
@@ -465,6 +466,12 @@ try {
   throw e
 }
 initRuntime({ scriptName: 'epic-run', sessionName: ARGS.session })
+// The issue's live status comment mirrors the pane's narration: the label says
+// WHICH state the issue is in, this says whether the run is alive and where it
+// got to. Issue mode only — slug mode has no issue to report on.
+initStatus({ issue: ARGS.issue, session: ARGS.session, phases: ['Prepare', 'Architect', 'Code', 'Review', 'Triage', 'Ship'] })
+onPhase(statusPhase)
+onLog(statusNote)
 
 const issue = ARGS.issue
 let slug = ARGS.slug
@@ -832,4 +839,8 @@ try {
 }
 }
 
-process.exit(finish(await main()))
+const RESULT = await main()
+// Best effort, and awaited so the edit lands before the process goes: this is the
+// last thing the issue page will show until a human or the merge worker acts.
+await statusFinish(RESULT?.blocked ? `**blocked** at ${RESULT.phase}: ${RESULT.reason}` : RESULT?.skipped ? `**skipped**: ${RESULT.reason}` : RESULT?.readyToMerge ? `**done** — ${RESULT.prUrl} queued for the merge worker` : RESULT?.prUrl ? `**done, held for review** — ${RESULT.prUrl} (${RESULT.mergeSkipped})` : '**finished**')
+process.exit(finish(RESULT))

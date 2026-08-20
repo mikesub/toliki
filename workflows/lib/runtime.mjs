@@ -52,12 +52,24 @@ export function initRuntime({ scriptName, sessionName } = {}) {
   installSignalHandlers()
 }
 
+// Observers of the run's own narration. The pane is the primary record; a hook
+// lets the issue's status comment mirror it without every call site having to
+// report twice, and without this module knowing what GitHub is. A throwing hook
+// must never take the run with it — reporting is not a gate.
+let phaseHook = null
+let logHook = null
+export function onPhase(fn) { phaseHook = fn }
+export function onLog(fn) { logHook = fn }
+const fire = (fn, arg) => { if (fn) { try { fn(arg) } catch { /* reporting never fails a run */ } } }
+
 export function log(message) {
   process.stdout.write(`${ts()} [${SCRIPT}${SESSION ? ` ${SESSION}` : ''}] ${message}\n`)
+  fire(logHook, message)
 }
 
 export function phase(title) {
   process.stdout.write(`${ts()} [${SCRIPT}${SESSION ? ` ${SESSION}` : ''}] ── ${title} ──\n`)
+  fire(phaseHook, title)
 }
 
 function installSignalHandlers() {
