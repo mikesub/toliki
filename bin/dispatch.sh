@@ -9,7 +9,7 @@ set -euo pipefail
 #
 # It walks a SECOND queue first: `needs-judgment` — issues whose PR the merge
 # worker declined on a judgment-class rebase conflict. Each gets a fixer
-# session (`/fix-conflict #N`, named `<repo>-epic-<N>` like any epic), at most
+# session (`launch.sh --fix N`, named `<repo>-epic-<N>` like any epic), at most
 # one per repo per tick and never while another fixer session in that repo is
 # still around. First on purpose: a needs-judgment issue is an epic that
 # already ran, one resolved conflict away from a reviewable PR, so finishing
@@ -45,7 +45,7 @@ Usage: $0 [-r <repo>] [-n|--dry-run]
 
 One dispatch tick. First walks the \`needs-judgment\` queue (judgment-class
 rebase conflicts the merge worker declined) and launches at most one fixer
-session per repo (\`/fix-conflict #N\`, session \`<repo>-epic-<N>\`). Then walks
+session per repo (\`launch.sh --fix N\`, session \`<repo>-epic-<N>\`). Then walks
 the \`ready\` queue of every registered repo ($(repo_names | tr '\n' ' '))
 oldest-first, skipping issues that have open blocked_by dependencies or
 already have a session, and launches each remaining one as \`<repo>-epic-<N>\`
