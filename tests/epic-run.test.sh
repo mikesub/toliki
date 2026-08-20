@@ -382,6 +382,7 @@ EDITS="$(grep -c 'issues/comments/999001' "$GH_LOG" || true)"
 assert_eq "exactly one comment is created" "1" "$CREATES"
 if [[ "$EDITS" -ge 1 ]]; then ok "later updates edit that comment ($EDITS)"; else nok "later updates edit that comment (got $EDITS)"; fi
 assert_contains "it names the phase and the session" "$GH" "epic-run"
+assert_contains "and the session name" "$GH" "myapp-epic-42"
 assert_contains "the last write reports the outcome" "$GH" "queued for the merge worker"
 
 printf '\nstatus comment: a blocked run says so on the issue\n'
@@ -396,6 +397,14 @@ printf '\nstatus comment: slug mode never touches the issue\n'
 mkdir -p "$TMP/slugrun/.epics/42-add-widget"
 run_pipeline "$EPIC_RUN" "$BASE" --slug 42-add-widget
 assert_eq "no gh calls at all" "0" "$(wc -l < "$GH_LOG" | tr -d ' ')"
+
+printf '\nstatus comment: a fixer run says fix-run, not epic-run\n'
+FIXST="$TMP/fixtures-fixstatus"
+cp -R "$FIXBASE" "$FIXST" 2>/dev/null || cp -R "$BASE" "$FIXST"
+run_pipeline "$FIX_RUN" "$FIXST" --issue 42 --session myapp-epic-42
+GH="$(cat "$GH_LOG")"
+assert_contains "the comment names fix-run" "$GH" "fix-run"
+assert_not_contains "and never claims to be epic-run" "$GH" "**epic-run**"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

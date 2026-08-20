@@ -28,6 +28,7 @@ const GH_TIMEOUT_MS = 20_000
 const MIN_INTERVAL_MS = 90_000
 
 let issue = null
+let script = 'epic-run'
 let session = ''
 let phases = []
 let commentId = null
@@ -44,9 +45,14 @@ const gh = (args) => new Promise((resolve) => {
   })
 })
 
-export function initStatus({ issue: n, session: s, phases: p } = {}) {
+export function initStatus({ issue: n, script: sc, session: s, phases: p } = {}) {
   if (!n) return                       // slug mode has no issue to report on
   issue = n
+  // Named by the caller, never hardcoded: a fixer run reports on the SAME issue
+  // as the epic that produced it, and a comment claiming "epic-run" while
+  // fix-run is what is actually running misreports precisely the thing this
+  // comment exists to make legible.
+  if (sc) script = sc
   session = s || ''
   phases = Array.isArray(p) ? p : []
   startedAt = ts()
@@ -56,7 +62,7 @@ function body() {
   const i = phases.indexOf(currentPhase)
   const step = i >= 0 && phases.length ? ` (${i + 1}/${phases.length})` : ''
   const lines = [
-    `🤖 **epic-run**${session ? ` · \`${session}\`` : ''} · phase: **${currentPhase || 'starting'}**${step}`,
+    `🤖 **${script}**${session ? ` · \`${session}\`` : ''} · phase: **${currentPhase || 'starting'}**${step}`,
     `started ${startedAt} · updated ${ts()}`,
   ]
   if (lastNote) lines.push('', lastNote)

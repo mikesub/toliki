@@ -279,7 +279,7 @@ initRuntime({ scriptName: 'fix-run', sessionName: ARGS.session })
 // The issue's live status comment mirrors the pane's narration: the label says
 // WHICH state the issue is in, this says whether the run is alive and where it
 // got to. Issue mode only — slug mode has no issue to report on.
-initStatus({ issue: ARGS.issue, session: ARGS.session, phases: ['Prepare', 'Resolve', 'Verify', 'Check', 'Ship'] })
+initStatus({ issue: ARGS.issue, script: 'fix-run', session: ARGS.session, phases: ['Prepare', 'Resolve', 'Verify', 'Check', 'Ship'] })
 onPhase(statusPhase)
 onLog(statusNote)
 const issue = ARGS.issue
