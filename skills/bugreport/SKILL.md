@@ -1,6 +1,7 @@
 ---
 name: bugreport
 description: Capture a reproducible bug report from the current context. Use when the user wants to report, file, or log a bug. Focuses on how to reproduce — not how to fix.
+disable-model-invocation: true
 ---
 
 Turn an observed problem into a **durable, reproducible** report. The goal: someone with no access to this session can reproduce it later. **Capture how to reproduce — do not diagnose or propose a fix.**

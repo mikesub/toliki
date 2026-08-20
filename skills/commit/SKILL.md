@@ -1,6 +1,7 @@
 ---
 name: commit
 description: Group all uncommitted changes into logical commits with proper messages and push. Use when the user wants to commit and push their working-tree changes.
+disable-model-invocation: true
 ---
 
 Turn the working tree into a clean series of logical commits, then push.
