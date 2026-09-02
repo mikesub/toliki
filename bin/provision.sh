@@ -69,10 +69,10 @@ note()    { printf '           %s\n' "$*"; }
 # the run down through `set -e` from inside a reporting string.
 ver() { local out; out="$("$@" 2>/dev/null | head -n1)" || out=""; printf '%s' "${out:-?}"; }
 
-# Codex is deliberately only a provisioned, authenticated CLI in this slice.
-# Keeping these two steps in a sourced helper makes them hermetically testable
-# without giving the monolithic host provisioner a test-only execution mode.
-source "$HERE/provision-codex.lib.sh"
+# Agent CLIs are deliberately only provisioned and authenticated in this slice.
+# Keeping their install logic and Codex's auth gate in a sourced helper makes
+# them hermetically testable without a test-only mode in this provisioner.
+source "$HERE/provision-agent-clis.lib.sh"
 
 # ---------------------------------------------------------------- preflight --
 
@@ -377,24 +377,7 @@ fi
 
 # --------------------------------------------------------- Claude Code CLI --
 
-say "Claude Code CLI"
-if command -v claude >/dev/null 2>&1; then
-  ok "claude $(ver claude --version)"
-else
-  curl -fsSL https://claude.ai/install.sh | bash
-  export PATH="$HOME/.local/bin:$PATH"
-  hash -r
-  if command -v claude >/dev/null 2>&1; then
-    changed "installed claude $(ver claude --version)"
-  else
-    blocked "claude install ran but the binary isn't on PATH — check ~/.local/bin"
-  fi
-fi
-# launch.sh types `claude ...` into a tmux pane's login shell, so the binary has
-# to be on PATH there, not just in this script's environment.
-if [[ -x "$HOME/.local/bin/claude" ]] && ! grep -q '\.local/bin' <<<"$PATH"; then
-  warn "~/.local/bin is not on PATH; tmux sessions won't find claude (Ubuntu's ~/.profile adds it — check it exists)"
-fi
+provision_claude_cli
 
 # ---------------------------------------------------------- OpenAI Codex CLI --
 

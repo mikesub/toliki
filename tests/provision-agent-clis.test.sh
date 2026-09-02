@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Exercises the Codex-specific part of provisioning against fake curl/codex
-# binaries and throwaway homes. Hermetic: no network, credentials, host, or
-# real ~/.codex state. The sourced helper is the exact code provision.sh calls.
+# Exercises agent-CLI provisioning against fake curl/claude/codex binaries and
+# throwaway homes. Hermetic: no network, credentials, host, or real auth state.
+# The sourced helper is the exact code provision.sh calls.
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP="$(mktemp -d)"
@@ -32,6 +32,16 @@ cat > "$TMP/bin/curl" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$INSTALL_LOG"
 [[ -z "${INSTALL_FAIL:-}" ]] || exit 22
+if [[ "$*" == *"claude.ai/install.sh"* ]]; then
+cat <<'INSTALLER'
+mkdir -p "$HOME/.local/bin"
+cat > "$HOME/.local/bin/claude" <<'CLAUDE'
+#!/usr/bin/env bash
+[[ "$*" == "--version" ]] && echo "2.9.9 (Claude Code)"
+CLAUDE
+chmod +x "$HOME/.local/bin/claude"
+INSTALLER
+else
 cat <<'INSTALLER'
 mkdir -p "$HOME/.local/bin"
 cat > "$HOME/.local/bin/codex" <<'CODEX'
@@ -46,6 +56,7 @@ esac
 CODEX
 chmod +x "$HOME/.local/bin/codex"
 INSTALLER
+fi
 STUB
 chmod +x "$TMP/bin/curl"
 
@@ -69,7 +80,7 @@ run_case() {
 
   RUN_OUT="$(
     HOME="$home" PATH="$path" AUTH_OK="$auth" INSTALL_LOG="$INSTALL_LOG" \
-      LIB="$ROOT/bin/provision-codex.lib.sh" bash -c '
+      LIB="$ROOT/bin/provision-agent-clis.lib.sh" bash -c '
         set -euo pipefail
         say() { printf "SAY|%s\n" "$*"; }
         ok() { printf "OK|%s\n" "$*"; }
@@ -91,6 +102,55 @@ case "$*" in
   "login status") [[ -n "${AUTH_OK:-}" ]] && exit 0 || exit 1 ;;
 esac
 CODEX
+
+cat > "$TMP/claude-template" <<'CLAUDE'
+#!/usr/bin/env bash
+[[ "$*" == "--version" ]] && echo "2.1.258 (Claude Code)"
+CLAUDE
+
+run_claude_case() {
+  local name="$1" setup="${2:-}"
+  local home="$TMP/claude-home-$name" path="$TMP/bin:/usr/bin:/bin"
+  mkdir -p "$home"
+  rm -f "$INSTALL_LOG"
+
+  if [[ "$setup" == "path" ]]; then
+    mkdir -p "$home/on-path"
+    cp "$TMP/claude-template" "$home/on-path/claude"
+    chmod +x "$home/on-path/claude"
+    path="$home/on-path:$path"
+  elif [[ "$setup" == "local" ]]; then
+    mkdir -p "$home/.local/bin"
+    cp "$TMP/claude-template" "$home/.local/bin/claude"
+    chmod +x "$home/.local/bin/claude"
+  fi
+
+  RUN_OUT="$(
+    HOME="$home" PATH="$path" INSTALL_LOG="$INSTALL_LOG" \
+      LIB="$ROOT/bin/provision-agent-clis.lib.sh" bash -c '
+        set -euo pipefail
+        say() { printf "SAY|%s\n" "$*"; }
+        ok() { printf "OK|%s\n" "$*"; }
+        changed() { printf "CHANGED|%s\n" "$*"; }
+        warn() { printf "WARN|%s\n" "$*"; }
+        blocked() { printf "BLOCKED|%s\n" "$*"; }
+        ver() { local out; out="$("$@" 2>/dev/null | head -n1)" || out=""; printf "%s" "${out:-?}"; }
+        source "$LIB"
+        provision_claude_cli
+      '
+  )"
+}
+
+printf '\nexisting Claude outside PATH\n'
+run_claude_case local local
+assert_contains "finds the existing local Claude binary" "$RUN_OUT" "OK|claude 2.1.258 (Claude Code)"
+assert_contains "warns about Claude's persistent PATH" "$RUN_OUT" "WARN|~/.local/bin is not on PATH"
+assert_eq "does not reinstall Claude on a PATH miss" "" "$(cat "$INSTALL_LOG" 2>/dev/null || true)"
+
+printf '\nmissing Claude installs\n'
+run_claude_case install ""
+assert_contains "records the Claude install" "$RUN_OUT" "CHANGED|installed claude 2.9.9 (Claude Code)"
+assert_contains "uses Claude's installer URL" "$(cat "$INSTALL_LOG")" "https://claude.ai/install.sh"
 
 printf '\nexisting Codex on PATH\n'
 run_case existing path yes

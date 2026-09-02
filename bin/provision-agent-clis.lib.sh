@@ -1,5 +1,42 @@
-# Sourced by bin/provision.sh. Kept separate so the install and authentication
-# gates can be exercised hermetically without running the host provisioner.
+# Sourced by bin/provision.sh. Kept separate so CLI discovery, installation,
+# and authentication gates can be exercised hermetically without running the
+# host provisioner.
+
+provision_claude_cli() {
+  say "Claude Code CLI"
+
+  local had_local_bin=0
+  case ":$PATH:" in
+    *":$HOME/.local/bin:"*) had_local_bin=1 ;;
+  esac
+
+  if command -v claude >/dev/null 2>&1; then
+    ok "claude $(ver claude --version)"
+  elif [[ -x "$HOME/.local/bin/claude" ]]; then
+    # A non-login SSH command may not inherit ~/.local/bin even though the
+    # binary and login-shell setup are healthy. Expose the existing install for
+    # this run; never interpret a PATH miss as permission to update the CLI.
+    export PATH="$HOME/.local/bin:$PATH"
+    hash -r
+    ok "claude $(ver claude --version)"
+  else
+    if curl -fsSL https://claude.ai/install.sh | bash; then
+      export PATH="$HOME/.local/bin:$PATH"
+      hash -r
+      if command -v claude >/dev/null 2>&1; then
+        changed "installed claude $(ver claude --version)"
+      else
+        blocked "Claude install ran but the binary isn't on PATH — check ~/.local/bin"
+      fi
+    else
+      blocked "Claude install failed — re-run, or install it by hand from https://claude.ai"
+    fi
+  fi
+
+  if [[ -x "$HOME/.local/bin/claude" && $had_local_bin -eq 0 ]]; then
+    warn "~/.local/bin is not on PATH; a fresh login shell or tmux pane may not find claude (Ubuntu's ~/.profile normally adds it — verify with: bash -lc 'command -v claude')"
+  fi
+}
 
 provision_codex_cli() {
   say "Codex CLI"

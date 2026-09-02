@@ -143,8 +143,9 @@ The suites cover:
   real throwaway rebase stops.
 - `tests/reap-worktree.test.sh`: worktree collection and every deletion guard.
 - `tests/update-claude.test.sh`: idle-gated updater behavior.
-- `tests/provision-codex.test.sh`: Codex installation, PATH discovery, and the
-  headless authentication gate against fake binaries and throwaway homes.
+- `tests/provision-agent-clis.test.sh`: Claude/Codex installation and PATH
+  discovery plus Codex's headless authentication gate, all against fake
+  binaries and throwaway homes.
 
 Never weaken or delete a test to make a change pass. Test the host-facing shell
 scripts using fake executables placed first on `PATH` and throwaway repositories
