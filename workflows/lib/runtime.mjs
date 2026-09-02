@@ -27,7 +27,7 @@ import os from 'node:os'
 import { resolveEngine, terminateAll } from './engine.mjs'
 import { validate } from './schema.mjs'
 
-const DEFAULT_ENGINE = process.env.EPIC_ENGINE || 'claude'
+let DEFAULT_ENGINE = process.env.EPIC_ENGINE || 'claude'
 
 // Matches the concurrency the workflow engine used to impose, now ours to
 // hold: every agent spawn passes this gate, so no fan-out anywhere in a
@@ -46,9 +46,14 @@ let shuttingDown = false
 
 const ts = () => new Date().toISOString().replace(/\.\d{3}Z$/, 'Z')
 
-export function initRuntime({ scriptName, sessionName } = {}) {
+export function initRuntime({ scriptName, sessionName, defaultEngine } = {}) {
   if (scriptName) SCRIPT = scriptName
   if (sessionName) SESSION = sessionName
+  if (defaultEngine) DEFAULT_ENGINE = defaultEngine
+  // Validate before status hooks or the first phase can touch GitHub. Letting
+  // an unknown engine degrade to a null first step also leaves the blocker
+  // reporter on that same unknown engine, stranding the issue without a label.
+  resolveEngine(DEFAULT_ENGINE)
   installSignalHandlers()
 }
 
@@ -107,13 +112,13 @@ function release() {
 //   label      short name for the log line (e.g. 'review:2')
 //   phase      the phase it belongs to — logging only, kept for parity
 //   agentType  charter from the shared agents/ registry ('coder' | 'architect' | 'reviewer')
-//   model      engine model tier; omitted means the engine's configured default
+//   tier       engine-neutral model tier; omitted means the adapter's default
 //   effort     reasoning effort, when a stage wants it lowered
 //   schema     JSON Schema; its presence is what makes the return value an object
-//   engine     which adapter runs it (defaults to EPIC_ENGINE, today 'claude')
+//   engine     which adapter runs it (defaults to the run's selected engine)
 //   timeoutMs  per-step ceiling
 export async function agent(prompt, opts = {}) {
-  const { label = 'agent', agentType, model, effort, schema, engine: engineName, timeoutMs = DEFAULT_TIMEOUT_MS } = opts
+  const { label = 'agent', agentType, tier, effort, schema, engine: engineName, timeoutMs = DEFAULT_TIMEOUT_MS } = opts
   let engine
   try {
     engine = resolveEngine(engineName || DEFAULT_ENGINE)
@@ -126,7 +131,7 @@ export async function agent(prompt, opts = {}) {
     await acquire()
     const started = Date.now()
     try {
-      return await engine.run({ prompt, agentType, model, effort, schema, cwd: process.cwd(), timeoutMs })
+      return await engine.run({ prompt, agentType, tier, effort, schema, cwd: process.cwd(), timeoutMs })
     } catch (e) {
       // An adapter is contracted not to throw; if one ever does, it must still
       // arrive at the call site as a null, not as an unwinding exception.

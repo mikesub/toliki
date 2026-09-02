@@ -7,6 +7,8 @@
 // pane's scrollback after the process is gone — the same surface
 // `tmux capture-pane` already reads to diagnose a session.
 
+import { engineNames } from './engine.mjs'
+
 export const EXIT = {
   OK: 0,        // shipped, held for review, or a manual-mode summary
   ERROR: 1,     // the run could not start (bad args) or crashed outside its own blocker path
@@ -22,7 +24,7 @@ export const EXIT = {
 // object" branch. argv cannot produce one, so it is not a shape to defend
 // against here.
 export function parseArgs(argv, { allowSlug = false, usage = '' } = {}) {
-  const out = { issue: undefined, slug: undefined, session: '' }
+  const out = { issue: undefined, slug: undefined, session: '', engine: process.env.EPIC_ENGINE || 'claude' }
   const rest = []
 
   for (let i = 0; i < argv.length; i++) {
@@ -42,6 +44,7 @@ export function parseArgs(argv, { allowSlug = false, usage = '' } = {}) {
       case '--issue': out.issue = take(); break
       case '--slug': out.slug = take(); break
       case '--session': out.session = take(); break
+      case '--engine': out.engine = take(); break
       default:
         if (flag.startsWith('-')) throw new UsageError(`unknown option ${flag}`, usage)
         rest.push(a)
@@ -72,6 +75,9 @@ export function parseArgs(argv, { allowSlug = false, usage = '' } = {}) {
 
   if (out.issue === undefined && out.slug === undefined) {
     throw new UsageError('nothing to run: pass --issue <N>' + (allowSlug ? ' or --slug <slug>' : ''), usage)
+  }
+  if (!engineNames().includes(out.engine)) {
+    throw new UsageError(`--engine must be one of ${engineNames().join(', ')}, got "${out.engine}"`, usage)
   }
   return out
 }

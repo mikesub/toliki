@@ -18,6 +18,7 @@ EPIC_RUN="$ROOT/workflows/epic-run.mjs"
 FIX_RUN="$ROOT/workflows/fix-run.mjs"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+printf '# Stub project constitution\n' > "$TMP/CLAUDE.md"
 
 PASS=0
 FAIL=0
@@ -102,6 +103,38 @@ exit 9
 STUB
 chmod +x "$TMP/bin/claude"
 
+# Codex stub: records its own argv, then reuses the fixture router above and
+# translates Claude's test envelope into Codex's --output-last-message file.
+# This gives the whole orchestrator a second-engine run without duplicating the
+# large prompt-to-fixture table.
+cat > "$TMP/bin/codex" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" | tr '\n' ' ' | tr -s ' ' >> "$STUB_CODEX_LOG"
+printf '\n' >> "$STUB_CODEX_LOG"
+out=""
+schema=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o|--output-last-message) out="$2"; shift 2 ;;
+    --output-schema) schema="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+prompt="$(cat)"
+set +e
+payload="$(printf '%s' "$prompt" | STUB_LOG=/dev/null "$STUB_CLAUDE")"
+rc=$?
+set -e
+(( rc == 0 )) || exit "$rc"
+if [[ -n "$schema" ]]; then
+  printf '%s' "$payload" | jq -c '.structured_output' > "$out"
+else
+  printf '%s' "$payload" | jq -r '.result' > "$out"
+fi
+STUB
+chmod +x "$TMP/bin/codex"
+
 # Stub `gh` too: the orchestrator writes a live status comment on the issue, and
 # that is a real subprocess. Without this the suite would shell out to the host's
 # gh — harmless (a temp dir is no repo, so it errors and the status disables
@@ -157,15 +190,20 @@ run_pipeline() { # script fixtures-dir args...
   local script="$1" fixtures="$2"; shift 2
   local state="$TMP/state.$RANDOM"
   RUN_LOG="$TMP/argv.$RANDOM"
+  CODEX_LOG="$TMP/codex-argv.$RANDOM"
   GH_LOG="$TMP/gh.$RANDOM"
   mkdir -p "$state"
   : > "$RUN_LOG"
+  : > "$CODEX_LOG"
   : > "$GH_LOG"
   RUN_RC=0
   RUN_OUT="$(
     cd "$TMP" && \
     PATH="$TMP/bin:$PATH" \
     CLAUDE_BIN="$TMP/bin/claude" \
+    CODEX_BIN="$TMP/bin/codex" \
+    STUB_CLAUDE="$TMP/bin/claude" \
+    STUB_CODEX_LOG="$CODEX_LOG" \
     STUB_FIXTURES="$fixtures" \
     STUB_STATE="$state" \
     STUB_LOG="$RUN_LOG" \
@@ -201,6 +239,17 @@ assert_contains "the reviewer charter reaches the model" "$ARGV" "Review code ag
 assert_contains "schemas are enforced by the engine" "$ARGV" "--json-schema"
 assert_contains "permissions are pre-granted for autonomy" "$ARGV" "--dangerously-skip-permissions"
 
+printf '\nepic-run: Codex engine completes the same happy path\n'
+run_pipeline "$EPIC_RUN" "$BASE" --issue 42 --session myapp-epic-42 --engine codex
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_contains "RESULT says readyToMerge" "$RUN_OUT" '"readyToMerge":true'
+CODEX_ARGV="$(cat "$CODEX_LOG")"
+assert_contains "mechanical phases use Luna" "$CODEX_ARGV" "--model gpt-5.6-luna"
+assert_contains "strong phases use Sol" "$CODEX_ARGV" "--model gpt-5.6-sol"
+assert_contains "hidden Codex fan-out is disabled" "$CODEX_ARGV" "--disable multi_agent --disable enable_fanout"
+assert_contains "Codex runs are ephemeral" "$CODEX_ARGV" "--ephemeral"
+assert_eq "all five Codex review lenses ran" 5 "$(( $(calls lens-correctness) + $(calls lens-simplicity) + $(calls lens-seam) + $(calls lens-acceptance) + $(calls lens-security) ))"
+
 printf '\nepic-run: prepare refuses (claimed by another run)\n'
 REFUSED="$TMP/fixtures-refused"; cp -R "$BASE" "$REFUSED"
 fixture "$REFUSED" prepare '{"alreadyExists":false,"resumed":false,"refused":"claimed by another run"}'
@@ -210,6 +259,13 @@ assert_contains "RESULT says skipped" "$RUN_OUT" '"skipped":true'
 assert_contains "the reason survives verbatim" "$RUN_OUT" 'claimed by another run'
 assert_eq "nothing was designed" 0 "$(calls design)"
 assert_eq "no blocker was posted" 0 "$(calls blocked)"
+
+printf '\nepic-run: an unknown engine is rejected before side effects\n'
+run_pipeline "$EPIC_RUN" "$BASE" --issue 42 --engine future
+assert_rc "exits 1 (usage)" 1 "$RUN_RC"
+assert_contains "the allowed engines are named" "$RUN_OUT" '--engine must be one of claude, codex'
+assert_eq "no agent process was spawned" 0 "$(calls prepare)"
+assert_eq "no GitHub status write occurred" 0 "$(wc -l < "$GH_LOG" | tr -d ' ')"
 
 printf '\nepic-run: a dead review lens fails the run closed\n'
 DEADLENS="$TMP/fixtures-deadlens"; cp -R "$BASE" "$DEADLENS"

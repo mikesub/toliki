@@ -19,12 +19,13 @@ import { agent, parallel, phase, log, initRuntime, onPhase, onLog } from './lib/
 import { parseArgs, finish, UsageError, EXIT } from './lib/cli.mjs'
 import { initStatus, statusPhase, statusNote, statusFinish } from './lib/status.mjs'
 
-const USAGE = `Usage: epic-run.mjs (--issue <N> | --slug <slug>) [--session <name>]
+const USAGE = `Usage: epic-run.mjs (--issue <N> | --slug <slug>) [--session <name>] [--engine <name>]
 
   --issue <N>    GitHub issue to build: branch, implement, review, open a PR
   --slug <slug>  manual mode: build on the current tree from an existing
                  .epics/<slug>/requirements.md, no git and no PR
   --session      name for log lines (the tmux session bin/launch.sh created)
+  --engine       registered coding-agent engine for every phase
 
 Exit: 0 shipped or held for review, 1 usage/crash, 2 skipped, 3 blocked.
 The final line is RESULT <json>.`
@@ -303,14 +304,12 @@ Return confirmation that the comment was posted and the label was swapped to fai
 // The five finders stay at the default tier deliberately: they drive recall, and more cheap finders beat fewer
 // expensive ones. If recall proves weak, add a sixth lens rather than upgrading the existing five.
 //
-// These are model names, not engines: every stage runs on the default engine (lib/engine.mjs) unless a
-// stage also passes `engine`. That is the seam a second vendor plugs into — per stage, not per pipeline.
-// They are also the CLI's ALIASES, resolved by the installed binary from a catalog bundled inside it —
-// `fable` meant claude-fable-5 up to CLI 2.1.256 and claude-fable-5-1 from 2.1.257 — so a stale CLI is a
-// stale tier table. bin/update-claude.sh keeps the host's binary current; nothing here has to change.
-const MECHANICAL = 'sonnet'
-const DESIGN = 'fable'
-const ADJUDICATE = 'fable'
+// These are engine-neutral tiers. The selected adapter in lib/engine.mjs maps
+// each tier to that vendor's model and reasoning effort, so model names never
+// leak into the orchestrator.
+const MECHANICAL = 'mechanical'
+const DESIGN = 'design'
+const ADJUDICATE = 'adjudicate'
 
 // This pipeline used to run its own real-database gate: an agent listed the changed paths, the script
 // path-matched them, and a second agent ran the project's `test:db` suite. That whole tier is gone — the
@@ -469,7 +468,7 @@ try {
   }
   throw e
 }
-initRuntime({ scriptName: 'epic-run', sessionName: ARGS.session })
+initRuntime({ scriptName: 'epic-run', sessionName: ARGS.session, defaultEngine: ARGS.engine })
 // The issue's live status comment mirrors the pane's narration: the label says
 // WHICH state the issue is in, this says whether the run is alive and where it
 // got to. Issue mode only — slug mode has no issue to report on.
@@ -494,7 +493,7 @@ async function fail(phase, reason) {
     if (!blockerPosted) {
       blockerPosted = true
       await agent(PROMPTS.blocked(issue, slug, phase, reason, openPr),
-        { label: 'ship:blocked', phase: 'Ship', agentType: 'coder', model: MECHANICAL })
+        { label: 'ship:blocked', phase: 'Ship', agentType: 'coder', tier: MECHANICAL })
     }
     return { blocked: true, issue, slug, phase, reason, prUrl: openPr || undefined }
   }
@@ -532,7 +531,7 @@ try {
   if (gitMode) {
     phase('Prepare')
     const prep = await agent(PROMPTS.prepare(issue),
-      { label: 'prepare', phase: 'Prepare', agentType: 'coder', model: MECHANICAL, schema: PREP_SCHEMA })
+      { label: 'prepare', phase: 'Prepare', agentType: 'coder', tier: MECHANICAL, schema: PREP_SCHEMA })
     if (!prep) return await fail('prepare', 'Prepare failed — could not fetch the issue or reach git/gh.')
     if (prep.refused) {
       log(`Prepare refused to start: ${prep.refused}`)
@@ -569,7 +568,7 @@ try {
   // manual mode has no Prepare, so one agent reads the file (the orchestrator itself has no FS access to it).
   if (!gitMode) {
     const reqRes = await agent(PROMPTS.readRequirement(dir),
-      { label: 'read:requirement', phase: 'Architect', agentType: 'coder', model: MECHANICAL, effort: 'low', schema: REQ_SCHEMA })
+      { label: 'read:requirement', phase: 'Architect', agentType: 'coder', tier: MECHANICAL, effort: 'low', schema: REQ_SCHEMA })
     if (!reqRes || !reqRes.requirement) return await fail('architect', 'Could not read requirements.md — aborting before code.')
     const badLayout = applyDiscovery(reqRes)
     if (badLayout) return await fail('architect', badLayout)
@@ -578,14 +577,14 @@ try {
   }
 
   const design = await agent(PROMPTS.architectDesign(dir),
-    { label: 'architect:design', phase: 'Architect', agentType: 'architect', model: DESIGN, schema: DESIGN_SCHEMA },
+    { label: 'architect:design', phase: 'Architect', agentType: 'architect', tier: DESIGN, schema: DESIGN_SCHEMA },
   )
   if (!design) return await fail('architect', 'Architect design failed — aborting before code.')
 
   // Fail closed if the artifact never lands: red and green both read architecture.md, so building on a missing
   // one means implementing against nothing but the requirements — silently, and only visible in the diff.
   const wrote = await agent(PROMPTS.architectWrite(dir, design),
-    { label: 'architect:write', phase: 'Architect', agentType: 'coder', model: MECHANICAL },
+    { label: 'architect:write', phase: 'Architect', agentType: 'coder', tier: MECHANICAL },
   )
   if (!wrote) return await fail('architect', 'architecture.md was not written — aborting before code, which reads it.')
   log(`Architecture: ${design.approach} — ${design.rationale}`)
@@ -684,7 +683,7 @@ try {
   })
   const verdicts = (await parallel(batches.map((group, bi) => () =>
     agent(PROMPTS.verify(group, DIFF),
-      { label: `verify:${bi + 1}/${batches.length}`, phase: 'Review', agentType: 'reviewer', model: ADJUDICATE, schema: VERDICT_SCHEMA },
+      { label: `verify:${bi + 1}/${batches.length}`, phase: 'Review', agentType: 'reviewer', tier: ADJUDICATE, schema: VERDICT_SCHEMA },
     ).then(v => group.map((f, i) => {
       const got = v && Array.isArray(v.verdicts) ? v.verdicts.find(x => Number(x.index) === i + 1) : null
       if (!got || typeof got.real !== 'boolean') return noVerdict(f)
@@ -737,7 +736,7 @@ try {
 
   // Write review.md from the surviving findings (+ the unconfirmed record).
   await agent(PROMPTS.reviewWrite(dir, JSON.stringify(verified, null, 2), JSON.stringify(unconfirmed, null, 2)),
-    { label: 'review:write', phase: 'Review', agentType: 'coder', model: MECHANICAL },
+    { label: 'review:write', phase: 'Review', agentType: 'coder', tier: MECHANICAL },
   )
 
   // ───────────────────────── Phase 4: Triage (auto-apply, no sign-off) ─────────────────────────
@@ -773,7 +772,7 @@ try {
 
   if (!gitMode) {
     const summary = await agent(PROMPTS.summaryManual(dir, design, triageStatus),
-      { label: 'summary:write', phase: 'Ship', agentType: 'coder', model: MECHANICAL },
+      { label: 'summary:write', phase: 'Ship', agentType: 'coder', tier: MECHANICAL },
     )
     return { slug, approach: design?.approach, greenStatus: green, findingsConfirmed: verified.length, findingsUnconfirmed: unconfirmed.length, triageStatus, summary }
   }
@@ -828,7 +827,7 @@ try {
   // step can go wrong leaves the issue in front of a human rather than in an unattended merge queue. That
   // asymmetry is the reason it is a separate step instead of something ship decided for itself.
   const handed = await agent(PROMPTS.handoff(dir, issue),
-    { label: 'ship:handoff', phase: 'Ship', agentType: 'coder', model: MECHANICAL, schema: HANDOFF_SCHEMA },
+    { label: 'ship:handoff', phase: 'Ship', agentType: 'coder', tier: MECHANICAL, schema: HANDOFF_SCHEMA },
   ).catch(() => null)
   if (!handed || !handed.labelled) {
     const why = `merge gate was clear but ready-to-merge could not be applied${handed?.summary ? ` (${handed.summary})` : ''} — the PR is complete and stays ready-to-review`

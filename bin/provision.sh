@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Idempotent rebuild of the VPS host: bare Ubuntu -> a box that runs detached
-# Claude sessions and has Codex ready for manual use. Runs ON the host, never
+# Claude sessions and Claude/Codex pipeline runs. Runs ON the host, never
 # over ssh from the laptop.
 #
 # Bootstrap on a fresh box (the only hand-typed part):
@@ -181,8 +181,9 @@ add_apt_source() {
 say "base packages"
 # curl/gnupg/ca-certificates are needed to register the apt sources below, so
 # they go in first; jq does the JSON surgery on ~/.claude/settings.json and the
-# workspace-trust check.
-apt_install git tmux jq curl ca-certificates gnupg
+# workspace-trust check. Codex uses bubblewrap to enforce the read-only sandbox
+# that fences architect and reviewer phases on Linux.
+apt_install git tmux jq curl ca-certificates gnupg bubblewrap
 
 # --------------------------------------------------------------------- node --
 
@@ -383,8 +384,8 @@ provision_claude_cli
 
 # Standalone installer is the official Linux path. Like every CLI here,
 # provisioning installs a missing binary but never upgrades one already present
-# under a fleet of live sessions. Codex is not a workflow engine yet: no launch,
-# cron, adapter or pipeline file reads it in this slice.
+# under a fleet of live sessions. The engine adapter invokes this binary for
+# issues routed with engine:codex.
 provision_codex_cli
 
 # ------------------------------------------------------------- gh auth gate --

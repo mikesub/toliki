@@ -115,8 +115,10 @@ assert_rc "exits 0" 0 "$RUN_RC"
 assert_contains "session is named <repo>-epic-<N>" "$(tmux_log)" "new-session -d -s testrepo-epic-63"
 assert_contains "the pane starts in the worktree" "$(tmux_log)" "-c $WT_ROOT/testrepo/testrepo-epic-63"
 assert_contains "the repo tag is set" "$(tmux_log)" "set-option -t testrepo-epic-63 @repo testrepo"
+assert_contains "the default engine tag is Claude" "$(tmux_log)" "set-option -t testrepo-epic-63 @engine claude"
 assert_contains "the pane runs the epic orchestrator" "$(tmux_log)" "workflows/epic-run.mjs' --issue 63"
 assert_contains "the session name is threaded through" "$(tmux_log)" "--session 'testrepo-epic-63'"
+assert_contains "the default engine reaches the orchestrator" "$(tmux_log)" "--engine 'claude'"
 assert_not_contains "no interactive claude is launched" "$(tmux_log)" "--remote-control"
 assert_file "the worktree exists" "$WT_ROOT/testrepo/testrepo-epic-63/frontend/package.json"
 
@@ -125,6 +127,12 @@ run_launch --fix '#63' --repo testrepo
 assert_rc "exits 0 (and strips the leading #)" 0 "$RUN_RC"
 assert_contains "session is still <repo>-epic-<N>" "$(tmux_log)" "new-session -d -s testrepo-epic-63"
 assert_contains "the pane runs the fixer orchestrator" "$(tmux_log)" "workflows/fix-run.mjs' --issue 63"
+
+printf '\nlaunch --epic --engine codex: engine is tagged and forwarded\n'
+run_launch --epic 64 --repo testrepo --engine codex
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_contains "the Codex engine tag is set" "$(tmux_log)" "set-option -t testrepo-epic-64 @engine codex"
+assert_contains "Codex reaches the orchestrator" "$(tmux_log)" "--engine 'codex'"
 
 printf '\nlaunch --epic: a reused worktree is scrubbed but keeps ignored files\n'
 WT="$WT_ROOT/testrepo/testrepo-epic-63"
@@ -164,6 +172,15 @@ assert_contains "and says why" "$RUN_OUT" "derives its own session name"
 run_launch --epic not-a-number --repo testrepo
 assert_rc "a non-numeric issue exits 1" 1 "$RUN_RC"
 assert_contains "and says why" "$RUN_OUT" "takes an issue number"
+
+run_launch --epic 63 --engine unknown --repo testrepo
+assert_rc "an unknown engine exits 1" 1 "$RUN_RC"
+assert_contains "and names the allowed engines" "$RUN_OUT" "must be claude or codex"
+assert_not_contains "validation happens before any session is created" "$(tmux_log)" "new-session"
+
+run_launch --engine codex --repo testrepo
+assert_rc "--engine is refused for interactive sessions" 1 "$RUN_RC"
+assert_contains "and says it is pipeline-only" "$RUN_OUT" "only applies to --epic/--fix"
 
 printf '\nlaunch --check-idle: the cap'"'"'s own count, against zero\n'
 run_launch --check-idle

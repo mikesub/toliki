@@ -32,13 +32,16 @@ Commands:
                            Refuses on a <repo>-epic-<N> session: use epic/fix.
   stop-all                 Stop every tmux session on the host.
   ls                       List all sessions with their repo and running/dead status.
-  epic <ref>               Run the epic pipeline on an issue, as session
+  epic <ref> --engine <e>  Run the epic pipeline on an issue, as session
                            <repo>-epic-<ref>. The manual override for dispatch's
                            ready queue. A ref starting with # isn't doubled.
-  fix <ref>                Run the conflict fixer on a needs-judgment issue —
+  fix <ref> --engine <e>   Run the conflict fixer on a needs-judgment issue —
                            the manual override for dispatch's fixer walk. Same
                            session name as dispatch would use, which is what
                            keeps it visible to reap and to the next tick.
+  next <claude|codex>      Route the first unrouted, unblocked ready issue to
+                           this engine. With -r, only considers that repo;
+                           otherwise uses dispatch's host-wide interleaving.
   <name> [-m msg]          Shorthand for: start <name> [-m msg]
 
   Note: epic/fix sessions run the pipeline directly (a node orchestrator that
@@ -51,10 +54,12 @@ Commands:
                            is non-interactive and would exit immediately). Also
                            names the session when no explicit name is given.
   -r, --repo <name>        Repo to run in: $(repo_names | tr '\n' ' ')(default: $DEFAULT_REPO).
-                           Applies to start/restart/stop/epic/fix; ls and stop-all
+                           Applies to start/restart/stop/epic/fix/next; ls and stop-all
                            are host-wide. Every session is named <repo>-<name>, so
                            "epic 63 -r otherapp" -> otherapp-epic-63. Names are given
                            short (epic-63) or full (otherapp-epic-63) interchangeably.
+  --engine <claude|codex>  Required for manual epic/fix launches. Queue-driven
+                           launches get the engine from the issue label instead.
 EOF
 }
 
@@ -67,6 +72,8 @@ REPO=""
 HAVE_REPO=0
 PIPELINE=""   # "epic" or "fix" when the epic/fix shortcut was used
 REF=""
+ENGINE=""
+HAVE_ENGINE=0
 
 # Pull optional -m/--message and -r/--repo (any position) out of the args.
 POSITIONAL=()
@@ -98,6 +105,20 @@ while [[ $# -gt 0 ]]; do
     -r=*|--repo=*)
       HAVE_REPO=1
       REPO="${1#*=}"
+      shift
+      ;;
+    --engine)
+      if [[ $# -lt 2 ]]; then
+        echo "[control] $1 requires a value" >&2
+        exit 1
+      fi
+      HAVE_ENGINE=1
+      ENGINE="$2"
+      shift 2
+      ;;
+    --engine=*)
+      HAVE_ENGINE=1
+      ENGINE="${1#*=}"
       shift
       ;;
     *)
@@ -148,11 +169,40 @@ else
       ACTION="start"
       PIPELINE="$CMD"
       REF="${REF#\#}"              # strip a leading # so we don't double it
+      if [[ ! "$REF" =~ ^[0-9]+$ ]]; then
+        echo "[control] $CMD takes a numeric issue reference" >&2
+        exit 1
+      fi
+      ;;
+    next)
+      ACTION="next"
+      NEXT_ENGINE="${POSITIONAL[1]:-}"
+      if [[ "$NEXT_ENGINE" != "claude" && "$NEXT_ENGINE" != "codex" ]]; then
+        echo "[control] next requires exactly one engine: claude or codex" >&2
+        exit 1
+      fi
+      if [[ -n "${POSITIONAL[2]:-}" ]]; then
+        echo "[control] next takes a single engine" >&2
+        exit 1
+      fi
       ;;
     *)
       SESSION="${POSITIONAL[0]}"   # bare <name> is shorthand for: start <name>
       ;;
   esac
+fi
+
+if [[ $HAVE_ENGINE -eq 1 && "$ENGINE" != "claude" && "$ENGINE" != "codex" ]]; then
+  echo "[control] --engine must be claude or codex" >&2
+  exit 1
+fi
+if [[ -n "$PIPELINE" && $HAVE_ENGINE -eq 0 ]]; then
+  echo "[control] manual $PIPELINE requires --engine claude|codex; queue launches inherit the issue's engine label" >&2
+  exit 1
+fi
+if [[ -z "$PIPELINE" && $HAVE_ENGINE -eq 1 ]]; then
+  echo "[control] --engine only applies to manual epic/fix launches" >&2
+  exit 1
 fi
 
 # --message only makes sense when we're launching claude.
@@ -162,8 +212,8 @@ if [[ $HAVE_MESSAGE -eq 1 && "$ACTION" != "start" && "$ACTION" != "restart" ]]; 
 fi
 
 # ls and stop-all are host-wide, so a repo would be meaningless there.
-if [[ $HAVE_REPO -eq 1 && "$ACTION" != "start" && "$ACTION" != "restart" && "$ACTION" != "stop" ]]; then
-  echo "[control] --repo only applies to start/restart/stop/epic/fix" >&2
+if [[ $HAVE_REPO -eq 1 && "$ACTION" != "start" && "$ACTION" != "restart" && "$ACTION" != "stop" && "$ACTION" != "next" ]]; then
+  echo "[control] --repo only applies to start/restart/stop/epic/fix/next" >&2
   exit 1
 fi
 
@@ -174,7 +224,7 @@ fi
 
 # Resolve the repo. A full session name (as `ls` prints it) already carries its
 # own repo, so honour that for restart when -r wasn't given.
-if [[ $HAVE_REPO -eq 0 ]]; then
+if [[ $HAVE_REPO -eq 0 && "$ACTION" != "next" ]]; then
   REPO="$DEFAULT_REPO"
   if [[ "$ACTION" == "restart" && -n "$SESSION" ]]; then
     if derived="$(repo_of_session "$SESSION")"; then
@@ -209,12 +259,21 @@ case "$ACTION" in
 esac
 
 case "$ACTION" in
+  next)
+    REMOTE="$HOST_CONTROL_DIR/bin/dispatch.sh --route-next $(sq "$NEXT_ENGINE")"
+    if [[ $HAVE_REPO -eq 1 ]]; then
+      REMOTE+=" --repo $(sq "$REPO")"
+    fi
+    ssh "$HOST" "$REMOTE"
+    ;;
   start)
     # Each arg is shell-quoted with sq() since ssh mashes the remote command
     # into one string and hands it to the remote shell.
     REMOTE="$LAUNCH --repo $(sq "$REPO")"
     if [[ -n "$PIPELINE" ]]; then
-      REMOTE+=" --$PIPELINE $(sq "$REF")"
+      ROUTE="$HOST_CONTROL_DIR/bin/dispatch.sh --route-issue $(sq "$REF") $(sq "$ENGINE") --repo $(sq "$REPO")"
+      REMOTE+=" --$PIPELINE $(sq "$REF") --engine $(sq "$ENGINE")"
+      REMOTE="$ROUTE && $REMOTE"
     else
       if [[ -n "$SESSION" ]]; then
         REMOTE+=" $(sq "$SESSION")"
@@ -251,7 +310,8 @@ EOF
     if [[ $HAVE_MESSAGE -eq 0 && "$SESSION" =~ -epic-([0-9]+)$ ]]; then
       N="${BASH_REMATCH[1]}"
       echo "[control] '$SESSION' is a pipeline session — 'restart' can't tell an epic from a fixer." >&2
-      echo "[control] Relaunch it explicitly:  $0 stop $SESSION && $0 epic $N   (or: $0 fix $N)" >&2
+      echo "[control] Relaunch it explicitly:  $0 stop $SESSION && $0 epic $N --engine <claude|codex>" >&2
+      echo "[control] Or use: $0 fix $N --engine <claude|codex>" >&2
       echo "[control] Or just stop it: dispatch relaunches an unfinished issue on its next tick." >&2
       exit 1
     fi
@@ -290,7 +350,8 @@ while IFS= read -r s; do
   esac
   # Sessions started before repo tagging (or by hand) have no @repo option.
   repo=$(tmux show-options -t "$s" -v @repo 2>/dev/null || true)
-  printf '%-28s %-10s %s\n' "$s" "${repo:--}" "$status"
+  engine=$(tmux show-options -t "$s" -v @engine 2>/dev/null || true)
+  printf '%-28s %-10s %-7s %s\n' "$s" "${repo:--}" "${engine:--}" "$status"
 done <<<"$sessions"
 EOF
     ;;

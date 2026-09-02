@@ -405,11 +405,11 @@ fi
 # hung one from the outside, and every other thing this script kills is proved
 # finished by a label or a commit — an orphan is proved by neither. So it is
 # surfaced for a human, which is what a non-zero exit is for.
-# The pattern is anchored on purpose. A loose `claude .*-p` also matches an
+# The patterns are anchored on purpose. A loose `claude .*-p` also matches an
 # INTERACTIVE session, whose command line carries --dangerously-skip-permissions
-# — so it would warn about a healthy session every sweep. Only an agent process
-# has `-p` as its first argument.
-if ORPHANS="$(pgrep -af '(^|/)claude -p( |$)' 2>/dev/null)"; then
+# — so it would warn about a healthy session every sweep. Claude pipeline agents
+# have `-p` first; Codex pipeline agents have `exec` first.
+if ORPHANS="$(pgrep -af '(^|/)(claude -p|codex exec)( |$)' 2>/dev/null)"; then
   ORPHAN_N=0
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
@@ -418,7 +418,7 @@ if ORPHANS="$(pgrep -af '(^|/)claude -p( |$)' 2>/dev/null)"; then
   # Only meaningful when no pipeline session is live to own them: with a run in
   # flight, every one of these is simply its current phase.
   if (( ORPHAN_N > 0 )) && [[ -z "$LIVE_EPICS" ]]; then
-    warn "$ORPHAN_N agent process(es) are running with no live pipeline session — likely orphaned by a killed run. Inspect with: pgrep -af 'claude .*-p'"
+    warn "$ORPHAN_N agent process(es) are running with no live pipeline session — likely orphaned by a killed run. Inspect with: pgrep -af '(^|/)(claude -p|codex exec)( |$)'"
   fi
 fi
 

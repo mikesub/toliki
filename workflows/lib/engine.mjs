@@ -1,11 +1,11 @@
 // The engine adapter: the one place that knows how a coding-agent CLI is
 // invoked. Every pipeline step is a short-lived process spawned through here,
 // so the pipeline itself never names a vendor — swapping or mixing engines is
-// a registry entry plus a per-stage `{engine, model}` tuple, not a rewrite.
+// a registry entry plus a per-stage `{engine, tier}` tuple, not a rewrite.
 //
 // The contract every adapter implements:
 //
-//   run({ prompt, agentType, model, effort, schema, cwd, timeoutMs, label })
+//   run({ prompt, agentType, tier, effort, schema, cwd, timeoutMs, label })
 //     -> { ok, output, exitCode, timedOut, reason, stderrTail }
 //
 //   ok === true  ⇔  the process exited 0 AND a payload was extracted
@@ -21,8 +21,9 @@
 // them, which is why runtime.mjs forwards signals through terminateAll().
 
 import { spawn } from 'node:child_process'
-import { readFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
+import { tmpdir } from 'node:os'
 import path from 'node:path'
 
 export const HARNESS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..')
@@ -79,6 +80,60 @@ function jsonFromText(text) {
   } catch { return null }
 }
 
+// Codex uses strict Structured Outputs, where every object property must be in
+// `required`. Toliki's engine contract deliberately has optional fields (for
+// example Prepare.refused). Make those fields required-but-nullable only for
+// the Codex CLI boundary, then remove the synthetic nulls before the shared
+// validator sees the original schema again.
+function codexOutputSchema(schema) {
+  if (Array.isArray(schema)) return schema.map(codexOutputSchema)
+  if (!schema || typeof schema !== 'object') return schema
+  const out = {}
+  for (const [key, value] of Object.entries(schema)) {
+    if (key !== 'properties' && key !== 'required') out[key] = codexOutputSchema(value)
+  }
+  if (schema.properties && typeof schema.properties === 'object') {
+    const originallyRequired = new Set(schema.required || [])
+    out.properties = {}
+    for (const [key, value] of Object.entries(schema.properties)) {
+      let property = codexOutputSchema(value)
+      if (!originallyRequired.has(key)) {
+        if (typeof property.type === 'string') property = { ...property, type: [property.type, 'null'] }
+        else if (Array.isArray(property.type) && !property.type.includes('null')) property = { ...property, type: [...property.type, 'null'] }
+        else property = { anyOf: [property, { type: 'null' }] }
+      }
+      out.properties[key] = property
+    }
+    out.required = Object.keys(schema.properties)
+  } else if (schema.required) {
+    out.required = [...schema.required]
+  }
+  return out
+}
+
+function stripCodexOptionalNulls(value, schema) {
+  if (Array.isArray(value)) {
+    return value.map(item => stripCodexOptionalNulls(item, schema?.items))
+  }
+  if (!value || typeof value !== 'object' || !schema?.properties) return value
+  const required = new Set(schema.required || [])
+  const out = {}
+  for (const [key, item] of Object.entries(value)) {
+    const known = Object.hasOwn(schema.properties, key)
+    if (item === null && known && !required.has(key) && !schemaAllowsNull(schema.properties[key])) continue
+    out[key] = stripCodexOptionalNulls(item, schema.properties[key])
+  }
+  return out
+}
+
+function schemaAllowsNull(schema) {
+  if (!schema || typeof schema !== 'object') return false
+  if (schema.type === 'null') return true
+  if (Array.isArray(schema.type) && schema.type.includes('null')) return true
+  if (schema.const === null || (Array.isArray(schema.enum) && schema.enum.includes(null))) return true
+  return ['anyOf', 'oneOf'].some(key => Array.isArray(schema[key]) && schema[key].some(schemaAllowsNull))
+}
+
 // Run one process to completion. Resolves a result record; never rejects.
 function execute({ bin, args, prompt, cwd, timeoutMs, onStart }) {
   return new Promise((resolve) => {
@@ -105,7 +160,9 @@ function execute({ bin, args, prompt, cwd, timeoutMs, onStart }) {
     }, timeoutMs)
 
     child.stdout.on('data', (d) => { stdout += d })
-    child.stderr.on('data', (d) => { stderr += d })
+    // Progress streams can be very chatty on a long run. Only the tail is ever
+    // reported, so bound it here rather than retaining hours of diagnostics.
+    child.stderr.on('data', (d) => { stderr = (stderr + d).slice(-64 * 1024) })
 
     const finish = (code, spawnError) => {
       if (settled) return
@@ -144,6 +201,44 @@ function execute({ bin, args, prompt, cwd, timeoutMs, onStart }) {
 const AGENTS_DIR = new URL('../../agents/', import.meta.url)
 const charterCache = new Map()
 
+const CLAUDE_TIERS = {
+  default: {},
+  mechanical: { model: 'sonnet' },
+  design: { model: 'fable' },
+  adjudicate: { model: 'fable' },
+}
+
+// These are the models exposed by the authenticated Codex CLI catalog on the
+// provisioned host. Environment overrides let an operator move a tier after a
+// deliberate eval without teaching the engine-neutral pipelines model names.
+const CODEX_TIERS = {
+  default: {
+    model: process.env.CODEX_MODEL_DEFAULT || 'gpt-5.6-terra',
+    effort: process.env.CODEX_EFFORT_DEFAULT || 'medium',
+  },
+  mechanical: {
+    model: process.env.CODEX_MODEL_MECHANICAL || 'gpt-5.6-luna',
+    effort: process.env.CODEX_EFFORT_MECHANICAL || 'low',
+  },
+  design: {
+    model: process.env.CODEX_MODEL_DESIGN || 'gpt-5.6-sol',
+    effort: process.env.CODEX_EFFORT_DESIGN || 'high',
+  },
+  adjudicate: {
+    model: process.env.CODEX_MODEL_ADJUDICATE || 'gpt-5.6-sol',
+    effort: process.env.CODEX_EFFORT_ADJUDICATE || 'high',
+  },
+}
+
+function resolveTier(engineName, table, tier, effort) {
+  const key = tier || 'default'
+  const selected = table[key]
+  if (!selected) {
+    throw new Error(`unknown ${engineName} tier '${key}' (known: ${Object.keys(table).join(', ')})`)
+  }
+  return { ...selected, effort: effort || selected.effort }
+}
+
 function loadCharter(agentType) {
   if (charterCache.has(agentType)) return charterCache.get(agentType)
   const file = new URL(`${agentType}.md`, AGENTS_DIR)
@@ -166,11 +261,52 @@ function loadCharter(agentType) {
   return charter
 }
 
+// Claude Code loads a target repo's CLAUDE.md and .claude/rules itself. Codex
+// discovers AGENTS.md instead, so relying on its native discovery would give
+// the two engines different project constitutions. Read the existing Claude
+// contract explicitly for Codex; missing/unreadable instructions fail closed.
+function loadProjectInstructions(cwd) {
+  const constitution = path.join(cwd, 'CLAUDE.md')
+  let body
+  try {
+    body = readFileSync(constitution, 'utf8').trim()
+  } catch (e) {
+    throw new Error(`Codex project constitution could not be read at ${constitution}: ${e.message}`)
+  }
+  if (!body) throw new Error(`Codex project constitution is empty at ${constitution}`)
+
+  const ruleRoot = path.join(cwd, '.claude', 'rules')
+  const rules = []
+  const visit = (dir) => {
+    let entries
+    try {
+      entries = readdirSync(dir, { withFileTypes: true })
+    } catch (e) {
+      if (e.code === 'ENOENT' && dir === ruleRoot) return
+      throw new Error(`Codex project rules could not be read at ${dir}: ${e.message}`)
+    }
+    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+      const file = path.join(dir, entry.name)
+      if (entry.isDirectory()) visit(file)
+      else if (entry.isFile() && entry.name.endsWith('.md')) {
+        rules.push({ file: path.relative(cwd, file), body: readFileSync(file, 'utf8').trim() })
+      }
+    }
+  }
+  visit(ruleRoot)
+
+  return [
+    `<project-constitution source="CLAUDE.md">\n${body}\n</project-constitution>`,
+    ...rules.map(rule => `<project-rule source="${rule.file}">\n${rule.body}\n</project-rule>`),
+  ].join('\n\n')
+}
+
 const claudeEngine = {
   name: 'claude',
   bin: process.env.CLAUDE_BIN || 'claude',
 
-  buildArgs({ agentType, model, effort, schema }) {
+  buildArgs({ agentType, tier, effort, schema }) {
+    const selected = resolveTier(this.name, CLAUDE_TIERS, tier, effort)
     const args = ['-p', '--output-format', 'json', '--dangerously-skip-permissions']
     // Charter + tool restrictions, applied as a system prompt plus an explicit
     // tool list rather than with `--agent <name>`.
@@ -201,14 +337,14 @@ const claudeEngine = {
     }
     // No --model = the CLI's configured default. That is the port of the old
     // workflow's "stages not listed in the tier table inherit the session model".
-    if (model) args.push('--model', model)
-    if (effort) args.push('--effort', effort)
+    if (selected.model) args.push('--model', selected.model)
+    if (selected.effort) args.push('--effort', selected.effort)
     if (schema) args.push('--json-schema', JSON.stringify(schema))
     return args
   },
 
-  async run({ prompt, agentType, model, effort, schema, cwd, timeoutMs, onStart }) {
-    const args = this.buildArgs({ agentType, model, effort, schema })
+  async run({ prompt, agentType, tier, effort, schema, cwd, timeoutMs, onStart }) {
+    const args = this.buildArgs({ agentType, tier, effort, schema })
     const r = await execute({ bin: this.bin, args, prompt, cwd, timeoutMs, onStart })
     const stderrTail = String(r.stderr || '').trim().slice(-2000)
 
@@ -253,10 +389,105 @@ const claudeEngine = {
   },
 }
 
-const ENGINES = { claude: claudeEngine }
+// ───────────────────────── codex ─────────────────────────
+// `codex exec` writes its final answer to --output-last-message while progress
+// stays out of the payload. When --output-schema is present, that file is the
+// schema-validated JSON object. A fresh temp directory per process prevents
+// concurrent review lenses from racing on either artifact.
+//
+// The CLI has no Claude-style per-run tool allow-list. The charter body is
+// therefore injected as developer instructions, and the tool boundary is
+// enforced by the Codex sandbox: charters without Edit/Write are read-only;
+// mutating phases retain the existing autonomous pipeline's full authority.
+const codexEngine = {
+  name: 'codex',
+  bin: process.env.CODEX_BIN || 'codex',
+
+  buildArgs({ charter, developerInstructions, tier, effort, schemaFile, outputFile, cwd }) {
+    const selected = resolveTier(this.name, CODEX_TIERS, tier, effort)
+    // Derive write authority from the charter itself. A new charter therefore
+    // starts read-only unless it explicitly names Edit or Write.
+    const sandbox = charter?.tools.some(tool => tool === 'Edit' || tool === 'Write')
+      ? 'danger-full-access'
+      : 'read-only'
+    const args = [
+      'exec', '--ephemeral', '--ignore-user-config', '--color', 'never',
+      '--disable', 'multi_agent', '--disable', 'enable_fanout',
+      '--sandbox', sandbox,
+      '-c', 'approval_policy="never"',
+      '-c', `developer_instructions=${JSON.stringify(developerInstructions)}`,
+      '-C', cwd,
+      '--model', selected.model,
+      '-c', `model_reasoning_effort="${selected.effort}"`,
+      '--output-last-message', outputFile,
+    ]
+    if (schemaFile) args.push('--output-schema', schemaFile)
+    args.push('-')
+    return args
+  },
+
+  async run({ prompt, agentType, tier, effort, schema, cwd, timeoutMs, onStart }) {
+    const work = mkdtempSync(path.join(tmpdir(), 'toliki-codex-'))
+    const outputFile = path.join(work, 'final.txt')
+    const schemaFile = schema ? path.join(work, 'schema.json') : null
+    try {
+      if (schemaFile) writeFileSync(schemaFile, JSON.stringify(codexOutputSchema(schema)))
+      const charter = agentType ? loadCharter(agentType) : null
+      const projectInstructions = loadProjectInstructions(cwd)
+      const developerInstructions = [charter?.body, projectInstructions].filter(Boolean).join('\n\n')
+      const args = this.buildArgs({ charter, developerInstructions, tier, effort, schemaFile, outputFile, cwd })
+      const r = await execute({ bin: this.bin, args, prompt, cwd, timeoutMs, onStart })
+      const stderrTail = String(r.stderr || '').trim().slice(-2000)
+
+      if (r.spawnError) {
+        const enoent = r.spawnError.code === 'ENOENT'
+        return {
+          ok: false, output: null, exitCode: null, timedOut: false, stderrTail,
+          reason: enoent
+            ? `'${this.bin}' not found on PATH — a cron-launched pane inherits the PATH set in etc/dispatch.cron, which must include the directory holding it`
+            : `could not spawn '${this.bin}': ${r.spawnError.message}`,
+        }
+      }
+      if (r.timedOut) {
+        return { ok: false, output: null, exitCode: r.code, timedOut: true, stderrTail, reason: `timed out after ${Math.round(timeoutMs / 60000)} min (process group killed)` }
+      }
+      if (r.code !== 0) {
+        return { ok: false, output: null, exitCode: r.code, timedOut: false, stderrTail, reason: `exited ${r.code}${stderrTail ? `: ${stderrTail.split('\n').pop()}` : ''}` }
+      }
+
+      let finalText
+      try {
+        finalText = readFileSync(outputFile, 'utf8')
+      } catch (e) {
+        return { ok: false, output: null, exitCode: 0, timedOut: false, stderrTail, reason: `final output file was not written: ${e.message}` }
+      }
+      if (schema) {
+        const structured = jsonFromText(finalText)
+        if (!structured) {
+          return { ok: false, output: null, exitCode: 0, timedOut: false, stderrTail, reason: 'final output was not the expected schema JSON' }
+        }
+        return { ok: true, output: stripCodexOptionalNulls(structured, schema), exitCode: 0, timedOut: false, stderrTail, reason: null }
+      }
+      return { ok: true, output: finalText.trim(), exitCode: 0, timedOut: false, stderrTail, reason: null }
+    } catch (e) {
+      return {
+        ok: false, output: null, exitCode: null, timedOut: false, stderrTail: '',
+        reason: `Codex adapter setup failed: ${e.message}`,
+      }
+    } finally {
+      rmSync(work, { recursive: true, force: true })
+    }
+  },
+}
+
+const ENGINES = { claude: claudeEngine, codex: codexEngine }
+
+export function engineNames() {
+  return Object.keys(ENGINES)
+}
 
 export function resolveEngine(name = 'claude') {
   const engine = ENGINES[name]
-  if (!engine) throw new Error(`unknown engine '${name}' (known: ${Object.keys(ENGINES).join(', ')})`)
+  if (!engine) throw new Error(`unknown engine '${name}' (known: ${engineNames().join(', ')})`)
   return engine
 }

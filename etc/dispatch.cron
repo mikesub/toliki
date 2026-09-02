@@ -46,10 +46,10 @@
 # keeps the repo list out of this file: it fans one worker out per repo in
 # etc/repos.conf.
 #
-# cron hands a job PATH=/usr/bin:/bin and nothing else, which has neither
-# claude (~/.local/bin, see provision.sh) nor node's global bins. This line has
-# to carry BOTH: node is the pane's own process (the pipeline orchestrator) and
-# claude is every agent it spawns, resolved through the same inherited PATH.
+# cron hands a job PATH=/usr/bin:/bin and nothing else, which has neither agent
+# CLI (~/.local/bin, see provision.sh) nor node's global bins. This line has to
+# carry all three: node is the pane's orchestrator, and claude/codex are the
+# short-lived phase processes selected by the issue's routing label.
 # Without it the session launches, the pane can't find its command, and it
 # shows up as `dead (at bash prompt)` in `./remote-control.sh ls` — the same
 # symptom as the workspace-trust trap, from a completely different cause.

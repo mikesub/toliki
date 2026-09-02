@@ -19,7 +19,7 @@ from memory.
   requirement the run is judged against; nobody answers follow-up questions at
   3 a.m., so a spec that needs clarification is a spec that fails.
 - **The pipeline outlives its engine.** Every phase is a process behind one
-  adapter, so which vendor's CLI runs a phase is a per-stage value, not an
+  adapter, so which vendor's CLI runs an epic is a routing value, not an
   architecture. That is worth the orchestration we now own outright (a
   concurrency gate, timeouts, signal forwarding — a few hundred lines, under
   test): the alternative was writing the pipeline twice, once per vendor, and
@@ -38,7 +38,8 @@ from memory.
   there is no parallelism to be had.
 - **Crons watch, models act.** Dispatch, reap and merge ticks are plain shell
   reading labels; the first model to run is the epic that got launched.
-- **State is GitHub.** Issues, labels, `blocked_by` edges, claim refs, PRs.
+- **State is GitHub.** Issues, lifecycle and engine-routing labels,
+  `blocked_by` edges, claim refs, PRs.
   Workers are disposable: kill any run at any moment, re-run without cleanup.
 - **One contract per project.** A package is a directory whose `package.json`
   declares `scripts.verify`; everything the project wants gated goes inside

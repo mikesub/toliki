@@ -6,9 +6,8 @@ autonomous "epic" per issue to an open green PR, and a serial merge worker
 rebases, re-verifies and lands them. You write specs; the box does the rest.
 
 The pipeline is a plain Node script that spawns one headless agent process per
-phase behind a small engine adapter, so which coding agent runs a phase is a
-per-stage setting rather than an architecture. Today that adapter is Claude
-Code's `claude -p`.
+phase behind a small engine adapter. Claude Code and Codex are both supported;
+one engine is selected for an epic and retained through its fixer retries.
 
 ## The loop
 
@@ -43,7 +42,7 @@ refs are the entire state store.
 
 - An Ubuntu VPS you can ssh into.
 - `gh` authenticated on the VPS; a Claude Code subscription for today's
-  pipeline, plus a ChatGPT account for the staged Codex CLI installation.
+  pipeline, plus a ChatGPT account for Codex pipeline runs.
 - Projects that define verification as a contract: a *package* is any
   directory whose `package.json` declares `scripts.verify`, and that script is
   the gate an epic must turn green.
@@ -63,11 +62,12 @@ bin/provision.sh                            # idempotent; repeats until green
 
 `provision.sh` installs everything else and prints an exact checklist of the
 few interactive steps it cannot do for you (logins, per-clone workspace
-trust, the bypass-permissions consent). It installs Codex and refuses a green
-summary until you authenticate it for manual use on the VM, but the autonomous
-pipelines still use only Claude Code; no workflow selects Codex yet. Turning
-the box autonomous is a deliberate last step: install the cron file per the
-comment at the top of `etc/dispatch.cron`.
+trust, the bypass-permissions consent). It installs and authenticates both
+agent CLIs. Route the next unassigned epic with
+`./remote-control.sh next codex` or `./remote-control.sh next claude`; add
+`-r <repo>` to restrict selection. Unlabeled issues default to Claude.
+Turning the box autonomous is a deliberate last step: install the cron file
+per the comment at the top of `etc/dispatch.cron`.
 
 On the laptop:
 

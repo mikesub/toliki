@@ -42,6 +42,8 @@ warn() { echo "$(ts) [dispatch] $*" >&2; }
 usage() {
   cat <<EOF
 Usage: $0 [-r <repo>] [-n|--dry-run]
+       $0 --route-next <claude|codex> [-r <repo>]
+       $0 --route-issue <N> <claude|codex> -r <repo>
 
 One dispatch tick. First walks the \`needs-judgment\` queue (judgment-class
 rebase conflicts the merge worker declined) and launches at most one fixer
@@ -55,11 +57,22 @@ until the host hits MAX_PARALLEL_EPICS ($MAX_PARALLEL_EPICS).
   -n, --dry-run       Report what it would launch; start nothing. Capacity is
                       not simulated (launch.sh owns it, and asking costs a
                       launch), so this can list more than a tick would start.
+  --route-next <name> Assign the first unrouted, unblocked ready issue to this
+                      engine. Uses the same lock, queue order, and strong reads
+                      as dispatch, but does not probe capacity or launch work.
+  --route-issue <N> <name>
+                      Persist an explicit manual epic/fix engine choice on one
+                      issue. Requires -r; labels only and launches nothing.
 EOF
 }
 
 ONLY_REPO=""
 DRY_RUN=0
+ROUTE_NEXT=""
+HAVE_ROUTE_NEXT=0
+ROUTE_ISSUE=""
+ROUTE_ISSUE_ENGINE=""
+HAVE_ROUTE_ISSUE=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
@@ -71,12 +84,54 @@ while [[ $# -gt 0 ]]; do
       fi
       ONLY_REPO="$2"; shift 2 ;;
     -r=*|--repo=*) ONLY_REPO="${1#*=}"; shift ;;
+    --route-next)
+      if [[ $# -lt 2 ]]; then
+        warn "$1 requires a value"
+        exit 1
+      fi
+      HAVE_ROUTE_NEXT=1
+      ROUTE_NEXT="$2"; shift 2 ;;
+    --route-next=*) HAVE_ROUTE_NEXT=1; ROUTE_NEXT="${1#*=}"; shift ;;
+    --route-issue)
+      if [[ $# -lt 3 ]]; then
+        warn "$1 requires an issue number and engine"
+        exit 1
+      fi
+      HAVE_ROUTE_ISSUE=1
+      ROUTE_ISSUE="${2#\#}"
+      ROUTE_ISSUE_ENGINE="$3"
+      shift 3 ;;
     *)
       warn "unknown argument '$1'"
       usage >&2
       exit 1 ;;
   esac
 done
+
+if (( HAVE_ROUTE_NEXT )); then
+  case "$ROUTE_NEXT" in
+    claude|codex) ;;
+    *) warn "--route-next must be claude or codex, got '$ROUTE_NEXT'"; exit 1 ;;
+  esac
+  if (( DRY_RUN )); then
+    warn "--route-next cannot be combined with --dry-run"
+    exit 1
+  fi
+fi
+if (( HAVE_ROUTE_ISSUE )); then
+  if (( HAVE_ROUTE_NEXT || DRY_RUN )); then
+    warn "--route-issue cannot be combined with --route-next/--dry-run"
+    exit 1
+  fi
+  if [[ ! "$ROUTE_ISSUE" =~ ^[0-9]+$ || ( "$ROUTE_ISSUE_ENGINE" != "claude" && "$ROUTE_ISSUE_ENGINE" != "codex" ) ]]; then
+    warn "--route-issue requires a numeric issue and engine claude|codex"
+    exit 1
+  fi
+  if [[ -z "$ONLY_REPO" ]]; then
+    warn "--route-issue requires --repo because issue numbers are per repository"
+    exit 1
+  fi
+fi
 
 if [[ -n "$ONLY_REPO" ]] && ! repo_path "$ONLY_REPO" >/dev/null; then
   warn "unknown repo '$ONLY_REPO' (known: $(repo_names | tr '\n' ' '))"
@@ -100,12 +155,100 @@ fi
 # open.
 exec 9>"${TMPDIR:-/tmp}/harness-dispatch.lock"
 if ! flock -n 9; then
+  if (( HAVE_ROUTE_NEXT || HAVE_ROUTE_ISSUE )); then
+    warn "dispatch lock is busy — routing was not changed"
+    exit 1
+  fi
   say "previous tick still running — skipping"
   exit 0
 fi
 
 LAUNCHED=0
 FAILED=0
+
+# Strong-read an issue and resolve its routing label. No engine label means
+# Claude for backward compatibility. Any unknown or conflicting engine label
+# is an error: silently guessing here would send work to the wrong vendor.
+ISSUE_STATE=""
+ISSUE_LABELS=""
+ISSUE_LABEL_LIST=""
+ISSUE_ENGINE=""
+ISSUE_ENGINE_EXPLICIT=0
+read_issue_engine() {
+  local path="$1" n="$2" meta label count=0
+  if ! meta="$(cd "$path" && gh issue view "$n" --json state,labels \
+      --jq '.state, .labels[].name' 2>/dev/null)"; then
+    return 1
+  fi
+  ISSUE_STATE="${meta%%$'\n'*}"
+  if [[ "$meta" == *$'\n'* ]]; then
+    ISSUE_LABEL_LIST="${meta#*$'\n'}"
+  else
+    ISSUE_LABEL_LIST=""
+  fi
+  ISSUE_LABELS="${ISSUE_LABEL_LIST//$'\n'/,}"
+  ISSUE_ENGINE="claude"
+  ISSUE_ENGINE_EXPLICIT=0
+  while IFS= read -r label; do
+    case "$label" in
+      engine:claude|engine:codex)
+        ISSUE_ENGINE="${label#engine:}"
+        ISSUE_ENGINE_EXPLICIT=1
+        count=$((count + 1)) ;;
+      engine:*) return 2 ;;
+    esac
+  done <<<"$ISSUE_LABEL_LIST"
+  (( count <= 1 )) || return 2
+  return 0
+}
+
+has_issue_label() {
+  local wanted="$1" label
+  while IFS= read -r label; do
+    [[ "$label" == "$wanted" ]] && return 0
+  done <<<"$ISSUE_LABEL_LIST"
+  return 1
+}
+
+issue_is_ready() {
+  [[ "$ISSUE_STATE" == "OPEN" ]] && has_issue_label ready \
+    && ! has_issue_label in-progress \
+    && ! has_issue_label failed \
+    && ! has_issue_label ready-to-merge \
+    && ! has_issue_label ready-to-review
+}
+
+write_issue_engine() {
+  local path="$1" n="$2" engine="$3" other="" args
+  if (( ISSUE_ENGINE_EXPLICIT )) && [[ "$ISSUE_ENGINE" != "$engine" ]]; then
+    other="$ISSUE_ENGINE"
+  fi
+  (cd "$path" && gh label create "engine:$engine" --color 5319E7 \
+    --description "Route autonomous pipeline runs to $engine" >/dev/null 2>&1) || true
+  args=(issue edit "$n" --add-label "engine:$engine")
+  [[ -z "$other" ]] || args+=(--remove-label "engine:$other")
+  if ! (cd "$path" && gh "${args[@]}" >/dev/null 2>&1); then return 1; fi
+  read_issue_engine "$path" "$n" \
+    && [[ "$ISSUE_STATE" == "OPEN" && "$ISSUE_ENGINE" == "$engine" && $ISSUE_ENGINE_EXPLICIT -eq 1 ]]
+}
+
+if (( HAVE_ROUTE_ISSUE )); then
+  route_path="$(repo_path "$ONLY_REPO")"
+  if tmux has-session -t "=$ONLY_REPO-epic-$ROUTE_ISSUE" 2>/dev/null; then
+    warn "#$ROUTE_ISSUE ($ONLY_REPO): pipeline session already exists — refusing to change its durable engine"
+    exit 1
+  fi
+  if ! read_issue_engine "$route_path" "$ROUTE_ISSUE" || [[ "$ISSUE_STATE" != "OPEN" ]]; then
+    warn "#$ROUTE_ISSUE ($ONLY_REPO): issue or engine routing is unreadable/invalid — not changing it"
+    exit 1
+  fi
+  if ! write_issue_engine "$route_path" "$ROUTE_ISSUE" "$ROUTE_ISSUE_ENGINE"; then
+    warn "#$ROUTE_ISSUE ($ONLY_REPO): could not persist and verify engine:$ROUTE_ISSUE_ENGINE"
+    exit 1
+  fi
+  say "#$ROUTE_ISSUE ($ONLY_REPO): routed manual run to $ROUTE_ISSUE_ENGINE"
+  exit 0
+fi
 
 # ───────────────────────── Fixer walk ─────────────────────────
 # The `needs-judgment` queue: merge-worker.sh applies that label beside
@@ -129,7 +272,7 @@ fixer_queue() {
 # (--check-capacity runs the same capacity_gate as a real launch), so the cap
 # still lives in exactly one place. Not run for --dry-run, which is
 # documented as not simulating capacity.
-if (( ! DRY_RUN )); then
+if (( ! DRY_RUN && ! HAVE_ROUTE_NEXT )); then
   set +e
   "$LAUNCH" --check-capacity </dev/null 9>&-
   rc=$?
@@ -145,6 +288,7 @@ if (( ! DRY_RUN )); then
   esac
 fi
 
+if (( ! HAVE_ROUTE_NEXT )); then
 for repo in $(repo_names); do
   [[ -z "$ONLY_REPO" || "$repo" == "$ONLY_REPO" ]] || continue
   path="$(repo_path "$repo")"
@@ -180,8 +324,13 @@ for repo in $(repo_names); do
 
   for num in $fixers; do
     session="$repo-epic-$num"
+    if ! read_issue_engine "$path" "$num"; then
+      warn "  #$num ($repo): engine routing is unreadable, unknown, or conflicting — not launching"
+      FAILED=$((FAILED + 1))
+      continue
+    fi
     if (( DRY_RUN )); then
-      say "  #$num ($repo): would launch fixer '$session'"
+      say "  #$num ($repo): would launch fixer '$session' with $ISSUE_ENGINE"
       LAUNCHED=$((LAUNCHED + 1))
       break
     fi
@@ -212,21 +361,19 @@ for repo in $(repo_names); do
     # launch would strand an unreapable in-progress session on an issue that
     # is no longer the fixer's. Revert and move on — fail closed on a read
     # that errors, for the same reason.
-    meta="$( (cd "$path" && gh issue view "$num" --json state,labels \
-               --jq '[.state, ([.labels[].name] | join(","))] | join(" ")') 2>/dev/null )" || meta=""
-    read -r istate ilabels <<<"$meta"
-    if [[ "$istate" != "OPEN" || ",$ilabels," != *,needs-judgment,* || ",$ilabels," == *,fix-retried,* ]]; then
-      say "  #$num ($repo): issue changed under the queue (state ${istate:-unreadable}, labels ${ilabels:-none}) — reverting the swap, skipping"
+    if ! read_issue_engine "$path" "$num" \
+        || [[ "$ISSUE_STATE" != "OPEN" ]] || ! has_issue_label needs-judgment || has_issue_label fix-retried; then
+      say "  #$num ($repo): issue changed under the queue or its engine routing became invalid (state ${ISSUE_STATE:-unreadable}, labels ${ISSUE_LABELS:-none}) — reverting the swap, skipping"
       (cd "$path" && gh issue edit "$num" --add-label failed --remove-label in-progress >/dev/null 2>&1) \
         || warn "  #$num ($repo): the label revert failed too — issue may be stuck in-progress, fix by hand"
       continue
     fi
 
-    say "  #$num ($repo): launching fixer '$session'"
+    say "  #$num ($repo): launching fixer '$session' with $ISSUE_ENGINE"
     set +e
     # </dev/null: nothing in launch.sh should ever read the tick's stdin;
     # 9>&- as in the ready walk below.
-    "$LAUNCH" --fix "$num" --repo "$repo" </dev/null 9>&-
+    "$LAUNCH" --fix "$num" --repo "$repo" --engine "$ISSUE_ENGINE" </dev/null 9>&-
     rc=$?
     set -e
     if (( rc != 0 )); then
@@ -250,6 +397,7 @@ for repo in $(repo_names); do
     break   # at most one fixer per repo per tick
   done
 done
+fi
 
 # ───────────────────────── Ready walk ─────────────────────────
 # The `ready` queue for one repo, oldest first. gh runs inside the clone so it
@@ -276,7 +424,7 @@ unblocked() {
   if ! open="$(cd "$path" && gh api "repos/{owner}/{repo}/issues/$n/dependencies/blocked_by" \
                  --jq '[.[] | select(.state == "open") | .number] | join(",")' 2>&1)"; then
     warn "  #$n: blocked_by query failed, skipping — $open"
-    return 1
+    return 2
   fi
   if [[ -n "$open" ]]; then
     say "  #$n: blocked by $open"
@@ -293,12 +441,14 @@ for repo in $(repo_names); do
   path="$(repo_path "$repo")"
   if [[ ! -d "$path/.git" ]]; then
     warn "$repo: no checkout at $path — run bin/provision.sh"
+    (( ! HAVE_ROUTE_NEXT )) || exit 1
     continue
   fi
   # A repo whose queue can't be read is reported and passed over; the other
   # repos still get their tick.
   if ! nums="$(queue "$path" | tr '\n' ' ')"; then
     warn "$repo: queue query failed, skipping this repo"
+    (( ! HAVE_ROUTE_NEXT )) || exit 1
     continue
   fi
   nums="${nums% }"
@@ -311,7 +461,11 @@ done
 # Only when the fixer walk did nothing either — otherwise fall through so the
 # tail summary (which is dry-run aware) accounts for it.
 if [[ ${#QUEUE_REPO[@]} -eq 0 ]] && (( LAUNCHED == 0 && FAILED == 0 )); then
-  say "nothing ready"
+  if (( HAVE_ROUTE_NEXT )); then
+    say "no unrouted, unblocked ready issue found"
+  else
+    say "nothing ready"
+  fi
   exit 0
 fi
 
@@ -350,19 +504,53 @@ for entry in "${ORDER[@]}"; do
     continue
   fi
 
-  unblocked "$path" "$num" || continue
+  if unblocked "$path" "$num"; then
+    :
+  else
+    blocker_rc=$?
+    if (( HAVE_ROUTE_NEXT && blocker_rc == 2 )); then exit 1; fi
+    continue
+  fi
+
+  if ! read_issue_engine "$path" "$num"; then
+    warn "  #$num ($repo): engine routing is unreadable, unknown, or conflicting — not launching"
+    if (( HAVE_ROUTE_NEXT )); then exit 1; fi
+    FAILED=$((FAILED + 1))
+    continue
+  fi
+  if ! issue_is_ready; then
+    say "  #$num ($repo): issue changed under the queue (state ${ISSUE_STATE:-unreadable}, labels ${ISSUE_LABELS:-none}) — skipping"
+    continue
+  fi
+
+  if (( HAVE_ROUTE_NEXT )); then
+    if (( ISSUE_ENGINE_EXPLICIT )); then
+      say "  #$num ($repo): already routed to $ISSUE_ENGINE, skipping"
+      continue
+    fi
+    if ! write_issue_engine "$path" "$num" "$ROUTE_NEXT"; then
+      warn "  #$num ($repo): could not assign engine:$ROUTE_NEXT"
+      exit 1
+    fi
+    if ! issue_is_ready; then
+      warn "  #$num ($repo): routing write could not be verified or issue changed — refusing success"
+      exit 1
+    fi
+    say "  #$num ($repo): routed next epic to $ROUTE_NEXT"
+    exit 0
+  fi
 
   if (( DRY_RUN )); then
-    say "  #$num ($repo): would launch '$session'"
+    say "  #$num ($repo): would launch '$session' with $ISSUE_ENGINE"
     LAUNCHED=$((LAUNCHED + 1))
     continue
   fi
 
-  say "  #$num ($repo): launching '$session'"
+  say "  #$num ($repo): launching '$session' with $ISSUE_ENGINE"
   set +e
   # 9>&- so the tmux server this may start cannot inherit the tick lock; see
   # the flock comment above for what that costs when it leaks.
-  "$LAUNCH" --epic "$num" --repo "$repo" 9>&-
+  "$LAUNCH" --epic "$num" --repo "$repo" --engine "$ISSUE_ENGINE" 9>&-
   rc=$?
   set -e
   case "$rc" in
@@ -385,6 +573,11 @@ for entry in "${ORDER[@]}"; do
       FAILED=$((FAILED + 1)) ;;
   esac
 done
+
+if (( HAVE_ROUTE_NEXT )); then
+  say "no unrouted, unblocked ready issue found"
+  exit 0
+fi
 
 if (( DRY_RUN )); then
   say "dry run: $LAUNCHED would launch (capacity not simulated)"

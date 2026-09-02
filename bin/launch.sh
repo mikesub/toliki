@@ -27,8 +27,8 @@ source "$HERE/../etc/lib.sh"
 usage() {
   cat <<EOF
 Usage: $0 [session-name] [-m <message>] [-r <repo>] [--check-capacity|--check-idle]
-       $0 --epic <N> [-r <repo>]
-       $0 --fix <N>  [-r <repo>]
+       $0 --epic <N> [-r <repo>] [--engine <claude|codex>]
+       $0 --fix <N>  [-r <repo>] [--engine <claude|codex>]
 
 Creates a detached tmux session in the named repo (default: $DEFAULT_REPO).
 
@@ -36,6 +36,7 @@ Creates a detached tmux session in the named repo (default: $DEFAULT_REPO).
 this script creates its git worktree under \${EPIC_WORKTREE_ROOT:-\$HOME/.epic-worktrees},
 and the pane runs workflows/epic-run.mjs (or fix-run.mjs) there. They take no
 session name and no -m — both are derived from the issue number.
+--engine is pipeline-only and selects one engine for every phase (default: claude).
 
 Without them the session is an interactive claude. Name resolution when no name
 is given: with -m, the session is named after the message (slugified); otherwise
@@ -59,6 +60,8 @@ CHECK_IDLE=0
 REPO="$DEFAULT_REPO"
 MODE=""       # "" = interactive claude; "epic" or "fix" = a pipeline run
 ISSUE=""
+ENGINE="claude"
+HAVE_ENGINE=0
 
 POSITIONAL=()
 while [[ $# -gt 0 ]]; do
@@ -101,6 +104,20 @@ while [[ $# -gt 0 ]]; do
       CHECK_IDLE=1
       shift
       ;;
+    --engine)
+      if [[ $# -lt 2 ]]; then
+        echo "[launch] $1 requires a value" >&2
+        exit 1
+      fi
+      HAVE_ENGINE=1
+      ENGINE="$2"
+      shift 2
+      ;;
+    --engine=*)
+      HAVE_ENGINE=1
+      ENGINE="${1#*=}"
+      shift
+      ;;
     --epic|--fix|--epic=*|--fix=*)
       # One leading '#' is stripped so `--epic #42` and `--epic 42` agree.
       case "$1" in
@@ -141,6 +158,17 @@ if [[ ${#POSITIONAL[@]} -gt 1 ]]; then
   exit 1
 fi
 SESSION="${POSITIONAL[0]:-}"
+
+case "$ENGINE" in
+  claude|codex) ;;
+  *)
+    echo "[launch] --engine must be claude or codex, got '$ENGINE'" >&2
+    exit 1 ;;
+esac
+if [[ $HAVE_ENGINE -eq 1 && -z "$MODE" ]]; then
+  echo "[launch] --engine only applies to --epic/--fix pipeline runs" >&2
+  exit 1
+fi
 
 # A pipeline run owns its own naming: the session name IS the issue, because
 # every other part of the harness (dispatch's has-session checks, reap's sweep,
@@ -321,14 +349,20 @@ fi
 echo "[launch] creating session '$SESSION' in $CWD"
 tmux new-session -d -s "$SESSION" -c "$CWD"
 # Tag the session with its repo so `ls` can report it regardless of where the
-# pane's cwd later moves.
-tmux set-option -t "$SESSION" @repo "$REPO"
+# pane's cwd later moves. If either tag fails, remove the new idle session:
+# leaving an untagged pipeline alive makes operator output lie about routing.
+if ! tmux set-option -t "$SESSION" @repo "$REPO" || \
+   ! tmux set-option -t "$SESSION" @engine "$ENGINE"; then
+  tmux kill-session -t "$SESSION" 2>/dev/null || true
+  echo "[launch] could not tag session '$SESSION' — removed it before starting" >&2
+  exit 1
+fi
 
 if [[ -n "$MODE" ]]; then
   # The pipeline. --session is both the log prefix and the marker
   # bin/resource-log.sh counts epics by, so it is not decoration.
   SCRIPT="$HERE/../workflows/$([[ "$MODE" == epic ]] && echo epic-run.mjs || echo fix-run.mjs)"
-  LINE="node $(sq "$SCRIPT") --issue $ISSUE --session $(sq "$SESSION")"
+  LINE="node $(sq "$SCRIPT") --issue $ISSUE --session $(sq "$SESSION") --engine $(sq "$ENGINE")"
 else
   # An interactive session. The name is threaded through --remote-control and
   # --worktree so it's identifiable in the Desktop app and reusable across

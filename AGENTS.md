@@ -96,7 +96,7 @@ Preserve the two session types:
 4. Update `CLAUDE.md`, `DOCTRINE.md`, README, templates, or script comments when
    the operational contract or rationale changes. Do not leave a new invariant
    only in a commit message.
-5. Run every relevant suite; run all six before handing off a broad change.
+5. Run every relevant suite; run all eight before handing off a broad change.
 
 This repository uses trunk-based development. If the user asks for a commit or
 push, commit directly on `main` and push normally; do not create a feature
@@ -137,6 +137,10 @@ The suites cover:
 
 - `tests/epic-run.test.sh`: both pipelines through a stub engine, including
   model/charter/schema arguments and fail-closed paths.
+- `tests/engine-codex.test.sh`: Codex argv, tier mapping, sandbox/charter
+  boundaries, strict-schema normalization, cleanup, and failure paths.
+- `tests/dispatch-engine.test.sh`: next-epic selection, durable routing labels,
+  default/fixer inheritance, and unknown/conflicting-label refusal.
 - `tests/launch-epic.test.sh`: worktree/session launch shapes and capacity
   probes.
 - `tests/merge-autoresolve.test.sh`: conflict classification, containment, and
@@ -156,8 +160,8 @@ under `mktemp`; never point a test at the real registry or host.
 The user's tmux sessions and GitHub queues are live production state. Without
 an explicit request, never run or invoke:
 
-- `remote-control.sh start`, `epic`, `fix`, `stop`, `restart`, or `stop-all`;
-- `bin/dispatch.sh` except with `--dry-run`;
+- `remote-control.sh start`, `epic`, `fix`, `next`, `stop`, `restart`, or `stop-all`;
+- `bin/dispatch.sh` except with `--dry-run` (`--route-next` and `--route-issue` mutate labels);
 - `bin/reap.sh` except with `-n`;
 - `bin/update-claude.sh` except with `-n`;
 - `bin/merge-worker.sh` or `bin/merge-tick.sh` in any mode.
