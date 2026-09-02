@@ -76,6 +76,8 @@ gh repo clone mikesub/toliki && cd toliki
 
 ## Reading order
 
+- **`AGENTS.md`** — Codex's project-development instructions: source-of-truth
+  map, architecture boundaries, verification workflow, and live-host safety.
 - **`DOCTRINE.md`** — why this exists, the principles, and the alternatives
   that were considered and rejected, with reasons.
 - **`CLAUDE.md`** — how every piece actually works, including the operational
