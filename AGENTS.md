@@ -96,7 +96,7 @@ Preserve the two session types:
 4. Update `CLAUDE.md`, `DOCTRINE.md`, README, templates, or script comments when
    the operational contract or rationale changes. Do not leave a new invariant
    only in a commit message.
-5. Run every relevant suite; run all five before handing off a broad change.
+5. Run every relevant suite; run all six before handing off a broad change.
 
 This repository uses trunk-based development. If the user asks for a commit or
 push, commit directly on `main` and push normally; do not create a feature
@@ -143,6 +143,8 @@ The suites cover:
   real throwaway rebase stops.
 - `tests/reap-worktree.test.sh`: worktree collection and every deletion guard.
 - `tests/update-claude.test.sh`: idle-gated updater behavior.
+- `tests/provision-codex.test.sh`: Codex installation, PATH discovery, and the
+  headless authentication gate against fake binaries and throwaway homes.
 
 Never weaken or delete a test to make a change pass. Test the host-facing shell
 scripts using fake executables placed first on `PATH` and throwaway repositories

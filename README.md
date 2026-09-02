@@ -42,7 +42,8 @@ refs are the entire state store.
 ## What it expects
 
 - An Ubuntu VPS you can ssh into.
-- `gh` authenticated on the VPS; a Claude Code subscription.
+- `gh` authenticated on the VPS; a Claude Code subscription for today's
+  pipeline, plus a ChatGPT account for the staged Codex CLI installation.
 - Projects that define verification as a contract: a *package* is any
   directory whose `package.json` declares `scripts.verify`, and that script is
   the gate an epic must turn green.
@@ -62,9 +63,11 @@ bin/provision.sh                            # idempotent; repeats until green
 
 `provision.sh` installs everything else and prints an exact checklist of the
 few interactive steps it cannot do for you (logins, per-clone workspace
-trust, the bypass-permissions consent). Turning the box autonomous is a
-deliberate last step: install the cron file per the comment at the top of
-`etc/dispatch.cron`.
+trust, the bypass-permissions consent). It installs Codex and refuses a green
+summary until you authenticate it for manual use on the VM, but the autonomous
+pipelines still use only Claude Code; no workflow selects Codex yet. Turning
+the box autonomous is a deliberate last step: install the cron file per the
+comment at the top of `etc/dispatch.cron`.
 
 On the laptop:
 

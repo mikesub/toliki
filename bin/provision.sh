@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Idempotent rebuild of the VPS host: bare Ubuntu -> a box that can run
-# detached claude sessions. Runs ON the host, never over ssh from the laptop.
+# Idempotent rebuild of the VPS host: bare Ubuntu -> a box that runs detached
+# Claude sessions and has Codex ready for manual use. Runs ON the host, never
+# over ssh from the laptop.
 #
 # Bootstrap on a fresh box (the only hand-typed part):
 #
@@ -31,11 +32,11 @@ usage() {
   cat <<EOF
 Usage: $0 [-h]
 
-Provisions this Ubuntu host for the claude harness: system packages, node 24,
-gh, docker (+ build-cache GC), supabase CLI, Claude Code, clones of the control
-repo and every repo in etc/repos.conf, and the ~/.claude wiring (skills/agents
-symlinks, CLAUDE_HARNESS_DIR). Safe to re-run; reports state and exits non-zero
-while any manual step is outstanding.
+Provisions this Ubuntu host for the coding-agent harness: system packages,
+node 24, gh, docker (+ build-cache GC), supabase CLI, Claude Code, Codex CLI,
+clones of the control repo and every repo in etc/repos.conf, and the ~/.claude
+wiring (skills/agents symlinks, CLAUDE_HARNESS_DIR). Safe to re-run; reports
+state and exits non-zero while any manual step is outstanding.
 EOF
 }
 
@@ -67,6 +68,11 @@ note()    { printf '           %s\n' "$*"; }
 # First line of a version probe, or "?" — a probe that misbehaves must not take
 # the run down through `set -e` from inside a reporting string.
 ver() { local out; out="$("$@" 2>/dev/null | head -n1)" || out=""; printf '%s' "${out:-?}"; }
+
+# Codex is deliberately only a provisioned, authenticated CLI in this slice.
+# Keeping these two steps in a sourced helper makes them hermetically testable
+# without giving the monolithic host provisioner a test-only execution mode.
+source "$HERE/provision-codex.lib.sh"
 
 # ---------------------------------------------------------------- preflight --
 
@@ -390,6 +396,14 @@ if [[ -x "$HOME/.local/bin/claude" ]] && ! grep -q '\.local/bin' <<<"$PATH"; the
   warn "~/.local/bin is not on PATH; tmux sessions won't find claude (Ubuntu's ~/.profile adds it — check it exists)"
 fi
 
+# ---------------------------------------------------------- OpenAI Codex CLI --
+
+# Standalone installer is the official Linux path. Like every CLI here,
+# provisioning installs a missing binary but never upgrades one already present
+# under a fleet of live sessions. Codex is not a workflow engine yet: no launch,
+# cron, adapter or pipeline file reads it in this slice.
+provision_codex_cli
+
 # ------------------------------------------------------------- gh auth gate --
 
 say "gh authentication"
@@ -656,6 +670,10 @@ if [[ -s "$HOME/.claude/.credentials.json" ]] \
 else
   blocked "Claude Code looks logged out — run 'claude' and complete /login (interactive)"
 fi
+
+# Device-code login is the official headless-host flow. Unlike Claude's
+# file-presence heuristic, Codex exposes a read-only authoritative status probe.
+provision_codex_auth_gate
 
 say "workspace trust"
 # The one that bites. Trust is per-directory and interactive; it can't be done

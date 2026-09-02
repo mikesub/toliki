@@ -1,0 +1,52 @@
+# Sourced by bin/provision.sh. Kept separate so the install and authentication
+# gates can be exercised hermetically without running the host provisioner.
+
+provision_codex_cli() {
+  say "Codex CLI"
+
+  local had_local_bin=0
+  case ":$PATH:" in
+    *":$HOME/.local/bin:"*) had_local_bin=1 ;;
+  esac
+
+  if command -v codex >/dev/null 2>&1; then
+    ok "codex $(ver codex --version)"
+  elif [[ -x "$HOME/.local/bin/codex" ]]; then
+    # The binary exists, but this shell cannot see it. Do not run the installer
+    # as an accidental update: expose the existing install for this run and
+    # report the persistent PATH problem below.
+    export PATH="$HOME/.local/bin:$PATH"
+    hash -r
+    ok "codex $(ver codex --version)"
+  else
+    if curl -fsSL https://chatgpt.com/codex/install.sh | bash; then
+      export PATH="$HOME/.local/bin:$PATH"
+      hash -r
+      if command -v codex >/dev/null 2>&1; then
+        changed "installed codex $(ver codex --version)"
+      else
+        blocked "Codex install ran but the binary isn't on PATH — check ~/.local/bin"
+      fi
+    else
+      blocked "Codex install failed — re-run, or install it by hand from https://learn.chatgpt.com/docs/codex/cli"
+    fi
+  fi
+
+  # Codex Desktop starts the remote app server through the remote user's login
+  # shell. The export above fixes only this provision run; a missing persistent
+  # PATH would leave the installed CLI unusable over the SSH connection.
+  if [[ -x "$HOME/.local/bin/codex" && $had_local_bin -eq 0 ]]; then
+    warn "~/.local/bin is not on PATH; a fresh login shell may not find codex (Ubuntu's ~/.profile normally adds it — verify with: bash -lc 'command -v codex')"
+  fi
+}
+
+provision_codex_auth_gate() {
+  say "Codex login"
+  if ! command -v codex >/dev/null 2>&1; then
+    blocked "Codex authentication cannot be checked until the CLI is installed"
+  elif codex login status >/dev/null 2>&1; then
+    ok "Codex authenticated"
+  else
+    blocked "Codex is not authenticated — run interactively: codex login --device-auth   (open the printed link in a browser and enter the one-time code)"
+  fi
+}
