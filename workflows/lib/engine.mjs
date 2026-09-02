@@ -202,23 +202,25 @@ const AGENTS_DIR = new URL('../../agents/', import.meta.url)
 const charterCache = new Map()
 
 const CLAUDE_TIERS = {
-  default: {},
-  mechanical: { model: 'sonnet' },
-  design: { model: 'fable' },
-  adjudicate: { model: 'fable' },
+  default: { model: 'opus', effort: 'xhigh' },
+  mechanical: { model: 'sonnet', effort: 'xhigh' },
+  design: { model: 'fable', effort: 'xhigh' },
+  adjudicate: { model: 'fable', effort: 'xhigh' },
 }
 
-// These are the models exposed by the authenticated Codex CLI catalog on the
-// provisioned host. Environment overrides let an operator move a tier after a
-// deliberate eval without teaching the engine-neutral pipelines model names.
+// Every tier runs the strongest catalog model at high effort until an eval says
+// a cheaper tier is safe (decided 2026-09-02). The IDs were verified against the
+// authenticated Codex catalog on the host. Environment overrides let an operator
+// move a tier after a deliberate eval without teaching the engine-neutral
+// pipelines model names.
 const CODEX_TIERS = {
   default: {
-    model: process.env.CODEX_MODEL_DEFAULT || 'gpt-5.6-terra',
-    effort: process.env.CODEX_EFFORT_DEFAULT || 'medium',
+    model: process.env.CODEX_MODEL_DEFAULT || 'gpt-5.6-sol',
+    effort: process.env.CODEX_EFFORT_DEFAULT || 'high',
   },
   mechanical: {
-    model: process.env.CODEX_MODEL_MECHANICAL || 'gpt-5.6-luna',
-    effort: process.env.CODEX_EFFORT_MECHANICAL || 'low',
+    model: process.env.CODEX_MODEL_MECHANICAL || 'gpt-5.6-sol',
+    effort: process.env.CODEX_EFFORT_MECHANICAL || 'high',
   },
   design: {
     model: process.env.CODEX_MODEL_DESIGN || 'gpt-5.6-sol',
@@ -335,8 +337,8 @@ const claudeEngine = {
       // follow it here.
       if (tools.length) args.push('--tools', tools.join(','))
     }
-    // No --model = the CLI's configured default. That is the port of the old
-    // workflow's "stages not listed in the tier table inherit the session model".
+    // Every tier names a model and an effort explicitly: the default tier is no
+    // longer "whatever the CLI would pick", so two engines can be compared fairly.
     if (selected.model) args.push('--model', selected.model)
     if (selected.effort) args.push('--effort', selected.effort)
     if (schema) args.push('--json-schema', JSON.stringify(schema))

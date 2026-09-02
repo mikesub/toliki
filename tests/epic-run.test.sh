@@ -234,6 +234,8 @@ assert_not_contains "no stage uses --agent (it would void --json-schema)" "$ARGV
 assert_contains "prepare runs the mechanical tier" "$ARGV" "--model sonnet"
 assert_contains "prepare is chartered as coder (Write/Edit allowed)" "$ARGV" "Bash,Glob,Grep,Read,Edit,Write,"
 assert_contains "design runs the strong tier" "$ARGV" "--model fable"
+assert_contains "the default tier is pinned to opus" "$ARGV" "--model opus"
+assert_contains "every Claude phase runs at xhigh effort" "$ARGV" "--effort xhigh"
 assert_contains "architect and reviewer cannot write" "$ARGV" "--tools Glob,Grep,Read,"
 assert_contains "the reviewer charter reaches the model" "$ARGV" "Review code against project guidelines"
 assert_contains "schemas are enforced by the engine" "$ARGV" "--json-schema"
@@ -244,8 +246,9 @@ run_pipeline "$EPIC_RUN" "$BASE" --issue 42 --session myapp-epic-42 --engine cod
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_contains "RESULT says readyToMerge" "$RUN_OUT" '"readyToMerge":true'
 CODEX_ARGV="$(cat "$CODEX_LOG")"
-assert_contains "mechanical phases use Luna" "$CODEX_ARGV" "--model gpt-5.6-luna"
-assert_contains "strong phases use Sol" "$CODEX_ARGV" "--model gpt-5.6-sol"
+assert_contains "every phase runs at high effort" "$CODEX_ARGV" 'model_reasoning_effort="high"'
+assert_contains "every phase uses Sol" "$CODEX_ARGV" "--model gpt-5.6-sol"
+assert_not_contains "no phase falls to a cheaper Codex model" "$CODEX_ARGV" "gpt-5.6-luna"
 assert_contains "hidden Codex fan-out is disabled" "$CODEX_ARGV" "--disable multi_agent --disable enable_fanout"
 assert_contains "Codex runs are ephemeral" "$CODEX_ARGV" "--ephemeral"
 assert_eq "all five Codex review lenses ran" 5 "$(( $(calls lens-correctness) + $(calls lens-simplicity) + $(calls lens-seam) + $(calls lens-acceptance) + $(calls lens-security) ))"

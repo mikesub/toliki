@@ -96,8 +96,8 @@ assert_not_contains "the optional field does not leak" "$RUN_OUT" '"note":null'
 assert_contains "an originally nullable optional null survives" "$RUN_OUT" '"maybe":null'
 assert_contains "an unknown null survives for the shared validator to reject" "$RUN_OUT" '"extra":null'
 ARGS="$(cat "$TMP/args")"
-assert_contains "mechanical maps to Luna" "$ARGS" 'ARG:gpt-5.6-luna'
-assert_contains "mechanical effort is low" "$ARGS" 'ARG:model_reasoning_effort="low"'
+assert_contains "mechanical maps to Sol" "$ARGS" 'ARG:gpt-5.6-sol'
+assert_contains "mechanical effort is high" "$ARGS" 'ARG:model_reasoning_effort="high"'
 assert_contains "a write charter gets full sandbox authority" "$ARGS" 'ARG:danger-full-access'
 assert_contains "approval prompts are disabled" "$ARGS" 'ARG:approval_policy="never"'
 PHYSICAL_TMP="$(cd "$TMP" && pwd -P)"
@@ -125,8 +125,8 @@ assert_contains "schema-less final text is returned" "$RUN_OUT" '"output":"plain
 printf '\nCodex adapter: default tier\n'
 run_adapter reviewer '' 0 text
 ARGS="$(cat "$TMP/args")"
-assert_contains "default maps to Terra" "$ARGS" 'ARG:gpt-5.6-terra'
-assert_contains "default effort is medium" "$ARGS" 'ARG:model_reasoning_effort="medium"'
+assert_contains "default maps to Sol" "$ARGS" 'ARG:gpt-5.6-sol'
+assert_contains "default effort is high" "$ARGS" 'ARG:model_reasoning_effort="high"'
 
 printf '\nCodex adapter: fail-closed process and payload errors\n'
 run_adapter coder mechanical 1 nonzero
