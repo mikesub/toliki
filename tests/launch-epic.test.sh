@@ -34,13 +34,15 @@ mkdir -p "$TMP/bin"
 
 # tmux: records every invocation; `has-session` always fails (nothing running),
 # so launch.sh always takes the create path. list-sessions/list-panes answer
-# empty so the capacity count sees an idle box.
+# from STUB_SESSIONS / STUB_PANE_CMD — unset, the capacity count sees an idle
+# box.
 cat > "$TMP/bin/tmux" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$TMUX_LOG"
 case "${1:-}" in
   has-session) exit 1 ;;
-  list-sessions|list-panes) exit 0 ;;
+  list-sessions) [[ -n "${STUB_SESSIONS:-}" ]] && printf '%s\n' $STUB_SESSIONS; exit 0 ;;
+  list-panes) echo "${STUB_PANE_CMD:-}"; exit 0 ;;
 esac
 exit 0
 STUB
@@ -162,6 +164,20 @@ assert_contains "and says why" "$RUN_OUT" "derives its own session name"
 run_launch --epic not-a-number --repo testrepo
 assert_rc "a non-numeric issue exits 1" 1 "$RUN_RC"
 assert_contains "and says why" "$RUN_OUT" "takes an issue number"
+
+printf '\nlaunch --check-idle: the cap'"'"'s own count, against zero\n'
+run_launch --check-idle
+assert_rc "an empty host is idle (exit 0)" 0 "$RUN_RC"
+assert_contains "and says so" "$RUN_OUT" "idle"
+assert_not_contains "it starts nothing" "$(tmux_log)" "new-session"
+export STUB_SESSIONS="testrepo-epic-63" STUB_PANE_CMD="node"
+run_launch --check-idle
+assert_rc "a running pane is not idle (exit 3, same code as the cap)" 3 "$RUN_RC"
+assert_contains "and names the count" "$RUN_OUT" "1 session(s) running"
+export STUB_PANE_CMD="bash"
+run_launch --check-idle
+assert_rc "a dead pane at a shell prompt is idle" 0 "$RUN_RC"
+unset STUB_SESSIONS STUB_PANE_CMD
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

@@ -188,7 +188,8 @@ Return confirmation that the comment was posted and the label was swapped to fai
 }
 
 // ───────────────────────── Config ─────────────────────────
-// Same tiering rationale as epic-run.mjs. MECHANICAL runs the fully-scripted
+// Same tiering rationale as epic-run.mjs (including that these are CLI aliases,
+// resolved by the installed binary — see the note there). MECHANICAL runs the fully-scripted
 // stages. RESOLVE is the judgment core — the entire reason a model is in the
 // loop — and ADJUDICATE is the last gate before a rewritten merge ships to a
 // force-push, so both get the strong model.

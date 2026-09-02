@@ -305,6 +305,9 @@ Return confirmation that the comment was posted and the label was swapped to fai
 //
 // These are model names, not engines: every stage runs on the default engine (lib/engine.mjs) unless a
 // stage also passes `engine`. That is the seam a second vendor plugs into — per stage, not per pipeline.
+// They are also the CLI's ALIASES, resolved by the installed binary from a catalog bundled inside it —
+// `fable` meant claude-fable-5 up to CLI 2.1.256 and claude-fable-5-1 from 2.1.257 — so a stale CLI is a
+// stale tier table. bin/update-claude.sh keeps the host's binary current; nothing here has to change.
 const MECHANICAL = 'sonnet'
 const DESIGN = 'fable'
 const ADJUDICATE = 'fable'

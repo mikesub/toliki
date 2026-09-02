@@ -26,7 +26,7 @@ source "$HERE/../etc/lib.sh"
 
 usage() {
   cat <<EOF
-Usage: $0 [session-name] [-m <message>] [-r <repo>] [--check-capacity]
+Usage: $0 [session-name] [-m <message>] [-r <repo>] [--check-capacity|--check-idle]
        $0 --epic <N> [-r <repo>]
        $0 --fix <N>  [-r <repo>]
 
@@ -46,6 +46,8 @@ Refuses with exit 3 when $MAX_PARALLEL_EPICS sessions are already running.
 --check-capacity answers ONLY that last question (exit 0 below the cap, 3 at
 it) and starts nothing — dispatch.sh probes it before work it would otherwise
 have to undo, so the counting stays in this one script.
+--check-idle is the same count against zero (exit 0 with nothing running, 3
+otherwise) — bin/update-claude.sh asks it before moving the claude binary.
 EOF
 }
 
@@ -53,6 +55,7 @@ SESSION=""
 MESSAGE=""
 HAVE_MESSAGE=0
 CHECK_CAPACITY=0
+CHECK_IDLE=0
 REPO="$DEFAULT_REPO"
 MODE=""       # "" = interactive claude; "epic" or "fix" = a pipeline run
 ISSUE=""
@@ -92,6 +95,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --check-capacity)
       CHECK_CAPACITY=1
+      shift
+      ;;
+    --check-idle)
+      CHECK_IDLE=1
       shift
       ;;
     --epic|--fix|--epic=*|--fix=*)
@@ -198,6 +205,21 @@ capacity_gate() {
 # host costs zero label writes instead of a swap it must immediately revert.
 if [[ $CHECK_CAPACITY -eq 1 ]]; then
   capacity_gate
+  exit 0
+fi
+
+# --check-idle: the same count, against zero. update-claude.sh asks this
+# before swapping the claude binary — every phase of a run is a fresh claude
+# process, so a swap under a live run hands its later phases a different CLI
+# than its earlier ones — and asking here means the one function that counts
+# running sessions for the cap is also the one that decides "idle".
+if [[ $CHECK_IDLE -eq 1 ]]; then
+  RUNNING="$(running_count)"
+  if (( RUNNING > 0 )); then
+    echo "[launch] $RUNNING session(s) running — not idle" >&2
+    exit 3
+  fi
+  echo "[launch] idle"
   exit 0
 fi
 

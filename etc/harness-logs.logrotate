@@ -1,4 +1,4 @@
-# Rotation for the harness cron logs — the three appenders in etc/dispatch.cron.
+# Rotation for the harness cron logs — the appenders in etc/dispatch.cron.
 # bin/provision.sh installs this at /etc/logrotate.d/harness-logs; Ubuntu's
 # stock daily logrotate run picks it up from there, no timer of our own.
 #
@@ -25,7 +25,7 @@
 # a cron redirect, and bin/resource-report.sh parses it. Its cron line therefore
 # sends stdout/stderr to a SEPARATE resource-log.err — a stray warning landing in
 # the data file would make the report choke on a line that is not JSON. Both are
-# listed here so neither grows without bound. It is the biggest of the five
+# listed here so neither grows without bound. It is the biggest of the six
 # (~1 MB/day, one line a minute), which is still nothing against six rotations.
 #
 # One consequence of monthly rotation worth knowing before it surprises someone:
@@ -33,7 +33,7 @@
 # rotation sees a short window. It is not silent about it — the header prints the
 # sample count and the real first/last timestamps — but the answer is thinner
 # than it looks, so reach for the rotated file directly on those days.
-/home/ubuntu/dispatch.log /home/ubuntu/reap.log /home/ubuntu/merge.log /home/ubuntu/resource.log /home/ubuntu/resource-log.err {
+/home/ubuntu/dispatch.log /home/ubuntu/reap.log /home/ubuntu/merge.log /home/ubuntu/update.log /home/ubuntu/resource.log /home/ubuntu/resource-log.err {
 	monthly
 	rotate 6
 	compress

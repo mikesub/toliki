@@ -73,3 +73,17 @@ PATH=/home/ubuntu/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/
 # snapshot taken by hand after the fact. Read it back with bin/resource-report.sh
 # (default: last 24h); the sampler costs ~0.4s and appends one line per tick.
 * * * * * ubuntu /home/ubuntu/toliki/bin/resource-log.sh >> /home/ubuntu/resource-log.err 2>&1
+
+# Hygiene class too, like the sampler, and hourly rather than per-minute:
+# bin/update-claude.sh moves the claude binary to the latest release when — and
+# only when — nothing is running (launch.sh --check-idle, the cap's own count).
+# Nothing else keeps that binary current: a headless `claude -p` never
+# self-updates and provision.sh never upgrades a version already present, so
+# without this line the CLI every phase spawns quietly ages until someone
+# updates it by hand — and with it, the model aliases the pipelines' tier
+# tables are written in. It holds dispatch's lock for the length of the
+# install, so a tick landing in that window logs "previous tick still running"
+# and moves on. A busy hour is simply skipped; the queue drains to empty often
+# enough to catch up. Minute 37 is arbitrary — the lock, not the offset, keeps
+# it clear of dispatch.
+37 * * * * ubuntu /home/ubuntu/toliki/bin/update-claude.sh >> /home/ubuntu/update.log 2>&1
