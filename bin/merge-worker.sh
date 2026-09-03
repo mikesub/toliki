@@ -415,10 +415,19 @@ merge_one() {
 
   # The branch holds exactly one commit (ship squashed it; rebasing one commit
   # yields one), so --squash preserves its message and its `Closes #N`.
-  # No other flags, ever: --admin would merge past the gates this whole script
-  # exists to honour, and GitHub deletes the remote branch itself on merge.
+  #
+  # --match-head-commit pins the merge to the EXACT sha whose checks this run
+  # watched go green. Without it, the window between wait_for_ci returning and
+  # this call is a stale-green hole: anything that pushed to the branch in
+  # between — a fixer session, a human, a racing worker — would merge on the
+  # previous head's result, which is the one failure this script exists to
+  # prevent. GitHub refuses instead, and the next tick re-rebases and re-runs
+  # the checks on whatever the branch has become.
+  #
+  # Those are the only two flags, ever: --admin would merge past the gates this
+  # script exists to honour, and GitHub deletes the remote branch on merge.
   local merge_err merge_rc=0
-  merge_err="$(gh pr merge "$pr" -R "$ORIGIN" --squash 2>&1)" || merge_rc=$?
+  merge_err="$(gh pr merge "$pr" -R "$ORIGIN" --squash --match-head-commit "$rebased" 2>&1)" || merge_rc=$?
   if (( merge_rc != 0 )); then
     # A refusal is this PR's verdict; an outage is nobody's. Aborting leaves
     # the label on, so the next tick re-runs the whole merge — and if this call

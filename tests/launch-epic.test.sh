@@ -32,15 +32,36 @@ assert_no_file() { if [[ ! -e "$2" ]]; then ok "$1"; else nok "$1 (unexpectedly 
 # ───────────────────────── the fake host ─────────────────────────
 mkdir -p "$TMP/bin"
 
-# tmux: records every invocation; `has-session` always fails (nothing running),
-# so launch.sh always takes the create path. list-sessions/list-panes answer
-# from STUB_SESSIONS / STUB_PANE_CMD — unset, the capacity count sees an idle
-# box.
+# flock: the admission lock. Linux-only in production, so it is stubbed here
+# the way dispatch's suite stubs it — without it these runs would exercise the
+# no-flock fallback instead of the locked path the host actually takes.
+cat > "$TMP/bin/flock" <<'STUB'
+#!/usr/bin/env bash
+printf 'flock %s\n' "$*" >> "$TMUX_LOG"
+exit 0
+STUB
+chmod +x "$TMP/bin/flock"
+
+# tmux: records every invocation. has-session answers from STUB_LIVE_SESSIONS
+# (a space-separated list) so a scenario can put a session on the fake host and
+# check the EXACT-name matching; unset, nothing is running and launch.sh always
+# takes the create path. list-sessions/list-panes answer from STUB_SESSIONS /
+# STUB_PANE_CMD — unset, the capacity count sees an idle box.
 cat > "$TMP/bin/tmux" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$TMUX_LOG"
 case "${1:-}" in
-  has-session) exit 1 ;;
+  has-session)
+    # Mirrors tmux: "=name" is an exact match, a bare name matches prefixes.
+    want="${3:-}"
+    for s in ${STUB_LIVE_SESSIONS:-}; do
+      case "$want" in
+        "=$s") exit 0 ;;
+        =*)    : ;;
+        *)     [[ "$s" == "$want"* ]] && exit 0 ;;
+      esac
+    done
+    exit 1 ;;
   list-sessions) [[ -n "${STUB_SESSIONS:-}" ]] && printf '%s\n' $STUB_SESSIONS; exit 0 ;;
   list-panes) echo "${STUB_PANE_CMD:-}"; exit 0 ;;
 esac
@@ -127,6 +148,28 @@ run_launch --fix '#63' --repo testrepo
 assert_rc "exits 0 (and strips the leading #)" 0 "$RUN_RC"
 assert_contains "session is still <repo>-epic-<N>" "$(tmux_log)" "new-session -d -s testrepo-epic-63"
 assert_contains "the pane runs the fixer orchestrator" "$(tmux_log)" "workflows/fix-run.mjs' --issue 63"
+
+printf '\nlaunch: a longer-numbered live session is not this one\n'
+# A bare `-t` matches session-name PREFIXES, so epic-63 would read a live
+# epic-631 as itself, report "already running" and start nothing.
+STUB_LIVE_SESSIONS="testrepo-epic-631" run_launch --epic 63 --repo testrepo
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_contains "the session is still created" "$(tmux_log)" "new-session -d -s testrepo-epic-63"
+assert_contains "and the check was pinned to the exact name" "$(tmux_log)" "has-session -t =testrepo-epic-63"
+unset STUB_LIVE_SESSIONS
+
+printf '\nlaunch: an exactly-named live session is reported, never relaunched\n'
+STUB_LIVE_SESSIONS="testrepo-epic-63" run_launch --epic 63 --repo testrepo
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_contains "it says the session is already there" "$RUN_OUT" "already running"
+assert_not_contains "and creates nothing" "$(tmux_log)" "new-session"
+unset STUB_LIVE_SESSIONS
+
+printf '\nlaunch: counting and creating are one critical section\n'
+run_launch --epic 63 --repo testrepo
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_contains "the admission lock is taken before the count" "$(tmux_log)" "flock 8"
+assert_contains "and released once the session exists" "$(tmux_log)" "flock -u 8"
 
 printf '\nlaunch --ci: same session shape, CI fixer script\n'
 run_launch --ci '#63' --repo testrepo

@@ -530,7 +530,9 @@ for entry in "${ORDER[@]}"; do
   # check the next tick would re-dispatch it, and launch.sh would answer
   # "already running" — harmless, but it burns the tick on an issue that is
   # already being built instead of moving down the queue.
-  if tmux has-session -t "$session" 2>/dev/null; then
+  # "=" pins the match, as in the fixer walk above: a bare -t matches prefixes,
+  # so a live epic #263 would make this skip #26 as already running.
+  if tmux has-session -t "=$session" 2>/dev/null; then
     say "  #$num ($repo): session '$session' exists, skipping"
     continue
   fi

@@ -290,7 +290,11 @@ fi
 
 # An existing session is reported, never relaunched into (a derived or pool
 # name colliding with a live session must not clobber it).
-if tmux has-session -t "$SESSION" 2>/dev/null; then
+#
+# "=" pins the match to the exact name: a bare -t matches session-name
+# PREFIXES, so launching epic-26 while epic-263 is live would report "already
+# running" and start nothing at all.
+if tmux has-session -t "=$SESSION" 2>/dev/null; then
   current="$(tmux list-panes -t "$SESSION" -F '#{pane_current_command}' | head -n1)"
   case "$current" in
     bash|zsh|sh|dash)
@@ -310,6 +314,27 @@ fi
 # is the only version that can't be bypassed. It sits after the has-session
 # check on purpose: reporting on a session that already exists starts nothing,
 # so it must not be refused for capacity.
+#
+# Counting and creating are ONE critical section, or the cap is advisory: two
+# launches that both read cap-1 both start, and the box runs cap+1. dispatch
+# serialises its own launches under the tick lock, but a manual
+# `./remote-control.sh epic N` reaches this script by another path, and that is
+# exactly the pair that can race. Blocking (no -n): a launch that waits a few
+# seconds for the one ahead of it is the correct outcome, not a refusal.
+# Released as soon as the session exists, since from then on running_count sees
+# it — which is what the next admission needs.
+# flock is Linux-only and everything in bin/ runs on the host, so this is the
+# normal path; a box without it degrades to the advisory counting this had
+# before rather than refusing to launch anything.
+LAUNCH_LOCKED=0
+if command -v flock >/dev/null 2>&1; then
+  exec 8>"${TMPDIR:-/tmp}/harness-launch.lock"
+  if flock 8; then
+    LAUNCH_LOCKED=1
+  else
+    echo "[launch] could not take the launch lock — counting without it" >&2
+  fi
+fi
 capacity_gate
 
 echo "[launch] pulling latest main in $PROJECT"
@@ -351,7 +376,10 @@ if [[ -n "$MODE" ]]; then
 fi
 
 echo "[launch] creating session '$SESSION' in $CWD"
-tmux new-session -d -s "$SESSION" -c "$CWD"
+# 8>&- so a tmux server started by this call cannot inherit the launch lock and
+# hold it for the life of the host (the hazard dispatch guards with 9>&-).
+tmux new-session -d -s "$SESSION" -c "$CWD" 8>&-
+(( LAUNCH_LOCKED == 0 )) || flock -u 8 2>/dev/null || true
 # Tag the session with its repo so `ls` can report it regardless of where the
 # pane's cwd later moves. If either tag fails, remove the new idle session:
 # leaving an untagged pipeline alive makes operator output lie about routing.

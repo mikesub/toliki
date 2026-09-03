@@ -36,7 +36,7 @@ let startedAt = null
 let currentPhase = ''
 let lastNote = ''
 let lastWriteAt = 0
-let inFlight = false
+let pending = Promise.resolve()
 let disabled = false
 
 const gh = (args) => new Promise((resolve) => {
@@ -70,29 +70,35 @@ function body() {
   return lines.join('\n')
 }
 
-// Writes are serialised through `inFlight`: two overlapping creates would post
-// two comments and then edit only one of them, leaving a stray forever.
-async function write(force) {
-  if (disabled || !issue || inFlight) return
-  const now = Date.now()
-  if (!force && now - lastWriteAt < MIN_INTERVAL_MS) return
-  inFlight = true
-  lastWriteAt = now
-  try {
-    const text = body()
-    if (!commentId) {
-      const url = await gh(['issue', 'comment', String(issue), '--body', text])
-      const m = url && url.match(/#issuecomment-(\d+)/)
-      if (m) commentId = m[1]
-      // No id parsed means every later update would post ANOTHER comment, so
-      // stop after this one rather than dribble a comment per phase.
-      else disabled = true
-      return
-    }
-    await gh(['api', '--method', 'PATCH', `repos/{owner}/{repo}/issues/comments/${commentId}`, '-f', `body=${text}`])
-  } finally {
-    inFlight = false
+// Writes are serialised through a promise chain: two overlapping creates would
+// post two comments and then edit only one of them, leaving a stray forever.
+// A chain rather than a busy flag, because the LAST write is the one that
+// matters — dropping it because a throttled note happened to be in flight
+// leaves the comment showing an earlier phase for as long as the issue is open.
+// The throttle stays above the queue, so notes are dropped before they queue
+// rather than piling up behind one another.
+async function doWrite() {
+  const text = body()
+  if (!commentId) {
+    const url = await gh(['issue', 'comment', String(issue), '--body', text])
+    const m = url && url.match(/#issuecomment-(\d+)/)
+    if (m) commentId = m[1]
+    // No id parsed means every later update would post ANOTHER comment, so
+    // stop after this one rather than dribble a comment per phase.
+    else disabled = true
+    return
   }
+  await gh(['api', '--method', 'PATCH', `repos/{owner}/{repo}/issues/comments/${commentId}`, '-f', `body=${text}`])
+}
+
+function write(force) {
+  if (disabled || !issue) return pending
+  const now = Date.now()
+  if (!force && now - lastWriteAt < MIN_INTERVAL_MS) return pending
+  lastWriteAt = now
+  // Both handlers, so a link that rejected cannot stop the writes behind it.
+  pending = pending.then(doWrite, doWrite)
+  return pending
 }
 
 export function statusPhase(title) {

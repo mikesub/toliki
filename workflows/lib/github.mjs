@@ -101,6 +101,20 @@ export async function comment(issue, body) {
     must(await gh(['issue', 'comment', String(issue), '--body-file', file]), `gh issue comment ${issue}`))
 }
 
+// Whether a run already posted the deferred record on this issue. Read-only and
+// best effort: a query that fails answers "no", because failing to record the
+// deferrals at all is worse than recording them twice.
+export async function hasDeferredRecord(issue) {
+  const r = await gh(['issue', 'view', String(issue), '--json', 'comments'])
+  if (!r.ok) return false
+  try {
+    const v = JSON.parse(r.out)
+    return (v.comments || []).some(c => String(c.body || '').startsWith('🤖 deferred / not done'))
+  } catch {
+    return false
+  }
+}
+
 export async function assignSelf(issue) {
   return gh(['issue', 'edit', String(issue), '--add-assignee', '@me'])
 }

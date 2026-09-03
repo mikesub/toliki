@@ -203,6 +203,16 @@ labels="$state/labels"
 labels_json() { jq -R -s -c 'split("\n") | map(select(length > 0)) | map({name: .})' "$labels"; }
 case "${1:-} ${2:-}" in
   "issue view")
+    # The deferred-record probe reads comments; they are stored as blocks
+    # separated by a lone --- line, exactly as the comment case writes them.
+    if [[ "$*" == *comments* ]]; then
+      if [[ -s "$state/comments" ]]; then
+        jq -R -s 'split("\n---\n") | map(select(length > 0) | {body: .}) | {comments: .}' < "$state/comments"
+      else
+        printf '{"comments":[]}\n'
+      fi
+      exit 0
+    fi
     printf '{"number":%s,"title":"Add widget","body":"Build a widget.","state":"%s","labels":%s}\n' "${3:-0}" "${GH_ISSUE_STATE:-OPEN}" "$(labels_json)" ;;
   "issue edit")
     shift 3
@@ -244,7 +254,15 @@ case "${1:-} ${2:-}" in
     printf '%s\n' "$*" >> "$state/pr-created"
     printf 'https://github.com/o/r/pull/7\n' ;;
   "api "*)
-    if [[ "$*" == *dependencies/blocked_by* ]]; then printf '%s\n' "${GH_BLOCKED_BY:-[]}"; else printf '{}\n'; fi ;;
+    if [[ "$*" == *dependencies/blocked_by* ]]; then
+      [[ "${GH_DEPS_FAIL:-}" != "1" ]] || { printf 'HTTP 502\n' >&2; exit 1; }
+      printf '%s\n' "${GH_BLOCKED_BY:-[]}"
+    else
+      # The status comment's edit. Slow on demand, so a scenario can have one
+      # in flight when the run finishes.
+      [[ "${GH_SLOW_PATCH:-}" != "1" ]] || sleep 1
+      printf '{}\n'
+    fi ;;
   *) : ;;
 esac
 exit 0
@@ -322,6 +340,9 @@ run_pipeline() { # script fixtures-dir args...   (scenario knobs via GH_* env)
   GH_LOG="$TMP/gh.$RANDOM$RANDOM"
   NPM_LOG="$TMP/npm.$RANDOM$RANDOM"
   mkdir -p "$state/gh"
+  # A scenario can put comments on the issue before the run, the way a previous
+  # attempt would have left them.
+  [[ -z "${SEED_COMMENTS:-}" ]] || printf '%s\n---\n' "$SEED_COMMENTS" > "$state/gh/comments"
   : > "$RUN_LOG"; : > "$CODEX_LOG"; : > "$GH_LOG"; : > "$NPM_LOG"
   WT="$(fresh_clone)"
   RUN_RC=0
@@ -344,6 +365,8 @@ run_pipeline() { # script fixtures-dir args...   (scenario knobs via GH_* env)
     GH_BLOCKED_BY="${GH_BLOCKED_BY:-[]}" \
     GH_OPEN_PR_BRANCH="${GH_OPEN_PR_BRANCH:-}" \
     GH_RED_CHECKS="${GH_RED_CHECKS:-}" \
+    GH_DEPS_FAIL="${GH_DEPS_FAIL:-}" \
+    GH_SLOW_PATCH="${GH_SLOW_PATCH:-}" \
     GH_JOB_LOG="${GH_JOB_LOG:-}" \
     EPIC_USAGE_LOG="$state/usage.jsonl" \
     node "$script" "$@" 2>&1
@@ -483,6 +506,26 @@ assert_contains "the reason names the open blocker only" "$RUN_OUT" 'blocked by 
 assert_not_contains "a closed dependency does not block" "$RUN_OUT" '#40'
 assert_eq "no branch was claimed" "" "$(origin_ref epic/42-add-widget)"
 
+scenario 'epic-run: a dependency check that cannot be read is not a green gate'
+GH_DEPS_FAIL=1 run_pipeline "$EPIC_RUN" "$BASE" --issue 42
+assert_rc "exits 2 (skipped)" 2 "$RUN_RC"
+assert_contains "the reason says it refused to guess" "$RUN_OUT" 'dependency check could not be read'
+assert_eq "no branch was claimed" "" "$(origin_ref epic/42-add-widget)"
+assert_eq "nothing was designed" 0 "$(calls design)"
+
+scenario 'epic-run: a failed fetch refuses rather than building on an unconfirmed base'
+# The clone is handed a dead origin, so `git fetch origin` fails the way an
+# unreachable or renamed remote would.
+BROKEN_WT="$(fresh_clone)"
+git -C "$BROKEN_WT" remote set-url origin "$TMP/no-such-origin.git"
+fresh_clone() { printf '%s' "$BROKEN_WT"; }
+run_pipeline "$EPIC_RUN" "$BASE" --issue 42
+unset -f fresh_clone
+fresh_clone() { local dir="$TMP/run-$RANDOM$RANDOM"; git clone -q "$ORIGIN" "$dir"; git -C "$dir" checkout -q --detach main; printf '%s' "$dir"; }
+assert_rc "exits 2 (skipped)" 2 "$RUN_RC"
+assert_contains "the reason names the unconfirmed base" "$RUN_OUT" 'refusing to build against an unconfirmed base'
+assert_eq "nothing was designed" 0 "$(calls design)"
+
 scenario 'epic-run: an open PR already delivering the issue skips it'
 GH_OPEN_PR_BRANCH=epic/42-add-widget run_pipeline "$EPIC_RUN" "$BASE" --issue 42
 assert_rc "exits 2 (skipped)" 2 "$RUN_RC"
@@ -604,6 +647,10 @@ assert_contains "a follow-up links back with the Follow-up line" "$(gh_issues_cr
 assert_contains "the record says how many qualified versus filed" "$(gh_comments)" "4 items qualified for a follow-up issue and 3 were filed"
 assert_contains "the PR body points at the record" "$(cat "$WT/.epics/42-add-widget/summary.md")" "Deferred items recorded on #42."
 assert_contains "the legal marker reaches the PR body" "$(cat "$WT/.epics/42-add-widget/summary.md")" "LEGAL-REVIEW: required"
+# Ordering is the idempotency guarantee: everything before the PR can be redone
+# by a retry, a filed issue and a posted comment cannot.
+GH_ORDER="$(grep -n -E '^(pr create|issue create|issue comment 42)' "$GH_LOG" | head -3 | cut -d: -f2- | cut -d' ' -f1-2 | tr '\n' '|')"
+assert_contains "the PR is created before any follow-up issue" "$GH_ORDER" "pr create|issue create"
 assert_contains "and the commit body" "$(git -C "$ORIGIN" log -1 --format=%B epic/42-add-widget)" "LEGAL-REVIEW: required"
 
 scenario 'verify gate: red tests that pass are sent back once, then accepted'
@@ -756,6 +803,18 @@ assert_rc "exits 0" 0 "$RUN_RC"
 assert_contains "the gate says the items are unclassified" "$RUN_OUT" 'the deferral check produced no result'
 assert_contains "the PR was still opened" "$RUN_OUT" '"prUrl":"https://github.com/o/r/pull/7"'
 assert_eq "the issue stays ready-to-review" "ready-to-review," "$(gh_labels)"
+
+scenario 'epic-run: a deferred record already on the issue is not doubled'
+# What a retry sees after a ship that died between recording the deferrals and
+# opening the PR: the record is already there, so this run must add nothing.
+SEED_COMMENTS='🤖 deferred / not done
+
+- Widget crashes on empty list (defect): Needs a product decision.' \
+  run_pipeline "$EPIC_RUN" "$DEFER" --issue 42
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_contains "the run says it left the record alone" "$RUN_OUT" 'already on the issue'
+assert_eq "no second deferred record is posted" 1 "$(grep -c 'deferred / not done' "$STATE_DIR/gh/comments")"
+assert_eq "and no follow-up issue is re-filed" 0 "$(grep -c '^TITLE: ' "$STATE_DIR/gh/issues-created" 2>/dev/null || echo 0)"
 
 scenario 'epic-run: an off-schema payload is respawned once, then accepted'
 RETRY="$TMP/fixtures-retry"; cp -R "$BASE" "$RETRY"
@@ -1116,6 +1175,14 @@ assert_contains "the last write reports the outcome" "$GH" "queued for the merge
 SHIP_PROMPT="$(cat "$STATE_DIR/ship.0.prompt")"
 assert_contains "ship is told not to number anything with a bare #N" "$SHIP_PROMPT" "Never write a bare"
 assert_contains "and told what GitHub does with one" "$SHIP_PROMPT" "renders it as that issue or PR"
+
+scenario 'status comment: the final outcome lands even with an edit in flight'
+# Every phase change forces a write; a slow edit means one is still in flight
+# when the run finishes. The final write must queue behind it, not be dropped —
+# otherwise the comment shows an earlier phase for as long as the issue is open.
+GH_SLOW_PATCH=1 run_pipeline "$EPIC_RUN" "$BASE" --issue 42 --session myapp-epic-42
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_contains "the last write still reports the outcome" "$(cat "$GH_LOG")" "queued for the merge worker"
 
 scenario 'status comment: a blocked run says so on the issue'
 run_pipeline "$EPIC_RUN" "$DEADLENS" --issue 42 --session myapp-epic-42

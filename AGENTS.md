@@ -138,6 +138,16 @@ lifecycle change. Follow-up issues ship with no labels and link back with a
   `tests/epic-run.test.sh`.
 - Merge eligibility is computed from structured counts in `epic-run.mjs`.
   Never replace it with a model's sign-off.
+- The merge is pinned to the sha whose checks were watched
+  (`--match-head-commit`). Anything pushed between green and merge makes
+  GitHub refuse rather than land on a result it never earned.
+- Session admission is one critical section in `bin/launch.sh`: the capacity
+  count and `tmux new-session` run under a lock, so a manual launch racing a
+  cron tick cannot overrun the cap. Every `has-session` target is `=`-pinned;
+  a bare one matches name prefixes, so epic-26 reads a live epic-263 as itself.
+- GitHub artifacts a retry cannot undo — a filed follow-up, the deferred
+  record — are created only after the PR exists, and a record already on the
+  issue is left alone. Everything before the PR is idempotent under a re-run.
 - `npm run verify` is run by the orchestrator: red after the red step, green
   after green and after fixes-after-review, each with one retry that hands the
   output back to the agent, then a blocker. An agent's report that verify

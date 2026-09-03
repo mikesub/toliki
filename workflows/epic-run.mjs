@@ -45,7 +45,7 @@ import { initStatus, statusPhase, statusNote, statusFinish } from './lib/status.
 import { failureReason, must } from './lib/proc.mjs'
 import {
   ensureLabels, editLabels, issueLabels, issueView, openBlockers, comment, assignSelf,
-  openPrs, searchOpenPrs, prCreate, issueCreate, withBodyFile,
+  openPrs, searchOpenPrs, prCreate, issueCreate, withBodyFile, hasDeferredRecord,
 } from './lib/github.mjs'
 import {
   git, gitOut, discoverPackages, pkgList, ensureDeps, runVerify, ensureEpicsIgnored, checkpoint, intentToAdd,
@@ -450,13 +450,19 @@ async function prepare(issue) {
   const view = await issueView(issue, 'number,title,body,state')
   if (String(view.state || '').toUpperCase() === 'CLOSED') return { refused: `issue #${issue} is closed` }
 
-  // Building on an unlanded dependency is exactly what blocked_by exists to prevent.
+  // Building on an unlanded dependency is exactly what blocked_by exists to prevent — and a
+  // dependency check that could not be READ is never a green gate either, so an errored query
+  // skips the issue instead of building it as if unblocked. Skipped rather than blocked: nothing
+  // has been claimed or labelled yet, so the next tick simply re-reads it.
   const deps = await openBlockers(issue)
-  if (deps.error) notes.push(`prepare: dependency preflight errored (${deps.error}); continued as if unblocked`)
+  if (deps.error) return { refused: `the blocked_by dependency check could not be read (${deps.error}) — refusing to build as if unblocked` }
   if (deps.blockers.length) return { refused: `blocked by open issue(s) ${deps.blockers.map(n => `#${n}`).join(', ')}` }
 
+  // Same rule for the base: every branch below is cut from origin/main and the claim is a push to
+  // origin, so a failed fetch means building against a base this run could not confirm and then
+  // claiming over a link that just failed.
   const fetched = await git(['fetch', 'origin'])
-  if (!fetched.ok) notes.push(`prepare: git fetch origin failed (${failureReason(fetched)}); the base may be stale`)
+  if (!fetched.ok) return { refused: `git fetch origin failed (${failureReason(fetched)}) — refusing to build against an unconfirmed base` }
   // Captured BEFORE any branch switch: the deps check compares this worktree's original checkout
   // against the new base.
   const base = await gitOut(['rev-parse', 'HEAD'], 'git rev-parse HEAD')
@@ -564,26 +570,6 @@ async function shipTransport({ issue, slug, dir, decision }) {
   body += `\n\nCloses #${issue}\n`
   writeFileSync(path.join(dir, 'summary.md'), body)
 
-  // Deferred work is recorded on the ISSUE, not the PR. A follow-up issue is filed only for the kinds
-  // that can earn one, only when ship judged it a coherent slice, and at most 3 — defects first. That
-  // "Follow-up to #N" line IS the relation (GitHub records it as a cross-reference); no label, no
-  // blocked_by, no sub-issue.
-  let filed = 0
-  if (deferred.length) {
-    const rank = { defect: 0, 'missing-gate': 1, 'scope-cut': 2 }
-    const eligible = deferred.filter(d => d.file === true && d.kind in rank).sort((a, b) => rank[a.kind] - rank[b.kind])
-    const links = new Map()
-    for (const d of eligible.slice(0, 3)) {
-      const url = await issueCreate({ title: d.issueTitle || d.title, body: `${String(d.issueBody || d.why).trim()}\n\nFollow-up to #${issue}` })
-      links.set(d, url)
-      filed++
-    }
-    const lines = ['🤖 deferred / not done', '']
-    for (const d of deferred) lines.push(`- ${d.title} (${d.kind}): ${d.why}${d.checkNote ? ` — ${d.checkNote}` : ''}${links.has(d) ? ` — filed as ${links.get(d)}` : ''}`)
-    if (eligible.length > filed) lines.push('', `${eligible.length} items qualified for a follow-up issue and ${filed} were filed (the cap is 3): needing more means this issue was under-scoped.`)
-    await comment(issue, lines.join('\n'))
-  }
-
   // Squash to ONE clean commit: fold leftovers into the checkpoint chain, soft-reset to the merge
   // base (NOT origin/main, which may have advanced during the run), commit once.
   await gitOut(['add', '-A'], 'git add -A')
@@ -602,6 +588,34 @@ async function shipTransport({ issue, slug, dir, decision }) {
   if (!push.ok) throw new Error(pushRejected(push) ? `the force-with-lease push was rejected — ${branch} moved on origin under this run` : `git push failed (${failureReason(push)})`)
 
   const prUrl = await prCreate({ head: branch, title, bodyFile: path.join(dir, 'summary.md') })
+
+  // Deferred work is recorded on the ISSUE, not the PR — and only now that the PR exists.
+  // Everything above is idempotent under a re-run (the branch is rebuilt, the push is a lease, and
+  // prepare's open-PR guard stops the second run outright); a filed issue and a posted comment are
+  // not. Creating them first meant a ship that died before the PR left duplicates behind for the
+  // retry to add to, so they go last, and a record already on the issue is left alone rather than
+  // doubled. A follow-up issue is filed only for the kinds that can earn one, only when ship judged
+  // it a coherent slice, and at most 3 — defects first. That "Follow-up to #N" line IS the relation
+  // (GitHub records it as a cross-reference); no label, no blocked_by, no sub-issue.
+  let filed = 0
+  if (deferred.length) {
+    if (await hasDeferredRecord(issue)) {
+      log('Ship: a deferred record from an earlier attempt is already on the issue — left as it is')
+    } else {
+      const rank = { defect: 0, 'missing-gate': 1, 'scope-cut': 2 }
+      const eligible = deferred.filter(d => d.file === true && d.kind in rank).sort((a, b) => rank[a.kind] - rank[b.kind])
+      const links = new Map()
+      for (const d of eligible.slice(0, 3)) {
+        const url = await issueCreate({ title: d.issueTitle || d.title, body: `${String(d.issueBody || d.why).trim()}\n\nFollow-up to #${issue}` })
+        links.set(d, url)
+        filed++
+      }
+      const lines = ['🤖 deferred / not done', '']
+      for (const d of deferred) lines.push(`- ${d.title} (${d.kind}): ${d.why}${d.checkNote ? ` — ${d.checkNote}` : ''}${links.has(d) ? ` — filed as ${links.get(d)}` : ''}`)
+      if (eligible.length > filed) lines.push('', `${eligible.length} items qualified for a follow-up issue and ${filed} were filed (the cap is 3): needing more means this issue was under-scoped.`)
+      await comment(issue, lines.join('\n'))
+    }
+  }
 
   // ready-to-review and nothing else: whether the PR may instead be queued for unattended merge is
   // the gate's decision, downstream of here. The assignee stays (it records ownership).
