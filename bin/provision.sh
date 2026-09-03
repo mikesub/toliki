@@ -182,8 +182,9 @@ say "base packages"
 # curl/gnupg/ca-certificates are needed to register the apt sources below, so
 # they go in first; jq does the JSON surgery on ~/.claude/settings.json and the
 # workspace-trust check. Codex uses bubblewrap to enforce the read-only sandbox
-# that fences architect and reviewer phases on Linux.
-apt_install git tmux jq curl ca-certificates gnupg bubblewrap
+# that fences architect and reviewer phases on Linux. unzip is required by
+# Bun's own installer (it fails outright without it — see provision_bun).
+apt_install git tmux jq curl ca-certificates gnupg bubblewrap unzip
 
 # --------------------------------------------------------------------- node --
 
