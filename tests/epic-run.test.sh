@@ -117,6 +117,7 @@ case "$prompt" in
   *"Review this change for the lens: requirements"*)   key=lens-acceptance ;;
   *"Review this change for the lens: security"*)       key=lens-security ;;
   *"Adversarially verify"*)                            key=verify ;;
+  *"Check the fixes applied after review"*)            key=fixcheck ;;
   *"Fixes-after-review phase, autonomous"*)            key=triage ;;
   *"Ship phase, autonomous"*)                          key=ship ;;
   *'return it in the "summary" field'*)                key=summary ;;
@@ -282,6 +283,7 @@ fixture "$BASE" lens-correctness '{"findings":[{"title":"Null deref on empty lis
 fixture "$BASE" verify '{"verdicts":[{"index":1,"real":true,"confidence":90,"reasoning":"Confirmed against the code."}]}'
 fixture "$BASE" triage '{"status":"Fixed the null deref, verify green.","deferred":[]}'
 fixture_sh "$BASE" triage 'printf "export const createWidget = () => ({ items: [] })\n" > frontend/src/widget.ts'
+fixture "$BASE" fixcheck '{"verdicts":[{"index":1,"resolved":true,"confidence":92,"reasoning":"The guard is in place and the empty case is tested."}],"regressions":[]}'
 fixture "$BASE" ship '{"title":"Add widget","body":"Adds a widget.\n\n## Review\n\nOne finding fixed.","commitBody":"Thin module, no caching.","deferred":[]}'
 
 # ───────────────────────── the runner ─────────────────────────
@@ -335,7 +337,11 @@ assert_rc "exits 0" 0 "$RUN_RC"
 assert_contains "RESULT says readyToMerge" "$RUN_OUT" '"readyToMerge":true'
 assert_contains "RESULT carries the PR url" "$RUN_OUT" '"prUrl":"https://github.com/o/r/pull/7"'
 assert_contains "review tally reported" "$RUN_OUT" '1 confirmed by adversarial verification, 0 refuted'
-assert_eq "exactly the eleven model steps ran" 11 "$(wc -l < "$RUN_LOG" | tr -d ' ')"
+assert_eq "exactly the twelve model steps ran" 12 "$(wc -l < "$RUN_LOG" | tr -d ' ')"
+assert_eq "the fixes were checked once" 1 "$(calls fixcheck)"
+assert_contains "the tally records the fix check" "$RUN_OUT" "fix check: 1/1 fixes confirmed, 0 regression(s)"
+assert_contains "the fix check was handed the exact delta" "$(cat "$STATE_DIR/fixcheck.0.prompt")" "git diff "
+assert_contains "review.md carries the post-fix section" "$(cat "$WT/.epics/42-add-widget/review.md")" "## Post-fix check"
 assert_eq "all five lenses ran" 5 "$(( $(calls lens-correctness) + $(calls lens-simplicity) + $(calls lens-seam) + $(calls lens-acceptance) + $(calls lens-security) ))"
 # What the orchestrator did to the repo and the issue.
 assert_eq "origin holds the branch as ONE commit above main" 1 "$(origin_count epic/42-add-widget)"
@@ -407,7 +413,7 @@ run_pipeline "$EPIC_RUN" "$BASE" --issue 42 --engine codex+claude
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_contains "the run ships" "$RUN_OUT" '"readyToMerge":true'
 assert_contains "review went to Codex" "$(cat "$CODEX_LOG")" 'model_reasoning_effort="xhigh"'
-assert_eq "exactly the five lenses and the confirm batches ran on Codex" "$(( 5 + $(calls verify) ))" "$(grep -c -- '--model gpt-5.6-sol' "$CODEX_LOG" || true)"
+assert_eq "exactly the five lenses, the confirm batches and the fix check ran on Codex" "$(( 5 + $(calls verify) + $(calls fixcheck) ))" "$(grep -c -- '--model gpt-5.6-sol' "$CODEX_LOG" || true)"
 assert_contains "coding stayed on Claude" "$(cat "$RUN_LOG")" "--model opus"
 assert_contains "the architect stayed on Claude" "$(cat "$RUN_LOG")" "--model fable"
 assert_contains "the pane names the vendor and model per step" "$RUN_OUT" "[codex gpt-5.6-sol/xhigh]"
@@ -611,6 +617,54 @@ assert_eq "one attempt only" 1 "$(calls design)"
 assert_contains "the reason says it timed out" "$RUN_OUT" "timed out"
 assert_not_contains "no respawn on a timeout" "$RUN_OUT" "respawning once (transient)"
 
+scenario 'post-fix check: an unconfirmed fix holds the PR'
+UNFIXED="$TMP/fixtures-unfixed"; cp -R "$BASE" "$UNFIXED"
+fixture "$UNFIXED" fixcheck '{"verdicts":[{"index":1,"resolved":false,"confidence":90,"reasoning":"The guard checks null, not empty."}],"regressions":[]}'
+run_pipeline "$EPIC_RUN" "$UNFIXED" --issue 42
+assert_rc "exits 0 (the PR is real, just held)" 0 "$RUN_RC"
+assert_contains "the gate names the unconfirmed fix" "$RUN_OUT" 'fix(es) not confirmed by the post-fix check (Null deref on empty list)'
+assert_not_contains "it is not queued for merge" "$RUN_OUT" '"readyToMerge":true'
+assert_eq "the issue stays ready-to-review" "ready-to-review," "$(gh_labels)"
+assert_contains "review.md records the verdict" "$(cat "$WT/.epics/42-add-widget/review.md")" "NOT confirmed"
+assert_eq "no second fix round" 1 "$(calls triage)"
+
+scenario 'post-fix check: a regression holds the PR'
+REGRESS="$TMP/fixtures-regress"; cp -R "$BASE" "$REGRESS"
+fixture "$REGRESS" fixcheck '{"verdicts":[{"index":1,"resolved":true,"confidence":90,"reasoning":"Fixed."}],"regressions":[{"title":"Guard breaks the non-empty path","severity":"Important","confidence":85,"location":"src/widget.ts:14","problem":"Returns early for every list.","fix":"Check length, not truthiness.","gate":"unit test for a non-empty list"}]}'
+run_pipeline "$EPIC_RUN" "$REGRESS" --issue 42
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_contains "the gate names the regression" "$RUN_OUT" 'regression(s) introduced by the fixes (Important: Guard breaks the non-empty path)'
+assert_eq "the issue stays ready-to-review" "ready-to-review," "$(gh_labels)"
+assert_contains "review.md lists it as a deferred defect" "$(cat "$WT/.epics/42-add-widget/review.md")" "Regressions introduced by the fixes"
+assert_eq "no second fix round" 1 "$(calls triage)"
+
+scenario 'post-fix check: a claimed fix with no diff holds the PR without a model'
+NODIFF="$TMP/fixtures-nodiff"; cp -R "$BASE" "$NODIFF"
+fixture_sh "$NODIFF" triage 'true'      # claims a fix, changes nothing
+run_pipeline "$EPIC_RUN" "$NODIFF" --issue 42
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_contains "the gate says so" "$RUN_OUT" 'reported fixed but the fixes step changed nothing'
+assert_eq "no skeptic was spawned for an empty delta" 0 "$(calls fixcheck)"
+assert_eq "the issue stays ready-to-review" "ready-to-review," "$(gh_labels)"
+
+scenario 'post-fix check: a dead check holds the PR, not the run'
+DEADCHECK="$TMP/fixtures-deadcheck"; cp -R "$BASE" "$DEADCHECK"
+printf '1' > "$DEADCHECK/fixcheck.0.rc"; printf '1' > "$DEADCHECK/fixcheck.1.rc"
+run_pipeline "$EPIC_RUN" "$DEADCHECK" --issue 42
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_contains "the gate says the fixes are unreviewed" "$RUN_OUT" 'the post-fix check produced no result'
+assert_contains "the PR was still opened" "$RUN_OUT" '"prUrl":"https://github.com/o/r/pull/7"'
+assert_eq "the issue stays ready-to-review" "ready-to-review," "$(gh_labels)"
+
+scenario 'post-fix check: nothing confirmed means nothing to check'
+CLEANREV="$TMP/fixtures-cleanrev"; cp -R "$BASE" "$CLEANREV"
+fixture "$CLEANREV" lens-correctness '{"findings":[]}'
+run_pipeline "$EPIC_RUN" "$CLEANREV" --issue 42
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_eq "no fixer ran" 0 "$(calls triage)"
+assert_eq "no fix check ran" 0 "$(calls fixcheck)"
+assert_contains "the run ships" "$RUN_OUT" '"readyToMerge":true'
+
 scenario 'epic-run: an off-schema payload is respawned once, then accepted'
 RETRY="$TMP/fixtures-retry"; cp -R "$BASE" "$RETRY"
 # Missing `contract` — the field red writes its tests from.
@@ -647,6 +701,7 @@ assert_contains "the summary came back" "$RUN_OUT" 'summary.md written'
 assert_contains "summary.md was written to the tree" "$(cat "$MANUAL_WT/.epics/42-add-widget/summary.md")" 'summary.md written'
 assert_eq "no gh calls at all" "0" "$(wc -l < "$GH_LOG" | tr -d ' ')"
 assert_eq "no branch was created on origin" "" "$(origin_ref epic/42-add-widget)"
+assert_eq "no fix check in manual mode" 0 "$(calls fixcheck)"
 assert_eq "no commit was made on the user's tree" "$MAIN_INITIAL" "$(git -C "$MANUAL_WT" rev-parse HEAD)"
 assert_contains "new files were intent-added for the blind review" "$(git -C "$MANUAL_WT" status --porcelain)" "frontend/src/widget.ts"
 

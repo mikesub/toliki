@@ -241,7 +241,7 @@ ${d.tradeoffs}
 // review.md, rendered from the verdicts. Confirmed findings first, highest
 // severity first; refuted ones under a section fixes-after-review and ship
 // are told never to act on — recorded so a human can double-check the discard.
-export function renderReview(dir, confirmed, unconfirmed) {
+export function renderReview(dir, confirmed, unconfirmed, postFix = null) {
   const order = { Critical: 0, Important: 1 }
   const sorted = [...confirmed].sort((a, b) => (order[a.severity] ?? 9) - (order[b.severity] ?? 9))
   const finding = (f, i) => `### Finding ${i + 1}: ${f.title}
@@ -257,6 +257,21 @@ export function renderReview(dir, confirmed, unconfirmed) {
   if (unconfirmed.length) {
     text += `\n## Unconfirmed — not fixed\n\nFixes-after-review and ship MUST NOT act on these. Adversarial verification refuted them or could not confirm them; they are recorded only so a human can double-check the discard.\n\n`
     text += unconfirmed.map(f => `- ${f.title} (${f.location}; ${f.severity}): ${f.verdict?.reasoning || 'no reasoning recorded'}`).join('\n') + '\n'
+  }
+  // The skeptic's one pass over the fixes-after-review delta. An unconfirmed fix
+  // and a regression are deferred work a human decides on; ship records each on
+  // the issue, and a regression is a defect.
+  if (postFix) {
+    const total = postFix.confirmed.length + postFix.unresolved.length
+    text += `\n## Post-fix check\n\n`
+    if (postFix.note) text += `${postFix.note}.\n\n`
+    text += `Fixes confirmed: ${postFix.confirmed.length} of ${total}.\n`
+    for (const c of postFix.confirmed) text += `- ${c.finding.title}: confirmed (confidence ${c.verdict.confidence}) — ${c.verdict.reasoning}\n`
+    for (const u of postFix.unresolved) text += `- ${u.finding.title}: NOT confirmed (confidence ${u.verdict.confidence}) — ${u.verdict.reasoning}\n`
+    if (postFix.regressions.length) {
+      text += `\nRegressions introduced by the fixes (each is a deferred DEFECT until a human decides):\n`
+      for (const r of postFix.regressions) text += `- ${r.severity}: ${r.title} (${r.location}): ${r.problem} Fix: ${r.fix} Gate: ${r.gate}\n`
+    }
   }
   mkdirSync(dir, { recursive: true })
   writeFileSync(path.join(dir, 'review.md'), text)

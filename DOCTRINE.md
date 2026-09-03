@@ -29,7 +29,9 @@ don't get re-litigated from memory.
 - **Review** — blind and adversarial. Five lenses judge the diff against the
   issue body alone, barred from the builder's notes; every finding goes to a
   skeptic instructed to refute it; survivors are auto-fixed, refuted ones
-  recorded as unconfirmed rather than deleted. The strong model goes to design
+  recorded as unconfirmed rather than deleted, and the fixes get one pass from
+  the same skeptic — a fix it cannot confirm holds the PR for a human instead
+  of starting another round. The strong model goes to design
   and adjudication, where being wrong is expensive; implementation runs on a
   cheaper model under the test gate.
 - **Merge** — a serial per-repo worker rebases each finished PR onto current

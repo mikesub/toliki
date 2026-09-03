@@ -25,6 +25,11 @@
 // after green and after fixes it must be green. An agent's word that it ran
 // is never the gate; a wrong answer is handed back to that agent once, with
 // the output, then blocks the run.
+//
+// The fixes themselves get one skeptic pass (fix-check) over exactly the
+// delta they produced. A fix the skeptic cannot confirm, a regression, a dead
+// check or a claimed fix with no diff holds the PR at ready-to-review; none
+// of them starts a second fix round, which is what keeps it bounded.
 
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
@@ -129,6 +134,25 @@ The pipeline ran \`npm run verify\` after your previous attempt and it is RED. T
 ${gate.tail}
 Fix the cause — never by weakening, skipping or deleting a test — and leave every package's verify green.`,
 
+  // Refute-by-default over the fix delta: the same adversarial shape as the review verify, aimed at
+  // the one diff no lens has seen.
+  fixCheck: (fixed, deltaCmd, diffCmd) =>
+`Check the fixes applied after review — you did not write them. An automated fixes-after-review step edited the change after five review lenses had judged it; its edits are exactly \`${deltaCmd}\` (also readable with --stat), applied on top of the reviewed change \`${diffCmd}\`. ${fixed.length ? `It reports these ${fixed.length} confirmed review finding(s) as FIXED:` : 'It reports no finding as fixed; check its edits for regressions only.'}
+
+${fixed.map((f, i) => `--- Finding ${i + 1} ---
+Title: ${f.title}
+Severity: ${f.severity}
+Location: ${f.location}
+Claim: ${f.problem}
+Recommended fix: ${f.fix}`).join('\n\n')}
+
+Two questions, refute-by-default:
+1. For each finding above: does the delta genuinely remove the defect? resolved=true only if the code now behaves correctly for the case the finding names. A test weakened, skipped or deleted so the finding no longer shows is NOT a fix, and neither is a comment or a suppression. resolved=false whenever you cannot confirm it against the code.
+2. Regressions: any defect the delta introduces that the reviewed change did not have — a behavior change outside the finding's scope, a dropped side effect, a broken neighbour, a new null path. Same bar as a review finding: report only what you are at least 75 confident of, with file:line, the problem, a concrete fix and the gate that would catch its class.
+
+Do NOT open anything under \`.epics/\` — it carries the builder's and the fixer's framing and would anchor you.
+Return exactly ${fixed.length} verdict${fixed.length === 1 ? '' : 's'}${fixed.length ? `, with \`index\` set to the finding's number above (${fixed.length === 1 ? '1' : `1-${fixed.length}`})` : ''}, and a regressions array (empty when none).`,
+
   // Judgment only: what the PR says, what was left undone and how each item is
   // classed. The pipeline squashes, pushes, opens the PR, files the follow-ups
   // and labels the issue from the JSON — and counts the merge gate from `kind`.
@@ -142,7 +166,7 @@ Your output is schema-enforced JSON:
    **Never write a bare \`#<number>\` for anything except issue #${issue} itself.** GitHub turns every \`#N\` into a live cross-reference and renders it as that issue or PR's TITLE, so numbering findings \`#1\`, \`#2\`, \`#3\` splices the titles of three unrelated PRs into your sentences and notifies them. Refer to a finding as \`Finding 3\`, or just lead with what it was; the same goes for hunks, steps, requirements and packages, in every field you return. Fixes-after-review status: ${triageStatus}
 3. commitBody: a short commit body (the why and notable details), or an empty string.
 4. legalMarker: apply THIS project's own legal/compliance review trigger, if it has one: look in its AGENTS.md for a section defining when a change needs legal or policy review. If one exists, judge this diff against the criteria written there — not against any you remember from elsewhere — and when they are met, return the exact marker string that section specifies; the pipeline adds it to the commit body and the PR body. If the project defines no such trigger, or the criteria are not met, omit the field: do NOT invent criteria and do NOT import another project's.
-5. deferred: everything deferred or out of scope, one entry each; empty array when nothing was. Read ${dir}/epic.md's phase log and ${dir}/review.md (confirmed sections only — refuted "Unconfirmed" findings are NOT deferred work) and collect: deferred review findings (with why), scope cut, edge cases intentionally skipped, clarifying answers that narrowed scope, uncovered test surfaces. For each entry:
+5. deferred: everything deferred or out of scope, one entry each; empty array when nothing was. Read ${dir}/epic.md's phase log and ${dir}/review.md (confirmed sections only — refuted "Unconfirmed" findings are NOT deferred work; a "Post-fix check" section, when present, lists fixes the check could not confirm and regressions it found, and every one of those IS deferred work — a regression is a defect) and collect: deferred review findings (with why), scope cut, edge cases intentionally skipped, clarifying answers that narrowed scope, uncovered test surfaces. For each entry:
    - title and why: one line each.
    - kind, judged honestly, because it drives a MERGE GATE:
      defect — a correctness, security, data-loss, or user-visible breakage bug that still exists on main AFTER this merges, whether this diff introduced it or merely exposed it. One defect holds the PR open for a human; none lets it merge unattended. A missing gate, a scope cut, a nice-to-have or a refactor idea is NOT a defect and must not inflate the count, and a real defect must not be relabelled to keep the merge.
@@ -268,6 +292,31 @@ const TRIAGE_SCHEMA = {
           why: { type: 'string', description: 'why it was left for a human' },
         },
       },
+    },
+  },
+}
+// One verdict per finding the fixer reported fixed, plus any defect the fix delta introduced. A
+// regression carries the same fields as a review finding so review.md and the gate can treat it as one.
+const FIXCHECK_SCHEMA = {
+  type: 'object', additionalProperties: false, required: ['verdicts', 'regressions'],
+  properties: {
+    verdicts: {
+      type: 'array',
+      description: 'exactly one entry per finding listed in the prompt, in that order',
+      items: {
+        type: 'object', additionalProperties: false, required: ['index', 'resolved', 'confidence', 'reasoning'],
+        properties: {
+          index: { type: 'number', description: '1-based number of the finding this verdict judges' },
+          resolved: { type: 'boolean', description: 'true only if the delta genuinely removes the defect' },
+          confidence: { type: 'number', description: '0-100' },
+          reasoning: { type: 'string' },
+        },
+      },
+    },
+    regressions: {
+      type: 'array',
+      description: 'defects the fix delta introduced; empty when none',
+      items: FINDINGS_SCHEMA.properties.findings.items,
     },
   },
 }
@@ -716,6 +765,7 @@ try {
     if (!gate.green) return await fail('code', `npm run verify is red after the green step and its retry (${gate.detail}) — refusing to review an unverified change.`)
   }
   const codeCheckpoint = await checkpointWork('code')
+  const codeSha = gitMode ? await gitOut(['rev-parse', 'HEAD'], 'git rev-parse HEAD') : null
   updateEpicMd(dir, { phase: 'code → done', log: `code: done (${codeCheckpoint})` })
   log(`Code: implementation complete, verify gate run, work checkpointed (${codeCheckpoint}).`)
 
@@ -839,7 +889,7 @@ try {
   // review than actually happened — the raw count is the only durable record that N independent lenses
   // converged on the same fault, and review.md dies with the worktree.
   const grouped = defects.length < verified.length ? `, which are ${defects.length} distinct defect(s)` : ''
-  const reviewTally = `${reviews.length} raw finding(s) across ${LENSES.length} blind lenses → ${verified.length} confirmed by adversarial verification${grouped}, ${unconfirmed.length} refuted`
+  let reviewTally = `${reviews.length} raw finding(s) across ${LENSES.length} blind lenses → ${verified.length} confirmed by adversarial verification${grouped}, ${unconfirmed.length} refuted`
   log(`Review: ${reviewTally}.`)
 
   // review.md, rendered from the surviving findings (+ the unconfirmed record).
@@ -884,6 +934,57 @@ try {
     updateEpicMd(dir, { phase: 'review→triaged', log: `fixes-after-review: ${triageStatus} (${fixCheckpoint})` })
   }
   log(`Fixes after review: ${triageStatus}`)
+
+  // ───────────────────────── Post-fix check ─────────────────────────
+  // The fixes changed code no lens has seen. One skeptic pass over exactly that delta: does each fix
+  // resolve its finding, and does the delta introduce a defect of its own? Every bad answer changes the
+  // label — the merge gate below holds the PR — never the tree. There is no second fix round, which is
+  // what keeps it bounded. Git mode only: manual mode has no checkpoints and no gate.
+  const fixBlockers = []
+  if (gitMode && verified.length) {
+    const fixSha = await gitOut(['rev-parse', 'HEAD'], 'git rev-parse HEAD')
+    const deferredTitles = new Set(triageDeferred.map(d => d.title))
+    const fixed = verified.filter(f => !deferredTitles.has(f.title))
+    const changed = (await git(['diff', '--quiet', codeSha, fixSha])).code !== 0
+    let postFix = null
+    if (!changed && fixed.length) {
+      // A claimed fix with no diff is not a fix. No model needed to say so.
+      fixBlockers.push(`${fixed.length} finding(s) reported fixed but the fixes step changed nothing`)
+      postFix = { confirmed: [], unresolved: fixed.map(f => ({ finding: f, verdict: { resolved: false, confidence: 0, reasoning: 'the fixes step produced no diff' } })), regressions: [], note: 'The fixes step reported fixes but produced no diff' }
+    } else if (changed) {
+      const c = await agent(PROMPTS.fixCheck(fixed, `git diff ${codeSha} ${fixSha}`, DIFF),
+        { label: 'fix-check', phase: 'Fixes after review', step: 'confirm-review', schema: FIXCHECK_SCHEMA },
+      )
+      if (!c) {
+        // A dead check leaves the fixes unreviewed; the PR is complete and verified, so it waits for a
+        // human rather than failing the run.
+        fixBlockers.push('the post-fix check produced no result — the fixes are unreviewed')
+        postFix = { confirmed: [], unresolved: fixed.map(f => ({ finding: f, verdict: { resolved: false, confidence: 0, reasoning: 'the post-fix check produced no result' } })), regressions: [], note: 'The post-fix check produced no result' }
+      } else {
+        const verdicts = Array.isArray(c.verdicts) ? c.verdicts : []
+        const confirmed = []
+        const unresolved = []
+        fixed.forEach((f, i) => {
+          const v = verdicts.find(x => Number(x.index) === i + 1)
+          if (v && v.resolved === true && Number(v.confidence) >= 75) confirmed.push({ finding: f, verdict: v })
+          else unresolved.push({ finding: f, verdict: v || { resolved: false, confidence: 0, reasoning: 'no verdict returned — recorded as unresolved rather than assumed fixed' } })
+        })
+        const regressions = (Array.isArray(c.regressions) ? c.regressions : []).filter(r => Number(r.confidence) >= 75)
+        if (unresolved.length) fixBlockers.push(`${unresolved.length} fix(es) not confirmed by the post-fix check (${unresolved.map(u => u.finding.title).join('; ')})`)
+        if (regressions.length) fixBlockers.push(`${regressions.length} regression(s) introduced by the fixes (${regressions.map(r => `${r.severity}: ${r.title}`).join('; ')})`)
+        postFix = { confirmed, unresolved, regressions, note: null }
+      }
+    }
+    if (postFix) {
+      renderReview(dir, verified, unconfirmed, postFix)
+      const summary = `fix check: ${postFix.confirmed.length}/${fixed.length} fixes confirmed, ${postFix.regressions.length} regression(s)${postFix.note ? ` (${postFix.note.toLowerCase()})` : ''}`
+      reviewTally += `; ${summary}`
+      updateEpicMd(dir, { log: summary })
+      log(`Fix check: ${summary}.`)
+    }
+  } else if (verified.length) {
+    log('Fix check: skipped in manual mode (no checkpoints, no merge gate).')
+  }
 
   // ───────────────────────── Phase 5: Ship ─────────────────────────
   // Issue mode: ship decides what the PR says; the script squashes to one commit (Closes #N), pushes,
@@ -940,6 +1041,7 @@ try {
   if (shipped.deferredDefects > 0) {
     mergeBlockers.push(`${shipped.deferredDefects} deferred defect(s) that still exist on main after this merge`)
   }
+  mergeBlockers.push(...fixBlockers)
 
   if (mergeBlockers.length) {
     const why = mergeBlockers.join(' + ')
