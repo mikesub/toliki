@@ -143,6 +143,9 @@ lifecycle change. Follow-up issues ship with no labels and link back with a
   unconfirmed fix, a regression, a dead check or a claimed fix with no diff
   holds the PR at `ready-to-review`; nothing starts a second fix round. Gated
   by `tests/epic-run.test.sh`.
+- Ship's deferral kinds feed the merge gate only after the skeptic re-judges
+  every item ship did not call a defect; the skeptic can only escalate, and a
+  dead check holds the PR. Gated by `tests/epic-run.test.sh`.
 - GitHub is the state store: issues, labels, `blocked_by`, claim refs, PRs. No
   second database, and no per-project facts in harness configuration.
 - Flat issue model: one issue is one autonomous, mergeable, independently

@@ -31,6 +31,11 @@
 // delta they produced. A fix the skeptic cannot confirm, a regression, a dead
 // check or a claimed fix with no diff holds the PR at ready-to-review; none
 // of them starts a second fix round, which is what keeps it bounded.
+//
+// Ship's deferrals go through the same skeptic before the merge gate counts
+// them: every item ship did not call a defect is re-judged, and the skeptic
+// can only escalate. The builder side never has the last word on whether a
+// deferred item is a defect.
 
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
@@ -135,6 +140,25 @@ The pipeline ran \`npm run verify\` after your previous attempt and it is RED. T
 ${gate.tail}
 Fix the cause — never by weakening, skipping or deleting a test — and leave every package's verify green.`,
 
+  // The merge gate's other input, re-judged: ship classified its deferrals, and only items it called
+  // defects hold the PR. The skeptic re-judges the rest and can only escalate.
+  deferralCheck: (items, requirement, diffCmd) =>
+`Check the deferrals an automated ship step classified — you did not write them. The PR for the requirement below is complete and verified; ship listed the work it left undone and classed each item. Only items classed as a DEFECT hold the PR for a human; everything else lets it merge unattended. Ship did NOT class these ${items.length} item(s) as defects:
+
+${items.map((d, i) => `--- Item ${i + 1} ---
+Title: ${d.title}
+Why deferred: ${d.why}
+Ship's class: ${d.kind}`).join('\n\n')}
+
+Requirement the PR was built against:
+"""
+${requirement}
+"""
+
+Refute each classification. Read \`${diffCmd}\` and the source tree; do NOT open anything under \`.epics/\` — it carries the builder's framing and would anchor you. An item is a defect when a correctness, security, data-loss or user-visible breakage bug will exist on main AFTER this PR merges — whether this diff introduced it, exposed it, or left it in place while claiming the requirement is met. A missing automated check, a scope cut the requirement allows, a nice-to-have or a refactor idea is not a defect. Say defect=true only when the code and the requirement bear it out at confidence 75 or above; otherwise defect=false.
+
+Return exactly ${items.length} verdict${items.length === 1 ? '' : 's'} with \`index\` set to the item's number above.`,
+
   // Refute-by-default over the fix delta: the same adversarial shape as the review verify, aimed at
   // the one diff no lens has seen.
   fixCheck: (fixed, deltaCmd, diffCmd) =>
@@ -170,7 +194,7 @@ Your output is schema-enforced JSON:
 5. deferred: everything deferred or out of scope, one entry each; empty array when nothing was. Read ${dir}/epic.md's phase log and ${dir}/review.md (confirmed sections only — refuted "Unconfirmed" findings are NOT deferred work; a "Post-fix check" section, when present, lists fixes the check could not confirm and regressions it found, and every one of those IS deferred work — a regression is a defect) and collect: deferred review findings (with why), scope cut, edge cases intentionally skipped, clarifying answers that narrowed scope, uncovered test surfaces. For each entry:
    - title and why: one line each.
    - kind, judged honestly, because it drives a MERGE GATE:
-     defect — a correctness, security, data-loss, or user-visible breakage bug that still exists on main AFTER this merges, whether this diff introduced it or merely exposed it. One defect holds the PR open for a human; none lets it merge unattended. A missing gate, a scope cut, a nice-to-have or a refactor idea is NOT a defect and must not inflate the count, and a real defect must not be relabelled to keep the merge.
+     defect — a correctness, security, data-loss, or user-visible breakage bug that still exists on main AFTER this merges, whether this diff introduced it or merely exposed it. One defect holds the PR open for a human; none lets it merge unattended. A missing gate, a scope cut, a nice-to-have or a refactor idea is NOT a defect and must not inflate the count, and a real defect must not be relabelled to keep the merge: an independent check re-judges every item you do not call a defect, and its verdict wins.
      missing-gate — an automated check whose absence let a class of bug through, that could not be added inside this diff.
      scope-cut — a requirement stated in ${dir}/requirements.md that was deliberately not delivered.
      other — everything else: refactor and consolidation ideas, nice-to-haves, cosmetic nits, rare edge-case tests, uncovered surfaces with no known defect behind them, follow-up verification or eval runs (if a run is needed to trust THIS diff it is a blocker on this epic, not a deferral), and anything whose value depends on a diff that main will move past within days.
@@ -318,6 +342,24 @@ const FIXCHECK_SCHEMA = {
       type: 'array',
       description: 'defects the fix delta introduced; empty when none',
       items: FINDINGS_SCHEMA.properties.findings.items,
+    },
+  },
+}
+const DEFERRAL_CHECK_SCHEMA = {
+  type: 'object', additionalProperties: false, required: ['verdicts'],
+  properties: {
+    verdicts: {
+      type: 'array',
+      description: 'exactly one entry per item listed in the prompt, in that order',
+      items: {
+        type: 'object', additionalProperties: false, required: ['index', 'defect', 'confidence', 'reasoning'],
+        properties: {
+          index: { type: 'number', description: '1-based number of the item this verdict judges' },
+          defect: { type: 'boolean', description: 'true only if a bug will exist on main after this merge' },
+          confidence: { type: 'number', description: '0-100' },
+          reasoning: { type: 'string' },
+        },
+      },
     },
   },
 }
@@ -537,7 +579,7 @@ async function shipTransport({ issue, slug, dir, decision }) {
       filed++
     }
     const lines = ['🤖 deferred / not done', '']
-    for (const d of deferred) lines.push(`- ${d.title} (${d.kind}): ${d.why}${links.has(d) ? ` — filed as ${links.get(d)}` : ''}`)
+    for (const d of deferred) lines.push(`- ${d.title} (${d.kind}): ${d.why}${d.checkNote ? ` — ${d.checkNote}` : ''}${links.has(d) ? ` — filed as ${links.get(d)}` : ''}`)
     if (eligible.length > filed) lines.push('', `${eligible.length} items qualified for a follow-up issue and ${filed} were filed (the cap is 3): needing more means this issue was under-scoped.`)
     await comment(issue, lines.join('\n'))
   }
@@ -1039,6 +1081,37 @@ try {
     { label: 'ship:pr', phase: 'Ship', step: 'code', schema: SHIP_SCHEMA },
   )
   if (!decision) return await fail('ship', 'Ship produced no PR description — nothing was pushed; the change is on epic/' + slug + ' (checkpoint commits + working tree).')
+
+  // ───────────────────────── Deferral check ─────────────────────────
+  // Ship's `kind` per deferral feeds the merge gate, and ship is the builder side. Every item it did
+  // not call a defect goes to the skeptic, whose verdict can only escalate: a builder's "defect" stands,
+  // a builder's "other" that the skeptic calls a defect becomes one. A dead check holds the PR.
+  const deferralBlockers = []
+  const deferred = Array.isArray(decision.deferred) ? decision.deferred : []
+  const toCheck = deferred.filter(d => d.kind !== 'defect')
+  if (toCheck.length) {
+    const c = await agent(PROMPTS.deferralCheck(toCheck, requirement, DIFF),
+      { label: 'deferral-check', phase: 'Ship', step: 'confirm-review', schema: DEFERRAL_CHECK_SCHEMA },
+    )
+    if (!c) {
+      deferralBlockers.push(`the deferral check produced no result — ${toCheck.length} deferred item(s) are unclassified`)
+      log('Deferral check: produced no result — the PR will be held.')
+    } else {
+      const verdicts = Array.isArray(c.verdicts) ? c.verdicts : []
+      let escalated = 0
+      toCheck.forEach((d, i) => {
+        const v = verdicts.find(x => Number(x.index) === i + 1)
+        if (v && v.defect === true && Number(v.confidence) >= 75) {
+          d.checkNote = `reclassified from ${d.kind} to defect by the deferral check (confidence ${v.confidence}): ${v.reasoning}`
+          d.kind = 'defect'
+          escalated++
+        }
+      })
+      log(`Deferral check: ${toCheck.length} non-defect item(s) re-judged, ${escalated} reclassified as defect(s).`)
+      updateEpicMd(dir, { log: `deferral-check: ${toCheck.length} re-judged, ${escalated} reclassified as defects` })
+    }
+  }
+
   const shipped = await shipTransport({ issue, slug, dir, decision })
   openPr = shipped.prUrl
   log(`Ship: PR opened — ${shipped.prUrl} (${shipped.deferredCount} deferred item(s), ${shipped.filed} filed as follow-ups)`)
@@ -1074,7 +1147,7 @@ try {
   if (shipped.deferredDefects > 0) {
     mergeBlockers.push(`${shipped.deferredDefects} deferred defect(s) that still exist on main after this merge`)
   }
-  mergeBlockers.push(...fixBlockers)
+  mergeBlockers.push(...fixBlockers, ...deferralBlockers)
 
   if (mergeBlockers.length) {
     const why = mergeBlockers.join(' + ')

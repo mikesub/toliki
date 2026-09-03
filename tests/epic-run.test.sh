@@ -120,6 +120,7 @@ case "${EPIC_STEP_LABEL:-}" in
   review:4)                                    key=lens-security ;;
   verify:*)                                    key=verify ;;
   fix-check)                                   key=fixcheck ;;
+  deferral-check)                              key=defercheck ;;
   fixes-after-review|fixes-after-review:retry) key=triage ;;
   ship:pr)                                     key=ship ;;
   summary:write)                               key=summary ;;
@@ -345,6 +346,7 @@ assert_contains "RESULT carries the PR url" "$RUN_OUT" '"prUrl":"https://github.
 assert_contains "review tally reported" "$RUN_OUT" '1 confirmed by adversarial verification, 0 refuted'
 assert_eq "exactly the twelve model steps ran" 12 "$(wc -l < "$RUN_LOG" | tr -d ' ')"
 assert_eq "the fixes were checked once" 1 "$(calls fixcheck)"
+assert_eq "no deferrals, no deferral check" 0 "$(calls defercheck)"
 assert_contains "the tally records the fix check" "$RUN_OUT" "fix check: 1/1 fixes confirmed, 0 regression(s)"
 assert_contains "the fix check was handed the exact delta" "$(cat "$STATE_DIR/fixcheck.0.prompt")" "git diff "
 assert_contains "review.md carries the post-fix section" "$(cat "$WT/.epics/42-add-widget/review.md")" "## Post-fix check"
@@ -565,8 +567,12 @@ fixture "$DEFER" ship '{"title":"Add widget","body":"Adds a widget.","commitBody
   {"title":"Third defect","why":"Same.","kind":"defect","file":true},
   {"title":"Fourth defect","why":"Same.","kind":"defect","file":true},
   {"title":"Refactor the helpers","why":"Nice to have.","kind":"other","file":true}]}'
+fixture "$DEFER" defercheck '{"verdicts":[{"index":1,"defect":false,"confidence":90,"reasoning":"A refactor idea; nothing breaks."}]}'
 run_pipeline "$EPIC_RUN" "$DEFER" --issue 42
 assert_rc "exits 0" 0 "$RUN_RC"
+assert_eq "the skeptic re-judged the deferrals once" 1 "$(calls defercheck)"
+assert_contains "only the non-defect item was put to it" "$(cat "$STATE_DIR/defercheck.0.prompt")" "Refactor the helpers"
+assert_not_contains "items ship already called defects are not re-judged" "$(cat "$STATE_DIR/defercheck.0.prompt")" "Second defect"
 assert_contains "the gate counts defects from the kinds" "$RUN_OUT" '4 deferred defect(s) that still exist on main after this merge'
 assert_not_contains "and holds the PR" "$RUN_OUT" '"readyToMerge":true'
 assert_eq "the issue stays ready-to-review" "ready-to-review," "$(gh_labels)"
@@ -710,6 +716,26 @@ assert_rc "exits 0" 0 "$RUN_RC"
 assert_eq "no fixer ran" 0 "$(calls triage)"
 assert_eq "no fix check ran" 0 "$(calls fixcheck)"
 assert_contains "the run ships" "$RUN_OUT" '"readyToMerge":true'
+
+scenario 'deferral check: an item ship called other but the skeptic calls a defect holds the PR'
+DOWNGRADED="$TMP/fixtures-downgraded"; cp -R "$BASE" "$DOWNGRADED"
+fixture "$DOWNGRADED" ship '{"title":"Add widget","body":"Adds a widget.","commitBody":"","deferred":[{"title":"Empty list still crashes on submit","why":"Out of scope for this slice.","kind":"other","file":false}]}'
+fixture "$DOWNGRADED" defercheck '{"verdicts":[{"index":1,"defect":true,"confidence":92,"reasoning":"Submit with an empty list throws on main after this merge; the requirement covers it."}]}'
+run_pipeline "$EPIC_RUN" "$DOWNGRADED" --issue 42
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_contains "the gate holds on the reclassified defect" "$RUN_OUT" '1 deferred defect(s) that still exist on main after this merge'
+assert_not_contains "it is not queued for merge" "$RUN_OUT" '"readyToMerge":true'
+assert_eq "the issue stays ready-to-review" "ready-to-review," "$(gh_labels)"
+assert_contains "the deferred record shows the reclassification" "$(gh_comments)" "Empty list still crashes on submit (defect): Out of scope for this slice. — reclassified from other to defect by the deferral check"
+
+scenario 'deferral check: a dead check holds the PR, not the run'
+DEADDEFER="$TMP/fixtures-deaddefer"; cp -R "$DOWNGRADED" "$DEADDEFER"
+printf '1' > "$DEADDEFER/defercheck.0.rc"; printf '1' > "$DEADDEFER/defercheck.1.rc"
+run_pipeline "$EPIC_RUN" "$DEADDEFER" --issue 42
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_contains "the gate says the items are unclassified" "$RUN_OUT" 'the deferral check produced no result'
+assert_contains "the PR was still opened" "$RUN_OUT" '"prUrl":"https://github.com/o/r/pull/7"'
+assert_eq "the issue stays ready-to-review" "ready-to-review," "$(gh_labels)"
 
 scenario 'epic-run: an off-schema payload is respawned once, then accepted'
 RETRY="$TMP/fixtures-retry"; cp -R "$BASE" "$RETRY"
