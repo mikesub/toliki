@@ -1,23 +1,40 @@
 #!/usr/bin/env node
 // epic-run — autonomous issue-to-PR delivery: prepare → architect → code →
-// review → triage → ship, no sign-offs.
+// review → fixes after review → ship, no sign-offs.
 //
 // Issue mode (`--issue N`): preflight (closed? blocked_by?) → branch
 // epic/<N>-<slug> off origin/main and claim it by pushing the ref (atomic; a
 // run that loses the race skips), resuming an existing branch when one is left
-// over → checkpoint commits after code/triage → squashed single-commit PR at
+// over → checkpoint commits after code/fixes → squashed single-commit PR at
 // ship + blocker-comment → merge gate labels the issue ready-to-merge when
 // nothing was deferred, ready-to-review when a human must decide.
 // Manual mode (`--slug S`): builds on the current tree, no git; needs
 // .epics/<slug>/requirements.md to already exist.
 //
 // The run never merges: bin/merge-worker.sh drains ready-to-merge serially per
-// repo. Each phase below is one engine process (see lib/engine.mjs); this file
-// names no vendor.
+// repo. Each model step below is one engine process (see lib/engine.mjs); this
+// file names no vendor. Everything deterministic — git, gh, npm, the layout
+// discovery, the artifacts rendered from structured output — runs here in the
+// orchestrator through lib/github.mjs and lib/repo.mjs, so a claim, a label, a
+// checkpoint or an open PR is a fact the script established, never a claim a
+// model reported. A model runs only where a judgment is needed: design, code,
+// the review lenses and their skeptic, the fixes, and what the PR says.
 
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import path from 'node:path'
 import { agent, parallel, phase, log, initRuntime, onPhase, onLog } from './lib/runtime.mjs'
 import { parseArgs, finish, UsageError, EXIT } from './lib/cli.mjs'
 import { initStatus, statusPhase, statusNote, statusFinish } from './lib/status.mjs'
+import { failureReason, must } from './lib/proc.mjs'
+import {
+  ensureLabels, editLabels, issueLabels, issueView, openBlockers, comment, assignSelf,
+  openPrs, searchOpenPrs, prCreate, issueCreate, withBodyFile,
+} from './lib/github.mjs'
+import {
+  git, gitOut, discoverPackages, pkgList, ensureDeps, ensureEpicsIgnored, checkpoint, intentToAdd,
+  pushRejected, slugify, epicDir, writeRequirements, readRequirements, initEpicMd, updateEpicMd,
+  renderArchitecture, renderReview,
+} from './lib/repo.mjs'
 
 const USAGE = `Usage: epic-run.mjs (--issue <N> | --slug <slug>) [--session <name>] [--engine <name>]
 
@@ -30,73 +47,10 @@ const USAGE = `Usage: epic-run.mjs (--issue <N> | --slug <slug>) [--session <nam
 Exit: 0 shipped or held for review, 1 usage/crash, 2 skipped, 3 blocked.
 The final line is RESULT <json>.`
 
-// ───────────────────────── Discovery ─────────────────────────
-// This pipeline is shared across projects with different shapes (frontend+backend, frontend+worker),
-// so the package list cannot be hardcoded here. It is also deliberately NOT configured: a config file
-// would restate what each repo already states in its own package.json, and would go stale the moment a
-// repo changed shape. The repo is the source of truth; the pipeline reads it.
-//
-// The contract is exactly one line: a package is a directory whose package.json declares `scripts.verify`.
-// Everything a project wants gated on the way to a green pipeline goes INSIDE that script — including a
-// real-database tier, which each project triggers from its own path-diffing bash gate. That keeps the
-// decision deterministic (no agent in the loop) and, because CI runs `verify` too, covers manual commits
-// to main that an in-pipeline gate could never see.
-//
-// Discovery rides along on the two agents that already run before any code (prepare in git mode,
-// read:requirement in slug mode), so it costs no extra spawn in either path.
-const DISCOVERY =
-`Discover this repository's layout — do NOT assume any particular shape or set of packages. Read package.json files to answer; look at the repo root and each directory one level below it, skipping node_modules.
-- \`packages\`: every directory whose package.json declares a \`scripts.verify\` entry, as repo-relative paths with no trailing slash (e.g. ["frontend","backend"]); use "." for the repo root itself. This is the exact set the downstream \`npm run verify\` gate runs in, so a package you miss is a package that is never verified.`
-
 // ───────────────────────── Prompts ─────────────────────────
-// All agent prompt bodies live here as template builders; the orchestration below just wires them.
+// One template per MODEL step. Anything a script can do is not here — see the
+// Transport section below.
 const PROMPTS = {
-  // Claiming (step 4c) is what makes it safe to run epics in parallel. The label swap `ready` → `in-progress`
-  // can't be the lock — it's a read-modify-write with a wide window — but creating a ref on origin is a
-  // compare-and-swap, so pushing the branch BEFORE any work is a real cross-machine lock with no new
-  // infrastructure. Labels stay as the human-readable signal; the ref is the lock.
-  //
-  // Three layers, in the order prepare hits them, because no single one covers every collision:
-  //   1. Local branch already checked out in another worktree (4b) — same host, same clone: sessions share
-  //      one .git, so a live run's branch is visible and `git switch` refuses. Predates claiming.
-  //   2. A claim-only branch on origin (4b) — catches a competitor on ANY host, and catches it even when the
-  //      two runs picked DIFFERENT slugs for the same issue (the slug is a model-written gist of the title,
-  //      so it is not reliably identical), because the `epic/<N>-*` glob matches regardless of slug.
-  //   3. The push CAS itself (4c) — closes the window where both runs pass 4b before either has pushed.
-  // Layer 2 is not optional: a claim ref IS a branch on origin, so without it the loser lands in 4b's resume
-  // path and adopts its competitor's branch, never reaching 4c at all.
-  prepare: (issue) =>
-`Prepare phase for GitHub issue #${issue}, autonomous (NO user interaction). All git/gh/npm work happens here.
-1. Run \`gh issue view ${issue} --json number,title,body,state\`. If the command fails, stop and report the failure. If the issue state is CLOSED, set refused="issue #${issue} is closed" and return — do nothing else.
-2. Dependency preflight: \`gh api repos/{owner}/{repo}/issues/${issue}/dependencies/blocked_by --jq '[.[] | select(.state == "open") | .number]'\`. If it lists open blockers, set refused="blocked by open issue(s) #<list>" and return. If the command itself errors, note it and continue (treat as no blockers).
-3. \`git fetch origin\` (if it fails, note it and continue). Capture BASE=$(git rev-parse HEAD) now, BEFORE any branch switch — step 8's deps check needs it.
-4. Idempotency / resume guard, in this order:
-   a. An open PR already delivering this issue → alreadyExists=true, note which PR, return, do nothing else. Check BOTH \`gh pr list --state open --json number,headRefName --jq '[.[] | select(.headRefName | startswith("epic/${issue}-"))]'\` AND (for legacy title-derived branch names) \`gh pr list --state open --search "Closes #${issue} in:body" --json number,title\`.
-   b. An existing branch without an open PR (an interrupted or blocked prior run) → RESUME it, do not start over. Find it via \`git branch --list 'epic/${issue}-*'\` and \`git ls-remote --heads origin 'epic/${issue}-*'\`. Adopt that branch's OWN slug (everything after "epic/"). When the branch exists ONLY on origin, first tell a leftover apart from a live claim: \`git fetch origin <branch>\` then \`git log --format=%s origin/main..FETCH_HEAD\`. If the ONLY commit it carries is a \`chore(epic ${issue}): claim ...\` commit, another run claimed this issue and is building it right now: set refused="claimed by another run" and return. A branch carrying any real commit is a genuine leftover: resume it. Check it out: \`git switch <branch>\`, or \`git switch -c <branch> --track origin/<branch>\` when it exists only on origin. If the switch fails because the branch is checked out in another worktree, set refused="epic/<slug> is checked out in another worktree — a run may be live there" and return. Then \`git rebase origin/main\`; on conflict, \`git rebase --abort\` and set refused="resume rebase onto origin/main conflicted — resolve manually on <branch> or delete it for a fresh build" and return. Set resumed=true.
-   c. Otherwise start fresh: slug = "${issue}-<short>" where <short> is a 2-4 word kebab-case gist of the issue title (whole slug ≤ 40 chars). \`git switch -c epic/<slug> origin/main\` — ALWAYS branch from origin/main, never from the local checkout (it can be stale). Then CLAIM the issue on origin, RIGHT NOW — before requirements.md, before \`npm ci\`, before anything else expensive:
-      \`\`\`
-      git commit --allow-empty -m "chore(epic ${issue}): claim $(date +%s)-$$"
-      git push origin "HEAD:refs/heads/epic/<slug>"
-      \`\`\`
-      That push is the lock: the unique empty commit makes a competing run's push a rejected non-fast-forward instead of a silent no-op, and Ship squashes it away. If the push is rejected, another run claimed this issue in the last instant: set refused="claimed by another run" and return. Do NOT retry it, do NOT force it, and do NOT pick a different slug to get around it — losing this race is the mechanism working.
-5. Signal on GitHub that autonomous work has started — now, before the slow deps step. These are best-effort: if one fails, note it and continue; do NOT abort the run.
-   a. Label swap, as ONE \`gh issue edit\`. First make sure every label the swap touches exists — \`gh label create\` is idempotent, run each with \`2>/dev/null || true\`: \`in-progress\` (color FBCA04, "Actively being worked by epic-run"), \`ready-to-merge\` (0E8A16, "epic-run finished; PR open and gates cleared — queued for bin/merge-worker.sh"), \`ready-to-review\` (0E8A16, "epic-run finished; PR is open and awaiting review"), \`failed\` (B60205, "epic-run stopped at a blocker; needs human attention"). Then the swap itself: \`gh issue edit ${issue} --add-label in-progress --remove-label ready --remove-label ready-to-merge --remove-label ready-to-review --remove-label failed\`. ONE combined call, never an add call plus a separate strip call: a half-applied swap leaves \`ready\` beside a terminal label, and the dispatch queue would re-pick the issue every tick. If the edit fails, do NOT abort — but include a \`- prepare: label swap failed: <error>\` line in the phase log when you write epic.md (step 6), so it surfaces in the PR body.
-   b. Self-assign: \`gh issue edit ${issue} --add-assignee @me\`.
-   Do NOT post a comment — the label and the assignment are the start signal.
-6. Create \`.epics/<slug>/\` (gitignored) and write \`.epics/<slug>/requirements.md\` = the issue body VERBATIM as the definition of done, prefixed with a line \`Issue: #${issue}\`. Also write \`.epics/<slug>/epic.md\` (fresh; on a resume where it already exists, keep it and append a phase-log line \`- prepare: resumed\`):
-   # <Title>
-   - slug: <slug>
-   - issue: ${issue}
-   - phase: prepare
-   - approach:
-
-   ## Phase log
-   - prepare: done
-7. Discover the layout. The downstream verify gate runs in exactly the packages you report here, so under-reporting silently removes a gate rather than failing loudly.
-${DISCOVERY}
-8. Ensure deps are present in EVERY package you discovered in step 7 — the \`npm run verify\` gate downstream is INVALID without them. In EACH package: if \`node_modules\` is missing, run \`npm ci\`; if it exists but the lockfile changed between this worktree's original checkout and the new base — \`git diff --quiet $BASE HEAD -- <package>/package-lock.json\` exits non-zero — ALSO run \`npm ci\`. Otherwise skip.
-Return: slug, branch (epic/<slug>), alreadyExists, resumed, refused (only when refusing), packages from step 7, and requirement = the full verbatim contents of the requirements.md you wrote.`,
-
   architectDesign: (dir) =>
 `Read ${dir}/requirements.md and design the implementation approach for it. It goes straight to implementation.
 
@@ -110,49 +64,16 @@ Your output is schema-enforced JSON — populate every field, do not cram everyt
 - contract: the public contract / API surface, explicit enough that tests can be written against it WITHOUT seeing the implementation.
 - tradeoffs: what this approach deliberately accepts.`,
 
-  // Transcription only — the design is already decided and arrives whole in the prompt. Kept separate from the
-  // design agent because that one is read-only by charter (the architect step is read-only: no Write tool), and the
-  // separation is what stops "design the epic" drifting into "start building it".
-  architectWrite: (dir, d) =>
-`Transcribe the design below into ${dir}/architecture.md. It is ALREADY DECIDED — do not redesign it, re-evaluate it, add to it, or read the codebase to check it.
-
-architecture.md must OPEN with this single line:
-Approach: ${d.approach} — <the rationale below, compressed to one line>
-
-Then lay the rest out under clear headings: the rationale; the ordered build steps (preserving which are independent vs. must serialize); the files to create/modify; the public contract / API surface; the deliberately accepted trade-offs. Keep the contract section verbatim-faithful — the next phase writes tests from this file alone, WITHOUT seeing the implementation, so anything you drop there becomes an untested surface.
-
-Rationale: ${d.rationale}
-
-Ordered build steps:
-${d.steps.map((s, i) => `${i + 1}. ${s}`).join('\n')}
-
-Files to create/modify:
-${d.files.map(f => `- ${f}`).join('\n')}
-
-Public contract / API surface:
-${d.contract}
-
-Trade-offs deliberately accepted:
-${d.tradeoffs}
-
-Also update ${dir}/epic.md (approach filled in, phase: architect → done, append a phase-log line). Write nothing else.`,
-
   codeRed: (dir) =>
 `Code phase, RED step. Write tests ONLY (no implementation). Read ${dir}/requirements.md and ${dir}/architecture.md, and derive tests from the requirements + the public contract/API surface. Cover what is genuinely testable in this stack (units, pure logic, backend handlers, frontend component behavior); for hard-to-test surfaces (canvas/visual, external I/O), SKIP and note in ${dir}/epic.md what is uncovered and why — do not fake a test.
 Return the list of test files you created and a one-line confirmation they fail for the right reason.`,
 
-  codeGreen: (dir, red, finish, pkgs) =>
+  codeGreen: (dir, red, pkgs) =>
 `Code phase, GREEN step. Read ${dir}/architecture.md and ${dir}/requirements.md and the existing failing tests:
 ${red}
 
 Implement the feature to make those tests pass, following architecture.md's build steps. Note any scope decision or wrong-test fix in ${dir}/epic.md's phase log. Run \`npm run verify\` in EACH touched package (this repo's packages: ${pkgs}) until green — that script is the project's whole gate, so whatever it runs (including any real-database tier it triggers for itself) has to be green, not just the unit tests.
-${finish}
-Update ${dir}/epic.md (phase: code → done, phase log). Return a short status: packages verified green, and any in-flight decisions or remaining failures you could not resolve.`,
-
-  readRequirement: (dir) =>
-`Read ${dir}/requirements.md and return its full contents VERBATIM in the "requirement" field.
-Then report this repo's layout in the "packages" field. This is the manual flow's only pass before code, so it is the one chance to establish the layout; read the package.json files you need for it and nothing else.
-${DISCOVERY}`,
+Leave everything in the working tree: do NOT commit or push; the pipeline checkpoints your work itself. Return a short status: packages verified green, and any in-flight decisions or remaining failures you could not resolve.`,
 
   review: (requirement, lens, diffCmd) =>
 `Review this change for the lens: ${lens}.
@@ -180,128 +101,55 @@ Return exactly ${findings.length} verdict${findings.length === 1 ? '' : 's'} —
 
 These were reported independently by different review lenses, so several may be one defect restated in different words, often pointing at DIFFERENT files (the component, the gate that guards it, its test, the doc describing it). Judge each on its own merits: if two are the same defect, set \`sameDefectAs\` on the LATER one to the earlier one's number and let them stand or fall together — do NOT mark one not-real merely because it overlaps another. Group only findings ONE fix would genuinely resolve together; two distinct bugs that happen to sit in the same function are NOT the same defect.` : ''}`,
 
-  reviewWrite: (dir, confirmedJson, unconfirmedJson) =>
-`Write ${dir}/review.md from the review results below.
-
-Confirmed findings (survived adversarial verification) come first, highest severity first. For each: severity, confidence, file:line, the behavior/guideline it breaks, a concrete fix, and the gate (test/type/real-DB check/lint) that would catch its whole class next time. If the list is empty, say so plainly.
-
-Confirmed (JSON):
-${confirmedJson}
-
-Unconfirmed findings (adversarial verification refuted them or could not confirm) — if any, add a FINAL section titled exactly "## Unconfirmed — not fixed": one line per finding plus the verifier's reasoning. Open the section by stating that fixes-after-review and ship MUST NOT act on these — they are recorded only so a human can double-check the discard. If there are none, omit the section.
-
-Unconfirmed (JSON):
-${unconfirmedJson}
-
-Then update ${dir}/epic.md (phase: review → done, phase log). Do not fix anything.`,
-
-  triage: (dir, finish, pkgs, grouping) =>
+  triage: (dir, pkgs, grouping) =>
 `Fixes-after-review phase, autonomous (NO user sign-off). Read ${dir}/review.md and the diff. Apply fixes for the CONFIRMED findings only, highest severity first — NEVER act on anything under "## Unconfirmed — not fixed" (those were refuted; they are listed for human eyes only). For every finding you fix, also add the automated check that would catch its whole CLASS, not just the instance in front of you — a test, a type, a lint rule, or a shared helper that makes the footgun impossible. Every review finding is a missing gate. Where this project's AGENTS.md states its own harden-the-gate rule, follow that wording; this instruction stands on its own where it does not.
 When the check that would catch a class is NOT expressible as a test/type/lint but is a convention (a rule about how to write something, a footgun only a human would know to avoid), write the rule into THIS project's own instructions instead: the relevant section of its AGENTS.md — the root one, or the per-directory AGENTS.md covering the code in question (or a \`.claude/rules/*.md\` file where this project still keeps those) — in the file's existing voice and length. Those are the only places you may write a rule. The skills, agents and this pipeline are shared harness files that live outside this repo and are used by other projects: a rule that belongs to one of them is out of scope for an epic, so do NOT edit or recreate one — record it as DEFERRED in ${dir}/epic.md's phase log, stating the rule you would have written and which harness file it belongs in, and leave the harness untouched. Note every amendment or deferral in ${dir}/epic.md's phase log so it surfaces in the PR body.
 If a finding is genuinely too risky or expensive to fix safely without a human decision, DO NOT guess — leave it, and record it as deferred (with why) in ${dir}/epic.md's phase log so the summary surfaces it.
 ${grouping}After fixes, re-run \`npm run verify\` in each touched package (this repo's packages: ${pkgs}) until green.
-${finish}
-Update ${dir}/epic.md (phase: review→triaged). Return:
+Leave everything in the working tree: do NOT commit or push; the pipeline checkpoints your work itself. Return:
 - status: a short summary — which findings were fixed, which were deferred and why, and the final verify result.
 - deferred: one entry per CONFIRMED finding you did NOT fix; empty array when you fixed them all. This list is a MERGE GATE: an empty list queues the PR to be merged to main unattended, so omitting something you left unfixed ships it. Report every one.`,
 
-  ship: (dir, issue, slug, design, triageStatus, tally) =>
-`Ship phase, autonomous. The work is complete and verified; now record deferrals, squash the branch to one commit, push, and open the PR. ALL git/gh work happens here.
+  // Judgment only: what the PR says, what was left undone and how each item is
+  // classed. The pipeline squashes, pushes, opens the PR, files the follow-ups
+  // and labels the issue from the JSON — and counts the merge gate from `kind`.
+  ship: (dir, issue, design, triageStatus, tally) =>
+`Ship phase, autonomous. The work is complete and verified. You decide what the PR says and what was left undone; the pipeline then squashes, pushes, opens the PR, records deferrals on the issue and labels it from what you return. Run NO git or gh commands.
 
-1. Write ${dir}/summary.md (the PR body source) — keep it about THIS diff, not future work. Do NOT include a files-modified/diff-stat listing or a verification/test-results section; the PR's Files tab and checks already show both. Capture, against ${dir}/requirements.md: what was built; the architecture approach — "${design?.approach}": ${design?.rationale}; review outcome — OPEN that section with this tally verbatim: "${tally}", then the findings that survived verification and which were fixed (review.md's "Unconfirmed — not fixed" findings were refuted, not deferred: leave them out, but keep the refuted COUNT in the tally). Do NOT enumerate deferred/out-of-scope work in the PR body — instead add a single pointer line: "Deferred items recorded on #${issue}."
-   **Never write a bare \`#<number>\` for anything except issue #${issue} itself.** GitHub turns every \`#N\` into a live cross-reference and renders it as that issue or PR's TITLE, so numbering findings \`#1\`, \`#2\`, \`#3\` splices the titles of three unrelated PRs into your sentences and notifies them. Refer to a finding as \`Finding 3\`, or just lead with what it was; the same goes for hunks, steps, requirements and packages, in every body you write here and in the issue comment in step 2. Fixes-after-review status: ${triageStatus}
+Your output is schema-enforced JSON:
 
-2. Record deferred work on the ISSUE, not the PR. Read ${dir}/epic.md's phase log and ${dir}/review.md (confirmed sections only — refuted "Unconfirmed" findings are NOT deferred work) and collect everything deferred or out of scope: deferred review findings (with why), scope cut, edge cases intentionally skipped, clarifying answers that narrowed scope, uncovered test surfaces.
-   a. Filing a follow-up issue is the EXCEPTION, not the default — the comment in (b) is the record. An item earns an issue ONLY if it clears BOTH gates:
-      GATE 1 — it is one of exactly three kinds:
-        i.   a DEFECT that exists on main after this merge — a correctness, security, data-loss, or user-visible breakage bug, whether this diff introduced it or merely exposed it;
-        ii.  a MISSING GATE — an automated check whose absence let a class of bug through, that could not be added inside this diff;
-        iii. an EXPLICIT SCOPE CUT — a requirement stated in ${dir}/requirements.md that was deliberately not delivered.
-      GATE 2 — it passes the slicing test: could ONE coherent PR close it and still mean something on its own? "Decide whether to X", "consider Y", "investigate Z" all FAIL — a question is not a mergeable change.
-      Everything else goes in the comment ONLY: refactor and consolidation ideas, nice-to-haves, cosmetic nits, rare edge-case tests, uncovered surfaces with no known defect behind them, follow-up verification or eval runs (if a run is needed to trust THIS diff it is a blocker on this epic, not a future issue), and anything whose value depends on a diff that main will move past within days.
-      Cap: file at most 3. If more than 3 clear both gates, file the 3 highest-severity (defects outrank everything) and state in the comment how many qualified versus how many were filed.
-      To file: \`gh issue create --title "<clear title>" --body "<what + why deferred + Follow-up to #${issue}>"\` — no label. That \`Follow-up to #${issue}\` line IS the relation, and the only one you can set: GitHub records it as a cross-reference on #${issue}'s timeline. Do NOT try to set GitHub's "relates to" relationship (it has no API), do NOT create or apply a label, do NOT add a \`blocked_by\`/\`blocking\` dependency (the follow-up gates nothing), and do NOT make it a sub-issue.
-   b. Post ONE comment on issue #${issue} listing all deferred items, each as a bullet; for the filed ones include the follow-up issue link. Start the comment with this exact first line:
-      🤖 deferred / not done
-   If there is nothing deferred, skip both (a) and (b) and the pointer line in step 1.
-   c. Return \`deferredDefects\` = how many of the collected items are GATE 1.i DEFECTS — a correctness, security, data-loss, or user-visible breakage bug that still exists on main AFTER this merges — whether or not you filed an issue for it. 0 when none. This is a MERGE GATE: 0 queues this PR for unattended merge and deploy; anything higher holds it open for a human. Count honestly — a missing gate, a scope cut, a nice-to-have, or a refactor idea is NOT a defect and must not inflate this number, and a real defect must not be rounded down to keep the merge.
-
-3. Squash the branch into ONE clean commit:
-   a. Fold any leftover working-tree changes into the checkpoint chain first: \`git add -A\`, then \`git commit -m "wip(epic ${slug}): pre-ship"\` only if something is staged (a clean tree skips this).
-   b. \`git reset --soft $(git merge-base HEAD origin/main)\` — soft-reset to the merge base, NOT to origin/main itself (it may have advanced during the run), leaving the entire change staged.
-   c. Commit once with the real message. It MUST include \`Closes #${issue}\` on its own line (this is what auto-closes the issue on merge — a bare \`(#${issue})\` only links). Then apply THIS project's own legal/compliance review trigger, if it has one: look in its AGENTS.md for a section defining when a change needs legal or policy review. If one exists, judge this diff against the criteria written there — not against any you remember from elsewhere — and when they are met, add the exact marker string that section specifies to the commit body and the PR body. If this project defines no such trigger, skip this check entirely: do NOT invent criteria and do NOT import another project's.
-4. \`git push -u origin epic/${slug}\`. EXPECT this to be rejected as non-fast-forward — the squash rewrote the branch Prepare claimed — and re-push with \`git push --force-with-lease -u origin epic/${slug}\`; the lease fails instead if anything else moved the ref.
-5. Open the PR: \`gh pr create --head epic/${slug} --title "<title>" --body "<body>"\`, using ${dir}/summary.md as the body and including \`Closes #${issue}\` in it. Do NOT merge it, and do NOT wait for its CI. NOTHING in this run merges; the merge worker does that outside this run.
-6. Flip the start-signal to review-ready: \`gh label create ready-to-review --color 0E8A16 --description "epic-run finished; PR is open and awaiting review" 2>/dev/null || true\`, then \`gh issue edit ${issue} --remove-label in-progress --add-label ready-to-review 2>/dev/null || true\`. Leave the assignee in place. Apply \`ready-to-review\` and nothing else: whether this PR may instead be queued for unattended merge is decided by the pipeline AFTER you return, from the number you report in 2c, and it is not yours to pre-empt.
-Update ${dir}/epic.md (phase: ship → done). Return the PR URL and deferredDefects.`,
-
-  // Transport, not judgment: the merge gate has already been computed in the script from structured counts,
-  // and this only writes its verdict where bin/merge-worker.sh will read it. Kept as a separate step AFTER
-  // the gate — rather than folded into ship — so the promoting label can only ever exist downstream of a
-  // clear gate. Ship's conservative `ready-to-review` is the state anything that goes wrong here decays to.
-  handoff: (dir, issue) =>
-`Queue issue #${issue} for the merge worker. The pipeline has ALREADY decided this PR may merge unattended — you are not re-judging that, and you must not merge, edit, rebase, push, or comment on anything.
-1. \`gh label create ready-to-merge --color 0E8A16 --description "epic-run finished; PR open and gates cleared — queued for bin/merge-worker.sh" 2>/dev/null || true\`
-2. \`gh issue edit ${issue} --remove-label ready-to-review --add-label ready-to-merge\`
-3. Verify it landed: \`gh issue view ${issue} --json labels --jq '[.labels[].name]'\` must now contain \`ready-to-merge\` and NOT \`ready-to-review\`.
-Append \`- handoff: queued for merge-worker\` to ${dir}/epic.md's phase log. Return labelled=true ONLY if step 3 confirmed both halves; otherwise labelled=false with what you saw.`,
+1. title: the PR title, also the squashed commit's subject line (one line, imperative, ≤ 72 chars).
+2. body: the PR body, in markdown — keep it about THIS diff, not future work. Do NOT include a files-modified/diff-stat listing or a verification/test-results section; the PR's Files tab and checks already show both. Capture, against ${dir}/requirements.md: what was built; the architecture approach — "${design?.approach}": ${design?.rationale}; review outcome — OPEN that section with this tally verbatim: "${tally}", then the findings that survived verification and which were fixed (review.md's "Unconfirmed — not fixed" findings were refuted, not deferred: leave them out, but keep the refuted COUNT in the tally). Do NOT enumerate deferred/out-of-scope work in the body, and do NOT write a "Closes #${issue}" line: the pipeline appends both a pointer to the issue's deferred record and the Closes line.
+   **Never write a bare \`#<number>\` for anything except issue #${issue} itself.** GitHub turns every \`#N\` into a live cross-reference and renders it as that issue or PR's TITLE, so numbering findings \`#1\`, \`#2\`, \`#3\` splices the titles of three unrelated PRs into your sentences and notifies them. Refer to a finding as \`Finding 3\`, or just lead with what it was; the same goes for hunks, steps, requirements and packages, in every field you return. Fixes-after-review status: ${triageStatus}
+3. commitBody: a short commit body (the why and notable details), or an empty string.
+4. legalMarker: apply THIS project's own legal/compliance review trigger, if it has one: look in its AGENTS.md for a section defining when a change needs legal or policy review. If one exists, judge this diff against the criteria written there — not against any you remember from elsewhere — and when they are met, return the exact marker string that section specifies; the pipeline adds it to the commit body and the PR body. If the project defines no such trigger, or the criteria are not met, omit the field: do NOT invent criteria and do NOT import another project's.
+5. deferred: everything deferred or out of scope, one entry each; empty array when nothing was. Read ${dir}/epic.md's phase log and ${dir}/review.md (confirmed sections only — refuted "Unconfirmed" findings are NOT deferred work) and collect: deferred review findings (with why), scope cut, edge cases intentionally skipped, clarifying answers that narrowed scope, uncovered test surfaces. For each entry:
+   - title and why: one line each.
+   - kind, judged honestly, because it drives a MERGE GATE:
+     defect — a correctness, security, data-loss, or user-visible breakage bug that still exists on main AFTER this merges, whether this diff introduced it or merely exposed it. One defect holds the PR open for a human; none lets it merge unattended. A missing gate, a scope cut, a nice-to-have or a refactor idea is NOT a defect and must not inflate the count, and a real defect must not be relabelled to keep the merge.
+     missing-gate — an automated check whose absence let a class of bug through, that could not be added inside this diff.
+     scope-cut — a requirement stated in ${dir}/requirements.md that was deliberately not delivered.
+     other — everything else: refactor and consolidation ideas, nice-to-haves, cosmetic nits, rare edge-case tests, uncovered surfaces with no known defect behind them, follow-up verification or eval runs (if a run is needed to trust THIS diff it is a blocker on this epic, not a deferral), and anything whose value depends on a diff that main will move past within days.
+   - file: whether it earns a follow-up issue. Filing is the EXCEPTION, not the default — the record the pipeline posts on the issue costs nothing, and an over-filed item rots in the backlog forever. true ONLY if the kind is defect, missing-gate or scope-cut AND it passes the slicing test: could ONE coherent PR close it and still mean something on its own? "Decide whether to X", "consider Y", "investigate Z" all FAIL — a question is not a mergeable change. The pipeline files at most 3, defects first, and notes in the record when more qualified: needing more than 3 means the issue was under-scoped, and that count is the signal.
+   - issueTitle and issueBody, for file=true: a clear title, and a body saying what it is and why it was deferred. The pipeline appends the \`Follow-up to #${issue}\` line and applies no label.`,
 
   summaryManual: (dir, design, triageStatus) =>
-`Write ${dir}/summary.md and return its full contents. This is the manual flow — do NOT commit, push, or open a PR; leave all changes in the working tree.
-Capture, against ${dir}/requirements.md: what was built; the architecture approach — "${design?.approach}": ${design?.rationale}; files modified (\`git diff --stat\`); verify status per package; review outcome (findings that survived verification, which were fixed, which were DEFERRED and why — read ${dir}/review.md and ${dir}/epic.md); anything deferred or out of scope; a suggested next step. Fixes-after-review status: ${triageStatus}
-Update ${dir}/epic.md (phase: ship → done).`,
-
-  blocked: (issue, slug, phase, reason, prUrl) => {
-    const branch = slug ? `epic/${slug}` : null
-    // A block AFTER ship means the PR is already open, pushed, and complete — the work needs a human, not
-    // preservation, and a re-run would skip it (prepare's open-PR guard) rather than resume. Say so, or the
-    // generic "re-run to resume" line sends the next run into a no-op.
-    const preserve = prUrl
-      ? `1. Nothing to preserve — the branch is pushed and PR ${prUrl} is open with the complete change. Run NO git commands.`
-      : branch
-      ? `1. Preserve the work — checkpoint commits already on ${branch} are durable; only uncommitted changes are at risk:
-   a. If the working tree has uncommitted changes, commit them as WIP: \`git add -A && git commit -m "wip: epic blocked at ${phase}"\`. Do NOT add \`Closes #${issue}\` — unfinished work must not auto-close the issue on an accidental merge; do not force-add gitignored paths. A clean tree has nothing to commit — skip this.
-   b. Push ONLY if ${branch} has a commit not on origin (a checkpoint, the WIP commit above, or a Ship commit): \`git push -u origin ${branch}\` (ignore errors). A branch with no commits beyond origin/main has nothing worth pushing — skip.`
-      : `1. No branch was created before the block — there is nothing to preserve in git.`
-    const branchLine = prUrl
-      ? `- PR: ${prUrl} — open on ${branch}, NOT merged and NOT queued for the merge worker; the change itself is complete. Fix the cause above, then merge it by hand. A re-run of /epic #${issue} will skip (an open PR already delivers this issue).`
-      : branch
-      ? `- branch: ${branch} — re-running /epic #${issue} resumes from it; delete the branch (locally AND on origin) to force a fresh build`
-      : `- branch: none (blocked before branch creation; a re-run of /epic #${issue} starts fresh)`
-    const phaseLog = branch
-      ? ` If \`.epics/${slug}/epic.md\` exists, append its \`## Phase log\` section verbatim under the body above — \`.epics/\` is gitignored and dies with the worktree, so this comment is what survives.`
-      : ''
-    return `The autonomous epic-run pipeline hit a blocker and must report it on GitHub, then stop. Do this and nothing else:
-${preserve}
-2. Post a comment on issue #${issue} whose body starts with EXACTLY this (fill the values; keep the first line and field names verbatim):
-
-🤖 epic-run blocked
-- phase: ${phase}
-- reason: ${reason}
-${branchLine}
-
-Post it with \`gh issue comment ${issue} --body-file -\`, feeding the body via a heredoc on stdin.${phaseLog}
-3. Flip the start-signal to failed: \`gh label create failed --color B60205 --description "epic-run stopped at a blocker; needs human attention" 2>/dev/null || true\`, then \`gh issue edit ${issue} --remove-label in-progress --remove-label ready-to-merge --remove-label ready-to-review --add-label failed 2>/dev/null || true\` — every terminal label must come off, \`ready-to-merge\` above all, since leaving it would hand a failed run's PR to the merge worker. Leave the assignee in place.
-Return confirmation that the comment was posted and the label was swapped to failed.`
-  },
+`Write the run's summary and return it in the "summary" field, as markdown. This is the manual flow — do NOT commit, push, or open a PR; leave all changes in the working tree.
+Capture, against ${dir}/requirements.md: what was built; the architecture approach — "${design?.approach}": ${design?.rationale}; files modified (\`git diff --stat\`); verify status per package; review outcome (findings that survived verification, which were fixed, which were DEFERRED and why — read ${dir}/review.md and ${dir}/epic.md); anything deferred or out of scope; a suggested next step. Fixes-after-review status: ${triageStatus}`,
 }
 
 // ───────────────────────── Config ─────────────────────────
 // Every agent() call below names one STEP (lib/engine.mjs STEPS); which vendor, model and effort runs it is
 // that step's row in the run's engine in etc/engines.json (--engine, or the issue's engine:<name> label).
 // What a row is written against:
-// bookkeeping — the prompt is a fully-specified procedure with no judgment call: transport, transcription,
-// scripted git/gh. Deliberately NOT ship:pr (weighs the project's own legal/compliance trigger where it has
-// one, and decides which deferrals become filed issues), which is a `code` step. ship:handoff IS bookkeeping —
-// the gate it writes down was already decided in the script, and a wrong answer there fails loudly and safely
-// (the issue stays `ready-to-review`, where a human is looking). Downgrade a step only when a wrong answer
-// would fail loudly.
 // architect — designs the epic in one pass. It is the one step that fixes the shape of everything downstream
-// (red writes its tests from that contract), so a weak call here is the most expensive kind. The transcription
-// half of the phase is bookkeeping.
+// (red writes its tests from that contract), so a weak call here is the most expensive kind.
+// code — red, green, and ship's judgment half (what the PR says, what was deferred and of what kind, the
+// project's own legal trigger). Ship's `kind` per deferral feeds the merge gate, which is why it is not a
+// cheaper row.
 // confirm-review — the adversarial verifier is the last judgment before fixes-after-review AUTO-APPLIES a fix
 // with no human sign-off, so a wrong "real" here becomes a committed change and a wrong "not real" buries a
-// live bug. It runs once per file cluster (a handful of spawns), not once per lens, which is what makes
+// live bug. It runs once per batch (a handful of spawns), not once per lens, which is what makes
 // upgrading it cheap.
 // review — the five finders drive recall, and more cheap finders beat fewer expensive ones. If recall proves
 // weak, add a sixth lens rather than upgrading the existing five.
@@ -328,37 +176,6 @@ const reviewLenses = (pkgs) => [
 ]
 
 // ───────────────────────── Schemas ─────────────────────────
-// Carried by both discovery-reporting agents. Kept OUT of either schema's `required` on purpose: prepare
-// can legitimately return before it ever looks at the layout (refused, or an open PR already delivers the
-// issue). The script validates it instead, after those early exits — see applyDiscovery.
-const DISCOVERY_PROPS = {
-  packages: {
-    type: 'array', items: { type: 'string' },
-    description: 'repo-relative path of every directory whose package.json declares scripts.verify (e.g. ["frontend","backend"]); "." for the repo root',
-  },
-}
-
-const PREP_SCHEMA = {
-  type: 'object', additionalProperties: false,
-  required: ['alreadyExists', 'resumed'],
-  properties: {
-    ...DISCOVERY_PROPS,
-    slug: { type: 'string', description: '"<issue>-<short-kebab-gist>", e.g. "42-locate-crop-pad" (≤ 40 chars; empty when refused)' },
-    branch: { type: 'string', description: 'the branch name, epic/<slug>' },
-    alreadyExists: { type: 'boolean', description: 'true if an open PR already delivers this issue (work was skipped)' },
-    resumed: { type: 'boolean', description: 'true when an existing epic/<N>-* branch was found and resumed (rebased onto origin/main)' },
-    refused: { type: 'string', description: 'set ONLY when the run must not start (closed issue, open blocked_by dependencies, "claimed by another run" when the claim push lost the race or a claim ref is already on origin, branch checked out elsewhere, resume-rebase conflict) — the reason' },
-    requirement: { type: 'string', description: 'full verbatim contents of the requirements.md that was written' },
-    note: { type: 'string', description: 'optional note, e.g. which PR made this a duplicate' },
-  },
-}
-const REQ_SCHEMA = {
-  type: 'object', additionalProperties: false, required: ['requirement'],
-  properties: {
-    ...DISCOVERY_PROPS,
-    requirement: { type: 'string', description: 'full verbatim contents of requirements.md' },
-  },
-}
 const DESIGN_SCHEMA = {
   type: 'object', additionalProperties: false,
   required: ['approach', 'rationale', 'steps', 'files', 'contract', 'tradeoffs'],
@@ -392,9 +209,9 @@ const FINDINGS_SCHEMA = {
     },
   },
 }
-// One verify agent covers every finding at a file, so verdicts come back as an array keyed by the
+// One verify agent covers every finding in a batch, so verdicts come back as an array keyed by the
 // finding's 1-based number in the prompt. A missing/extra entry is handled at the call site (fail-closed
-// to unconfirmed) rather than trusted, since one batch now carries a whole file's findings.
+// to unconfirmed) rather than trusted, since one batch carries several findings.
 const VERDICT_SCHEMA = {
   type: 'object', additionalProperties: false, required: ['verdicts'],
   properties: {
@@ -435,19 +252,37 @@ const TRIAGE_SCHEMA = {
     },
   },
 }
+// Ship returns judgment only. `kind` is what the merge gate counts; `file` is
+// honoured only for the kinds that can earn an issue, and capped in code.
 const SHIP_SCHEMA = {
-  type: 'object', additionalProperties: false, required: ['prUrl', 'deferredDefects'],
+  type: 'object', additionalProperties: false,
+  required: ['title', 'body', 'commitBody', 'deferred'],
   properties: {
-    prUrl: { type: 'string', description: 'URL of the opened PR' },
-    deferredDefects: { type: 'number', description: 'how many deferred items are DEFECTS that still exist on main after this merges (0 when none)' },
+    title: { type: 'string', description: 'PR title and squashed-commit subject, one line' },
+    body: { type: 'string', description: 'PR body markdown; no bare #N except this issue; no Closes line' },
+    commitBody: { type: 'string', description: 'short commit body; empty string when none' },
+    legalMarker: { type: 'string', description: "the project's own legal-review marker, only when its AGENTS.md defines one and the criteria are met" },
+    deferred: {
+      type: 'array',
+      description: 'everything deferred or out of scope; empty when nothing was',
+      items: {
+        type: 'object', additionalProperties: false,
+        required: ['title', 'why', 'kind', 'file'],
+        properties: {
+          title: { type: 'string' },
+          why: { type: 'string' },
+          kind: { enum: ['defect', 'missing-gate', 'scope-cut', 'other'], description: 'defect = a bug still on main after this merges (holds the merge); see the prompt' },
+          file: { type: 'boolean', description: 'true only when the kind qualifies and one coherent PR could close it' },
+          issueTitle: { type: 'string', description: 'for file=true' },
+          issueBody: { type: 'string', description: 'for file=true: what and why deferred' },
+        },
+      },
+    },
   },
 }
-const HANDOFF_SCHEMA = {
-  type: 'object', additionalProperties: false, required: ['labelled'],
-  properties: {
-    labelled: { type: 'boolean', description: 'true ONLY if `gh issue view` was observed carrying ready-to-merge and not ready-to-review' },
-    summary: { type: 'string', description: 'one line on what was observed' },
-  },
+const SUMMARY_SCHEMA = {
+  type: 'object', additionalProperties: false, required: ['summary'],
+  properties: { summary: { type: 'string', description: 'the run summary, markdown' } },
 }
 
 // ───────────────────────── Args & mode ─────────────────────────
@@ -475,11 +310,250 @@ const issue = ARGS.issue
 let slug = ARGS.slug
 const gitMode = issue != null
 
-// In git mode the blocker path posts a comment on the issue; in slug mode it just returns the error.
-// blockerPosted guards the double-post: fail() can be re-entered when the blocked agent itself throws
-// (e.g. the engine dying), and the outer catch calls fail() again.
-// openPr is set once ship succeeds: a block after that point must not tell the reader to resume a branch
-// whose work is already delivered by an open PR.
+// ───────────────────────── Transport ─────────────────────────
+// The deterministic half of the run. Every function here either returns a
+// structured outcome the pipeline branches on, or throws with a message that
+// names the command that failed — main()'s catch turns that into a blocker.
+
+const LIFECYCLE = ['in-progress', 'ready-to-merge', 'ready-to-review', 'failed']
+
+// Claiming is what makes it safe to run epics in parallel. The label swap `ready` → `in-progress`
+// can't be the lock — it's a read-modify-write with a wide window — but creating a ref on origin is a
+// compare-and-swap, so pushing the branch BEFORE any work is a real cross-machine lock with no new
+// infrastructure. Labels stay as the human-readable signal; the ref is the lock.
+//
+// Three layers, in the order prepare hits them, because no single one covers every collision:
+//   1. Local branch already checked out in another worktree — same host, same clone: sessions share
+//      one .git, so a live run's branch is visible and `git switch` refuses. Predates claiming.
+//   2. A claim-only branch on origin — catches a competitor on ANY host, and catches it even when the
+//      two runs derived DIFFERENT slugs for the same issue, because the `epic/<N>-*` glob matches
+//      regardless of slug.
+//   3. The push CAS itself — closes the window where both runs pass 2 before either has pushed. The
+//      claim commit is empty (it changes no files, so it never appears in a diff) and unique (so the
+//      loser's push is a genuine non-fast-forward, not a no-op the server accepts from both). Ship
+//      squashes it away.
+// Layer 2 is not optional: a claim ref IS a branch on origin, so without it the loser lands in the
+// resume path and adopts its competitor's branch, never reaching 3 at all.
+async function prepare(issue) {
+  const notes = []
+  const view = await issueView(issue, 'number,title,body,state')
+  if (String(view.state || '').toUpperCase() === 'CLOSED') return { refused: `issue #${issue} is closed` }
+
+  // Building on an unlanded dependency is exactly what blocked_by exists to prevent.
+  const deps = await openBlockers(issue)
+  if (deps.error) notes.push(`prepare: dependency preflight errored (${deps.error}); continued as if unblocked`)
+  if (deps.blockers.length) return { refused: `blocked by open issue(s) ${deps.blockers.map(n => `#${n}`).join(', ')}` }
+
+  const fetched = await git(['fetch', 'origin'])
+  if (!fetched.ok) notes.push(`prepare: git fetch origin failed (${failureReason(fetched)}); the base may be stale`)
+  // Captured BEFORE any branch switch: the deps check compares this worktree's original checkout
+  // against the new base.
+  const base = await gitOut(['rev-parse', 'HEAD'], 'git rev-parse HEAD')
+
+  // An open PR already delivering this issue — by branch name, and (for legacy title-derived branch
+  // names) by the Closes line in its body.
+  const prefix = `epic/${issue}-`
+  const delivering = (await openPrs('number,headRefName')).find(p => String(p.headRefName || '').startsWith(prefix))
+  if (delivering) return { alreadyExists: true, note: `an open PR already delivers this issue (PR #${delivering.number})` }
+  const legacy = await searchOpenPrs(`Closes #${issue} in:body`)
+  if (legacy.length) return { alreadyExists: true, note: `an open PR already delivers this issue (PR #${legacy[0].number})` }
+
+  // A leftover branch (an interrupted or blocked prior run) is RESUMED, never started over.
+  const local = (await gitOut(['branch', '--list', `${prefix}*`, '--format=%(refname:short)'], 'git branch --list'))
+    .split('\n').map(s => s.trim()).filter(Boolean)
+  const remote = (await gitOut(['ls-remote', '--heads', 'origin', `${prefix}*`], 'git ls-remote'))
+    .split('\n').map(l => l.trim().split(/\s+/)[1]).filter(Boolean).map(r => r.replace(/^refs\/heads\//, ''))
+  let branch = local[0] || remote[0] || null
+  let resumed = false
+  if (branch) {
+    slug = branch.slice('epic/'.length)
+    let sw
+    if (local.includes(branch)) {
+      sw = await git(['switch', branch])
+    } else {
+      // Only on origin: a leftover, or another run's live claim? A branch whose every commit above
+      // origin/main is a claim commit holds no work — its owner is building this issue right now.
+      await gitOut(['fetch', 'origin', branch], `git fetch origin ${branch}`)
+      const subjects = (await gitOut(['log', '--format=%s', 'origin/main..FETCH_HEAD'], 'git log')).split('\n').filter(Boolean)
+      if (subjects.length && subjects.every(s => s.startsWith(`chore(epic ${issue}): claim`))) return { refused: 'claimed by another run' }
+      sw = await git(['switch', '-c', branch, '--track', `origin/${branch}`])
+    }
+    if (!sw.ok) {
+      if (/already (checked out|used by worktree)/i.test(`${sw.err}\n${sw.out}`)) {
+        return { refused: `${branch} is checked out in another worktree — a run may be live there` }
+      }
+      must(sw, `git switch ${branch}`)
+    }
+    // A relaunch reuses the worktree, so a killed run's uncommitted work may still be sitting here.
+    // Checkpoint it: nothing is lost, and the rebase below refuses a dirty tree.
+    if (await gitOut(['status', '--porcelain'], 'git status')) {
+      await gitOut(['add', '-A'], 'git add -A')
+      if ((await git(['diff', '--cached', '--quiet'])).code !== 0) await gitOut(['commit', '-q', '-m', `wip(epic ${slug}): resume checkpoint`], 'git commit (resume checkpoint)')
+    }
+    const rb = await git(['rebase', 'origin/main'])
+    if (!rb.ok) {
+      await git(['rebase', '--abort'])
+      return { refused: `resume rebase onto origin/main conflicted — resolve manually on ${branch} or delete it for a fresh build` }
+    }
+    resumed = true
+  } else {
+    slug = slugify(issue, view.title)
+    branch = `epic/${slug}`
+    // ALWAYS from origin/main, never the local checkout (it can be stale).
+    await gitOut(['switch', '-c', branch, 'origin/main'], `git switch -c ${branch} origin/main`)
+    // CLAIM, right now — before requirements.md, before npm ci, before anything else expensive.
+    await gitOut(['commit', '--allow-empty', '-q', '-m', `chore(epic ${issue}): claim ${Math.floor(Date.now() / 1000)}-${process.pid}`], 'git commit (claim)')
+    const push = await git(['push', 'origin', `HEAD:refs/heads/${branch}`])
+    if (!push.ok) {
+      // Losing this race is the mechanism working: never retry, force, or pick another slug.
+      if (pushRejected(push)) return { refused: 'claimed by another run' }
+      must(push, 'git push (claim)')
+    }
+  }
+
+  // Signal on GitHub that autonomous work has started — now, before the slow deps step. Best-effort:
+  // a failure is noted in the phase log (so it surfaces in the PR body) and never aborts the run.
+  await ensureLabels(LIFECYCLE)
+  const swap = await editLabels(issue, { add: ['in-progress'], remove: ['ready', 'ready-to-merge', 'ready-to-review', 'failed'] })
+  if (!swap.ok) notes.push(`prepare: label swap failed: ${failureReason(swap)}`)
+  const assigned = await assignSelf(issue)
+  if (!assigned.ok) notes.push(`prepare: self-assign failed: ${failureReason(assigned)}`)
+
+  const dir = epicDir(slug)
+  await ensureEpicsIgnored()
+  writeRequirements(dir, issue, view.body)
+  initEpicMd(dir, { title: view.title, slug, issue })
+  for (const n of notes) updateEpicMd(dir, { log: n })
+
+  const packages = discoverPackages('.')
+  const depLines = packages.length ? await ensureDeps(packages, { pairs: [[base, 'HEAD']] }) : []
+  return { slug, branch, resumed, requirement: readRequirements(dir), packages, depLines }
+}
+
+// Squash, push, open the PR, record deferrals, label — from ship's JSON.
+async function shipTransport({ issue, slug, dir, decision }) {
+  const branch = `epic/${slug}`
+  const deferred = Array.isArray(decision.deferred) ? decision.deferred : []
+  // The merge gate's input, counted here from the classification, never taken as a number a model
+  // typed.
+  const deferredDefects = deferred.filter(d => d.kind === 'defect').length
+  const title = String(decision.title || '').trim().split('\n')[0]
+  if (!title) throw new Error('ship returned no PR title')
+
+  // summary.md is the PR body source. The Closes line is what auto-closes the issue on merge — a
+  // bare (#N) only links — so it is appended here, unconditionally.
+  let body = String(decision.body || '').trim()
+  if (decision.legalMarker) body += `\n\n${decision.legalMarker}`
+  if (deferred.length) body += `\n\nDeferred items recorded on #${issue}.`
+  body += `\n\nCloses #${issue}\n`
+  writeFileSync(path.join(dir, 'summary.md'), body)
+
+  // Deferred work is recorded on the ISSUE, not the PR. A follow-up issue is filed only for the kinds
+  // that can earn one, only when ship judged it a coherent slice, and at most 3 — defects first. That
+  // "Follow-up to #N" line IS the relation (GitHub records it as a cross-reference); no label, no
+  // blocked_by, no sub-issue.
+  let filed = 0
+  if (deferred.length) {
+    const rank = { defect: 0, 'missing-gate': 1, 'scope-cut': 2 }
+    const eligible = deferred.filter(d => d.file === true && d.kind in rank).sort((a, b) => rank[a.kind] - rank[b.kind])
+    const links = new Map()
+    for (const d of eligible.slice(0, 3)) {
+      const url = await issueCreate({ title: d.issueTitle || d.title, body: `${String(d.issueBody || d.why).trim()}\n\nFollow-up to #${issue}` })
+      links.set(d, url)
+      filed++
+    }
+    const lines = ['🤖 deferred / not done', '']
+    for (const d of deferred) lines.push(`- ${d.title} (${d.kind}): ${d.why}${links.has(d) ? ` — filed as ${links.get(d)}` : ''}`)
+    if (eligible.length > filed) lines.push('', `${eligible.length} items qualified for a follow-up issue and ${filed} were filed (the cap is 3): needing more means this issue was under-scoped.`)
+    await comment(issue, lines.join('\n'))
+  }
+
+  // Squash to ONE clean commit: fold leftovers into the checkpoint chain, soft-reset to the merge
+  // base (NOT origin/main, which may have advanced during the run), commit once.
+  await gitOut(['add', '-A'], 'git add -A')
+  if ((await git(['diff', '--cached', '--quiet'])).code !== 0) await gitOut(['commit', '-q', '-m', `wip(epic ${slug}): pre-ship`], 'git commit (pre-ship)')
+  const mergeBase = await gitOut(['merge-base', 'HEAD', 'origin/main'], 'git merge-base')
+  await gitOut(['reset', '--soft', mergeBase], 'git reset --soft')
+  if ((await git(['diff', '--cached', '--quiet'])).code === 0) throw new Error('nothing to ship — the branch holds no change against origin/main')
+  const message = [title, '', String(decision.commitBody || '').trim(), decision.legalMarker ? `\n${decision.legalMarker}` : '', '', `Closes #${issue}`]
+    .join('\n').replace(/\n{3,}/g, '\n\n')
+  await withBodyFile(message, (file) => gitOut(['commit', '-q', '-F', file], 'git commit (squash)'))
+
+  // The branch has been on origin since prepare claimed it, and the squash rewrote every commit above
+  // the merge base; the lease overwrites only the ref THIS run has held since the claim and fails if
+  // anything else moved it.
+  const push = await git(['push', '--force-with-lease', '-u', 'origin', branch])
+  if (!push.ok) throw new Error(pushRejected(push) ? `the force-with-lease push was rejected — ${branch} moved on origin under this run` : `git push failed (${failureReason(push)})`)
+
+  const prUrl = await prCreate({ head: branch, title, bodyFile: path.join(dir, 'summary.md') })
+
+  // ready-to-review and nothing else: whether the PR may instead be queued for unattended merge is
+  // the gate's decision, downstream of here. The assignee stays (it records ownership).
+  await ensureLabels(['ready-to-review'])
+  const flip = await editLabels(issue, { add: ['ready-to-review'], remove: ['in-progress'] })
+  if (!flip.ok) log(`Ship: label flip to ready-to-review failed (${failureReason(flip)}) — the PR is open; a human finishes the labels`)
+  updateEpicMd(dir, { phase: 'ship → done', log: `ship: PR opened ${prUrl}; ${deferred.length} deferred item(s), ${filed} filed, ${deferredDefects} defect(s)` })
+  return { prUrl, deferredDefects, deferredCount: deferred.length, filed }
+}
+
+// Transport, not judgment: the merge gate has already been computed from structured counts, and this
+// only writes its verdict where bin/merge-worker.sh will read it. Verified by reading the labels
+// back: labelled=true only when ready-to-merge is on and ready-to-review is off.
+async function handoff(issue, dir) {
+  await ensureLabels(['ready-to-merge'])
+  const r = await editLabels(issue, { add: ['ready-to-merge'], remove: ['ready-to-review'] })
+  if (!r.ok) return { labelled: false, summary: failureReason(r) }
+  const labels = await issueLabels(issue)
+  const labelled = labels.includes('ready-to-merge') && !labels.includes('ready-to-review')
+  if (labelled) updateEpicMd(dir, { log: 'handoff: queued for merge-worker' })
+  return { labelled, summary: labelled ? 'ready-to-merge observed' : `observed labels: ${labels.join(', ')}` }
+}
+
+// The blocker report: preserve the work, say where it is, flip the label to failed.
+async function postBlocker({ issue, slug, phase, reason, prUrl }) {
+  const branch = slug ? `epic/${slug}` : null
+  let branchLine
+  if (prUrl) {
+    // A block AFTER ship: the PR is open, pushed and complete — the work needs a human, not
+    // preservation, and a re-run would skip it (prepare's open-PR guard) rather than resume.
+    branchLine = `- PR: ${prUrl} — open on ${branch}, NOT merged and NOT queued for the merge worker; the change itself is complete. Fix the cause above, then merge it by hand. A re-run of /epic #${issue} will skip (an open PR already delivers this issue).`
+  } else if (branch) {
+    // Checkpoint commits on the branch are durable; only uncommitted changes are at risk. The WIP
+    // commit never carries "Closes #N" (unfinished work must not auto-close the issue on an accidental
+    // merge) and `git add -A` respects .gitignore, so .epics/ stays out.
+    try {
+      if (await gitOut(['status', '--porcelain'], 'git status')) {
+        await gitOut(['add', '-A'], 'git add -A')
+        if ((await git(['diff', '--cached', '--quiet'])).code !== 0) await gitOut(['commit', '-q', '-m', `wip: epic blocked at ${phase}`], 'git commit (wip)')
+      }
+      const tracked = (await git(['rev-parse', '--verify', '-q', `refs/remotes/origin/${branch}`])).ok ? `origin/${branch}` : 'origin/main'
+      const ahead = Number((await git(['rev-list', '--count', `${tracked}..HEAD`])).out) || 0
+      if (ahead > 0) await git(['push', '--force-with-lease', '-u', 'origin', branch])
+    } catch (e) {
+      log(`blocked: could not preserve the work (${e && e.message || e})`)
+    }
+    branchLine = `- branch: ${branch} — re-running /epic #${issue} resumes from it; delete the branch (locally AND on origin) to force a fresh build`
+  } else {
+    branchLine = `- branch: none (blocked before branch creation; a re-run of /epic #${issue} starts fresh)`
+  }
+  let body = `🤖 epic-run blocked\n- phase: ${phase}\n- reason: ${reason}\n${branchLine}\n`
+  // .epics/ is gitignored and dies with the worktree; the phase log survives in this comment.
+  if (branch && existsSync(path.join(epicDir(slug), 'epic.md'))) {
+    const m = readFileSync(path.join(epicDir(slug), 'epic.md'), 'utf8').match(/## Phase log[\s\S]*$/)
+    if (m) body += `\n${m[0].trim()}\n`
+  }
+  await comment(issue, body)
+  // Every terminal label comes off — ready-to-merge above all, since leaving it would hand a failed
+  // run's PR to the merge worker. The assignee stays.
+  await ensureLabels(['failed'])
+  const flip = await editLabels(issue, { add: ['failed'], remove: ['in-progress', 'ready-to-merge', 'ready-to-review'] })
+  if (!flip.ok) log(`blocked: label flip to failed failed (${failureReason(flip)})`)
+}
+
+// In git mode the blocker path reports on the issue; in slug mode it just returns the error.
+// blockerPosted guards the double-post: fail() can be re-entered when the outer catch fires after a
+// phase that already failed. openPr is set once ship succeeds: a block after that point must not tell
+// the reader to resume a branch whose work is already delivered by an open PR.
 let currentPhase = 'prepare'
 let blockerPosted = false
 let openPr = null
@@ -487,8 +561,11 @@ async function fail(phase, reason) {
   if (gitMode) {
     if (!blockerPosted) {
       blockerPosted = true
-      await agent(PROMPTS.blocked(issue, slug, phase, reason, openPr),
-        { label: 'ship:blocked', phase: 'Ship', step: 'bookkeeping' })
+      try {
+        await postBlocker({ issue, slug, phase, reason, prUrl: openPr })
+      } catch (e) {
+        log(`blocked: could not report on GitHub (${e && e.message || e})`)
+      }
     }
     return { blocked: true, issue, slug, phase, reason, prUrl: openPr || undefined }
   }
@@ -497,78 +574,66 @@ async function fail(phase, reason) {
 
 // The issue carries no per-phase commentary: the ready → in-progress → ready-to-merge/ready-to-review/failed
 // label lifecycle is the live signal, the PR body is the record of HOW it was built, and the only comments
-// are the deferred list (nothing else records it) and the blocker report. Per-phase posts duplicated the PR
-// body, notified watchers five times per run, and each one cost an awaited agent spawn on the critical path.
+// are the deferred list (nothing else records it) and the blocker report.
 
 let requirement
-// Discovered layout: which packages the verify gate runs in. Set once, by whichever pre-code agent this
-// mode runs (prepare in git mode, read:requirement in slug mode).
+// Discovered layout: which packages the verify gate runs in. Fail closed, like every other gate in this
+// file: an empty package list would make the verify gate a silent no-op — the run finishes "green"
+// having verified nothing.
 let packages = []
-
-// Fail closed on discovery, like every other gate in this file: an empty package list would make the
-// verify gate a silent no-op — the run finishes "green" having verified nothing.
-// Returns null when the discovery is usable, or the blocker reason when it is not.
-const applyDiscovery = (d) => {
-  const clean = (p) => String(p).trim().replace(/^\.\//, '').replace(/\/+$/, '')
-  const pkgs = Array.isArray(d.packages) ? d.packages.map(clean).filter(Boolean) : []
-  if (!pkgs.length) {
+const applyDiscovery = (pkgs) => {
+  if (!Array.isArray(pkgs) || !pkgs.length) {
     return 'layout discovery found no package declaring an `npm run verify` script, so the verify gate downstream would be a silent no-op — refusing to build a change that nothing would verify.'
   }
   packages = pkgs
   return null
 }
-// How the package list reads inside a prompt: "frontend/, backend/".
-const pkgList = () => packages.map(p => (p === '.' ? 'the repo root' : `${p}/`)).join(', ')
 
 async function main() {
 try {
   // ───────────────────────── Phase 0: Prepare (issue mode only) ─────────────────────────
   if (gitMode) {
     phase('Prepare')
-    const prep = await agent(PROMPTS.prepare(issue),
-      { label: 'prepare', phase: 'Prepare', step: 'bookkeeping', schema: PREP_SCHEMA })
-    if (!prep) return await fail('prepare', 'Prepare failed — could not fetch the issue or reach git/gh.')
+    const prep = await prepare(issue)
     if (prep.refused) {
       log(`Prepare refused to start: ${prep.refused}`)
       return { skipped: true, issue, reason: prep.refused }
     }
     if (prep.alreadyExists) {
-      log(`Prepare: an open PR for #${issue} already exists — skipping to avoid duplicate work.`)
-      return { skipped: true, issue, slug: prep.slug, reason: prep.note || 'an open PR for this issue already exists' }
+      log(`Prepare: ${prep.note} — skipping to avoid duplicate work.`)
+      return { skipped: true, issue, reason: prep.note }
     }
-    if (!prep.slug || !prep.requirement) return await fail('prepare', 'Prepare returned no slug/requirement — branch or requirements.md was not set up.')
-    const badLayout = applyDiscovery(prep)
+    const badLayout = applyDiscovery(prep.packages)
     if (badLayout) return await fail('prepare', badLayout)
     slug = prep.slug
     requirement = prep.requirement
-    log(`Prepare: requirements written, branch epic/${slug} ${prep.resumed ? 'resumed and rebased onto origin/main' : 'created off origin/main'}, deps checked. Packages: ${pkgList()}.`)
+    log(`Prepare: requirements written, branch epic/${slug} ${prep.resumed ? 'resumed and rebased onto origin/main' : 'created off origin/main'}, deps checked (${prep.depLines.join('; ')}). Packages: ${pkgList(packages)}.`)
   }
 
-  const dir = `.epics/${slug}`
+  const dir = epicDir(slug)
   // Git mode reviews the checkpoint-committed branch against the fresh base; manual mode reviews the working tree.
   const DIFF = gitMode ? 'git diff origin/main...HEAD' : 'git diff'
-  // How code/triage make their work visible downstream: git mode checkpoint-commits (durability + clean
-  // origin/main...HEAD diffs); manual mode keeps the git add -N dance (no commits allowed on the user's tree).
-  const checkpoint = (label) => gitMode
-    ? `Then checkpoint the work so it survives an interrupted run: \`git add -A && git commit -m "wip(epic ${slug}): ${label} checkpoint"\`. This is a durability checkpoint, NOT the final commit — Ship squashes the branch into one clean commit later. NEVER put "Closes #..." in a checkpoint message; do NOT push. (\`.epics/\` is gitignored; committing makes new files visible to the review's \`git diff origin/main...HEAD\`.)`
-    : `Then run \`git add -N .\` (intent-to-add) so the downstream blind review can see your work: new files are untracked and would otherwise be INVISIBLE to the \`git diff\` / \`git diff --stat\` the reviewers read. This respects .gitignore, so \`.epics/\` stays excluded. Do NOT commit — this is the manual flow.`
+  // How code/fixes make their work visible downstream: git mode checkpoint-commits (durability + clean
+  // origin/main...HEAD diffs); manual mode intent-to-adds (no commits allowed on the user's tree).
+  const checkpointWork = async (label) => {
+    if (gitMode) return checkpoint(slug, label)
+    await intentToAdd()
+    return 'intent-to-add'
+  }
 
   // ───────────────────────── Phase 1: Architect ─────────────────────────
-  // One read-only architect designs the epic outright; one mechanical coder transcribes it to architecture.md.
   currentPhase = 'architect'
   phase('Architect')
 
   // The spec is fed inline to the blind reviewers so they never need to enter .epics/<slug>/ (where
-  // epic.md/architecture.md/etc. would anchor them). Issue mode gets it straight from Prepare's output;
-  // manual mode has no Prepare, so one agent reads the file (the orchestrator itself has no FS access to it).
+  // epic.md/architecture.md/etc. would anchor them). Issue mode gets it from prepare; manual mode
+  // reads the file the user wrote.
   if (!gitMode) {
-    const reqRes = await agent(PROMPTS.readRequirement(dir),
-      { label: 'read:requirement', phase: 'Architect', step: 'bookkeeping', schema: REQ_SCHEMA })
-    if (!reqRes || !reqRes.requirement) return await fail('architect', 'Could not read requirements.md — aborting before code.')
-    const badLayout = applyDiscovery(reqRes)
+    if (!existsSync(path.join(dir, 'requirements.md'))) return await fail('architect', `${dir}/requirements.md does not exist — aborting before code.`)
+    requirement = readRequirements(dir)
+    const badLayout = applyDiscovery(discoverPackages('.'))
     if (badLayout) return await fail('architect', badLayout)
-    requirement = reqRes.requirement
-    log(`Packages: ${pkgList()}.`)
+    log(`Packages: ${pkgList(packages)}.`)
   }
 
   const design = await agent(PROMPTS.architectDesign(dir),
@@ -576,15 +641,14 @@ try {
   )
   if (!design) return await fail('architect', 'Architect design failed — aborting before code.')
 
-  // Fail closed if the artifact never lands: red and green both read architecture.md, so building on a missing
-  // one means implementing against nothing but the requirements — silently, and only visible in the diff.
-  const wrote = await agent(PROMPTS.architectWrite(dir, design),
-    { label: 'architect:write', phase: 'Architect', step: 'bookkeeping' },
-  )
-  if (!wrote) return await fail('architect', 'architecture.md was not written — aborting before code, which reads it.')
+  // Rendered here from the decided design: red and green both read architecture.md, so it exists
+  // before either runs, verbatim to what the architect returned.
+  renderArchitecture(dir, design)
+  updateEpicMd(dir, { phase: 'architect → done', approach: design.approach, log: `architect: ${design.approach}` })
+  if (!existsSync(path.join(dir, 'architecture.md'))) return await fail('architect', 'architecture.md was not written — aborting before code, which reads it.')
   log(`Architecture: ${design.approach} — ${design.rationale}`)
 
-  // ───────────────────────── Phase 2: Code (red → green → gate) ─────────────────────────
+  // ───────────────────────── Phase 2: Code (red → green → checkpoint) ─────────────────────────
   currentPhase = 'code'
   phase('Code')
 
@@ -596,11 +660,13 @@ try {
   log('Code: red tests written and failing for the right reason.')
 
   // Green: implement against architecture + the red tests, then pass the gate. Single agent to keep the working tree coherent.
-  const green = await agent(PROMPTS.codeGreen(dir, red, checkpoint('code'), pkgList()),
+  const green = await agent(PROMPTS.codeGreen(dir, red, pkgList(packages)),
     { label: 'code:green', phase: 'Code', step: 'code' },
   )
   if (!green) return await fail('code', 'Green step failed — implementation did not complete, aborting before review.')
-  log('Code: implementation complete, verify gate run.')
+  const codeCheckpoint = await checkpointWork('code')
+  updateEpicMd(dir, { phase: 'code → done', log: `code: done (${codeCheckpoint})` })
+  log(`Code: implementation complete, verify gate run, work checkpointed (${codeCheckpoint}).`)
 
   // ───────────────────────── Phase 3: Review (blind, adversarially verified) ─────────────────────────
   currentPhase = 'review'
@@ -636,7 +702,7 @@ try {
 
   // Soft dedup before the verify fan-out (free — reviews is already fully materialized). Overlapping lenses
   // (correctness vs. the seam lens) can restate the same defect, which otherwise gets verified twice, listed
-  // twice in review.md, and fixed twice in triage. Collapse ONLY a confident duplicate — same location AND same
+  // twice in review.md, and fixed twice. Collapse ONLY a confident duplicate — same location AND same
   // normalized title. Biased toward keeping: when in doubt we keep both, so distinct bugs at one file:line
   // survive (different titles) and nothing is ever dropped on location alone.
   const seen = new Set()
@@ -647,7 +713,7 @@ try {
   // Cluster by FILE (line numbers stripped) before the adversarial fan-out. The title dedup above only catches
   // verbatim restatements; overlapping lenses (correctness vs. the seam lens) word one defect differently and
   // slip through. On #194 that put five paraphrases of a single history.ts bug in front of five separate
-  // skeptics, each re-reading the same diff to re-confirm it. One skeptic per file pays that cost once and can
+  // skeptics, each re-reading the same diff to re-confirm it. One skeptic per batch pays that cost once and can
   // see the claims are one defect — a call the per-finding verifiers each had to make blind. Verdicts stay PER
   // FINDING: clustering changes who judges, never what survives.
   // Batches are sized, NOT keyed by file. Keying by file was the first version of this and it only caught
@@ -669,9 +735,9 @@ try {
 
   // Adversarial verify: an independent skeptic tries to REFUTE each finding before it counts. Refuted /
   // low-confidence findings are NOT silently dropped — they land in review.md's "Unconfirmed" section for
-  // human eyes (triage and ship are told to ignore them). Fail closed on a missing verdict: batching means a
-  // dead agent or a short array would otherwise take a whole file's findings with it, and a lost finding must
-  // surface as unconfirmed (a human re-checks it), never vanish and never pass as confirmed.
+  // human eyes (fixes-after-review and ship are told to ignore them). Fail closed on a missing verdict: batching means
+  // a dead agent or a short array would otherwise take a whole batch's findings with it, and a lost finding
+  // must surface as unconfirmed (a human re-checks it), never vanish and never pass as confirmed.
   const noVerdict = f => ({
     finding: f,
     verdict: { real: false, confidence: 0, reasoning: 'Batched verifier returned no verdict for this finding — recorded as unconfirmed rather than dropped. Re-check by hand.' },
@@ -698,11 +764,11 @@ try {
 
   // Collapse the confirmed findings into DEFECTS — the things a fix addresses — using the links the
   // skeptics returned. Five lenses reporting one fault is the design working (it is how #66's migration
-  // bug was caught five times over), but handing triage five items makes it fix and gate the same thing
-  // five times, and triage is the longest phase in the run.
+  // bug was caught five times over), but handing fixes-after-review five items makes it fix and gate the
+  // same thing five times, and that is the longest phase in the run.
   //
-  // This is presentation, never a filter: every finding still reaches triage, grouped, and the grouping
-  // is advisory — triage is told to split a group back apart if the findings are actually distinct. So a
+  // This is presentation, never a filter: every finding still reaches fixes-after-review, grouped, and the
+  // grouping is advisory — it is told to split a group back apart if the findings are actually distinct. So a
   // wrong link costs a sentence of explanation, never an unfixed bug. Union-find over the links, since a
   // chain (3→2, 2→1) has to land in one group.
   const parent = new Map(verified.map(f => [f, f]))
@@ -729,55 +795,61 @@ try {
   const reviewTally = `${reviews.length} raw finding(s) across ${LENSES.length} blind lenses → ${verified.length} confirmed by adversarial verification${grouped}, ${unconfirmed.length} refuted`
   log(`Review: ${reviewTally}.`)
 
-  // Write review.md from the surviving findings (+ the unconfirmed record).
-  await agent(PROMPTS.reviewWrite(dir, JSON.stringify(verified, null, 2), JSON.stringify(unconfirmed, null, 2)),
-    { label: 'review:write', phase: 'Review', step: 'bookkeeping' },
-  )
+  // review.md, rendered from the surviving findings (+ the unconfirmed record).
+  renderReview(dir, verified, unconfirmed)
+  updateEpicMd(dir, { phase: 'review → done', log: `review: ${reviewTally}` })
 
   // ───────────────────────── Phase 4: Fixes after review (auto-apply, no sign-off) ─────────────────────────
   currentPhase = 'triage'
   phase('Fixes after review')
 
-  let triageStatus = 'No confirmed findings — nothing to triage.'
+  let triageStatus = 'No confirmed findings — nothing to fix.'
   let triageDeferred = []
   if (verified.length) {
     // Advisory grouping: the same defect, found by several lenses, arrives as several findings. Naming the
-    // groups lets triage fix and gate once instead of once per restatement — while every finding is still
-    // listed, and triage is told to split a group it disagrees with rather than silently honour it.
+    // groups lets the fixer fix and gate once instead of once per restatement — while every finding is still
+    // listed, and it is told to split a group it disagrees with rather than silently honour it.
     const multi = defects.filter(g => g.length > 1)
     const grouping = multi.length
       ? `\nSeveral findings are the SAME underlying defect, reported by different review lenses looking at different files. An independent verifier grouped them; one fix and one gate should resolve each group, so do NOT fix or gate the same fault once per finding:\n${multi.map((g, i) => `- Defect ${i + 1}:\n${g.map(f => `  - "${f.title}" (${f.location})`).join('\n')}`).join('\n')}\nThis grouping is a hint, not an instruction: if the findings in a group are genuinely distinct faults needing separate fixes, treat them separately and say so in your status. Every finding above must still end up either fixed or reported as deferred.\n`
       : ''
-    const triaged = await agent(PROMPTS.triage(dir, checkpoint('triage'), pkgList(), grouping),
+    const triaged = await agent(PROMPTS.triage(dir, pkgList(packages), grouping),
       { label: 'fixes-after-review', phase: 'Fixes after review', step: 'fixes-after-review', schema: TRIAGE_SCHEMA },
     )
-    // Fail closed: a dead triage agent leaves confirmed findings in an unknown state — some fixed, some not,
+    // Fail closed: a dead agent leaves confirmed findings in an unknown state — some fixed, some not,
     // verify possibly never re-run — and the merge gate below reads exactly that list to decide whether main
     // gets this change unattended. "We don't know what it left unfixed" must never merge.
-    if (!triaged) return await fail('triage', `triage produced no result for ${verified.length} confirmed finding(s) — their state is unknown (partially applied fixes may sit in the tree) and the merge gate has nothing to read.`)
+    if (!triaged) return await fail('triage', `fixes-after-review produced no result for ${verified.length} confirmed finding(s) — their state is unknown (partially applied fixes may sit in the tree) and the merge gate has nothing to read.`)
     triageStatus = triaged.status
     triageDeferred = Array.isArray(triaged.deferred) ? triaged.deferred : []
+    const fixCheckpoint = await checkpointWork('triage')
+    updateEpicMd(dir, { phase: 'review→triaged', log: `fixes-after-review: ${triageStatus} (${fixCheckpoint})` })
   }
   log(`Fixes after review: ${triageStatus}`)
 
   // ───────────────────────── Phase 5: Ship ─────────────────────────
-  // Issue mode: write summary.md, squash to one commit (Closes #N), push, open the PR. Slug mode: summary.md only, no git.
+  // Issue mode: ship decides what the PR says; the script squashes to one commit (Closes #N), pushes,
+  // opens the PR. Slug mode: summary.md only, no git.
   currentPhase = 'ship'
   phase('Ship')
 
   if (!gitMode) {
-    const summary = await agent(PROMPTS.summaryManual(dir, design, triageStatus),
-      { label: 'summary:write', phase: 'Ship', step: 'bookkeeping' },
+    const s = await agent(PROMPTS.summaryManual(dir, design, triageStatus),
+      { label: 'summary:write', phase: 'Ship', step: 'code', schema: SUMMARY_SCHEMA },
     )
-    return { slug, approach: design?.approach, greenStatus: green, findingsConfirmed: verified.length, findingsUnconfirmed: unconfirmed.length, triageStatus, summary }
+    if (!s) return await fail('ship', 'the summary was not written.')
+    writeFileSync(path.join(dir, 'summary.md'), `${String(s.summary).trim()}\n`)
+    updateEpicMd(dir, { phase: 'ship → done', log: 'ship: summary.md written (manual mode, no PR)' })
+    return { slug, approach: design?.approach, greenStatus: green, findingsConfirmed: verified.length, findingsUnconfirmed: unconfirmed.length, triageStatus, summary: s.summary }
   }
 
-  const shipped = await agent(PROMPTS.ship(dir, issue, slug, design, triageStatus, reviewTally),
+  const decision = await agent(PROMPTS.ship(dir, issue, design, triageStatus, reviewTally),
     { label: 'ship:pr', phase: 'Ship', step: 'code', schema: SHIP_SCHEMA },
   )
-  if (!shipped || !shipped.prUrl) return await fail('ship', 'Ship failed — commit/push/PR did not complete; the change is on epic/' + slug + ' (checkpoint commits + working tree).')
+  if (!decision) return await fail('ship', 'Ship produced no PR description — nothing was pushed; the change is on epic/' + slug + ' (checkpoint commits + working tree).')
+  const shipped = await shipTransport({ issue, slug, dir, decision })
   openPr = shipped.prUrl
-  log(`Ship: PR opened — ${shipped.prUrl}`)
+  log(`Ship: PR opened — ${shipped.prUrl} (${shipped.deferredCount} deferred item(s), ${shipped.filed} filed as follow-ups)`)
 
   const result = {
     issue,
@@ -794,22 +866,21 @@ try {
   // ───────────────────────── The merge gate ─────────────────────────
   // Everything the pipeline could verify is green by here: verify per package (whatever that script gates,
   // including any real-database tier the project triggers for itself), five blind lenses adversarially
-  // verified, and triage's fixes re-verified. What is left is the judgment calls the pipeline explicitly
+  // verified, and the fixes re-verified. What is left is the judgment calls the pipeline explicitly
   // refused to make. Those refusals ARE the gate — a deferred confirmed finding or a defect that outlives
   // this merge is the pipeline saying "a human decides this", and a human cannot decide it after it has
   // already deployed. Counted HERE in the script from structured values, never inside an agent that could
   // talk itself past them.
   //
-  // The gate no longer merges anything; it chooses which terminal label the issue wears, and
-  // `bin/merge-worker.sh` acts on that — rebasing onto current main, re-running CI, merging serially per
-  // repo. Merging inside the run would park a build slot on a lock while the whole queue waited behind it.
-  const deferredDefects = Number(shipped.deferredDefects) || 0
+  // The gate merges nothing; it chooses which terminal label the issue wears, and `bin/merge-worker.sh`
+  // acts on that — rebasing onto current main, re-running CI, merging serially per repo. Merging inside
+  // the run would park a build slot on a lock while the whole queue waited behind it.
   const mergeBlockers = []
   if (triageDeferred.length) {
-    mergeBlockers.push(`${triageDeferred.length} confirmed review finding(s) left unfixed by triage (${triageDeferred.map(d => `${d.severity}: ${d.title}`).join('; ')})`)
+    mergeBlockers.push(`${triageDeferred.length} confirmed review finding(s) left unfixed by fixes-after-review (${triageDeferred.map(d => `${d.severity}: ${d.title}`).join('; ')})`)
   }
-  if (deferredDefects > 0) {
-    mergeBlockers.push(`${deferredDefects} deferred defect(s) that still exist on main after this merge`)
+  if (shipped.deferredDefects > 0) {
+    mergeBlockers.push(`${shipped.deferredDefects} deferred defect(s) that still exist on main after this merge`)
   }
 
   if (mergeBlockers.length) {
@@ -821,11 +892,14 @@ try {
   // Promotion, never demotion: ship already applied the conservative `ready-to-review`, so every way this
   // step can go wrong leaves the issue in front of a human rather than in an unattended merge queue. That
   // asymmetry is the reason it is a separate step instead of something ship decided for itself.
-  const handed = await agent(PROMPTS.handoff(dir, issue),
-    { label: 'ship:handoff', phase: 'Ship', step: 'bookkeeping', schema: HANDOFF_SCHEMA },
-  ).catch(() => null)
-  if (!handed || !handed.labelled) {
-    const why = `merge gate was clear but ready-to-merge could not be applied${handed?.summary ? ` (${handed.summary})` : ''} — the PR is complete and stays ready-to-review`
+  let handed
+  try {
+    handed = await handoff(issue, dir)
+  } catch (e) {
+    handed = { labelled: false, summary: e && e.message || String(e) }
+  }
+  if (!handed.labelled) {
+    const why = `merge gate was clear but ready-to-merge could not be applied${handed.summary ? ` (${handed.summary})` : ''} — the PR is complete and stays ready-to-review`
     log(`Merge gate: clear, handoff FAILED — ${why}.`)
     return { ...result, mergeSkipped: why }
   }

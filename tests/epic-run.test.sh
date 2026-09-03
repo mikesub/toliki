@@ -1,43 +1,36 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -uo pipefail
 
-# Exercises workflows/epic-run.mjs and workflows/fix-run.mjs end to end against
-# a STUB ENGINE — a fake `claude` on PATH that answers each step from a fixture
-# keyed by a marker in the prompt it was handed. Nothing here touches git, gh,
-# the network, or any real repo, so it is safe to run anywhere, live host
-# included.
+# Exercises workflows/epic-run.mjs and workflows/fix-run.mjs end to end. The
+# orchestrator's own git runs for real against a throwaway bare origin under
+# mktemp; `gh` and `npm` are stubs on PATH; the model steps are a stub engine
+# that answers each prompt with a fixture keyed by a marker in the prompt and
+# can run a side-effect script (what the real step would have written to the
+# tree). Nothing here touches the network, a real clone, or a live tmux server.
 #
-# What it is actually holding: the gates. Every scenario below is a way the
-# pipeline is supposed to REFUSE to ship — a dead review lens, a deferred
-# finding, an off-schema payload — plus the one path where it does ship. The
-# stub's argv log is what lets it assert the model tiering and agent charters
-# too, which are otherwise invisible until a production run bills for them.
+# Both the Claude and Codex adapters are exercised: the codex stub translates
+# the test envelope into Codex's --output-last-message contract. The stubs' argv
+# logs are what let the suite assert the model tiering and agent charters —
+# invisible in production until they bill — and the origin plus the gh stub's
+# label state are what let it assert what the run actually did.
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EPIC_RUN="$ROOT/workflows/epic-run.mjs"
 FIX_RUN="$ROOT/workflows/fix-run.mjs"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-printf '# Stub project instructions\n' > "$TMP/AGENTS.md"
 
 PASS=0
 FAIL=0
 ok() { PASS=$((PASS + 1)); printf '  ok   %s\n' "$1"; }
 nok() { FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$1"; }
-
 assert_rc() { # name want got
   if [[ "$2" == "$3" ]]; then ok "$1"; else nok "$1 (want rc $2, got $3)"; fi
 }
-assert_not_contains() {
-  if [[ "$2" != *"$3"* ]]; then ok "$1"; else
-    nok "$1"; printf '       unexpectedly present: %s\n' "$3"
-  fi
-}
 assert_contains() { # name haystack needle
   if [[ "$2" == *"$3"* ]]; then ok "$1"; else
-    nok "$1"
-    printf '       missing: %s\n' "$3"
-    printf '       in:\n%s\n' "$2" | sed 's/^/         /' | head -25
+    nok "$1"; printf '       missing: %s\n' "$3"
+    printf '%s\n' "$2" | tail -n 12 | sed 's/^/       | /'
   fi
 }
 assert_not_contains() { # name haystack needle
@@ -47,11 +40,61 @@ assert_eq() { # name want got
   if [[ "$2" == "$3" ]]; then ok "$1"; else nok "$1 (want '$2', got '$3')"; fi
 }
 
+# ───────────────────────── a throwaway project on a bare origin ─────────────────────────
+# One package declaring scripts.verify, .epics/ ignored, an AGENTS.md (the
+# Codex adapter fails closed without one). Every run gets a fresh clone; every
+# scenario starts from this pristine main with no epic branches.
+export GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.com GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.com
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+ORIGIN="$TMP/origin.git"
+git init -q --bare "$ORIGIN"
+git -C "$ORIGIN" symbolic-ref HEAD refs/heads/main
+SEED="$TMP/seed"
+git init -q -b main "$SEED"
+mkdir -p "$SEED/frontend/src"
+printf '{"name":"frontend","scripts":{"verify":"true"}}\n' > "$SEED/frontend/package.json"
+printf 'export const items = []\n' > "$SEED/frontend/src/index.ts"
+printf '.epics/\nnode_modules/\n' > "$SEED/.gitignore"
+printf '# app\n' > "$SEED/README.md"
+printf '# Stub project instructions\n' > "$SEED/AGENTS.md"
+git -C "$SEED" add -A && git -C "$SEED" commit -qm 'initial'
+git -C "$SEED" remote add origin "$ORIGIN"
+git -C "$SEED" push -q origin main
+MAIN_INITIAL="$(git -C "$SEED" rev-parse HEAD)"
+
+reset_origin() {
+  git -C "$ORIGIN" update-ref refs/heads/main "$MAIN_INITIAL"
+  local ref
+  for ref in $(git -C "$ORIGIN" for-each-ref --format='%(refname)' refs/heads/); do
+    [[ "$ref" == refs/heads/main ]] || git -C "$ORIGIN" update-ref -d "$ref"
+  done
+  rm -f "$ORIGIN/hooks/pre-receive"
+}
+fresh_clone() { # -> path; detached at origin/main, like launch.sh's worktree
+  local dir="$TMP/run-$RANDOM$RANDOM"
+  git clone -q "$ORIGIN" "$dir"
+  git -C "$dir" checkout -q --detach main
+  printf '%s' "$dir"
+}
+origin_ref() { git -C "$ORIGIN" rev-parse -q --verify "refs/heads/$1" 2>/dev/null || true; }
+origin_count() { git -C "$ORIGIN" rev-list --count "main..$1" 2>/dev/null || echo '?'; }
+# Seed origin with a branch built by a helper clone: seed_branch <branch> <base> <script>
+seed_branch() {
+  local branch="$1" base="$2" script="$3" dir="$TMP/seeder-$RANDOM"
+  git clone -q "$ORIGIN" "$dir"
+  git -C "$dir" switch -q -c "$branch" "origin/$base"
+  (cd "$dir" && bash -c "$script")
+  git -C "$dir" push -q origin "HEAD:refs/heads/$branch"
+}
+scenario() { printf '\n%s\n' "$1"; reset_origin; }
+
 # ───────────────────────── the stub engine ─────────────────────────
 # Keys a fixture off a marker in the prompt (read from stdin, exactly as the
 # adapter feeds a real CLI), counts calls per key so a scenario can make the
-# first attempt fail and the second succeed, and logs its own argv so the
-# tiering assertions have something to read.
+# first attempt fail and the second succeed, runs a side-effect script when the
+# fixture set carries one (<key>.sh — the files a real step would have written
+# to the worktree), and logs its own argv so the tiering assertions have
+# something to read.
 mkdir -p "$TMP/bin"
 cat > "$TMP/bin/claude" <<'STUB'
 #!/usr/bin/env bash
@@ -65,29 +108,20 @@ prompt="$(cat)"
 
 key=unknown
 case "$prompt" in
-  *"hit a blocker and must report it on GitHub"*)      key=blocked ;;
-  *"Prepare phase for GitHub issue #"*)                key=prepare ;;
-  *"conflict-fixer run on GitHub issue"*)              key=fix-prepare ;;
-  *"Resolve the JUDGMENT hunks"*)                      key=fix-resolve ;;
-  *"Adversarially check a rebase-conflict resolution"*) key=fix-check ;;
-  *"Ship the fixer run for issue"*)                    key=fix-ship ;;
-  *"Verify phase, autonomous"*)                        key=fix-verify ;;
   *"design the implementation approach for it"*)       key=design ;;
-  *"Transcribe the design below into"*)                key=arch-write ;;
   *"Code phase, RED step"*)                            key=red ;;
   *"Code phase, GREEN step"*)                          key=green ;;
-  *'return its full contents VERBATIM in the "requirement" field'*) key=read-req ;;
   *"Review this change for the lens: correctness"*)    key=lens-correctness ;;
   *"Review this change for the lens: simplicity"*)     key=lens-simplicity ;;
   *"Review this change for the lens: test honesty"*)   key=lens-seam ;;
   *"Review this change for the lens: requirements"*)   key=lens-acceptance ;;
   *"Review this change for the lens: security"*)       key=lens-security ;;
   *"Adversarially verify"*)                            key=verify ;;
-  *"from the review results below"*)                   key=review-write ;;
-  *"Fixes-after-review phase, autonomous"*)                        key=triage ;;
+  *"Fixes-after-review phase, autonomous"*)            key=triage ;;
   *"Ship phase, autonomous"*)                          key=ship ;;
-  *"Queue issue #"*)                                   key=handoff ;;
-  *"This is the manual flow"*)                         key=summary ;;
+  *'return it in the "summary" field'*)                key=summary ;;
+  *"Resolve the JUDGMENT hunks"*)                      key=fix-resolve ;;
+  *"Adversarially check a rebase-conflict resolution"*) key=fix-check ;;
 esac
 
 n="$(cat "$STUB_STATE/$key.n" 2>/dev/null || echo 0)"
@@ -95,6 +129,9 @@ printf '%s' "$((n + 1))" > "$STUB_STATE/$key.n"
 printf '%s' "$prompt" > "$STUB_STATE/$key.$n.prompt"
 
 if [[ -f "$STUB_FIXTURES/$key.$n.rc" ]]; then exit "$(cat "$STUB_FIXTURES/$key.$n.rc")"; fi
+for f in "$STUB_FIXTURES/$key.$n.sh" "$STUB_FIXTURES/$key.sh"; do
+  if [[ -f "$f" ]]; then bash "$f"; break; fi
+done
 for f in "$STUB_FIXTURES/$key.$n.json" "$STUB_FIXTURES/$key.json"; do
   if [[ -f "$f" ]]; then cat "$f"; exit 0; fi
 done
@@ -106,7 +143,7 @@ chmod +x "$TMP/bin/claude"
 # Codex stub: records its own argv, then reuses the fixture router above and
 # translates Claude's test envelope into Codex's --output-last-message file.
 # This gives the whole orchestrator a second-engine run without duplicating the
-# large prompt-to-fixture table.
+# prompt-to-fixture table.
 cat > "$TMP/bin/codex" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -136,23 +173,77 @@ fi
 STUB
 chmod +x "$TMP/bin/codex"
 
-# Stub `gh` too: the orchestrator writes a live status comment on the issue, and
-# that is a real subprocess. Without this the suite would shell out to the host's
-# gh — harmless (a temp dir is no repo, so it errors and the status disables
-# itself) but no longer hermetic, which is the property that makes these safe to
-# run on the live box. Logging argv here also makes the comment's create-once,
-# edit-after behaviour assertable.
+# gh stub: answers the reads the orchestrator makes from a per-run label file
+# and a few scenario knobs (GH_ISSUE_STATE, GH_ISSUE_LABELS, GH_BLOCKED_BY,
+# GH_OPEN_PR_BRANCH), records label edits, comments, created issues and PRs,
+# and logs argv. A comment prints the URL the status comment keys its edits on.
 cat > "$TMP/bin/gh" <<'STUB'
 #!/usr/bin/env bash
+set -uo pipefail
 printf '%s\n' "$*" >> "${STUB_GH_LOG:-/dev/null}"
-# `gh issue comment` prints the new comment's URL; the id in it is what every
-# later edit is addressed to.
-if [[ "${1:-}" == "issue" && "${2:-}" == "comment" ]]; then
-  printf 'https://github.com/o/r/issues/42#issuecomment-999001\n'
-fi
+state="$STUB_GH_STATE"
+labels="$state/labels"
+[[ -f "$labels" ]] || printf '%s\n' "${GH_ISSUE_LABELS:-}" | tr ',' '\n' | sed '/^$/d' > "$labels"
+labels_json() { jq -R -s -c 'split("\n") | map(select(length > 0)) | map({name: .})' "$labels"; }
+case "${1:-} ${2:-}" in
+  "issue view")
+    printf '{"number":%s,"title":"Add widget","body":"Build a widget.","state":"%s","labels":%s}\n' "${3:-0}" "${GH_ISSUE_STATE:-OPEN}" "$(labels_json)" ;;
+  "issue edit")
+    shift 3
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --add-label) grep -qx -- "$2" "$labels" || printf '%s\n' "$2" >> "$labels"; shift 2 ;;
+        --remove-label) grep -vx -- "$2" "$labels" > "$labels.tmp" || true; mv "$labels.tmp" "$labels"; shift 2 ;;
+        *) shift ;;
+      esac
+    done ;;
+  "issue comment")
+    shift 3; body=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in --body-file) body="$(cat "$2")"; shift 2 ;; --body) body="$2"; shift 2 ;; *) shift ;; esac
+    done
+    printf '%s\n---\n' "$body" >> "$state/comments"
+    printf 'https://github.com/o/r/issues/42#issuecomment-999001\n' ;;
+  "issue create")
+    shift 2; title=""; body=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in --title) title="$2"; shift 2 ;; --body-file) body="$(cat "$2")"; shift 2 ;; *) shift ;; esac
+    done
+    printf 'TITLE: %s\n%s\n---\n' "$title" "$body" >> "$state/issues-created"
+    printf 'https://github.com/o/r/issues/%s\n' "$(( 100 + $(grep -c '^---$' "$state/issues-created") ))" ;;
+  "pr list")
+    if [[ "$*" == *--search* || -z "${GH_OPEN_PR_BRANCH:-}" ]]; then printf '[]\n'; else
+      sha="$(git -C "$STUB_ORIGIN" rev-parse -q --verify "refs/heads/$GH_OPEN_PR_BRANCH" 2>/dev/null || echo missing)"
+      printf '[{"number":7,"url":"https://github.com/o/r/pull/7","headRefName":"%s","headRefOid":"%s"}]\n' "$GH_OPEN_PR_BRANCH" "$sha"
+    fi ;;
+  "pr create")
+    printf '%s\n' "$*" >> "$state/pr-created"
+    printf 'https://github.com/o/r/pull/7\n' ;;
+  "api "*)
+    if [[ "$*" == *dependencies/blocked_by* ]]; then printf '%s\n' "${GH_BLOCKED_BY:-[]}"; else printf '{}\n'; fi ;;
+  *) : ;;
+esac
 exit 0
 STUB
 chmod +x "$TMP/bin/gh"
+
+# npm stub: `ci` makes node_modules appear, `run verify` passes unless the
+# fixture set carries verify.rc. Logs argv.
+cat > "$TMP/bin/npm" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${STUB_NPM_LOG:-/dev/null}"
+case "$*" in
+  ci) mkdir -p node_modules; exit 0 ;;
+  "run verify")
+    if [[ -f "${STUB_FIXTURES:-/nonexistent}/verify.rc" ]]; then
+      printf 'verify: widget.test.ts expected 2 got 1\n' >&2
+      exit "$(cat "$STUB_FIXTURES/verify.rc")"
+    fi
+    printf 'verify ok\n'; exit 0 ;;
+esac
+exit 0
+STUB
+chmod +x "$TMP/bin/npm"
 
 # A success envelope carrying structured output, exactly the shape the CLI's
 # own result schema describes (see lib/engine.mjs).
@@ -163,43 +254,46 @@ fixture() { # dir key structured-json
 fixture_text() { # dir key text
   printf '{"type":"result","subtype":"success","is_error":false,"result":"%s"}\n' "$3" > "$1/$2.json"
 }
+# What a step would have written to the worktree.
+fixture_sh() { # dir key script
+  printf '%s\n' "$3" > "$1/$2.sh"
+}
 
 # ───────────────────────── the happy-path fixture set ─────────────────────────
 BASE="$TMP/fixtures-base"
 mkdir -p "$BASE"
-fixture "$BASE" prepare '{"alreadyExists":false,"resumed":false,"slug":"42-add-widget","branch":"epic/42-add-widget","requirement":"Build a widget.","packages":["frontend"]}'
 fixture "$BASE" design '{"approach":"Thin widget module","rationale":"Fits the existing shape.","steps":["one","two"],"files":["src/widget.ts — new"],"contract":"createWidget(): Widget","tradeoffs":"No caching."}'
-fixture_text "$BASE" arch-write "architecture.md written"
 fixture_text "$BASE" red "wrote widget.test.ts; fails on missing export"
+fixture_sh "$BASE" red 'printf "test(\"widget\", () => {})\n" > frontend/src/widget.test.ts'
 fixture_text "$BASE" green "frontend verified green"
+fixture_sh "$BASE" green 'printf "export const createWidget = () => ({})\n" > frontend/src/widget.ts'
 for lens in lens-simplicity lens-seam lens-acceptance lens-security; do
   fixture "$BASE" "$lens" '{"findings":[]}'
 done
 fixture "$BASE" lens-correctness '{"findings":[{"title":"Null deref on empty list","severity":"Critical","confidence":90,"location":"src/widget.ts:12","problem":"Crashes when items is empty.","fix":"Guard the access.","gate":"unit test for the empty case"}]}'
 fixture "$BASE" verify '{"verdicts":[{"index":1,"real":true,"confidence":90,"reasoning":"Confirmed against the code."}]}'
-fixture_text "$BASE" review-write "review.md written"
 fixture "$BASE" triage '{"status":"Fixed the null deref, verify green.","deferred":[]}'
-fixture "$BASE" ship '{"prUrl":"https://github.com/o/r/pull/7","deferredDefects":0}'
-fixture "$BASE" handoff '{"labelled":true}'
-fixture_text "$BASE" blocked "blocker comment posted, label swapped to failed"
+fixture_sh "$BASE" triage 'printf "export const createWidget = () => ({ items: [] })\n" > frontend/src/widget.ts'
+fixture "$BASE" ship '{"title":"Add widget","body":"Adds a widget.\n\n## Review\n\nOne finding fixed.","commitBody":"Thin module, no caching.","deferred":[]}'
 
 # ───────────────────────── the runner ─────────────────────────
 RUN_OUT=""
 RUN_RC=0
 RUN_LOG=""
-run_pipeline() { # script fixtures-dir args...
+WT=""
+run_pipeline() { # script fixtures-dir args...   (scenario knobs via GH_* env)
   local script="$1" fixtures="$2"; shift 2
-  local state="$TMP/state.$RANDOM"
-  RUN_LOG="$TMP/argv.$RANDOM"
-  CODEX_LOG="$TMP/codex-argv.$RANDOM"
-  GH_LOG="$TMP/gh.$RANDOM"
-  mkdir -p "$state"
-  : > "$RUN_LOG"
-  : > "$CODEX_LOG"
-  : > "$GH_LOG"
+  local state="$TMP/state.$RANDOM$RANDOM"
+  RUN_LOG="$TMP/argv.$RANDOM$RANDOM"
+  CODEX_LOG="$TMP/codex-argv.$RANDOM$RANDOM"
+  GH_LOG="$TMP/gh.$RANDOM$RANDOM"
+  NPM_LOG="$TMP/npm.$RANDOM$RANDOM"
+  mkdir -p "$state/gh"
+  : > "$RUN_LOG"; : > "$CODEX_LOG"; : > "$GH_LOG"; : > "$NPM_LOG"
+  WT="$(fresh_clone)"
   RUN_RC=0
   RUN_OUT="$(
-    cd "$TMP" && \
+    cd "$WT" && \
     PATH="$TMP/bin:$PATH" \
     CLAUDE_BIN="$TMP/bin/claude" \
     CODEX_BIN="$TMP/bin/codex" \
@@ -209,31 +303,58 @@ run_pipeline() { # script fixtures-dir args...
     STUB_STATE="$state" \
     STUB_LOG="$RUN_LOG" \
     STUB_GH_LOG="$GH_LOG" \
+    STUB_GH_STATE="$state/gh" \
+    STUB_ORIGIN="$ORIGIN" \
+    STUB_NPM_LOG="$NPM_LOG" \
+    GH_ISSUE_STATE="${GH_ISSUE_STATE:-OPEN}" \
+    GH_ISSUE_LABELS="${GH_ISSUE_LABELS:-ready}" \
+    GH_BLOCKED_BY="${GH_BLOCKED_BY:-[]}" \
+    GH_OPEN_PR_BRANCH="${GH_OPEN_PR_BRANCH:-}" \
     node "$script" "$@" 2>&1
   )" || RUN_RC=$?
   STATE_DIR="$state"
 }
 calls() { cat "$STATE_DIR/$1.n" 2>/dev/null || echo 0; }
+gh_labels() { sort "$STATE_DIR/gh/labels" 2>/dev/null | tr '\n' ',' ; }
+gh_comments() { cat "$STATE_DIR/gh/comments" 2>/dev/null || true; }
+gh_issues_created() { cat "$STATE_DIR/gh/issues-created" 2>/dev/null || true; }
+gh_pr_created() { cat "$STATE_DIR/gh/pr-created" 2>/dev/null || true; }
 
-printf '\nepic-run: happy path to ready-to-merge\n'
-run_pipeline "$EPIC_RUN" "$BASE" --issue 42 --session myapp-epic-42
+# ───────────────────────── epic-run ─────────────────────────
+scenario 'epic-run: happy path ships and queues for merge'
+run_pipeline "$EPIC_RUN" "$BASE" --issue 42
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_contains "RESULT says readyToMerge" "$RUN_OUT" '"readyToMerge":true'
 assert_contains "RESULT carries the PR url" "$RUN_OUT" '"prUrl":"https://github.com/o/r/pull/7"'
 assert_contains "review tally reported" "$RUN_OUT" '1 confirmed by adversarial verification, 0 refuted'
-assert_eq "handoff ran once" 1 "$(calls handoff)"
-assert_eq "no blocker was posted" 0 "$(calls blocked)"
+assert_eq "exactly the eleven model steps ran" 11 "$(wc -l < "$RUN_LOG" | tr -d ' ')"
 assert_eq "all five lenses ran" 5 "$(( $(calls lens-correctness) + $(calls lens-simplicity) + $(calls lens-seam) + $(calls lens-acceptance) + $(calls lens-security) ))"
+# What the orchestrator did to the repo and the issue.
+assert_eq "origin holds the branch as ONE commit above main" 1 "$(origin_count epic/42-add-widget)"
+assert_eq "the squashed commit's subject is the PR title" "Add widget" "$(git -C "$ORIGIN" log -1 --format=%s epic/42-add-widget)"
+assert_contains "the squashed commit closes the issue" "$(git -C "$ORIGIN" log -1 --format=%B epic/42-add-widget)" "Closes #42"
+assert_contains "the commit body survived the squash" "$(git -C "$ORIGIN" log -1 --format=%B epic/42-add-widget)" "Thin module, no caching."
+assert_contains "the fix landed in the squashed tree" "$(git -C "$ORIGIN" show epic/42-add-widget:frontend/src/widget.ts)" "items: []"
+assert_contains "the red tests landed too" "$(git -C "$ORIGIN" ls-tree -r --name-only epic/42-add-widget)" "frontend/src/widget.test.ts"
+assert_contains "the PR was opened on the branch with the title" "$(gh_pr_created)" "--head epic/42-add-widget --title Add widget"
+assert_eq "the issue ends ready-to-merge and nothing else" "ready-to-merge," "$(gh_labels)"
+assert_not_contains "no deferred record was posted" "$(gh_comments)" "deferred / not done"
+assert_not_contains "no blocker was posted" "$(gh_comments)" "epic-run blocked"
+assert_eq "deps were installed once for the discovered package" 1 "$(grep -c '^ci$' "$NPM_LOG")"
+assert_contains "summary.md is the PR body plus the Closes line" "$(cat "$WT/.epics/42-add-widget/summary.md")" "Closes #42"
+assert_contains "architecture.md was rendered from the design" "$(cat "$WT/.epics/42-add-widget/architecture.md")" "Approach: Thin widget module"
+assert_contains "review.md was rendered from the verdicts" "$(cat "$WT/.epics/42-add-widget/review.md")" "Null deref on empty list"
+assert_contains "requirements.md carries the issue body verbatim" "$(cat "$WT/.epics/42-add-widget/requirements.md")" "Build a widget."
 # Tiering and charters are invisible in production until they bill; assert them here.
 ARGV="$(cat "$RUN_LOG")"
 # Charters ride in as --append-system-prompt + an explicit --tools list, never
-# as --agent: `--agent` silently disables --json-schema (measured 2026-08-20),
-# which is what broke vms#66's prepare. Asserting the ABSENCE of --agent is the
+# --agent: measured 2026-08-20, --agent silently disables --json-schema, so
+# every schema'd stage would come back as prose. The --agent check is the
 # regression guard; asserting the tool lists is the safety property that flag
 # used to provide.
 assert_not_contains "no stage uses --agent (it would void --json-schema)" "$ARGV" "--agent "
-assert_contains "prepare runs the mechanical tier" "$ARGV" "--model sonnet"
-assert_contains "prepare is chartered as coder (Write/Edit allowed)" "$ARGV" "Bash,Glob,Grep,Read,Edit,Write,"
+assert_not_contains "nothing runs on the retired bookkeeping row" "$ARGV" "--model sonnet"
+assert_contains "code is chartered as coder (Write/Edit allowed)" "$ARGV" "Bash,Glob,Grep,Read,Edit,Write,"
 assert_contains "design runs the strong tier" "$ARGV" "--model fable"
 assert_contains "the default tier is pinned to opus" "$ARGV" "--model opus"
 assert_contains "every Claude phase runs at xhigh effort" "$ARGV" "--effort xhigh"
@@ -242,8 +363,8 @@ assert_contains "the reviewer charter reaches the model" "$ARGV" "Review code ag
 assert_contains "schemas are enforced by the engine" "$ARGV" "--json-schema"
 assert_contains "permissions are pre-granted for autonomy" "$ARGV" "--dangerously-skip-permissions"
 
-printf '\nepic-run: Codex engine completes the same happy path\n'
-run_pipeline "$EPIC_RUN" "$BASE" --issue 42 --session myapp-epic-42 --engine codex
+scenario 'epic-run: --engine codex routes every step to the Codex CLI'
+run_pipeline "$EPIC_RUN" "$BASE" --issue 42 --engine codex
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_contains "RESULT says readyToMerge" "$RUN_OUT" '"readyToMerge":true'
 CODEX_ARGV="$(cat "$CODEX_LOG")"
@@ -253,61 +374,97 @@ assert_not_contains "no phase falls to a cheaper Codex model" "$CODEX_ARGV" "gpt
 assert_contains "hidden Codex fan-out is disabled" "$CODEX_ARGV" "--disable multi_agent --disable enable_fanout"
 assert_contains "Codex runs are ephemeral" "$CODEX_ARGV" "--ephemeral"
 assert_eq "all five Codex review lenses ran" 5 "$(( $(calls lens-correctness) + $(calls lens-simplicity) + $(calls lens-seam) + $(calls lens-acceptance) + $(calls lens-security) ))"
+assert_eq "no Claude process was spawned" 0 "$(wc -l < "$RUN_LOG" | tr -d ' ')"
+assert_eq "origin holds the squashed branch" 1 "$(origin_count epic/42-add-widget)"
 
-printf '\nepic-run: EPIC_ENGINE selects the engine when --engine is absent\n'
-export EPIC_ENGINE=codex
-run_pipeline "$EPIC_RUN" "$BASE" --issue 42 --session myapp-epic-42
-unset EPIC_ENGINE
+scenario 'epic-run: EPIC_ENGINE=codex routes every phase without a flag'
+EPIC_ENGINE=codex run_pipeline "$EPIC_RUN" "$BASE" --issue 42
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_contains "the run ships" "$RUN_OUT" '"readyToMerge":true'
 assert_contains "every phase went to Codex" "$(cat "$CODEX_LOG")" "--model gpt-5.6-sol"
 assert_eq "no phase went to Claude directly" 0 "$(grep -c -- '--model' "$RUN_LOG" || true)"
-export EPIC_ENGINE=future
-run_pipeline "$EPIC_RUN" "$BASE" --issue 42
-unset EPIC_ENGINE
+
+scenario 'epic-run: an unknown EPIC_ENGINE is refused before any side effect'
+EPIC_ENGINE=future run_pipeline "$EPIC_RUN" "$BASE" --issue 42
 assert_rc "an unknown EPIC_ENGINE exits 1 (usage)" 1 "$RUN_RC"
 assert_contains "and names the allowed engines" "$RUN_OUT" '--engine must be one of claude, codex'
+assert_eq "no branch was claimed" "" "$(origin_ref epic/42-add-widget)"
 
-printf '\nepic-run: an engine can mix vendors per step\n'
-jq '. + {mixed: (.claude | .review = "codex/gpt-5.6-sol/high" | ."confirm-review" = "codex/gpt-5.6-sol/high")}' "$ROOT/etc/engines.json" > "$TMP/engines.json"
-export EPIC_ENGINES_FILE="$TMP/engines.json"
-run_pipeline "$EPIC_RUN" "$BASE" --issue 42 --session myapp-epic-42 --engine mixed
-unset EPIC_ENGINES_FILE
+scenario 'epic-run: codex+claude codes on Claude and reviews on Codex'
+run_pipeline "$EPIC_RUN" "$BASE" --issue 42 --engine codex+claude
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_contains "the run ships" "$RUN_OUT" '"readyToMerge":true'
-assert_contains "review went to Codex" "$(cat "$CODEX_LOG")" 'model_reasoning_effort="high"'
+assert_contains "review went to Codex" "$(cat "$CODEX_LOG")" 'model_reasoning_effort="xhigh"'
 assert_eq "exactly the five lenses and the confirm batches ran on Codex" "$(( 5 + $(calls verify) ))" "$(grep -c -- '--model gpt-5.6-sol' "$CODEX_LOG" || true)"
 assert_contains "coding stayed on Claude" "$(cat "$RUN_LOG")" "--model opus"
 assert_contains "the architect stayed on Claude" "$(cat "$RUN_LOG")" "--model fable"
-assert_contains "the pane names the vendor and model per step" "$RUN_OUT" "[codex gpt-5.6-sol/high]"
+assert_contains "the pane names the vendor and model per step" "$RUN_OUT" "[codex gpt-5.6-sol/xhigh]"
 
-printf '\nepic-run: a broken engines file stops the run before any side effect\n'
+scenario 'epic-run: an engines file with a hole is refused before any side effect'
 jq 'del(.claude.review)' "$ROOT/etc/engines.json" > "$TMP/engines-broken.json"
-export EPIC_ENGINES_FILE="$TMP/engines-broken.json"
-run_pipeline "$EPIC_RUN" "$BASE" --issue 42
-unset EPIC_ENGINES_FILE
+EPIC_ENGINES_FILE="$TMP/engines-broken.json" run_pipeline "$EPIC_RUN" "$BASE" --issue 42
 assert_rc "exits 1" 1 "$RUN_RC"
 assert_contains "and names the hole" "$RUN_OUT" "has no entry for step 'review'"
-assert_eq "no agent process was spawned" 0 "$(calls prepare)"
+assert_eq "no agent process was spawned" 0 "$(wc -l < "$RUN_LOG" | tr -d ' ')"
+assert_eq "no GitHub call was made" 0 "$(wc -l < "$GH_LOG" | tr -d ' ')"
+assert_eq "no branch was claimed" "" "$(origin_ref epic/42-add-widget)"
 
-printf '\nepic-run: prepare refuses (claimed by another run)\n'
-REFUSED="$TMP/fixtures-refused"; cp -R "$BASE" "$REFUSED"
-fixture "$REFUSED" prepare '{"alreadyExists":false,"resumed":false,"refused":"claimed by another run"}'
-run_pipeline "$EPIC_RUN" "$REFUSED" --issue 42
+scenario 'epic-run: a closed issue is skipped before any side effect'
+GH_ISSUE_STATE=CLOSED run_pipeline "$EPIC_RUN" "$BASE" --issue 42
+assert_rc "exits 2 (skipped)" 2 "$RUN_RC"
+assert_contains "the reason names the state" "$RUN_OUT" 'issue #42 is closed'
+assert_eq "no branch was claimed" "" "$(origin_ref epic/42-add-widget)"
+assert_eq "nothing was designed" 0 "$(calls design)"
+
+scenario 'epic-run: open blocked_by dependencies skip the issue'
+GH_BLOCKED_BY='[{"number":41,"state":"open"},{"number":40,"state":"closed"}]' run_pipeline "$EPIC_RUN" "$BASE" --issue 42
+assert_rc "exits 2 (skipped)" 2 "$RUN_RC"
+assert_contains "the reason names the open blocker only" "$RUN_OUT" 'blocked by open issue(s) #41'
+assert_not_contains "a closed dependency does not block" "$RUN_OUT" '#40'
+assert_eq "no branch was claimed" "" "$(origin_ref epic/42-add-widget)"
+
+scenario 'epic-run: an open PR already delivering the issue skips it'
+GH_OPEN_PR_BRANCH=epic/42-add-widget run_pipeline "$EPIC_RUN" "$BASE" --issue 42
+assert_rc "exits 2 (skipped)" 2 "$RUN_RC"
+assert_contains "the reason names the PR" "$RUN_OUT" 'an open PR already delivers this issue (PR #7)'
+assert_eq "no branch was claimed" "" "$(origin_ref epic/42-add-widget)"
+
+scenario 'epic-run: a claim-only branch on origin means another run owns the issue'
+seed_branch epic/42-add-widget main 'git commit -q --allow-empty -m "chore(epic 42): claim 1-1"'
+CLAIM="$(origin_ref epic/42-add-widget)"
+run_pipeline "$EPIC_RUN" "$BASE" --issue 42
 assert_rc "exits 2 (skipped)" 2 "$RUN_RC"
 assert_contains "RESULT says skipped" "$RUN_OUT" '"skipped":true'
 assert_contains "the reason survives verbatim" "$RUN_OUT" 'claimed by another run'
 assert_eq "nothing was designed" 0 "$(calls design)"
-assert_eq "no blocker was posted" 0 "$(calls blocked)"
+assert_eq "the other run's claim ref is untouched" "$CLAIM" "$(origin_ref epic/42-add-widget)"
+assert_not_contains "no blocker was posted" "$(gh_comments)" "epic-run blocked"
 
-printf '\nepic-run: an unknown engine is rejected before side effects\n'
-run_pipeline "$EPIC_RUN" "$BASE" --issue 42 --engine future
-assert_rc "exits 1 (usage)" 1 "$RUN_RC"
-assert_contains "the allowed engines are named" "$RUN_OUT" '--engine must be one of claude, codex'
-assert_eq "no agent process was spawned" 0 "$(calls prepare)"
-assert_eq "no GitHub status write occurred" 0 "$(wc -l < "$GH_LOG" | tr -d ' ')"
+scenario 'epic-run: losing the claim push race is a skip, not a retry'
+cat > "$ORIGIN/hooks/pre-receive" <<'HOOK'
+#!/usr/bin/env bash
+while read -r old new ref; do
+  [[ "$ref" == refs/heads/epic/42-* ]] && { echo "epic/42 was claimed a moment ago" >&2; exit 1; }
+done
+exit 0
+HOOK
+chmod +x "$ORIGIN/hooks/pre-receive"
+run_pipeline "$EPIC_RUN" "$BASE" --issue 42
+assert_rc "exits 2 (skipped)" 2 "$RUN_RC"
+assert_contains "the rejected push reads as a lost race" "$RUN_OUT" 'claimed by another run'
+assert_eq "nothing was designed" 0 "$(calls design)"
+assert_eq "no branch landed on origin" "" "$(origin_ref epic/42-add-widget)"
 
-printf '\nepic-run: a dead review lens fails the run closed\n'
+scenario 'epic-run: a leftover branch with real work is resumed, not restarted'
+seed_branch epic/42-add-widget main 'printf "leftover\n" > frontend/src/leftover.ts && git add -A && git commit -qm "wip(epic 42-add-widget): code checkpoint"'
+run_pipeline "$EPIC_RUN" "$BASE" --issue 42
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_contains "prepare resumed the branch" "$RUN_OUT" 'resumed and rebased onto origin/main'
+assert_eq "the resumed branch still squashes to one commit" 1 "$(origin_count epic/42-add-widget)"
+assert_contains "the leftover work is in the squashed tree" "$(git -C "$ORIGIN" ls-tree -r --name-only epic/42-add-widget)" "frontend/src/leftover.ts"
+assert_contains "and so is the new work" "$(git -C "$ORIGIN" ls-tree -r --name-only epic/42-add-widget)" "frontend/src/widget.ts"
+
+scenario 'epic-run: a dead review lens fails the run closed and preserves the work'
 DEADLENS="$TMP/fixtures-deadlens"; cp -R "$BASE" "$DEADLENS"
 printf '1' > "$DEADLENS/lens-security.0.rc"   # first attempt dies
 printf '1' > "$DEADLENS/lens-security.1.rc"   # and so does the retry
@@ -316,11 +473,17 @@ assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
 assert_contains "the blocker names the review phase" "$RUN_OUT" '"phase":"review"'
 assert_contains "the reason names the unreviewed lens" "$RUN_OUT" 'security + authorization'
 assert_eq "the lens was retried exactly once" 2 "$(calls lens-security)"
-assert_eq "a blocker comment was posted" 1 "$(calls blocked)"
-assert_eq "nothing shipped" 0 "$(calls ship)"
-assert_eq "nothing was queued for merge" 0 "$(calls handoff)"
+assert_contains "a blocker comment was posted" "$(gh_comments)" "🤖 epic-run blocked"
+assert_contains "it names the phase" "$(gh_comments)" "- phase: review"
+assert_contains "it says how to resume" "$(gh_comments)" "re-running /epic #42 resumes from it"
+assert_contains "it carries the phase log" "$(gh_comments)" "## Phase log"
+assert_eq "the issue ends failed and nothing else" "failed," "$(gh_labels)"
+assert_eq "nothing shipped a PR" "" "$(gh_pr_created)"
+assert_eq "the checkpoint was pushed so a re-run resumes it" 2 "$(origin_count epic/42-add-widget)"
+assert_contains "the pushed checkpoint holds the implementation" "$(git -C "$ORIGIN" ls-tree -r --name-only epic/42-add-widget)" "frontend/src/widget.ts"
+assert_not_contains "the WIP never carries a Closes line" "$(git -C "$ORIGIN" log --format=%B main..epic/42-add-widget)" "Closes #"
 
-printf '\nepic-run: a deferred finding holds the merge gate\n'
+scenario 'epic-run: a deferred finding holds the merge gate'
 HELD="$TMP/fixtures-held"; cp -R "$BASE" "$HELD"
 fixture "$HELD" triage '{"status":"Left one for a human.","deferred":[{"title":"Null deref on empty list","severity":"Critical","why":"The fix needs a product decision."}]}'
 run_pipeline "$EPIC_RUN" "$HELD" --issue 42
@@ -328,9 +491,32 @@ assert_rc "exits 0 (the PR is real, just held)" 0 "$RUN_RC"
 assert_contains "RESULT records why the gate held" "$RUN_OUT" '"mergeSkipped"'
 assert_contains "the held reason names the finding" "$RUN_OUT" 'Critical: Null deref on empty list'
 assert_not_contains "it is not queued for merge" "$RUN_OUT" '"readyToMerge":true'
-assert_eq "handoff never ran" 0 "$(calls handoff)"
+assert_eq "the issue stays ready-to-review" "ready-to-review," "$(gh_labels)"
 
-printf '\nepic-run: an off-schema payload is respawned once, then accepted\n'
+scenario 'epic-run: ship classifies deferrals; the script counts, files and records them'
+DEFER="$TMP/fixtures-defer"; cp -R "$BASE" "$DEFER"
+fixture "$DEFER" ship '{"title":"Add widget","body":"Adds a widget.","commitBody":"","legalMarker":"LEGAL-REVIEW: required","deferred":[
+  {"title":"Widget crashes on empty list","why":"Needs a product decision.","kind":"defect","file":true,"issueTitle":"Widget crashes on empty list","issueBody":"Still on main after the merge."},
+  {"title":"Second defect","why":"Same.","kind":"defect","file":true},
+  {"title":"Third defect","why":"Same.","kind":"defect","file":true},
+  {"title":"Fourth defect","why":"Same.","kind":"defect","file":true},
+  {"title":"Refactor the helpers","why":"Nice to have.","kind":"other","file":true}]}'
+run_pipeline "$EPIC_RUN" "$DEFER" --issue 42
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_contains "the gate counts defects from the kinds" "$RUN_OUT" '4 deferred defect(s) that still exist on main after this merge'
+assert_not_contains "and holds the PR" "$RUN_OUT" '"readyToMerge":true'
+assert_eq "the issue stays ready-to-review" "ready-to-review," "$(gh_labels)"
+assert_contains "the deferred record was posted with the exact first line" "$(gh_comments)" "🤖 deferred / not done"
+assert_contains "it lists every item, kind and why" "$(gh_comments)" "- Refactor the helpers (other): Nice to have."
+assert_eq "at most three follow-ups were filed, defects first" 3 "$(grep -c '^TITLE: ' "$STATE_DIR/gh/issues-created")"
+assert_not_contains "an 'other' item is never filed even when asked" "$(gh_issues_created)" "Refactor the helpers"
+assert_contains "a follow-up links back with the Follow-up line" "$(gh_issues_created)" "Follow-up to #42"
+assert_contains "the record says how many qualified versus filed" "$(gh_comments)" "4 items qualified for a follow-up issue and 3 were filed"
+assert_contains "the PR body points at the record" "$(cat "$WT/.epics/42-add-widget/summary.md")" "Deferred items recorded on #42."
+assert_contains "the legal marker reaches the PR body" "$(cat "$WT/.epics/42-add-widget/summary.md")" "LEGAL-REVIEW: required"
+assert_contains "and the commit body" "$(git -C "$ORIGIN" log -1 --format=%B epic/42-add-widget)" "LEGAL-REVIEW: required"
+
+scenario 'epic-run: an off-schema payload is respawned once, then accepted'
 RETRY="$TMP/fixtures-retry"; cp -R "$BASE" "$RETRY"
 # Missing `contract` — the field red writes its tests from.
 fixture "$RETRY" design.0 '{"approach":"Thin widget module","rationale":"Fits.","steps":["one"],"files":["src/widget.ts"],"tradeoffs":"None."}'
@@ -340,136 +526,201 @@ assert_rc "the run still completes" 0 "$RUN_RC"
 assert_eq "design was spawned twice" 2 "$(calls design)"
 assert_contains "the retry was announced" "$RUN_OUT" 'did not match the schema'
 
-printf '\nepic-run: an off-schema payload twice fails the phase closed\n'
+scenario 'epic-run: an off-schema payload twice fails the phase closed'
 BADSCHEMA="$TMP/fixtures-badschema"; cp -R "$BASE" "$BADSCHEMA"
 fixture "$BADSCHEMA" design '{"approach":"Thin widget module","rationale":"Fits.","steps":["one"],"files":["src/widget.ts"],"tradeoffs":"None."}'
 run_pipeline "$EPIC_RUN" "$BADSCHEMA" --issue 42
 assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
 assert_contains "it blocks in the architect phase" "$RUN_OUT" '"phase":"architect"'
 assert_eq "nothing was implemented" 0 "$(calls red)"
+assert_contains "the blocker names the branch to resume" "$(gh_comments)" "- branch: epic/42-add-widget"
+assert_eq "the issue ends failed" "failed," "$(gh_labels)"
 
-printf '\nepic-run: manual slug mode touches no git phase\n'
+scenario 'epic-run: manual slug mode touches no git phase and no issue'
 MANUAL="$TMP/fixtures-manual"; cp -R "$BASE" "$MANUAL"
-fixture "$MANUAL" read-req '{"requirement":"Build a widget.","packages":["frontend"]}'
-fixture_text "$MANUAL" summary "summary.md written"
+fixture "$MANUAL" summary '{"summary":"summary.md written"}'
+MANUAL_WT="$(fresh_clone)"
+mkdir -p "$MANUAL_WT/.epics/42-add-widget"
+printf 'Build a widget.\n' > "$MANUAL_WT/.epics/42-add-widget/requirements.md"
+# run in that prepared clone rather than a fresh one
+fresh_clone() { printf '%s' "$MANUAL_WT"; }
 run_pipeline "$EPIC_RUN" "$MANUAL" --slug 42-add-widget
+unset -f fresh_clone
+fresh_clone() { local dir="$TMP/run-$RANDOM$RANDOM"; git clone -q "$ORIGIN" "$dir"; git -C "$dir" checkout -q --detach main; printf '%s' "$dir"; }
 assert_rc "exits 0" 0 "$RUN_RC"
-assert_eq "prepare never ran" 0 "$(calls prepare)"
-assert_eq "nothing shipped a PR" 0 "$(calls ship)"
-assert_eq "nothing was queued for merge" 0 "$(calls handoff)"
 assert_contains "the summary came back" "$RUN_OUT" 'summary.md written'
+assert_contains "summary.md was written to the tree" "$(cat "$MANUAL_WT/.epics/42-add-widget/summary.md")" 'summary.md written'
+assert_eq "no gh calls at all" "0" "$(wc -l < "$GH_LOG" | tr -d ' ')"
+assert_eq "no branch was created on origin" "" "$(origin_ref epic/42-add-widget)"
+assert_eq "no commit was made on the user's tree" "$MAIN_INITIAL" "$(git -C "$MANUAL_WT" rev-parse HEAD)"
+assert_contains "new files were intent-added for the blind review" "$(git -C "$MANUAL_WT" status --porcelain)" "frontend/src/widget.ts"
 
 # ───────────────────────── fix-run ─────────────────────────
+# A finished epic PR (one commit, Closes #42) whose line conflicts with a
+# commit that landed on main since: both sides edited the same base line, which
+# the deterministic rung classifies as needing judgment and hands to the model.
+seed_conflict() {
+  seed_branch epic/42-add-widget main 'printf "export const items = [] // pr-guard\n" > frontend/src/index.ts && git commit -qam "feat: add guard" -m "Closes #42"'
+  seed_branch main main 'printf "export const items = [] // main-rename\n" > frontend/src/index.ts && git commit -qam "main: rename helper" -m "Closes #41"'
+}
+seed_clean() {
+  seed_branch epic/42-add-widget main 'printf "export const items = [] // pr-guard\n" > frontend/src/index.ts && git commit -qam "feat: add guard" -m "Closes #42"'
+  seed_branch main main 'printf "# app\n\nmoved on\n" > README.md && git commit -qam "docs: main moved" -m "Closes #41"'
+}
 FIXBASE="$TMP/fixtures-fix"
 mkdir -p "$FIXBASE"
-fixture "$FIXBASE" fix-prepare '{"attempt":1,"branch":"epic/42-add-widget","prUrl":"https://github.com/o/r/pull/7","prNumber":7,"prHead":"abc123","mergeBase":"def456","cleanRebase":false,"report":"hunk 1: needs judgment","markedFiles":["src/widget.ts"],"mainIssues":[41],"packages":["frontend"]}'
-fixture "$FIXBASE" fix-resolve '{"completed":true,"resolutions":[{"file":"src/widget.ts","hunk":1,"mainIntent":"main renamed the helper","prIntent":"the PR added a guard","resolution":"Keeps the rename and the guard."}]}'
-fixture "$FIXBASE" fix-verify '{"green":true,"detail":"frontend — pass"}'
+fixture "$FIXBASE" fix-resolve '{"completed":true,"resolutions":[{"file":"frontend/src/index.ts","hunk":1,"mainIntent":"main renamed the helper","prIntent":"the PR added a guard","resolution":"Keeps the rename and the guard."}]}'
+# What the resolver does to the tree: settle the marked block, stage, continue.
+fixture_sh "$FIXBASE" fix-resolve 'printf "export const items = [] // main-rename pr-guard\n" > frontend/src/index.ts && git add frontend/src/index.ts && GIT_EDITOR=true git rebase --continue >/dev/null'
 fixture "$FIXBASE" fix-check '{"survives":true,"confidence":88,"reasoning":"Both changes are present at HEAD."}'
-fixture "$FIXBASE" fix-ship '{"pushed":true,"labelled":true}'
-fixture_text "$FIXBASE" blocked "blocker comment posted"
+run_fix() { GH_ISSUE_LABELS="${FIX_LABELS:-failed,needs-judgment}" GH_OPEN_PR_BRANCH=epic/42-add-widget run_pipeline "$FIX_RUN" "$@"; }
 
-printf '\nfix-run: judgment hunk resolved, checked, shipped ready-to-review\n'
-run_pipeline "$FIX_RUN" "$FIXBASE" --issue 42 --session myapp-epic-42
+scenario 'fix-run: judgment hunk resolved, verified, checked, shipped ready-to-review'
+seed_conflict
+BEFORE="$(origin_ref epic/42-add-widget)"
+run_fix "$FIXBASE" --issue 42 --session myapp-epic-42
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_contains "RESULT lands ready-to-review" "$RUN_OUT" '"readyToReview":true'
-assert_contains "it never claims ready-to-merge" "$RUN_OUT" '"resolvedHunks":1'
+assert_contains "it records one judgment hunk" "$RUN_OUT" '"resolvedHunks":1'
 assert_not_contains "no merge queue promotion" "$RUN_OUT" 'readyToMerge'
-SHIP_PROMPT="$(cat "$STATE_DIR/fix-ship.0.prompt")"
-assert_contains "the audit comment states main's intent" "$SHIP_PROMPT" "origin/main intended: main renamed the helper"
-assert_contains "the audit comment states the PR's intent" "$SHIP_PROMPT" "the PR intended: the PR added a guard"
-assert_contains "the audit comment records the adversarial check" "$SHIP_PROMPT" "confidence 88/100"
+assert_contains "the resolver was handed the rung's classification" "$(cat "$STATE_DIR/fix-resolve.0.prompt")" 'needs judgment'
+assert_eq "the branch on origin was rewritten" "$(git -C "$WT" rev-parse HEAD)" "$(origin_ref epic/42-add-widget)"
+assert_not_contains "and is not what it was" "$(origin_ref epic/42-add-widget)" "$BEFORE"
+assert_eq "it is exactly one commit above the new main" 1 "$(origin_count epic/42-add-widget)"
+assert_contains "both intents are in the shipped file" "$(git -C "$ORIGIN" show epic/42-add-widget:frontend/src/index.ts)" "main-rename pr-guard"
+assert_contains "verify ran in the discovered package" "$(cat "$NPM_LOG")" "run verify"
+assert_contains "the audit comment states main's intent" "$(gh_comments)" "origin/main intended: main renamed the helper"
+assert_contains "the audit comment states the PR's intent" "$(gh_comments)" "the PR intended: the PR added a guard"
+assert_contains "the audit comment records the adversarial check" "$(gh_comments)" "confidence 88/100"
+assert_eq "the labels: ready-to-review, ladder kept, needs-judgment cleared" "fix-attempted,ready-to-review," "$(gh_labels)"
 
-printf '\nfix-run: the resolver escalates instead of guessing\n'
-ESCALATE="$TMP/fixtures-escalate"; cp -R "$FIXBASE" "$ESCALATE"
-fixture "$ESCALATE" fix-resolve '{"completed":false,"escalate":"src/widget.ts hunk 1: the two sides set the same flag to opposite values."}'
-run_pipeline "$FIX_RUN" "$ESCALATE" --issue 42
+scenario 'fix-run: the resolver escalates instead of guessing'
+seed_conflict
+BEFORE="$(origin_ref epic/42-add-widget)"
+ESCALATE="$TMP/fixtures-escalate"; cp -R "$FIXBASE" "$ESCALATE"; rm -f "$ESCALATE/fix-resolve.sh"
+fixture "$ESCALATE" fix-resolve '{"completed":false,"escalate":"frontend/src/index.ts hunk 1: the two sides set the same flag to opposite values."}'
+run_fix "$ESCALATE" --issue 42
 assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
 assert_contains "the escalation reaches the blocker" "$RUN_OUT" 'escalated rather than guessed'
-assert_eq "nothing was pushed" 0 "$(calls fix-ship)"
+assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+assert_eq "the worktree is not left mid-rebase" "" "$(cd "$WT" && ls -d .git/rebase-merge .git/rebase-apply 2>/dev/null)"
+assert_contains "the blocker block names the next step" "$(gh_comments)" "- next: This was the first attempt"
+assert_eq "labels: failed, ladder and needs-judgment kept" "failed,fix-attempted,needs-judgment," "$(gh_labels)"
 
-printf '\nfix-run: a red verify blocks — the fixer never fixes code\n'
+scenario 'fix-run: the retry that fails hands the issue to a human'
+seed_conflict
+FIX_LABELS="failed,needs-judgment,fix-attempted" run_fix "$ESCALATE" --issue 42
+assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
+assert_contains "RESULT records attempt 2" "$RUN_OUT" '"attempt":2'
+assert_contains "the blocker block says the ladder is spent" "$(gh_comments)" "- next: This was the RETRY"
+assert_contains "fix-retried was recorded" "$(gh_labels)" "fix-retried,"
+
+scenario 'fix-run: a red verify blocks — the fixer never fixes code'
+seed_conflict
+BEFORE="$(origin_ref epic/42-add-widget)"
 REDVERIFY="$TMP/fixtures-redverify"; cp -R "$FIXBASE" "$REDVERIFY"
-fixture "$REDVERIFY" fix-verify '{"green":false,"detail":"frontend — fail: widget.test.ts expected 2 got 1"}'
-run_pipeline "$FIX_RUN" "$REDVERIFY" --issue 42
+printf '1' > "$REDVERIFY/verify.rc"
+run_fix "$REDVERIFY" --issue 42
 assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
 assert_contains "the failing detail reaches the blocker" "$RUN_OUT" 'widget.test.ts expected 2 got 1'
 assert_eq "the adversarial check never ran" 0 "$(calls fix-check)"
-assert_eq "nothing was pushed" 0 "$(calls fix-ship)"
+assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
 
-printf '\nfix-run: a refuted resolution blocks\n'
+scenario 'fix-run: a refuted resolution blocks'
+seed_conflict
+BEFORE="$(origin_ref epic/42-add-widget)"
 REFUTED="$TMP/fixtures-refuted"; cp -R "$FIXBASE" "$REFUTED"
 fixture "$REFUTED" fix-check '{"survives":false,"confidence":20,"reasoning":"The rename was dropped from the guarded branch."}'
-run_pipeline "$FIX_RUN" "$REFUTED" --issue 42
+run_fix "$REFUTED" --issue 42
 assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
 assert_contains "the refutation reaches the blocker" "$RUN_OUT" 'the adversarial check refuted the resolution'
-assert_eq "nothing was pushed" 0 "$(calls fix-ship)"
+assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
 
-printf '\nfix-run: an exhausted attempt ladder refuses without running\n'
-LADDER="$TMP/fixtures-ladder"; cp -R "$FIXBASE" "$LADDER"
-fixture "$LADDER" fix-prepare '{"attempt":0,"cleanRebase":false,"markedFiles":[],"refused":"attempt ladder exhausted (fix-retried present)","refusalFinal":true}'
-run_pipeline "$FIX_RUN" "$LADDER" --issue 42
+scenario 'fix-run: a resolver that claims completion mid-rebase is caught'
+seed_conflict
+BEFORE="$(origin_ref epic/42-add-widget)"
+LIAR="$TMP/fixtures-liar"; cp -R "$FIXBASE" "$LIAR"; rm -f "$LIAR/fix-resolve.sh"
+run_fix "$LIAR" --issue 42
+assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
+assert_contains "the tree, not the claim, decides" "$RUN_OUT" 'the rebase is still in progress'
+assert_eq "verify never ran" 0 "$(grep -c 'run verify' "$NPM_LOG")"
+assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+
+scenario 'fix-run: an exhausted attempt ladder refuses without running'
+seed_conflict
+BEFORE="$(origin_ref epic/42-add-widget)"
+FIX_LABELS="failed,needs-judgment,fix-attempted,fix-retried" run_fix "$FIXBASE" --issue 42
 assert_rc "exits 2 (skipped)" 2 "$RUN_RC"
 assert_contains "the refusal is final" "$RUN_OUT" '"refusalFinal":true'
 assert_eq "no resolver was woken" 0 "$(calls fix-resolve)"
+assert_contains "the refusal was commented" "$(gh_comments)" "🤖 fix-conflict refused: attempt ladder exhausted"
+assert_contains "the issue is left failed" "$(gh_labels)" "failed,"
+assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
 
-printf '\nfix-run: a rebase that came back clean skips judgment entirely\n'
-CLEAN="$TMP/fixtures-clean"; cp -R "$FIXBASE" "$CLEAN"
-fixture "$CLEAN" fix-prepare '{"attempt":1,"branch":"epic/42-add-widget","prUrl":"https://github.com/o/r/pull/7","prNumber":7,"prHead":"abc123","mergeBase":"def456","cleanRebase":true,"report":"","markedFiles":[],"mainIssues":[],"packages":["frontend"]}'
-run_pipeline "$FIX_RUN" "$CLEAN" --issue 42
+scenario 'fix-run: no open PR is a final refusal'
+seed_conflict
+GH_OPEN_PR_BRANCH="" GH_ISSUE_LABELS="failed,needs-judgment" run_pipeline "$FIX_RUN" "$FIXBASE" --issue 42
+assert_rc "exits 2 (skipped)" 2 "$RUN_RC"
+assert_contains "the reason names the missing PR" "$RUN_OUT" 'no open PR on an epic/42-* branch'
+assert_contains "the refusal was commented" "$(gh_comments)" "🤖 fix-conflict refused: no open PR"
+
+scenario 'fix-run: a rebase that came back clean skips judgment entirely'
+seed_clean
+run_fix "$FIXBASE" --issue 42
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_eq "no resolver ran" 0 "$(calls fix-resolve)"
 assert_eq "no adversarial check ran" 0 "$(calls fix-check)"
 assert_contains "it still verified before shipping" "$RUN_OUT" 'Verify: green'
 assert_contains "RESULT records that no judgment was exercised" "$RUN_OUT" '"resolvedHunks":0'
+assert_eq "the branch was rebased onto the new main and pushed" 1 "$(origin_count epic/42-add-widget)"
+if git -C "$ORIGIN" merge-base --is-ancestor main epic/42-add-widget; then ok "and sits on top of main"; else nok "and sits on top of main"; fi
+assert_contains "the audit comment says the conflict evaporated" "$(gh_comments)" "the conflict had evaporated"
 
 # ───────────────────── defect grouping (restatements across files) ─────────────────────
 # Five blind lenses reporting one fault is the design working — it is how #66's migration
-# bug was caught five times over — but triage must not then fix and gate that fault five
+# bug was caught five times over — but the fixer must not then fix and gate that fault five
 # times. The skeptic links restatements with sameDefectAs; the script unions them into
-# defects and tells triage, WITHOUT dropping any finding.
-printf '\ngrouping: restatements across files become one defect for triage\n'
+# defects and tells the fixer, WITHOUT dropping any finding.
+scenario 'grouping: restatements across files become one defect for the fixer'
 GROUP="$TMP/fixtures-group"
 cp -R "$BASE" "$GROUP"
-# Three lenses, three DIFFERENT files, one underlying fault — the shape file-clustering missed.
 fixture "$GROUP" lens-correctness '{"findings":[{"title":"Unusable schedule does not block submit","severity":"Critical","confidence":90,"location":"src/dialog.tsx:40","problem":"Submit stays enabled.","fix":"Block it.","gate":"unit test"}]}'
 fixture "$GROUP" lens-simplicity '{"findings":[{"title":"Block gate tests the wrong condition","severity":"Important","confidence":85,"location":"src/gate.ts:12","problem":"Checks null, not empty.","fix":"Check emptiness.","gate":"unit test"}]}'
 fixture "$GROUP" lens-seam '{"findings":[{"title":"Test asserts the wrong guard","severity":"Important","confidence":80,"location":"src/gate.test.ts:8","problem":"Encodes the wrong rule.","fix":"Assert emptiness.","gate":"unit test"}]}'
-# One batch (3 findings < MAX_BATCH), so the skeptic can see all three: 2 and 3 restate 1.
+# One skeptic sees all three (one batch) and links 2 and 3 back to 1.
 fixture "$GROUP" verify '{"verdicts":[
   {"index":1,"real":true,"confidence":90,"reasoning":"Confirmed."},
   {"index":2,"real":true,"confidence":88,"reasoning":"Same fault as 1.","sameDefectAs":1},
   {"index":3,"real":true,"confidence":85,"reasoning":"Same fault as 1.","sameDefectAs":1}]}'
-run_pipeline "$EPIC_RUN" "$GROUP" --issue 42 --session myapp-epic-42
+run_pipeline "$EPIC_RUN" "$GROUP" --issue 42
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_contains "one batch, not one per file" "$RUN_OUT" "in 1 batch(es)"
 assert_contains "the tally keeps BOTH counts" "$RUN_OUT" "3 confirmed by adversarial verification, which are 1 distinct defect(s)"
 TRIAGE_PROMPT="$(cat "$STATE_DIR/triage.0.prompt")"
-assert_contains "triage is told they are one defect" "$TRIAGE_PROMPT" "SAME underlying defect"
+assert_contains "the fixer is told they are one defect" "$TRIAGE_PROMPT" "SAME underlying defect"
 assert_contains "grouping lists every finding, losing none" "$TRIAGE_PROMPT" "Block gate tests the wrong condition"
 assert_contains "...including the third" "$TRIAGE_PROMPT" "Test asserts the wrong guard"
 assert_contains "the grouping is advisory, not an order" "$TRIAGE_PROMPT" "hint, not an instruction"
 
-# A link the skeptic did not make must not invent a group — distinct faults stay distinct.
-printf '\ngrouping: unlinked findings stay separate defects\n'
-NOGROUP="$TMP/fixtures-nogroup"
-cp -R "$GROUP" "$NOGROUP"
-fixture "$NOGROUP" verify '{"verdicts":[
+scenario 'grouping: distinct defects stay distinct'
+DISTINCT="$TMP/fixtures-distinct"
+cp -R "$GROUP" "$DISTINCT"
+fixture "$DISTINCT" verify '{"verdicts":[
   {"index":1,"real":true,"confidence":90,"reasoning":"Confirmed."},
   {"index":2,"real":true,"confidence":88,"reasoning":"Distinct fault."},
   {"index":3,"real":true,"confidence":85,"reasoning":"Distinct fault."}]}'
-run_pipeline "$EPIC_RUN" "$NOGROUP" --issue 42 --session myapp-epic-42
+run_pipeline "$EPIC_RUN" "$DISTINCT" --issue 42
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_not_contains "no defect collapsing is claimed" "$RUN_OUT" "distinct defect(s)"
 TRIAGE_PROMPT="$(cat "$STATE_DIR/triage.0.prompt")"
-assert_not_contains "and triage is told nothing about groups" "$TRIAGE_PROMPT" "SAME underlying defect"
+assert_not_contains "and the fixer is told nothing about groups" "$TRIAGE_PROMPT" "SAME underlying defect"
 
 # ───────────────────── the issue's live status comment ─────────────────────
 # The label says WHICH state an issue is in; this says whether the run is alive
 # and where it got to — the one question that otherwise needs ssh + capture-pane.
 # It must be posted ONCE and edited thereafter: a comment per phase is the thing
 # that made per-phase commentary not worth having.
-printf '\nstatus comment: posted once, edited in place, ends with the outcome\n'
+scenario 'status comment: posted once, edited in place, ends with the outcome'
 run_pipeline "$EPIC_RUN" "$BASE" --issue 42 --session myapp-epic-42
 assert_rc "exits 0" 0 "$RUN_RC"
 GH="$(cat "$GH_LOG")"
@@ -488,23 +739,14 @@ SHIP_PROMPT="$(cat "$STATE_DIR/ship.0.prompt")"
 assert_contains "ship is told not to number anything with a bare #N" "$SHIP_PROMPT" "Never write a bare"
 assert_contains "and told what GitHub does with one" "$SHIP_PROMPT" "renders it as that issue or PR"
 
-printf '\nstatus comment: a blocked run says so on the issue\n'
-DEAD="$TMP/fixtures-deadlens"
-cp -R "$BASE" "$DEAD"
-printf '1' > "$DEAD/lens-security.rc"; printf '1' > "$DEAD/lens-security.0.rc"; printf '1' > "$DEAD/lens-security.1.rc"
-run_pipeline "$EPIC_RUN" "$DEAD" --issue 42 --session myapp-epic-42
+scenario 'status comment: a blocked run says so on the issue'
+run_pipeline "$EPIC_RUN" "$DEADLENS" --issue 42 --session myapp-epic-42
 GH="$(cat "$GH_LOG")"
 assert_contains "the status comment records the block" "$GH" "blocked"
 
-printf '\nstatus comment: slug mode never touches the issue\n'
-mkdir -p "$TMP/slugrun/.epics/42-add-widget"
-run_pipeline "$EPIC_RUN" "$BASE" --slug 42-add-widget
-assert_eq "no gh calls at all" "0" "$(wc -l < "$GH_LOG" | tr -d ' ')"
-
-printf '\nstatus comment: a fixer run says fix-run, not epic-run\n'
-FIXST="$TMP/fixtures-fixstatus"
-cp -R "$FIXBASE" "$FIXST" 2>/dev/null || cp -R "$BASE" "$FIXST"
-run_pipeline "$FIX_RUN" "$FIXST" --issue 42 --session myapp-epic-42
+scenario 'status comment: a fixer run says fix-run, not epic-run'
+seed_conflict
+run_fix "$FIXBASE" --issue 42 --session myapp-epic-42
 GH="$(cat "$GH_LOG")"
 assert_contains "the comment names fix-run" "$GH" "fix-run"
 assert_not_contains "and never claims to be epic-run" "$GH" "**epic-run**"

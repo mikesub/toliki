@@ -91,7 +91,8 @@ gh repo clone mikesub/toliki && cd toliki
 - **`bin/`, `etc/`** — the host-side scripts and config; each header states
   its contract and the incident behind it.
 - **`workflows/`** — the two pipelines and the small runtime they sit on
-  (the engine adapter, the concurrency gate, structured-output validation).
+  (the engine adapter, the git/gh transport, the concurrency gate,
+  structured-output validation).
 - **`skills/`, `agents/`** — the shared content: `/spec` (the human gate), the
   agent charters each phase runs under, and the manual entry points.
 

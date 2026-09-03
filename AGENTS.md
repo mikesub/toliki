@@ -53,10 +53,12 @@ in the same change.
 - **Engine**: a top-level key of `etc/engines.json`, selected per issue by the
   `engine:<name>` label. An unlabeled issue uses `EPIC_ENGINE` from
   `etc/dispatch.cron` (claude when unset). The label survives fixer retries.
-- **Step**: one of the seven pipeline steps in `STEPS` in
-  `workflows/lib/engine.mjs`. Pipelines name steps; the engine file says who
-  runs them; `STEPS` fixes each step's charter and tool boundary, so
-  architect, review and confirm-review stay read-only under any vendor.
+- **Step**: one of the six pipeline steps in `STEPS` in
+  `workflows/lib/engine.mjs`, each a judgment call. Pipelines name steps; the
+  engine file says who runs them; `STEPS` fixes each step's charter and tool
+  boundary, so architect, review and confirm-review stay read-only under any
+  vendor. Nothing deterministic is a step: git, gh and npm work runs in the
+  orchestrator.
 - **Charter**: an `agents/*.md` file, read on every phase. Missing or malformed
   refuses the run.
 - **Package**: a directory whose `package.json` declares `scripts.verify`. The
@@ -97,6 +99,12 @@ lifecycle change. Follow-up issues ship with no labels and link back with a
 - `workflows/lib/runtime.mjs` owns phase execution, the concurrency gate,
   timeouts and signal forwarding. Deterministic control flow lives here or in
   scripts, never inside model judgment.
+- `workflows/lib/github.mjs` and `workflows/lib/repo.mjs` are the pipelines'
+  transport: every claim, label swap, comment, checkpoint, squash, push, PR,
+  follow-up issue, layout discovery, `npm ci` and the fixer's verify run is
+  executed there by the orchestrator, never delegated to a model. The merge
+  gate's inputs are counted from ship's structured deferral kinds. Gated by
+  `tests/epic-run.test.sh`.
 - `bin/launch.sh` is the only session-creation primitive; `bin/dispatch.sh` and
   `remote-control.sh` both go through it. It owns the pipeline worktree and
   the slot cap, refusing with exit 3. Gated by `tests/launch-epic.test.sh`.

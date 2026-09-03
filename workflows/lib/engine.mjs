@@ -15,41 +15,19 @@
 //   pipeline's own fail-closed branches read, not an exception that unwinds
 //   past them.
 //
-// Children are spawned into their OWN PROCESS GROUP (detached). That is what
-// makes a timeout able to kill the whole tree — an agent running `npm run
-// verify` has a subtree of its own, and killing only the CLI would orphan it.
-// The cost is that a signal sent to this orchestrator's group does not reach
-// them, which is why runtime.mjs forwards signals through terminateAll().
+// Processes are spawned through lib/proc.mjs, in their own process groups and
+// tracked alongside the run's git/gh/npm children, so one signal forward from
+// runtime.mjs (terminateAll) takes the whole tree.
 
-import { spawn } from 'node:child_process'
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import { run, terminateAll } from './proc.mjs'
+
+export { terminateAll }
 
 export const HARNESS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..')
-
-// Live children, so a signal to the orchestrator can take the tree with it.
-const LIVE = new Set()
-
-// SIGTERM every live child's process group, then SIGKILL what is still up
-// after the grace. Used both by the timeout path and by signal forwarding.
-export function terminateAll(graceMs = 5000) {
-  const groups = [...LIVE]
-  for (const pid of groups) killGroup(pid, 'SIGTERM')
-  if (!groups.length) return Promise.resolve()
-  return new Promise((resolve) => {
-    setTimeout(() => {
-      for (const pid of groups) if (LIVE.has(pid)) killGroup(pid, 'SIGKILL')
-      resolve()
-    }, graceMs).unref?.()
-  })
-}
-
-function killGroup(pid, signal) {
-  // Negative pid = the whole process group. ESRCH just means it already died.
-  try { process.kill(-pid, signal) } catch { /* already gone */ }
-}
 
 // Pull the payload out of whatever the CLI printed. Tolerant on purpose: the
 // envelope is pinned (see the claude adapter's notes) but a version skew
@@ -136,52 +114,11 @@ function schemaAllowsNull(schema) {
 }
 
 // Run one process to completion. Resolves a result record; never rejects.
+// The prompt goes on stdin rather than argv: requirement bodies and review
+// prompts run to tens of KB, and stdin has neither an ARG_MAX ceiling nor a
+// quoting story to get wrong.
 function execute({ bin, args, prompt, cwd, timeoutMs, onStart }) {
-  return new Promise((resolve) => {
-    let child
-    try {
-      child = spawn(bin, args, { cwd, detached: true, stdio: ['pipe', 'pipe', 'pipe'], env: process.env })
-    } catch (e) {
-      resolve({ spawnError: e, stdout: '', stderr: String(e && e.message || e), code: null, timedOut: false })
-      return
-    }
-
-    LIVE.add(child.pid)
-    onStart?.(child.pid)
-
-    let stdout = ''
-    let stderr = ''
-    let timedOut = false
-    let settled = false
-
-    const timer = setTimeout(() => {
-      timedOut = true
-      killGroup(child.pid, 'SIGTERM')
-      setTimeout(() => { if (LIVE.has(child.pid)) killGroup(child.pid, 'SIGKILL') }, 10_000).unref?.()
-    }, timeoutMs)
-
-    child.stdout.on('data', (d) => { stdout += d })
-    // Progress streams can be very chatty on a long run. Only the tail is ever
-    // reported, so bound it here rather than retaining hours of diagnostics.
-    child.stderr.on('data', (d) => { stderr = (stderr + d).slice(-64 * 1024) })
-
-    const finish = (code, spawnError) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      LIVE.delete(child.pid)
-      resolve({ spawnError, stdout, stderr, code, timedOut })
-    }
-
-    child.on('error', (e) => finish(null, e))
-    child.on('close', (code) => finish(code, undefined))
-
-    // The prompt goes on stdin rather than argv: requirement bodies and review
-    // prompts run to tens of KB, and stdin has neither an ARG_MAX ceiling nor a
-    // quoting story to get wrong.
-    child.stdin.on('error', () => { /* child exited before reading; close() reports it */ })
-    child.stdin.end(prompt)
-  })
+  return run(bin, args, { cwd, stdin: prompt, timeoutMs, onStart })
 }
 
 // ───────────────────────── claude ─────────────────────────
@@ -206,9 +143,10 @@ const charterCache = new Map()
 // never by etc/engines.json: the file picks a vendor, model and effort per
 // step, not whether the step may write files. architect, review and
 // confirm-review are read-only under both vendors; the rest carry the coder
-// charter and may edit the worktree.
+// charter and may edit the worktree. Every step here is a judgment call; the
+// run's git, gh and npm work is done by the orchestrator (lib/github.mjs,
+// lib/repo.mjs), never by a model.
 export const STEPS = {
-  bookkeeping: 'coder',
   architect: 'architect',
   code: 'coder',
   review: 'reviewer',

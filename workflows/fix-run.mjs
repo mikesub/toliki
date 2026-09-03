@@ -10,11 +10,20 @@
 // force-pushes, and lands the issue ready-to-review, never ready-to-merge.
 // Attempt ladder in labels: fix-attempted, then fix-retried (one retry);
 // exhausted → refuses and stays failed.
+//
+// Two model steps: the resolver and its skeptic. Everything else — the gates,
+// the ladder write, the rebase, the partial autoresolve, verify, the push, the
+// audit comment, the labels — is the orchestrator's own work through
+// lib/github.mjs and lib/repo.mjs, so what got pushed and what got labelled is
+// a fact this script established, not a claim a model reported.
 
 import { agent, phase, log, initRuntime, onPhase, onLog } from './lib/runtime.mjs'
 import { HARNESS_DIR } from './lib/engine.mjs'
 import { parseArgs, finish, UsageError, EXIT } from './lib/cli.mjs'
 import { initStatus, statusPhase, statusNote, statusFinish } from './lib/status.mjs'
+import { sh, must, failureReason } from './lib/proc.mjs'
+import { ensureLabels, editLabels, issueLabels, issueView, comment, openPrs } from './lib/github.mjs'
+import { git, gitOut, discoverPackages, pkgList, ensureDeps, runVerify, rebaseInProgress, pushRejected } from './lib/repo.mjs'
 
 const USAGE = `Usage: fix-run.mjs --issue <N> [--session <name>] [--engine <name>]
 
@@ -37,61 +46,12 @@ The final line is RESULT <json>.`
 // stated intents and survive an adversarial check, verify must be green, and
 // the landing is ready-to-review — a human glances, but the work is done.
 
-// ───────────────────────── Discovery ─────────────────────────
-// Same one-line contract as epic-run.mjs: a package is a directory whose
-// package.json declares `scripts.verify`; the repo is the source of truth.
-const DISCOVERY =
-`Discover this repository's layout — do NOT assume any particular shape or set of packages. Read package.json files to answer; look at the repo root and each directory one level below it, skipping node_modules.
-- \`packages\`: every directory whose package.json declares a \`scripts.verify\` entry, as repo-relative paths with no trailing slash (e.g. ["frontend","backend"]); use "." for the repo root itself. This is the exact set the downstream \`npm run verify\` gate runs in, so a package you miss is a package that is never verified.`
-
 // The deterministic rung, by absolute path. Resolved from this file's own
-// location rather than from an environment variable: the orchestrator knows
-// where the harness is, and a prompt that depends on the engine's shell
-// carrying a particular env var is a dependency the next engine may not have.
+// location: the orchestrator knows where the harness is.
 const AUTORESOLVE = `${HARNESS_DIR}/bin/merge-autoresolve.sh`
 
 // ───────────────────────── Prompts ─────────────────────────
 const PROMPTS = {
-  // The ladder labels are the attempt store — queues here are label queries,
-  // never comment greps — and the write is VERIFIED because it is the bound
-  // that keeps this loop finite: a silently failed write would let dispatch
-  // relaunch forever. The in-progress swap is usually already done by
-  // dispatch (synchronously at launch, to shield the new session from reap's
-  // terminal-label sweep); repeating it here is an idempotent belt for manual
-  // launches.
-  prepare: (issue) =>
-`Prepare phase for the conflict-fixer run on GitHub issue #${issue}, autonomous (NO user interaction). All git/gh/npm work happens here. The issue's PR hit a judgment-class rebase conflict; this run's later phases resolve it. You only set the table — do NOT resolve any conflict content yourself.
-
-1. \`gh issue view ${issue} --json state,labels,title\`. If the command fails, stop and report the failure. Gates, in order:
-   a. state CLOSED → refused="issue #${issue} is closed", return, touch nothing.
-   b. labels lack \`needs-judgment\` → refused="issue #${issue} is not labelled needs-judgment — not a fixer's issue", return, touch nothing.
-   c. labels contain \`fix-retried\` → the attempt ladder is exhausted. Post this comment (via \`gh issue comment ${issue} --body-file -\`, heredoc on stdin):
-
-      🤖 fix-conflict refused: attempt ladder exhausted
-      Two fixer attempts already ran (fix-attempted + fix-retried are both on the issue). A human decides now: resolve the conflict by hand, or strip the fix-attempted and fix-retried labels to grant the fixer another round.
-
-      Then \`gh issue edit ${issue} --remove-label in-progress --add-label failed 2>/dev/null || true\`, set refused="attempt ladder exhausted (fix-retried present)" and refusalFinal=true, and return.
-2. Find the PR: \`gh pr list --state open --json number,url,headRefName,headRefOid --jq '[.[] | select(.headRefName | startswith("epic/${issue}-"))]'\`. Exactly one is expected. None → post a comment (same heredoc form):
-
-   🤖 fix-conflict refused: no open PR
-   Issue #${issue} is labelled needs-judgment but no open PR delivers it (branch epic/${issue}-*). Resolve by hand; strip needs-judgment to take it out of the fixer queue.
-
-   then \`gh issue edit ${issue} --remove-label in-progress --add-label failed 2>/dev/null || true\`, refused="no open PR on an epic/${issue}-* branch", refusalFinal=true, return. More than one → same treatment with refused="multiple open PRs on epic/${issue}-* branches — ambiguous".
-3. Attempt ladder + start signal, VERIFIED, not best-effort — it is the bound that keeps the fixer loop finite. attempt = 2 if \`fix-attempted\` is already in the labels, else 1. Ensure the labels exist (idempotent, each with \`2>/dev/null || true\`): \`gh label create fix-attempted --color FEF2C0 --description "a fixer session has attempted this conflict once"\`, \`gh label create fix-retried --color F9D0C4 --description "the fixer retry is spent — the next failure waits for a human"\`, \`gh label create in-progress --color FBCA04 --description "Actively being worked by epic-run"\`. Then ONE edit: \`gh issue edit ${issue} --add-label in-progress --add-label <fix-attempted|fix-retried by attempt> --remove-label failed\`. Then verify: \`gh issue view ${issue} --json labels --jq '[.labels[].name]'\` must contain in-progress and the ladder label you added, and not failed. If it does not, set refused="could not record the attempt (label write failed)" and return — an uncounted attempt must not run.
-4. Git setup, in the session's own worktree (wherever you are — never cd elsewhere):
-   a. Scrub what a killed predecessor may have left, since a relaunched fixer inherits the previous run's worktree: \`git rebase --abort 2>/dev/null || true\`. Then \`git fetch origin --prune\`.
-   b. branch = the PR's headRefName; prHead = its headRefOid. Verify \`git rev-parse refs/remotes/origin/<branch>\` equals prHead — if not, set gitBlocked="branch <branch> moved under the fixer (PR head <prHead>, origin now <sha>)" and return (labels stay; the pipeline files the blocker).
-   c. \`git checkout -f --detach <prHead>\` (force: a reused worktree may sit on stale state; everything real is committed).
-   d. mergeBase=$(git merge-base <prHead> origin/main). mainIssues = issue numbers in \`git log --format=%b <mergeBase>..origin/main\` matching 'Closes #<n>' (unique, sorted) — those issue bodies are the intent record for main's side of the conflict.
-   e. \`git -c merge.conflictStyle=diff3 rebase origin/main\`. If it COMPLETES with no stop: cleanRebase=true, skip to step 5 (report="", markedFiles=[]).
-      If it stops on conflict: run \`${AUTORESOLVE} --partial "$(git rev-parse --show-toplevel)"\` and capture stdout+exit code. Non-zero exit → the conflict has a shape the fixer does not own (symlink/delete-modify/marker-shaped/unparseable): set gitBlocked="partial autoresolve declined: <its first output line>" and return. Zero → report=its stdout (one line per hunk, mechanical and judgment alike; keep it verbatim), markedFiles = \`git diff --name-only --diff-filter=U\` (the files still holding diff3 markers).
-      If markedFiles is EMPTY (the conflict turned fully mechanical since the merge worker saw it): \`GIT_EDITOR=true git rebase --continue\`; if the rebase is then still in progress, gitBlocked="more than one commit conflicted — an epic branch holds exactly one" and return.
-   f. Do NOT touch the content inside any conflict markers, do NOT stage marked files, do NOT continue a rebase that still has marked files — the Resolve phase owns that.
-5. Discover the layout (needed for the verify gate later):
-${DISCOVERY}
-6. Deps for the verify gate: in EACH discovered package, run \`npm ci\` if \`node_modules\` is missing, or if \`git diff --quiet <mergeBase> HEAD -- <package>/package-lock.json\` or \`git diff --quiet <mergeBase> origin/main -- <package>/package-lock.json\` reports a change (either side may have moved the lockfile).
-Return: attempt, branch, prUrl, prNumber, prHead, mergeBase, cleanRebase, report, markedFiles, mainIssues, packages — plus refused/refusalFinal/gitBlocked only when set.`,
-
   // The judgment core — the one stage that exists because a model is needed.
   // It gets the same evidence a human would open: both sides' diffs and both
   // sides' issue bodies. Its charter is narrow: only the marked hunks, both
@@ -116,14 +76,9 @@ For EACH marker block (<<<<<<< ours is origin/main's side, >>>>>>> theirs is the
 
 Boundaries: edit ONLY between and including marker lines, ONLY in the files listed above; never revisit the mechanical resolutions or any other file; never commit anything new; never push.
 
-When every block is resolved: confirm no markers remain (\`git diff --check\` and \`grep -n '^<<<<<<<\\|^>>>>>>>' <files>\` must be clean), \`git add\` exactly those files, \`GIT_EDITOR=true git rebase --continue\`. Then confirm the rebase fully finished (\`git status\` shows no rebase in progress; \`git rev-list --count origin/main..HEAD\` is exactly 1 — if a second stop appears, escalate="rebase stopped again — an epic branch holds exactly one commit" instead of resolving further).
+When every block is resolved: confirm no markers remain (\`git diff --check\` and \`grep -n '^<<<<<<<\\|^>>>>>>>' <files>\` must be clean), \`git add\` exactly those files, \`GIT_EDITOR=true git rebase --continue\`. Then confirm the rebase fully finished (\`git status\` shows no rebase in progress; \`git rev-list --count origin/main..HEAD\` is exactly 1 — if a second stop appears, escalate="rebase stopped again — an epic branch holds exactly one commit" instead of resolving further). The pipeline checks all of that again before anything ships.
 
 Return: completed (true only when the rebase finished clean), escalate (INSTEAD of completing, when set), and resolutions — one entry per marker block you resolved: file, hunk number (as the classification above numbers them), mainIntent, prIntent, resolution (one sentence: what the merged text does and how it keeps both).`,
-
-  verify: (pkgs) =>
-`Verify phase, autonomous. Run \`npm run verify\` in each of: ${pkgs}. Report the outcome — that is the whole job.
-The fixer NEVER fixes code: if verify is red, do not repair anything, do not re-run flaky-looking suites more than once, do not touch a single file. A red verify goes to a human with this report.
-Return: green (true only if every package's verify exited 0), detail (one line per package: package — pass/fail, and for a fail the first genuinely failing thing).`,
 
   // Blind on purpose, and refute-by-default on purpose: this is the same
   // adversarial shape as epic-run's review verify — the resolver's stated
@@ -146,77 +101,16 @@ Hunt specifically for: a side's change silently dropped (picking a side is the c
 Default to refuted: if you cannot positively confirm, from the code in front of you, that both sides' intents survive, say survives=false. An over-cautious refute costs one human review; a wrong pass ships a silently mangled merge.
 
 Return: survives, confidence (0-100), reasoning (name the hunk and the evidence, whichever way you rule).`,
-
-  // Transport, not judgment: push, record, relabel. The comment body arrives
-  // fully built — the audit trail is composed in the script from structured
-  // pieces, not re-worded by an agent.
-  ship: (issue, prep, comment) =>
-`Ship the fixer run for issue #${issue}, autonomous. Three steps, in this order:
-1. Push the rebased branch: \`git push --force-with-lease=refs/heads/${prep.branch}:${prep.prHead} origin HEAD:refs/heads/${prep.branch}\`. The lease is pinned to the exact head this run inspected, so if ANYTHING else moved the branch the push is rejected — in that case return pushed=false with the error, and do nothing further.
-2. Record the audit trail on the issue — the resolution rewrote lines nobody reviewed, so it lives where a human will look. Post EXACTLY this comment (via \`gh issue comment ${issue} --body-file -\`, heredoc on stdin):
-
-${comment.split('\n').map(l => '   ' + l).join('\n')}
-
-3. Relabel — ready-to-review, NEVER ready-to-merge: a rewritten resolution needs a human glance before it may merge unattended. \`gh label create ready-to-review --color 0E8A16 --description "epic-run finished; PR is open and awaiting review" 2>/dev/null || true\`, then \`gh issue edit ${issue} --remove-label in-progress --remove-label needs-judgment --add-label ready-to-review\`. Leave fix-attempted/fix-retried in place — the ladder deliberately does not reset. Then verify: \`gh issue view ${issue} --json labels --jq '[.labels[].name]'\` must contain ready-to-review and neither in-progress nor needs-judgment.
-Return: pushed, labelled (true only if step 3's verification held), note (any error text).`,
-
-  // What happens next is the LADDER's call, never the phase's — so it is a
-  // field of the block (`- next:`), not a paragraph after it. #272 shipped it
-  // as a trailing paragraph, the agent read that as narration and dropped it,
-  // and the operator saw a first-attempt decline with no notice that a retry
-  // was already queued. Keep every disposition claim inside the block; a
-  // `reason` string states what broke, never who picks it up.
-  blocked: (issue, phase, reason, prUrl, attempt) => {
-    const ladder = attempt >= 2
-      ? 'This was the RETRY (fix-attempted and fix-retried are both on the issue), so the fixer is done with it: resolve by hand, or strip the two fix-* labels to grant another round.'
-      : attempt === 1
-      ? 'This was the first attempt (fix-attempted is on the issue), so dispatch relaunches the fixer once, automatically, a few minutes after this session is reaped. Nothing to do unless the retry also fails.'
-      : 'The attempt ladder was not reached, so dispatch will relaunch the fixer on its next tick.'
-    return `The autonomous fix-conflict run hit a blocker and must report it on GitHub, then stop. Do this and nothing else:
-1. If a rebase is in progress, abort it: \`git rebase --abort 2>/dev/null || true\` — the worktree must not be left mid-rebase for the next run to trip over. Do not commit or push anything.
-2. Post a comment on issue #${issue} whose body is EXACTLY this block and nothing else — every value is already filled in, so copy all five lines verbatim, add nothing and drop nothing:
-
-🤖 fix-conflict blocked
-- phase: ${phase}
-- reason: ${reason}
-- pr: ${prUrl || 'not resolved'}
-- next: ${ladder}
-
-Post it with \`gh issue comment ${issue} --body-file -\`, feeding the body via a heredoc on stdin.
-3. Flip the start-signal back to failed: \`gh label create failed --color B60205 --description "epic-run stopped at a blocker; needs human attention" 2>/dev/null || true\`, then \`gh issue edit ${issue} --remove-label in-progress --add-label failed 2>/dev/null || true\`. Leave needs-judgment and the fix-* labels exactly as they are — needs-judgment keeps the issue in the fixer queue and the ladder labels are what bound the retries.
-Return confirmation that the comment was posted and the label was swapped to failed.`
-  },
 }
 
 // ───────────────────────── Config ─────────────────────────
 // Which vendor, model and effort each step runs on is a row of the run's
 // engine in etc/engines.json; every agent() call names only its step.
-// bookkeeping covers the fully-scripted stages. fix-conflicts is the judgment
-// core — the entire reason a model is in the loop — and confirm-review is the
-// last gate before a rewritten merge ships to a force-push, so a row for
-// either wants the strong model.
+// fix-conflicts is the judgment core — the entire reason a model is in the
+// loop — and confirm-review is the last gate before a rewritten merge ships to
+// a force-push, so a row for either wants the strong model.
 
 // ───────────────────────── Schemas ─────────────────────────
-const PREP_SCHEMA = {
-  type: 'object', additionalProperties: false,
-  required: ['attempt', 'cleanRebase', 'markedFiles'],
-  properties: {
-    refused: { type: 'string', description: 'set ONLY when the run must not proceed (closed, not needs-judgment, ladder exhausted, no/ambiguous PR, ladder label write failed) — the reason' },
-    refusalFinal: { type: 'boolean', description: 'true when the refusal was already commented and the issue left failed (exhausted ladder, missing PR) — nothing retries it' },
-    gitBlocked: { type: 'string', description: 'set when the git half failed AFTER the labels went on (branch moved, partial autoresolve declined, multi-commit rebase) — the pipeline files the blocker' },
-    attempt: { type: 'number', description: '1 on the first run (fix-attempted applied), 2 on the retry (fix-retried applied); 0 when refused before the ladder write' },
-    branch: { type: 'string', description: 'the PR head branch, epic/<N>-<slug>' },
-    prUrl: { type: 'string' },
-    prNumber: { type: 'number' },
-    prHead: { type: 'string', description: 'the PR head sha BEFORE the rebase — the force-with-lease anchor' },
-    mergeBase: { type: 'string', description: 'merge-base of the old PR head and origin/main' },
-    cleanRebase: { type: 'boolean', description: 'true when the rebase completed without stopping (the conflict evaporated — main moved since the decline)' },
-    report: { type: 'string', description: 'merge-autoresolve.sh --partial stdout, verbatim: one line per hunk, mechanical and judgment alike' },
-    markedFiles: { type: 'array', items: { type: 'string' }, description: 'files still holding diff3 markers after the partial resolve (empty when cleanRebase, or when the stop turned out fully mechanical)' },
-    mainIssues: { type: 'array', items: { type: 'number' }, description: 'issue numbers closed by the commits in mergeBase..origin/main' },
-    packages: { type: 'array', items: { type: 'string' }, description: 'repo-relative path of every directory whose package.json declares scripts.verify; "." for the repo root' },
-  },
-}
 const RESOLVE_SCHEMA = {
   type: 'object', additionalProperties: false,
   required: ['completed'],
@@ -240,27 +134,12 @@ const RESOLVE_SCHEMA = {
     },
   },
 }
-const VERIFY_SCHEMA = {
-  type: 'object', additionalProperties: false, required: ['green', 'detail'],
-  properties: {
-    green: { type: 'boolean', description: 'true only if every package\'s npm run verify exited 0' },
-    detail: { type: 'string', description: 'one line per package: pass/fail, and for a fail the first genuinely failing thing' },
-  },
-}
 const CHECK_SCHEMA = {
   type: 'object', additionalProperties: false, required: ['survives', 'confidence', 'reasoning'],
   properties: {
     survives: { type: 'boolean', description: 'true only if both sides\' intents demonstrably survive in every judgment hunk' },
     confidence: { type: 'number', description: '0-100' },
     reasoning: { type: 'string', description: 'names the hunk(s) and the evidence, whichever way it rules' },
-  },
-}
-const SHIP_SCHEMA = {
-  type: 'object', additionalProperties: false, required: ['pushed', 'labelled'],
-  properties: {
-    pushed: { type: 'boolean' },
-    labelled: { type: 'boolean', description: 'true only if gh issue view was observed carrying ready-to-review and neither in-progress nor needs-judgment' },
-    note: { type: 'string', description: 'any error text' },
   },
 }
 
@@ -278,16 +157,159 @@ try {
 initRuntime({ scriptName: 'fix-run', sessionName: ARGS.session, defaultEngine: ARGS.engine })
 // The issue's live status comment mirrors the pane's narration: the label says
 // WHICH state the issue is in, this says whether the run is alive and where it
-// got to. Issue mode only — slug mode has no issue to report on.
+// got to.
 initStatus({ issue: ARGS.issue, script: 'fix-run', session: ARGS.session, phases: ['Prepare', 'Resolve', 'Verify', 'Check', 'Ship'] })
 onPhase(statusPhase)
 onLog(statusNote)
 const issue = ARGS.issue
 
+// ───────────────────────── Transport ─────────────────────────
+// The ladder labels are the attempt store — queues here are label queries,
+// never comment greps — and the write is VERIFIED because it is the bound
+// that keeps this loop finite: a silently failed write would let dispatch
+// relaunch forever. The in-progress swap is usually already done by dispatch
+// (synchronously at launch, to shield the new session from reap's
+// terminal-label sweep); repeating it here is an idempotent belt for manual
+// launches.
+async function prepare(issue) {
+  const view = await issueView(issue, 'state,labels,title')
+  const labels = Array.isArray(view.labels) ? view.labels.map(l => l.name) : []
+  if (String(view.state || '').toUpperCase() === 'CLOSED') return { refused: `issue #${issue} is closed` }
+  if (!labels.includes('needs-judgment')) return { refused: `issue #${issue} is not labelled needs-judgment — not a fixer's issue` }
+
+  // A refusal a retry cannot fix is commented and left `failed` for a human.
+  const refuseFinal = async (body, reason) => {
+    await comment(issue, body)
+    await editLabels(issue, { add: ['failed'], remove: ['in-progress'] })
+    return { refused: reason, refusalFinal: true }
+  }
+  if (labels.includes('fix-retried')) {
+    return refuseFinal('🤖 fix-conflict refused: attempt ladder exhausted\nTwo fixer attempts already ran (fix-attempted + fix-retried are both on the issue). A human decides now: resolve the conflict by hand, or strip the fix-attempted and fix-retried labels to grant the fixer another round.',
+      'attempt ladder exhausted (fix-retried present)')
+  }
+
+  const prefix = `epic/${issue}-`
+  const prs = (await openPrs()).filter(p => String(p.headRefName || '').startsWith(prefix))
+  if (!prs.length) {
+    return refuseFinal(`🤖 fix-conflict refused: no open PR\nIssue #${issue} is labelled needs-judgment but no open PR delivers it (branch epic/${issue}-*). Resolve by hand; strip needs-judgment to take it out of the fixer queue.`,
+      `no open PR on an epic/${issue}-* branch`)
+  }
+  if (prs.length > 1) {
+    return refuseFinal(`🤖 fix-conflict refused: multiple open PRs\nIssue #${issue} has ${prs.length} open PRs on epic/${issue}-* branches — ambiguous. Resolve by hand; strip needs-judgment to take it out of the fixer queue.`,
+      `multiple open PRs on epic/${issue}-* branches — ambiguous`)
+  }
+  const pr = prs[0]
+
+  // Attempt ladder + start signal, VERIFIED: an uncounted attempt must not run.
+  const attempt = labels.includes('fix-attempted') ? 2 : 1
+  const ladderLabel = attempt === 2 ? 'fix-retried' : 'fix-attempted'
+  await ensureLabels(['fix-attempted', 'fix-retried', 'in-progress'])
+  await editLabels(issue, { add: ['in-progress', ladderLabel], remove: ['failed'] })
+  const now = await issueLabels(issue)
+  if (!now.includes('in-progress') || !now.includes(ladderLabel) || now.includes('failed')) {
+    return { refused: 'could not record the attempt (label write failed)' }
+  }
+  const base = { attempt, branch: pr.headRefName, prUrl: pr.url, prNumber: pr.number, prHead: pr.headRefOid }
+
+  // Git setup, in the session's own worktree. Scrub what a killed predecessor may have left first: a
+  // relaunched fixer inherits the previous run's worktree, and a leftover mid-rebase state makes every
+  // later step fail on cleanup instead of retrying.
+  await git(['rebase', '--abort'])
+  await gitOut(['fetch', 'origin', '--prune'], 'git fetch origin --prune')
+  const originHead = (await git(['rev-parse', `refs/remotes/origin/${pr.headRefName}`])).out
+  if (originHead !== pr.headRefOid) {
+    return { ...base, gitBlocked: `branch ${pr.headRefName} moved under the fixer (PR head ${pr.headRefOid}, origin now ${originHead || 'missing'})` }
+  }
+  // Force: a reused worktree may sit on stale state; everything real is committed.
+  await gitOut(['checkout', '-f', '--detach', pr.headRefOid], 'git checkout --detach')
+  const mergeBase = await gitOut(['merge-base', pr.headRefOid, 'origin/main'], 'git merge-base')
+  // Each squash-merged PR carries a Closes line, and those issue bodies are the intent record for
+  // main's side of the conflict.
+  const bodies = await gitOut(['log', '--format=%b', `${mergeBase}..origin/main`], 'git log')
+  const mainIssues = [...new Set([...bodies.matchAll(/Closes #(\d+)/g)].map(m => Number(m[1])))].sort((a, b) => a - b)
+
+  let cleanRebase = false, report = '', markedFiles = []
+  const rb = await git(['-c', 'merge.conflictStyle=diff3', 'rebase', 'origin/main'])
+  if (rb.ok) {
+    cleanRebase = true
+  } else {
+    // The deterministic rung settles every mechanical hunk in place and leaves the judgment ones
+    // marked exactly as git wrote them. Non-zero means a shape the fixer does not own.
+    const top = await gitOut(['rev-parse', '--show-toplevel'], 'git rev-parse --show-toplevel')
+    const ar = await sh(AUTORESOLVE, ['--partial', top], { timeoutMs: 10 * 60 * 1000 })
+    if (!ar.ok) return { ...base, mergeBase, mainIssues, gitBlocked: `partial autoresolve declined: ${(ar.out || ar.err).split('\n')[0] || failureReason(ar)}` }
+    report = ar.out
+    markedFiles = (await gitOut(['diff', '--name-only', '--diff-filter=U'], 'git diff --diff-filter=U')).split('\n').filter(Boolean)
+    if (!markedFiles.length) {
+      // The conflict turned fully mechanical since the merge worker saw it (main moved).
+      must(await git(['rebase', '--continue'], { env: { ...process.env, GIT_EDITOR: 'true' } }), 'git rebase --continue')
+      if (await rebaseInProgress()) return { ...base, mergeBase, mainIssues, report, gitBlocked: 'more than one commit conflicted — an epic branch holds exactly one' }
+    }
+  }
+
+  const packages = discoverPackages('.')
+  // Either side may have moved the lockfile; a stale install makes the gate lie.
+  const depLines = packages.length ? await ensureDeps(packages, { pairs: [[mergeBase, 'HEAD'], [mergeBase, 'origin/main']] }) : []
+  return { ...base, mergeBase, cleanRebase, report, markedFiles, mainIssues, packages, depLines }
+}
+
+// What the resolver claims, checked against the tree: no rebase in progress, exactly one commit above
+// origin/main, no marker left in the files it owned. Returns the first problem, or null.
+async function resolutionProblem(markedFiles) {
+  if (await rebaseInProgress()) return 'the rebase is still in progress'
+  const count = Number((await git(['rev-list', '--count', 'origin/main..HEAD'])).out)
+  if (count !== 1) return `the rebased branch holds ${Number.isNaN(count) ? 'an unknown number of' : count} commit(s) above origin/main — an epic branch holds exactly one`
+  const markers = await git(['grep', '-n', '-E', '^(<<<<<<<|>>>>>>>|\\|{7})( |$)', 'HEAD', '--', ...markedFiles])
+  if (markers.ok) return `conflict markers remain at HEAD: ${markers.out.split('\n')[0]}`
+  return null
+}
+
+// Push, record, relabel. Pinned to the exact head this run inspected, so if ANYTHING else moved the
+// branch the push is rejected and nothing further happens.
+async function ship(issue, prep, body) {
+  const push = await git(['push', `--force-with-lease=refs/heads/${prep.branch}:${prep.prHead}`, 'origin', `HEAD:refs/heads/${prep.branch}`])
+  if (!push.ok) return { pushed: false, labelled: false, note: pushRejected(push) ? `rejected — ${prep.branch} moved on origin under this run` : failureReason(push) }
+  // The resolution rewrote lines nobody reviewed, so the audit trail lives where a human will look.
+  await comment(issue, body)
+  // ready-to-review, NEVER ready-to-merge: a rewritten resolution needs a human glance before it may
+  // merge unattended. The ladder labels stay: the ladder deliberately does not reset.
+  await ensureLabels(['ready-to-review'])
+  const flip = await editLabels(issue, { add: ['ready-to-review'], remove: ['in-progress', 'needs-judgment'] })
+  let labels
+  try {
+    labels = await issueLabels(issue)
+  } catch (e) {
+    return { pushed: true, labelled: false, note: e && e.message || String(e) }
+  }
+  const labelled = labels.includes('ready-to-review') && !labels.includes('in-progress') && !labels.includes('needs-judgment')
+  return { pushed: true, labelled, note: labelled ? '' : (flip.ok ? `observed labels: ${labels.join(', ')}` : failureReason(flip)) }
+}
+
+// What happens next is the LADDER's call, never the phase's — so it is a
+// field of the block (`- next:`), not a paragraph after it. #272 shipped it
+// as a trailing paragraph, the agent read that as narration and dropped it,
+// and the operator saw a first-attempt decline with no notice that a retry
+// was already queued. Keep every disposition claim inside the block; a
+// `reason` string states what broke, never who picks it up.
+async function postBlocker({ issue, phase, reason, prUrl, attempt }) {
+  // The worktree must not be left mid-rebase for the next run to trip over.
+  if (await rebaseInProgress()) await git(['rebase', '--abort'])
+  const ladder = attempt >= 2
+    ? 'This was the RETRY (fix-attempted and fix-retried are both on the issue), so the fixer is done with it: resolve by hand, or strip the two fix-* labels to grant another round.'
+    : attempt === 1
+    ? 'This was the first attempt (fix-attempted is on the issue), so dispatch relaunches the fixer once, automatically, a few minutes after this session is reaped. Nothing to do unless the retry also fails.'
+    : 'The attempt ladder was not reached, so dispatch will relaunch the fixer on its next tick.'
+  await comment(issue, `🤖 fix-conflict blocked\n- phase: ${phase}\n- reason: ${reason}\n- pr: ${prUrl || 'not resolved'}\n- next: ${ladder}\n`)
+  // needs-judgment keeps the issue in the fixer queue and the ladder labels bound the retries; both stay.
+  await ensureLabels(['failed'])
+  const flip = await editLabels(issue, { add: ['failed'], remove: ['in-progress'] })
+  if (!flip.ok) log(`blocked: label flip to failed failed (${failureReason(flip)})`)
+}
+
 // ───────────────────────── Blocker path ─────────────────────────
 // Same shape as epic-run's fail(): comment the blocker, restore the terminal
 // label, return a structured block. blockerPosted guards re-entry when the
-// blocked agent itself throws and the outer catch calls fail() again.
+// outer catch fires after a phase that already failed.
 let currentPhase = 'prepare'
 let blockerPosted = false
 let prUrl = null
@@ -295,16 +317,19 @@ let attempt = 0
 async function fail(phase, reason) {
   if (!blockerPosted) {
     blockerPosted = true
-    await agent(PROMPTS.blocked(issue, phase, reason, prUrl, attempt),
-      { label: 'ship:blocked', phase: 'Ship', step: 'bookkeeping' })
+    try {
+      await postBlocker({ issue, phase, reason, prUrl, attempt })
+    } catch (e) {
+      log(`blocked: could not report on GitHub (${e && e.message || e})`)
+    }
   }
   return { blocked: true, issue, phase, reason, prUrl: prUrl || undefined, attempt }
 }
 
 // ───────────────────────── The audit comment ─────────────────────────
-// Composed here, in the script, from structured pieces — the ship agent
-// transports it verbatim. The resolution rewrote lines nobody reviewed, so
-// the record has to name every hunk, both intents, and every gate that ran.
+// Composed here, in the script, from structured pieces. The resolution rewrote
+// lines nobody reviewed, so the record has to name every hunk, both intents,
+// and every gate that ran.
 const buildComment = (prep, resolutions, verifyDetail, check) => {
   const lines = []
   lines.push('🤖 fix-conflict resolved a judgment rebase conflict')
@@ -343,9 +368,7 @@ const buildComment = (prep, resolutions, verifyDetail, check) => {
 async function main() {
 try {
   phase('Prepare')
-  const prep = await agent(PROMPTS.prepare(issue),
-    { label: 'prepare', phase: 'Prepare', step: 'bookkeeping', schema: PREP_SCHEMA })
-  if (!prep) return await fail('prepare', 'Prepare produced no result — could not reach git/gh.')
+  const prep = await prepare(issue)
   if (prep.refused) {
     log(`Prepare refused: ${prep.refused}`)
     return { skipped: true, issue, reason: prep.refused, refusalFinal: !!prep.refusalFinal }
@@ -353,21 +376,16 @@ try {
   attempt = prep.attempt
   prUrl = prep.prUrl || null
   if (prep.gitBlocked) return await fail('prepare', prep.gitBlocked)
-  if (!prep.branch || !prep.prHead || !prep.mergeBase) {
-    return await fail('prepare', 'Prepare returned no branch/prHead/mergeBase — the git half never got set up.')
-  }
   // Fail closed on discovery, exactly like epic-run: an empty package list
   // would make the verify gate a silent no-op on a rewritten merge.
-  const packages = (Array.isArray(prep.packages) ? prep.packages : [])
-    .map(p => String(p).trim().replace(/^\.\//, '').replace(/\/+$/, '')).filter(Boolean)
+  const packages = Array.isArray(prep.packages) ? prep.packages : []
   if (!packages.length) {
     return await fail('prepare', 'layout discovery found no package declaring an `npm run verify` script — refusing to ship a resolution nothing would verify.')
   }
-  const pkgList = packages.map(p => (p === '.' ? 'the repo root' : `${p}/`)).join(', ')
   const marked = Array.isArray(prep.markedFiles) ? prep.markedFiles : []
   log(prep.cleanRebase
     ? `Prepare: attempt ${attempt} on PR ${prep.prUrl} — rebase onto origin/main was CLEAN (the conflict evaporated).`
-    : `Prepare: attempt ${attempt} on PR ${prep.prUrl} — mechanical hunks settled, ${marked.length} file(s) left for judgment${marked.length ? ` (${marked.join(', ')})` : ''}. Packages: ${pkgList}.`)
+    : `Prepare: attempt ${attempt} on PR ${prep.prUrl} — mechanical hunks settled, ${marked.length} file(s) left for judgment${marked.length ? ` (${marked.join(', ')})` : ''}. Packages: ${pkgList(packages)}.`)
 
   // ───────────────────────── Resolve (judgment hunks only) ─────────────────────────
   let resolutions = []
@@ -386,15 +404,18 @@ try {
     if (!resolutions.length) {
       return await fail('resolve', 'the resolver reported completion but returned no per-hunk intent statements — refusing to ship an unauditable resolution.')
     }
-    log(`Resolve: ${resolutions.length} judgment hunk(s) resolved with stated intents.`)
+    // The claim of completion, checked against the tree.
+    const problem = await resolutionProblem(marked)
+    if (problem) return await fail('resolve', `the resolver reported completion but ${problem}.`)
+    log(`Resolve: ${resolutions.length} judgment hunk(s) resolved with stated intents; rebase finished clean.`)
   }
 
   // ───────────────────────── Verify ─────────────────────────
+  // The fixer NEVER fixes code: a red verify here means the resolution (or the
+  // combination of the two sides) broke something, and that goes to a human.
   currentPhase = 'verify'
   phase('Verify')
-  const v = await agent(PROMPTS.verify(pkgList),
-    { label: 'verify', phase: 'Verify', step: 'bookkeeping', schema: VERIFY_SCHEMA })
-  if (!v) return await fail('verify', 'the verify agent produced no result — an unverified resolution must not ship.')
+  const v = await runVerify(packages)
   if (!v.green) return await fail('verify', `npm run verify is red after the resolution (${v.detail}) — the fixer never fixes code, so nothing was pushed and the PR branch is untouched.`)
   log(`Verify: green — ${v.detail}`)
 
@@ -418,17 +439,15 @@ try {
   // ───────────────────────── Ship ─────────────────────────
   currentPhase = 'ship'
   phase('Ship')
-  const comment = buildComment(prep, resolutions, v.detail, check)
-  const shipped = await agent(PROMPTS.ship(issue, prep, comment),
-    { label: 'ship', phase: 'Ship', step: 'bookkeeping', schema: SHIP_SCHEMA })
-  if (!shipped || !shipped.pushed) {
-    return await fail('ship', `the force-with-lease push did not land${shipped?.note ? ` (${shipped.note})` : ''} — the branch on origin is untouched.`)
+  const shipped = await ship(issue, prep, buildComment(prep, resolutions, v.detail, check))
+  if (!shipped.pushed) {
+    return await fail('ship', `the force-with-lease push did not land${shipped.note ? ` (${shipped.note})` : ''} — the branch on origin is untouched.`)
   }
   if (!shipped.labelled) {
     // Fail closed on the label half too: pushed-but-unlabelled would leave a
     // fixed PR on an issue reap reads as "still working" — a leaked slot and
     // an invisible success. failed + the blocker comment puts a human on it.
-    return await fail('ship', `pushed, but the ready-to-review label swap could not be verified${shipped?.note ? ` (${shipped.note})` : ''} — a human finishes the labels; the PR itself is fixed and rebased.`)
+    return await fail('ship', `pushed, but the ready-to-review label swap could not be verified${shipped.note ? ` (${shipped.note})` : ''} — a human finishes the labels; the PR itself is fixed and rebased.`)
   }
   log(`Ship: pushed and labelled ready-to-review — ${prep.prUrl}`)
 
