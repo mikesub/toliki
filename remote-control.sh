@@ -43,12 +43,15 @@ Commands:
                            the manual override for dispatch's fixer walk. Same
                            session name as dispatch would use, which is what
                            keeps it visible to reap and to the next tick.
+  ci <ref> --engine <e>    Run the CI fixer on a needs-ci-fix issue (checks red
+                           on the rebased head) — the manual override for the
+                           other fixer walk. Same session name again.
   next <engine>            Route the first unrouted, unblocked ready issue to
                            this engine. With -r, only considers that repo;
                            otherwise uses dispatch's host-wide interleaving.
   <name> [-m msg]          Shorthand for: start <name> [-m msg]
 
-  Note: epic/fix sessions run the pipeline directly (a node orchestrator that
+  Note: epic/fix/ci sessions run the pipeline directly (a node orchestrator that
   spawns one headless agent per phase), so they have no Remote Control channel
   to attach to. Watch one with: ssh <host> 'tmux attach -t <name>' — or read it
   after the fact with 'tmux capture-pane -p -t <name> -S -200'.
@@ -58,11 +61,11 @@ Commands:
                            is non-interactive and would exit immediately). Also
                            names the session when no explicit name is given.
   -r, --repo <name>        Repo to run in: $(repo_names | tr '\n' ' ')(default: $DEFAULT_REPO).
-                           Applies to start/restart/stop/epic/fix/next; ls and stop-all
+                           Applies to start/restart/stop/epic/fix/ci/next; ls and stop-all
                            are host-wide. Every session is named <repo>-<name>, so
                            "epic 63 -r otherapp" -> otherapp-epic-63. Names are given
                            short (epic-63) or full (otherapp-epic-63) interchangeably.
-  --engine <engine>        Required for manual epic/fix launches; a name from
+  --engine <engine>        Required for manual epic/fix/ci launches; a name from
                            etc/engines.json ($(engine_names | tr '\n' ' ')). Queue-driven
                            launches get the engine from the issue label instead.
 EOF
@@ -165,9 +168,9 @@ else
       ACTION="stop"                        # `rm` is an alias for stop
       SESSIONS=("${POSITIONAL[@]:1}")       # stop takes one or more session names
       ;;
-    epic|fix)
-      # `epic <ref>` == `start --epic <ref>`, `fix <ref>` == `start --fix <ref>`.
-      # Both produce exactly the session dispatch would have: launch.sh derives
+    epic|fix|ci)
+      # `epic <ref>` == `start --epic <ref>`, and so for `fix` and `ci`.
+      # All three produce exactly the session dispatch would have: launch.sh derives
       # the <repo>-epic-<N> name itself, which is what makes a manual launch
       # visible to dispatch's has-session checks and reclaimable by reap.
       CMD="${POSITIONAL[0]}"

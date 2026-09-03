@@ -28,10 +28,15 @@ set -euo pipefail
 # same lines declines the whole PR. Everything else stays unfixed: a judgment
 # conflict, a red check, or a failed merge flips the issue to `failed` with a
 # comment naming which, and the drain moves on to the next PR. The one nuance
-# is WHO resolves it: a judgment-class decline (exit 4 from merge-autoresolve)
-# also gets the `needs-judgment` label, which is the fixer queue — dispatch
-# launches a session that resolves those hunks under an adversarial gate and
-# lands the issue ready-to-review. Every other failure waits for a human.
+# is WHO resolves it. Two decline classes are automated rather than human:
+# a judgment-class conflict (exit 4 from merge-autoresolve) also gets
+# `needs-judgment`, whose fixer resolves the hunks under an adversarial gate
+# and lands the issue ready-to-review; a RED check on the rebased head also
+# gets `needs-ci-fix`, whose fixer repairs the cause under an adversarial
+# check and lands it back on ready-to-merge — where this worker rebases and
+# re-runs those same checks before anything merges. A check that timed out or
+# never registered is infrastructure, not a red check, and waits for a human
+# like every other failure.
 #
 # Infrastructure failures (fetch, gh API) abort the run instead of labelling
 # anything: cron retries on the next tick, and a network hiccup must never
@@ -86,7 +91,8 @@ Each PR is rebased onto the current origin/main and its CI re-run before it
 merges. A rebase conflict whose hunks are all mechanical (both sides added at
 the same point, or one side edited base lines the other only added around) is
 auto-resolved, containment-verified and CI-gated; a conflict that needs
-judgment flips its issue to \`failed\` plus \`needs-judgment\` (the fixer queue
+judgment flips its issue to \`failed\` plus \`needs-judgment\`, and a red check to
+\`failed\` plus \`needs-ci-fix\` (both automated fixer queues
 dispatch drains); anything else that fails leaves the PR open and flips its
 issue to plain \`failed\`.
 Exits 0 doing nothing if another invocation for the same repo is still running.
@@ -152,6 +158,7 @@ ensure_worktree() {
 FAIL=""     # why this PR could not be merged; consumed by mark_failed
 PR_URL=""   # the PR merge_one last looked at, so a failure report can name it
 NEEDS_JUDGMENT=0   # the decline was judgment-class (merge-autoresolve exit 4)
+NEEDS_CI_FIX=0     # the decline was a RED check on the rebased head
 
 mark_failed() {
   local issue="$1" pr_url="$2" reason="$3" next
@@ -163,6 +170,16 @@ mark_failed() {
 needs judgment, so this issue is queued for an automated fixer session:
 dispatch launches one that resolves the judgment hunks under an adversarial
 gate, re-verifies, and lands the issue ready-to-review. Nothing to do unless
+it comes back failed again with the fixer's own blocker comment."
+  elif (( NEEDS_CI_FIX )); then
+    # Also automated: `needs-ci-fix` is the CI fixer's queue. It lands the
+    # issue back on ready-to-merge, and this worker then rebases and re-runs
+    # these same checks before anything merges — so a fix that is still red
+    # cannot land.
+    next="The PR is open and NOT merged; the checks are red on the rebased head, so
+this issue is queued for an automated CI fixer session: dispatch launches one
+that reads the failing job logs, fixes the cause, re-verifies, and puts the
+issue back on ready-to-merge under an adversarial check. Nothing to do unless
 it comes back failed again with the fixer's own blocker comment."
   else
     next="The PR is open and NOT merged; the change itself is complete. Fix the cause
@@ -184,6 +201,12 @@ EOF
       --description "rebase conflict needs judgment — queued for an automated fixer session" >/dev/null 2>&1 || true
     gh issue edit "$issue" -R "$ORIGIN" \
       --remove-label ready-to-merge --add-label failed --add-label needs-judgment >/dev/null 2>&1 \
+      || say "$REPO: could not relabel #$issue"
+  elif (( NEEDS_CI_FIX )); then
+    gh label create needs-ci-fix -R "$ORIGIN" --color D93F0B \
+      --description "checks were red on the rebased head — queued for an automated CI fixer session" >/dev/null 2>&1 || true
+    gh issue edit "$issue" -R "$ORIGIN" \
+      --remove-label ready-to-merge --add-label failed --add-label needs-ci-fix >/dev/null 2>&1 \
       || say "$REPO: could not relabel #$issue"
   else
     gh issue edit "$issue" -R "$ORIGIN" \
@@ -260,6 +283,10 @@ wait_for_ci() {
       ) | (.name // .context // "check")] | join(", ")' <<<"$json")"
 
     if [[ -n "$bad" ]]; then
+      # The one decline class where the code is genuinely wrong and a fixer has
+      # something to act on. A timeout or a check that never registered is
+      # infrastructure, and both fall through to a plain `failed` below.
+      NEEDS_CI_FIX=1
       FAIL="PR checks failed on the rebased head $want: $bad"
       return 1
     fi
@@ -283,6 +310,7 @@ merge_one() {
   local issue="$1" pr branch head rebased state
   PR_URL=""
   NEEDS_JUDGMENT=0
+  NEEDS_CI_FIX=0
 
   pr="$(gh pr list -R "$ORIGIN" --state open --json number,headRefName --limit 100 2>/dev/null \
         | jq -r --arg pfx "epic/$issue-" '[.[] | select(.headRefName | startswith($pfx))][0].number // empty')" \

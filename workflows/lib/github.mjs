@@ -35,6 +35,9 @@ export const LABELS = {
   failed:            { color: 'B60205', description: 'epic-run stopped at a blocker; needs human attention' },
   'fix-attempted':   { color: 'FEF2C0', description: 'a fixer session has attempted this conflict once' },
   'fix-retried':     { color: 'F9D0C4', description: 'the fixer retry is spent — the next failure waits for a human' },
+  'needs-ci-fix':    { color: 'D93F0B', description: 'checks were red on the rebased head — queued for an automated CI fixer session' },
+  'ci-attempted':    { color: 'FEF2C0', description: 'a CI fixer session has attempted this red check once' },
+  'ci-retried':      { color: 'F9D0C4', description: 'the CI fixer retry is spent — the next failure waits for a human' },
 }
 
 // Idempotent and best-effort: `gh label create` fails when the label exists,

@@ -7,14 +7,14 @@ set -euo pipefail
 # `./remote-control.sh epic N` (laptop-side) remains the manual override for
 # jumping the queue.
 #
-# It walks a SECOND queue first: `needs-judgment` — issues whose PR the merge
-# worker declined on a judgment-class rebase conflict. Each gets a fixer
-# session (`launch.sh --fix N`, named `<repo>-epic-<N>` like any epic), at most
-# one per repo per tick and never while another fixer session in that repo is
-# still around. First on purpose: a needs-judgment issue is an epic that
-# already ran, one resolved conflict away from a reviewable PR, so finishing
-# it outranks starting new work — and being bounded per repo it cannot starve
-# the ready queue.
+# It walks TWO other queues first, both filled by the merge worker:
+# `needs-judgment` (a judgment-class rebase conflict, fixed by `--fix`) and
+# `needs-ci-fix` (checks red on the rebased head, fixed by `--ci`). Each
+# candidate gets a session named `<repo>-epic-<N>` like any epic, at most one
+# of either kind per repo per tick and never while another fixer session in
+# that repo is still around. First on purpose: both are epics that already ran,
+# one repair away from a landable PR, so finishing them outranks starting new
+# work — and being bounded per repo they cannot starve the ready queue.
 #
 # It dispatches; it does NOT claim. The claim is a unique commit pushed to
 # `epic/<N>-<slug>` by the pipeline's own prepare phase, and a
@@ -48,9 +48,11 @@ Usage: $0 [-r <repo>] [-n|--dry-run]
 <engine> is a name from etc/engines.json (a vendor/model/effort table per
 pipeline step): currently $(engine_names | tr '\n' ' ').
 
-One dispatch tick. First walks the \`needs-judgment\` queue (judgment-class
-rebase conflicts the merge worker declined) and launches at most one fixer
-session per repo (\`launch.sh --fix N\`, session \`<repo>-epic-<N>\`). Then walks
+One dispatch tick. First walks the two fixer queues — \`needs-judgment\`
+(judgment-class rebase conflicts) and \`needs-ci-fix\` (checks red on the
+rebased head), both applied by the merge worker — and launches at most one
+fixer session per repo (\`launch.sh --fix N\` or \`--ci N\`, session
+\`<repo>-epic-<N>\`). Then walks
 the \`ready\` queue of every registered repo ($(repo_names | tr '\n' ' '))
 oldest-first, skipping issues that have open blocked_by dependencies or
 already have a session, and launches each remaining one as \`<repo>-epic-<N>\`
@@ -259,16 +261,26 @@ if (( HAVE_ROUTE_ISSUE )); then
   exit 0
 fi
 
-# ───────────────────────── Fixer walk ─────────────────────────
-# The `needs-judgment` queue: merge-worker.sh applies that label beside
-# `failed` on exactly the judgment-class rebase declines, so the queue is a
-# label query, never a grep of comment prose. `fix-retried` marks an exhausted
-# attempt ladder (the fixer gets one retry, then a human) — those stay out of
-# the walk until a human strips the ladder labels to grant another round.
+# ───────────────────────── Fixer walks ─────────────────────────
+# Two queues, each a label merge-worker.sh applies beside `failed` on exactly
+# one decline class, so a queue is a label query and never a grep of comment
+# prose: `needs-judgment` (a judgment-class rebase conflict, repaired by
+# fix-run.mjs) and `needs-ci-fix` (checks red on the rebased head, repaired by
+# ci-run.mjs). Each carries its OWN attempt ladder — one PR can need both, and
+# a shared budget would let the first failure spend the second's retries. An
+# exhausted ladder (the fixer gets one retry, then a human) stays out of its
+# walk until a human strips those labels to grant another round.
+#
+# Walked in order, at most one launch of either kind per repo per tick: both
+# rebase or amend the same branch against the same moving main.
+FIXER_QUEUES=(
+  "needs-judgment:fix-retried:--fix:conflict"
+  "needs-ci-fix:ci-retried:--ci:CI"
+)
 fixer_queue() {
-  local path="$1"
+  local path="$1" label="$2" ladder="$3"
   (cd "$path" && gh issue list \
-      --search 'label:needs-judgment -label:fix-retried sort:created-asc' \
+      --search "label:$label -label:$ladder sort:created-asc" \
       --state open --limit "$QUEUE_LIMIT" --json number --jq '.[].number')
 }
 
@@ -302,21 +314,24 @@ for repo in $(repo_names); do
   [[ -z "$ONLY_REPO" || "$repo" == "$ONLY_REPO" ]] || continue
   path="$(repo_path "$repo")"
   [[ -d "$path/.git" ]] || continue    # the ready walk below reports this
+  launched_fixer=0
+  for spec in "${FIXER_QUEUES[@]}"; do
+  IFS=: read -r QLABEL QLADDER QFLAG QKIND <<<"$spec"
   # Fail closed like the blocker check: a queue we could not read must not
-  # launch — and must not stop the other repos from getting their walk.
-  if ! fixers="$(fixer_queue "$path" | tr '\n' ' ')"; then
-    warn "$repo: needs-judgment queue query failed, skipping its fixer walk"
+  # launch — and must not stop the other queue or the other repos.
+  if ! fixers="$(fixer_queue "$path" "$QLABEL" "$QLADDER" | tr '\n' ' ')"; then
+    warn "$repo: $QLABEL queue query failed, skipping its fixer walk"
     continue
   fi
   fixers="${fixers% }"
   [[ -n "$fixers" ]] || continue
-  say "$repo: needs-judgment: $fixers"
+  say "$repo: $QLABEL: $fixers"
 
-  # Serial per repo: every fixer rebases onto the same moving main, so one
-  # runs at a time. Any candidate that still has a session — live, just
-  # finished and not yet reaped, or dead and flagged for a human — parks the
-  # whole repo's fixer walk for this tick. (An issue the fixer is working
-  # RIGHT NOW is still in this queue: `needs-judgment` only comes off on
+  # Serial per repo: every fixer rebases or amends against the same moving
+  # main, so one runs at a time. Any candidate that still has a session — live,
+  # just finished and not yet reaped, or dead and flagged for a human — parks
+  # BOTH of the repo's fixer walks for this tick. (An issue the fixer is
+  # working RIGHT NOW is still in its queue: the queue label only comes off on
   # success, so the running fixer's own issue is what trips this check.)
   # "=" pins the match: a bare -t matches session-name PREFIXES, so fixer #26
   # would read a live epic #263 as its own session and park the repo.
@@ -327,8 +342,8 @@ for repo in $(repo_names); do
     fi
   done
   if [[ -n "$busy" ]]; then
-    say "  #$busy ($repo): fixer session exists — repo's fixer walk waits"
-    continue
+    say "  #$busy ($repo): fixer session exists — repo's fixer walks wait"
+    break
   fi
 
   for num in $fixers; do
@@ -339,8 +354,9 @@ for repo in $(repo_names); do
       continue
     fi
     if (( DRY_RUN )); then
-      say "  #$num ($repo): would launch fixer '$session' with $ISSUE_ENGINE"
+      say "  #$num ($repo): would launch $QKIND fixer '$session' with $ISSUE_ENGINE"
       LAUNCHED=$((LAUNCHED + 1))
+      launched_fixer=1
       break
     fi
 
@@ -364,25 +380,26 @@ for repo in $(repo_names); do
 
     # The queue above rode gh's SEARCH index, which lags label edits by up to
     # about a minute — long enough for the documented human takeover
-    # (stripping needs-judgment) to race this tick and win invisibly. Re-read
+    # (stripping the queue label) to race this tick and win invisibly. Re-read
     # the issue directly (issue view is a strong read) AFTER the swap: if the
     # takeover happened, the swap just stripped the human's `failed` and a
     # launch would strand an unreapable in-progress session on an issue that
     # is no longer the fixer's. Revert and move on — fail closed on a read
     # that errors, for the same reason.
     if ! read_issue_engine "$path" "$num" \
-        || [[ "$ISSUE_STATE" != "OPEN" ]] || ! has_issue_label needs-judgment || has_issue_label fix-retried; then
+        || [[ "$ISSUE_STATE" != "OPEN" ]] || ! has_issue_label "$QLABEL" || has_issue_label "$QLADDER"; then
       say "  #$num ($repo): issue changed under the queue or its engine routing became invalid (state ${ISSUE_STATE:-unreadable}, labels ${ISSUE_LABELS:-none}) — reverting the swap, skipping"
       (cd "$path" && gh issue edit "$num" --add-label failed --remove-label in-progress >/dev/null 2>&1) \
         || warn "  #$num ($repo): the label revert failed too — issue may be stuck in-progress, fix by hand"
       continue
     fi
 
-    say "  #$num ($repo): launching fixer '$session' with $ISSUE_ENGINE"
+    say "  #$num ($repo): launching $QKIND fixer '$session' with $ISSUE_ENGINE"
+    launched_fixer=1
     set +e
     # </dev/null: nothing in launch.sh should ever read the tick's stdin;
     # 9>&- as in the ready walk below.
-    "$LAUNCH" --fix "$num" --repo "$repo" --engine "$ISSUE_ENGINE" </dev/null 9>&-
+    "$LAUNCH" "$QFLAG" "$num" --repo "$repo" --engine "$ISSUE_ENGINE" </dev/null 9>&-
     rc=$?
     set -e
     if (( rc != 0 )); then
@@ -400,10 +417,15 @@ for repo in $(repo_names); do
         warn "launch.sh rejected its configuration — aborting tick"
         exit 1 ;;
       *)
-        warn "  #$num ($repo): fixer launch failed (exit $rc), continuing"
+        warn "  #$num ($repo): $QKIND fixer launch failed (exit $rc), continuing"
         FAILED=$((FAILED + 1)) ;;
     esac
     break   # at most one fixer per repo per tick
+  done
+  # An `if`, never `(( x )) && break`: that list returns 1 when the flag is 0,
+  # and under `set -e` a failing list at statement position ends the whole tick
+  # — silently skipping the ready walk on every tick that launched no fixer.
+  if (( launched_fixer )); then break; fi   # ...of either kind
   done
 done
 fi

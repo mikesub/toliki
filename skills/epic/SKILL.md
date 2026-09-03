@@ -38,5 +38,5 @@ Request: $ARGUMENTS
 
 - Re-running `/epic #N` resumes a leftover `epic/<N>-*` branch after rebasing it onto `origin/main`; a branch that already carries a code checkpoint skips design and code and goes straight to the verify gate and review. Delete the branch locally and on origin to force a fresh build.
 - A run that died before its first checkpoint left only the claim commit, so a re-run refuses it as `claimed by another run`. Release it with `git push origin --delete epic/<N>-<slug>`, or wait for `bin/reap.sh` to collect it.
-- A run that already opened a PR is skipped by any re-run. Finish that PR by hand, unless the issue carries `needs-judgment`: then the `/fix-conflict` fixer owns it.
+- A run that already opened a PR is skipped by any re-run. Finish that PR by hand, unless the issue carries a fixer queue label: `needs-judgment` belongs to `/fix-conflict`, `needs-ci-fix` to `/fix-ci`.
 - Manual mode: `node "$CLAUDE_HARNESS_DIR/workflows/epic-run.mjs" --slug <slug>` builds from an existing `.epics/<slug>/requirements.md` on the current tree, with no git and no PR.

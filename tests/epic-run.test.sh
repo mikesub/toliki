@@ -17,6 +17,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EPIC_RUN="$ROOT/workflows/epic-run.mjs"
 FIX_RUN="$ROOT/workflows/fix-run.mjs"
+CI_RUN="$ROOT/workflows/ci-run.mjs"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -79,12 +80,19 @@ fresh_clone() { # -> path; detached at origin/main, like launch.sh's worktree
 origin_ref() { git -C "$ORIGIN" rev-parse -q --verify "refs/heads/$1" 2>/dev/null || true; }
 origin_count() { git -C "$ORIGIN" rev-list --count "main..$1" 2>/dev/null || echo '?'; }
 # Seed origin with a branch built by a helper clone: seed_branch <branch> <base> <script>
+# A counter, not $RANDOM: a suite this long draws the same number twice, and a
+# collided clone path fails the seed with the scenario's assertions still armed.
+SEED_N=0
 seed_branch() {
-  local branch="$1" base="$2" script="$3" dir="$TMP/seeder-$RANDOM"
+  local branch="$1" base="$2" script="$3"
+  SEED_N=$((SEED_N + 1))
+  local dir="$TMP/seeder-$SEED_N"
+  rm -rf "$dir"
   git clone -q "$ORIGIN" "$dir"
   git -C "$dir" switch -q -c "$branch" "origin/$base"
   (cd "$dir" && bash -c "$script")
   git -C "$dir" push -q origin "HEAD:refs/heads/$branch"
+  rm -rf "$dir"
 }
 scenario() { printf '\n%s\n' "$1"; reset_origin; }
 
@@ -126,6 +134,8 @@ case "${EPIC_STEP_LABEL:-}" in
   summary:write)                               key=summary ;;
   resolve)                                     key=fix-resolve ;;
   check)                                       key=fix-check ;;
+  fix-ci)                                      key=ci-fix ;;
+  ci-check)                                    key=ci-check ;;
 esac
 
 n="$(cat "$STUB_STATE/$key.n" 2>/dev/null || echo 0)"
@@ -220,8 +230,16 @@ case "${1:-} ${2:-}" in
   "pr list")
     if [[ "$*" == *--search* || -z "${GH_OPEN_PR_BRANCH:-}" ]]; then printf '[]\n'; else
       sha="$(git -C "$STUB_ORIGIN" rev-parse -q --verify "refs/heads/$GH_OPEN_PR_BRANCH" 2>/dev/null || echo missing)"
-      printf '[{"number":7,"url":"https://github.com/o/r/pull/7","headRefName":"%s","headRefOid":"%s"}]\n' "$GH_OPEN_PR_BRANCH" "$sha"
+      # statusCheckRollup mirrors what the merge worker reads: GH_RED_CHECKS is a
+      # comma-separated list of failing check names, empty for an all-green PR.
+      # printf with the trailing newline, or `read` drops the last name.
+      rollup="$(printf '%s\n' "${GH_RED_CHECKS:-}" | tr ',' '\n' | sed '/^$/d' | while IFS= read -r c; do
+        printf '{"__typename":"CheckRun","name":"%s","status":"COMPLETED","conclusion":"FAILURE","detailsUrl":"https://github.com/o/r/actions/runs/555/job/1"},' "$c"
+      done)"
+      printf '[{"number":7,"url":"https://github.com/o/r/pull/7","headRefName":"%s","headRefOid":"%s","statusCheckRollup":[%s{"__typename":"CheckRun","name":"lint","status":"COMPLETED","conclusion":"SUCCESS"}]}]\n' "$GH_OPEN_PR_BRANCH" "$sha" "$rollup"
     fi ;;
+  "run view")
+    printf '%s\n' "${GH_JOB_LOG:-FAIL src/widget.test.ts: expected createWidget to be exported}" ;;
   "pr create")
     printf '%s\n' "$*" >> "$state/pr-created"
     printf 'https://github.com/o/r/pull/7\n' ;;
@@ -325,6 +343,8 @@ run_pipeline() { # script fixtures-dir args...   (scenario knobs via GH_* env)
     GH_ISSUE_LABELS="${GH_ISSUE_LABELS:-ready}" \
     GH_BLOCKED_BY="${GH_BLOCKED_BY:-[]}" \
     GH_OPEN_PR_BRANCH="${GH_OPEN_PR_BRANCH:-}" \
+    GH_RED_CHECKS="${GH_RED_CHECKS:-}" \
+    GH_JOB_LOG="${GH_JOB_LOG:-}" \
     EPIC_USAGE_LOG="$state/usage.jsonl" \
     node "$script" "$@" 2>&1
   )" || RUN_RC=$?
@@ -897,6 +917,142 @@ assert_contains "RESULT records that no judgment was exercised" "$RUN_OUT" '"res
 assert_eq "the branch was rebased onto the new main and pushed" 1 "$(origin_count epic/42-add-widget)"
 if git -C "$ORIGIN" merge-base --is-ancestor main epic/42-add-widget; then ok "and sits on top of main"; else nok "and sits on top of main"; fi
 assert_contains "the audit comment says the conflict evaporated" "$(gh_comments)" "the conflict had evaporated"
+
+# ───────────────────────── ci-run ─────────────────────────
+# A finished epic PR the merge worker rebased and re-ran: its checks came back
+# red. The seed leaves the branch's single commit holding a test with no
+# implementation, so `npm run verify` is red locally too and the fixer's fixture
+# writes the missing file — the same shape the epic-run gates use.
+seed_ci_pr() {
+  seed_branch epic/42-add-widget main 'mkdir -p frontend/src && printf "test(\"widget\", () => {})\n" > frontend/src/widget.test.ts && git add -A && git commit -qm "Add widget" -m "Closes #42"'
+}
+CIBASE="$TMP/fixtures-ci"
+mkdir -p "$CIBASE"
+fixture "$CIBASE" ci-fix '{"completed":true,"cause":"createWidget was never exported","summary":"Exports createWidget from the widget module.","files":["frontend/src/widget.ts"]}'
+fixture_sh "$CIBASE" ci-fix 'printf "export const createWidget = () => ({})\n" > frontend/src/widget.ts'
+fixture "$CIBASE" ci-check '{"survives":true,"confidence":91,"reasoning":"The export is added and nothing else changed."}'
+run_ci() { GH_ISSUE_LABELS="${CI_LABELS:-failed,needs-ci-fix}" GH_OPEN_PR_BRANCH=epic/42-add-widget GH_RED_CHECKS="${CI_RED-build}" run_pipeline "$@"; }
+
+scenario 'ci-run: a red check is repaired, checked, and put back in the merge queue'
+seed_ci_pr
+BEFORE="$(origin_ref epic/42-add-widget)"
+run_ci "$CI_RUN" "$CIBASE" --issue 42 --session myapp-epic-42
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_contains "RESULT lands ready-to-merge" "$RUN_OUT" '"readyToMerge":true'
+assert_contains "it names the check that was red" "$RUN_OUT" '"failedChecks":["build"]'
+assert_eq "the branch on origin was amended" "$(git -C "$WT" rev-parse HEAD)" "$(origin_ref epic/42-add-widget)"
+assert_not_contains "and is not what it was" "$(origin_ref epic/42-add-widget)" "$BEFORE"
+assert_eq "it is still exactly one commit above main" 1 "$(origin_count epic/42-add-widget)"
+assert_contains "the commit keeps its message and Closes line" "$(git -C "$ORIGIN" log -1 --format=%B epic/42-add-widget)" "Closes #42"
+assert_contains "the fix is in the pushed tree" "$(git -C "$ORIGIN" ls-tree -r --name-only epic/42-add-widget)" "frontend/src/widget.ts"
+assert_eq "the issue is back on ready-to-merge, ladder kept" "ci-attempted,ready-to-merge," "$(gh_labels)"
+assert_contains "the audit comment names the cause" "$(gh_comments)" "Cause: createWidget was never exported"
+assert_contains "and records the adversarial check" "$(gh_comments)" "confidence 91/100"
+assert_contains "and says the merge worker re-runs the real checks" "$(gh_comments)" "re-runs the real checks before anything lands"
+FIXPROMPT="$(cat "$STATE_DIR/ci-fix.0.prompt")"
+assert_contains "the fixer is told which checks failed" "$FIXPROMPT" "Checks that failed: build"
+assert_contains "and gets the failing job log" "$FIXPROMPT" "expected createWidget to be exported"
+assert_contains "and is told the failure reproduces locally" "$FIXPROMPT" "RED locally on this exact tree"
+assert_contains "and is forbidden to weaken a test" "$FIXPROMPT" "Never weaken, skip, delete or loosen a test"
+assert_eq "verify ran before and after the fix" 2 "$(grep -c '^run verify$' "$NPM_LOG")"
+
+scenario 'ci-run: a failure that does not reproduce locally says so'
+GREENLOCAL="$TMP/fixtures-ci-green"; cp -R "$CIBASE" "$GREENLOCAL"
+# The implementation is already there, so the local gate is green while CI is red.
+seed_branch epic/42-add-widget main 'mkdir -p frontend/src && printf "test(\"widget\", () => {})\n" > frontend/src/widget.test.ts && printf "export const createWidget = () => ({})\n" > frontend/src/widget.ts && git add -A && git commit -qm "Add widget" -m "Closes #42"'
+fixture_sh "$GREENLOCAL" ci-fix 'printf "export const createWidget = () => ({ ok: true })\n" > frontend/src/widget.ts'
+run_ci "$CI_RUN" "$GREENLOCAL" --issue 42
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_contains "the prompt says the local gate is green" "$(cat "$STATE_DIR/ci-fix.0.prompt")" "GREEN locally on this exact tree"
+assert_contains "and asks why it fails only there" "$(cat "$STATE_DIR/ci-fix.0.prompt")" "why it fails there and not here"
+
+scenario 'ci-run: the fixer escalates instead of guessing'
+seed_ci_pr
+ESC="$TMP/fixtures-ci-esc"; cp -R "$CIBASE" "$ESC"; rm -f "$ESC/ci-fix.sh"
+fixture "$ESC" ci-fix '{"completed":false,"escalate":"the runner could not reach the package registry — no code change here fixes that."}'
+BEFORE="$(origin_ref epic/42-add-widget)"
+run_ci "$CI_RUN" "$ESC" --issue 42
+assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
+assert_contains "the escalation reaches the blocker" "$RUN_OUT" 'escalated rather than guessed'
+assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+assert_eq "no adversarial check ran" 0 "$(calls ci-check)"
+assert_contains "the blocker block names the next step" "$(gh_comments)" "- next: This was the first attempt"
+assert_eq "labels: failed, queue and ladder kept" "ci-attempted,failed,needs-ci-fix," "$(gh_labels)"
+
+scenario 'ci-run: a fix that changes nothing is refused'
+seed_ci_pr
+NOOP="$TMP/fixtures-ci-noop"; cp -R "$CIBASE" "$NOOP"; rm -f "$NOOP/ci-fix.sh"
+BEFORE="$(origin_ref epic/42-add-widget)"
+run_ci "$CI_RUN" "$NOOP" --issue 42
+assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
+assert_contains "the reason says the checks would come back red" "$RUN_OUT" 'changed no file'
+assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+
+scenario 'ci-run: a red verify after the fix blocks'
+seed_ci_pr
+REDV="$TMP/fixtures-ci-redverify"; cp -R "$CIBASE" "$REDV"
+fixture_sh "$REDV" ci-fix 'printf "broken\n" > frontend/src/other.ts'   # writes something, fixes nothing
+BEFORE="$(origin_ref epic/42-add-widget)"
+run_ci "$CI_RUN" "$REDV" --issue 42
+assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
+assert_contains "the failing detail reaches the blocker" "$RUN_OUT" 'npm run verify is red after the fix'
+assert_eq "no adversarial check ran" 0 "$(calls ci-check)"
+assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+
+scenario 'ci-run: a refuted fix blocks — a weakened test must not reach the queue'
+seed_ci_pr
+REF="$TMP/fixtures-ci-refuted"; cp -R "$CIBASE" "$REF"
+fixture "$REF" ci-check '{"survives":false,"confidence":15,"reasoning":"The assertion was deleted rather than satisfied."}'
+BEFORE="$(origin_ref epic/42-add-widget)"
+run_ci "$CI_RUN" "$REF" --issue 42
+assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
+assert_contains "the refutation reaches the blocker" "$RUN_OUT" 'the adversarial check refuted the fix'
+assert_contains "and quotes its reasoning" "$RUN_OUT" 'assertion was deleted'
+assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+assert_not_contains "the issue never reaches the merge queue" "$(gh_labels)" "ready-to-merge"
+
+scenario 'ci-run: checks that are green again are refused without a model'
+seed_ci_pr
+BEFORE="$(origin_ref epic/42-add-widget)"
+CI_RED= run_ci "$CI_RUN" "$CIBASE" --issue 42
+assert_rc "exits 2 (skipped)" 2 "$RUN_RC"
+assert_contains "the refusal is final" "$RUN_OUT" '"refusalFinal":true'
+assert_contains "and says why" "$RUN_OUT" 'checks are no longer failing'
+assert_eq "no fixer was woken" 0 "$(calls ci-fix)"
+assert_contains "it is commented on the issue" "$(gh_comments)" "the checks are no longer red"
+assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+
+scenario 'ci-run: an exhausted attempt ladder refuses without running'
+seed_ci_pr
+CI_LABELS="failed,needs-ci-fix,ci-attempted,ci-retried" run_ci "$CI_RUN" "$CIBASE" --issue 42
+assert_rc "exits 2 (skipped)" 2 "$RUN_RC"
+assert_contains "the refusal is final" "$RUN_OUT" '"refusalFinal":true'
+assert_eq "no fixer was woken" 0 "$(calls ci-fix)"
+assert_contains "the refusal was commented" "$(gh_comments)" "🤖 fix-ci refused: attempt ladder exhausted"
+
+scenario 'ci-run: the retry that fails hands the issue to a human'
+seed_ci_pr
+CI_LABELS="failed,needs-ci-fix,ci-attempted" run_ci "$CI_RUN" "$ESC" --issue 42
+assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
+assert_contains "RESULT records attempt 2" "$RUN_OUT" '"attempt":2'
+assert_contains "the blocker block says the ladder is spent" "$(gh_comments)" "- next: This was the RETRY"
+assert_contains "ci-retried was recorded" "$(gh_labels)" "ci-retried,"
+
+scenario 'ci-run: a branch that is not a single epic commit is refused'
+seed_branch epic/42-add-widget main 'mkdir -p frontend/src && printf "a\n" > frontend/src/widget.test.ts && git add -A && git commit -qm "Add widget" -m "Closes #42" && printf "b\n" >> frontend/src/widget.test.ts && git commit -qam "second commit"'
+BEFORE="$(origin_ref epic/42-add-widget)"
+run_ci "$CI_RUN" "$CIBASE" --issue 42
+assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
+assert_contains "the reason names the shape" "$RUN_OUT" 'commit(s) above origin/main'
+assert_eq "no fixer was woken" 0 "$(calls ci-fix)"
+assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+
+scenario 'ci-run: an issue without the queue label is not a CI fixer issue'
+seed_ci_pr
+CI_LABELS="failed" run_ci "$CI_RUN" "$CIBASE" --issue 42
+assert_rc "exits 2 (skipped)" 2 "$RUN_RC"
+assert_contains "the reason says so" "$RUN_OUT" 'not labelled needs-ci-fix'
+assert_eq "no fixer was woken" 0 "$(calls ci-fix)"
 
 # ───────────────────── defect grouping (restatements across files) ─────────────────────
 # Five blind lenses reporting one fault is the design working — it is how #66's migration

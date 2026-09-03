@@ -5,7 +5,8 @@
     "review":             "claude/opus/xhigh",
     "confirm-review":     "claude/fable/xhigh",
     "fixes-after-review": "claude/opus/xhigh",
-    "fix-conflicts":      "claude/fable/xhigh"
+    "fix-conflicts":      "claude/fable/xhigh",
+    "fix-ci":             "claude/opus/xhigh"
   },
   "codex": {
     "architect":          "codex/gpt-5.6-sol/xhigh",
@@ -13,7 +14,8 @@
     "review":             "codex/gpt-5.6-sol/xhigh",
     "confirm-review":     "codex/gpt-5.6-sol/xhigh",
     "fixes-after-review": "codex/gpt-5.6-sol/xhigh",
-    "fix-conflicts":      "codex/gpt-5.6-sol/xhigh"
+    "fix-conflicts":      "codex/gpt-5.6-sol/xhigh",
+    "fix-ci":             "codex/gpt-5.6-sol/xhigh"
   },
   "codex+claude": {
     "architect":          "claude/fable/xhigh",
@@ -21,6 +23,7 @@
     "review":             "codex/gpt-5.6-sol/xhigh",
     "confirm-review":     "codex/gpt-5.6-sol/xhigh",
     "fixes-after-review": "claude/opus/xhigh",
-    "fix-conflicts":      "codex/gpt-5.6-sol/xhigh"
+    "fix-conflicts":      "codex/gpt-5.6-sol/xhigh",
+    "fix-ci":             "claude/opus/xhigh"
   }
 }

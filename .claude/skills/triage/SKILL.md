@@ -34,17 +34,21 @@ machine-local, and the copy destroys the real registry.
 
 Per repo, via `gh -R <owner/repo>`:
 
-- **`failed`**: first check for `needs-judgment` beside it, which changes who
-  owns the issue:
-  - `needs-judgment` **without** `fix-retried`: the automated fixer owns it and
-    dispatch relaunches it on its own, so this is not a decision item. Mention
-    it under "stuck in the machine" only if it has sat unchanged for over ~1h;
-    then check sessions and `~/dispatch.log` for why the fixer walk is not
-    picking it up.
-  - `needs-judgment` **with** `fix-retried`: the fixer's attempt ladder is
-    exhausted, a real decision item. Read the newest 🤖 fix-conflict comment;
-    the human either resolves by hand or strips `fix-attempted` and
-    `fix-retried` to grant the fixer another round.
+- **`failed`**: first check for a fixer queue label beside it, which changes
+  who owns the issue. Two of them exist, each with its own attempt ladder:
+  `needs-judgment` (a rebase conflict; ladder `fix-attempted`/`fix-retried`)
+  and `needs-ci-fix` (checks red on the rebased head; ladder
+  `ci-attempted`/`ci-retried`).
+  - a queue label **without** its spent-ladder label: the automated fixer owns
+    it and dispatch relaunches it on its own, so this is not a decision item.
+    Mention it under "stuck in the machine" only if it has sat unchanged for
+    over ~1h; then check sessions and `~/dispatch.log` for why the fixer walk
+    is not picking it up.
+  - a queue label **with** its spent-ladder label (`fix-retried`,
+    `ci-retried`): that fixer's attempt ladder is exhausted, a real decision
+    item. Read the newest 🤖 fix-conflict or 🤖 fix-ci comment; the human
+    either finishes it by hand or strips that ladder's two labels to grant
+    another round.
   - plain `failed`: read the newest 🤖 comment for the cause and check the
     PR's state (`mergeable` says if a conflict is still live). Report a
     one-line cause, the PR link, and what finishing takes: typically *fix the
@@ -61,7 +65,8 @@ broken".
 
 - **`ready-to-merge` open for over ~1h**: the worker drains in minutes, so
   check the tail of `~/merge.log` for the why (infrastructure aborts log
-  "aborting the run" and write no label).
+  "aborting the run" and write no label). An issue the CI fixer just returned
+  here is normal: it goes back through the worker's rebase and check re-run.
 - **`ready` untouched for over ~18h**: list its open `blocked_by` issues.
   Blockers explain it (report the chain); no blockers means dispatch is
   passing it over, so flag it for investigation.

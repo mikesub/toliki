@@ -8,8 +8,9 @@ set -euo pipefail
 # calls it directly — keep it free of any ssh/laptop assumptions.
 #
 # Two kinds of session, and they run different things:
-#   --epic N / --fix N   a pipeline run: this script creates the git worktree
-#                        and the pane runs workflows/{epic,fix}-run.mjs, which
+#   --epic N / --fix N / --ci N
+#                        a pipeline run: this script creates the git worktree
+#                        and the pane runs workflows/{epic,fix,ci}-run.mjs, which
 #                        spawns one headless agent process per phase. No
 #                        interactive session wraps it, so there is no
 #                        --remote-control channel to attach to — watch it with
@@ -29,12 +30,13 @@ usage() {
 Usage: $0 [session-name] [-m <message>] [-r <repo>] [--check-capacity|--check-idle]
        $0 --epic <N> [-r <repo>] [--engine <engine>]
        $0 --fix <N>  [-r <repo>] [--engine <engine>]
+       $0 --ci <N>   [-r <repo>] [--engine <engine>]
 
 Creates a detached tmux session in the named repo (default: $DEFAULT_REPO).
 
---epic/--fix run the autonomous pipeline: the session is named <repo>-epic-<N>,
+--epic/--fix/--ci run the autonomous pipeline: the session is named <repo>-epic-<N>,
 this script creates its git worktree under \${EPIC_WORKTREE_ROOT:-\$HOME/.epic-worktrees},
-and the pane runs workflows/epic-run.mjs (or fix-run.mjs) there. They take no
+and the pane runs workflows/epic-run.mjs (or fix-run.mjs, or ci-run.mjs) there. They take no
 session name and no -m — both are derived from the issue number.
 --engine is pipeline-only: a name from etc/engines.json, the vendor/model/effort
 table the run uses per step (default: \$EPIC_ENGINE from the environment,
@@ -60,7 +62,7 @@ HAVE_MESSAGE=0
 CHECK_CAPACITY=0
 CHECK_IDLE=0
 REPO="$DEFAULT_REPO"
-MODE=""       # "" = interactive claude; "epic" or "fix" = a pipeline run
+MODE=""       # "" = interactive claude; "epic", "fix" or "ci" = a pipeline run
 ISSUE=""
 ENGINE="$DEFAULT_ENGINE"   # from etc/lib.sh: EPIC_ENGINE, claude when unset
 HAVE_ENGINE=0
@@ -120,14 +122,15 @@ while [[ $# -gt 0 ]]; do
       ENGINE="${1#*=}"
       shift
       ;;
-    --epic|--fix|--epic=*|--fix=*)
+    --epic|--fix|--ci|--epic=*|--fix=*|--ci=*)
       # One leading '#' is stripped so `--epic #42` and `--epic 42` agree.
       case "$1" in
         --epic*) want="epic" ;;
+        --ci*)   want="ci" ;;
         *)       want="fix" ;;
       esac
       if [[ -n "$MODE" ]]; then
-        echo "[launch] --epic and --fix are mutually exclusive" >&2
+        echo "[launch] --epic, --fix and --ci are mutually exclusive" >&2
         exit 1
       fi
       MODE="$want"
@@ -167,7 +170,7 @@ if ! engine_known "$ENGINE"; then
   exit 1
 fi
 if [[ $HAVE_ENGINE -eq 1 && -z "$MODE" ]]; then
-  echo "[launch] --engine only applies to --epic/--fix pipeline runs" >&2
+  echo "[launch] --engine only applies to --epic/--fix/--ci pipeline runs" >&2
   exit 1
 fi
 
@@ -362,7 +365,11 @@ fi
 if [[ -n "$MODE" ]]; then
   # The pipeline. --session is both the log prefix and the marker
   # bin/resource-log.sh counts epics by, so it is not decoration.
-  SCRIPT="$HERE/../workflows/$([[ "$MODE" == epic ]] && echo epic-run.mjs || echo fix-run.mjs)"
+  case "$MODE" in
+    epic) SCRIPT="$HERE/../workflows/epic-run.mjs" ;;
+    fix)  SCRIPT="$HERE/../workflows/fix-run.mjs" ;;
+    ci)   SCRIPT="$HERE/../workflows/ci-run.mjs" ;;
+  esac
   LINE="node $(sq "$SCRIPT") --issue $ISSUE --session $(sq "$SESSION") --engine $(sq "$ENGINE")"
 else
   # An interactive session. The name is threaded through --remote-control and

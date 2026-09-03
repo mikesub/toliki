@@ -128,6 +128,12 @@ assert_rc "exits 0 (and strips the leading #)" 0 "$RUN_RC"
 assert_contains "session is still <repo>-epic-<N>" "$(tmux_log)" "new-session -d -s testrepo-epic-63"
 assert_contains "the pane runs the fixer orchestrator" "$(tmux_log)" "workflows/fix-run.mjs' --issue 63"
 
+printf '\nlaunch --ci: same session shape, CI fixer script\n'
+run_launch --ci '#63' --repo testrepo
+assert_rc "exits 0 (and strips the leading #)" 0 "$RUN_RC"
+assert_contains "session is still <repo>-epic-<N>" "$(tmux_log)" "new-session -d -s testrepo-epic-63"
+assert_contains "the pane runs the CI orchestrator" "$(tmux_log)" "workflows/ci-run.mjs' --issue 63"
+
 printf '\nlaunch --epic --engine codex: engine is tagged and forwarded\n'
 run_launch --epic 64 --repo testrepo --engine codex
 assert_rc "exits 0" 0 "$RUN_RC"
@@ -175,6 +181,10 @@ run_launch --epic 63 --fix 64 --repo testrepo
 assert_rc "--epic with --fix exits 1" 1 "$RUN_RC"
 assert_contains "and says why" "$RUN_OUT" "mutually exclusive"
 
+run_launch --fix 63 --ci 64 --repo testrepo
+assert_rc "--fix with --ci exits 1" 1 "$RUN_RC"
+assert_contains "and says why" "$RUN_OUT" "mutually exclusive"
+
 run_launch --epic 63 -m "hello" --repo testrepo
 assert_rc "--epic with -m exits 1" 1 "$RUN_RC"
 assert_contains "and says why" "$RUN_OUT" "takes no -m"
@@ -194,7 +204,7 @@ assert_not_contains "validation happens before any session is created" "$(tmux_l
 
 run_launch --engine codex --repo testrepo
 assert_rc "--engine is refused for interactive sessions" 1 "$RUN_RC"
-assert_contains "and says it is pipeline-only" "$RUN_OUT" "only applies to --epic/--fix"
+assert_contains "and says it is pipeline-only" "$RUN_OUT" "only applies to --epic/--fix/--ci"
 
 printf '\nlaunch --check-idle: the cap'"'"'s own count, against zero\n'
 run_launch --check-idle

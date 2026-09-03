@@ -37,7 +37,10 @@ don't get re-litigated from memory.
 - **Merge** — a serial per-repo worker rebases each finished PR onto current
   `main`, waits for checks to re-run on the rebased head, squash-merges.
   Serial is not caution: every merge invalidates every other PR's green, so
-  there is no parallelism to be had.
+  there is no parallelism to be had. Its two decline classes that a machine can
+  own — a judgment-class conflict and a red check — go to fixer runs rather
+  than to a human, each under an adversarial check and each bounded by one
+  retry.
 - **Crons watch, models act.** Dispatch, reap and merge ticks are plain shell
   reading labels; the first model to run is the epic that got launched.
 - **State is GitHub.** Issues, lifecycle and engine-routing labels,

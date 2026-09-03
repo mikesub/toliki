@@ -66,6 +66,8 @@ case "${1:-} ${2:-}" in
     [[ "${FAIL_QUEUE:-}" != "1" ]] || exit 6
     if [[ "$*" == *needs-judgment* ]]; then
       [[ -z "${FIXER_QUEUE:-}" ]] || printf '%b\n' "$FIXER_QUEUE"
+    elif [[ "$*" == *needs-ci-fix* ]]; then
+      [[ -z "${CI_QUEUE:-}" ]] || printf '%b\n' "$CI_QUEUE"
     else
       [[ -z "${READY_QUEUE:-}" ]] || printf '%b\n' "$READY_QUEUE"
     fi
@@ -130,7 +132,7 @@ run_dispatch() {
     PATH="$TMP/bin:$PATH" TMPDIR="$TMP/locks" \
     LAUNCH_LOG="$TMP/launch.log" GH_LOG="$TMP/gh.log" \
     LABEL_DIR="$TMP/labels" BLOCKER_DIR="$TMP/blockers" \
-    READY_QUEUE="${READY_QUEUE:-}" FIXER_QUEUE="${FIXER_QUEUE:-}" \
+    READY_QUEUE="${READY_QUEUE:-}" FIXER_QUEUE="${FIXER_QUEUE:-}" CI_QUEUE="${CI_QUEUE:-}" \
     FAIL_VIEW_ISSUE="${FAIL_VIEW_ISSUE:-}" FAIL_EDIT_ISSUE="${FAIL_EDIT_ISSUE:-}" \
     FAIL_BLOCKER_ISSUE="${FAIL_BLOCKER_ISSUE:-}" \
     FAIL_QUEUE="${FAIL_QUEUE:-}" \
@@ -144,6 +146,7 @@ reset_state() {
   rm -f "$TMP/labels"/* "$TMP/blockers"/*
   READY_QUEUE=""
   FIXER_QUEUE=""
+  CI_QUEUE=""
   FAIL_VIEW_ISSUE=""
   FAIL_EDIT_ISSUE=""
   FAIL_BLOCKER_ISSUE=""
@@ -265,6 +268,60 @@ printf 'failed,needs-judgment,engine:codex' > "$TMP/labels/9"
 run_dispatch
 assert_rc "tick exits 0" 0 "$RUN_RC"
 assert_contains "fixer launch keeps Codex" "$(cat "$TMP/launch.log")" '--fix 9 --repo testrepo --engine codex'
+
+printf '\nfixer: a red check goes to the CI fixer, not the conflict fixer\n'
+reset_state
+CI_QUEUE=21
+printf 'failed,needs-ci-fix,engine:claude' > "$TMP/labels/21"
+run_dispatch
+assert_rc "tick exits 0" 0 "$RUN_RC"
+assert_contains "it launches the CI pipeline" "$(cat "$TMP/launch.log")" '--ci 21 --repo testrepo --engine claude'
+assert_not_contains "and never the conflict fixer" "$(cat "$TMP/launch.log")" '--fix 21'
+assert_contains "the shield swap ran before the launch" "$(cat "$TMP/labels/21")" 'in-progress'
+
+printf '\nfixer: an exhausted CI ladder stays out of the queue\n'
+reset_state
+CI_QUEUE=22
+printf 'failed,needs-ci-fix,ci-retried' > "$TMP/labels/22"
+# The queue query excludes ci-retried, so the stub is asked and answers with it;
+# the post-swap re-read is what refuses. Either way nothing launches.
+run_dispatch
+assert_rc "tick exits 0" 0 "$RUN_RC"
+assert_not_contains "nothing is launched on a spent ladder" "$(cat "$TMP/launch.log")" '--ci 22'
+assert_contains "and the shield swap is reverted" "$(cat "$TMP/labels/22")" 'failed'
+assert_not_contains "leaving no stranded in-progress" "$(cat "$TMP/labels/22")" 'in-progress'
+
+printf '\nfixer: one fixer of either kind per repo per tick\n'
+reset_state
+FIXER_QUEUE=23
+CI_QUEUE=24
+printf 'failed,needs-judgment' > "$TMP/labels/23"
+printf 'failed,needs-ci-fix' > "$TMP/labels/24"
+run_dispatch
+assert_rc "tick exits 0" 0 "$RUN_RC"
+assert_contains "the conflict queue is walked first" "$(cat "$TMP/launch.log")" '--fix 23'
+assert_not_contains "and the CI queue waits for the next tick" "$(cat "$TMP/launch.log")" '--ci 24'
+
+printf '\nfixer: a live session parks both fixer walks in that repo\n'
+reset_state
+FIXER_QUEUE=25
+CI_QUEUE=26
+printf 'failed,needs-judgment' > "$TMP/labels/25"
+printf 'failed,needs-ci-fix' > "$TMP/labels/26"
+STUB_SESSION_NAME="testrepo-epic-25"
+run_dispatch
+assert_rc "tick exits 0" 0 "$RUN_RC"
+assert_not_contains "the busy conflict candidate launches nothing" "$(cat "$TMP/launch.log")" '--fix 25'
+assert_not_contains "and the CI queue is parked too" "$(cat "$TMP/launch.log")" '--ci 26'
+
+printf '\nfixer: a CI queue that cannot be read never launches\n'
+reset_state
+CI_QUEUE=27
+printf 'failed,needs-ci-fix' > "$TMP/labels/27"
+FAIL_QUEUE=1
+run_dispatch
+assert_rc "tick exits 0" 0 "$RUN_RC"
+assert_not_contains "an unreadable queue launches nothing" "$(cat "$TMP/launch.log")" '--ci 27'
 
 printf '\nroute-issue: a manual choice becomes durable before launch\n'
 reset_state

@@ -26,7 +26,10 @@ one engine is selected for an epic and retained through its fixer retries.
    Mechanical rebase conflicts it resolves itself under a line-containment
    gate; a conflict that needs judgment is labeled for **`fix-run.mjs`**, a
    dispatched fixer run that resolves it under an adversarial check and
-   returns the PR for human review.
+   returns the PR for human review. A red check on the rebased head is labeled
+   for **`ci-run.mjs`**, which reads the failing job logs, repairs the cause
+   under its own adversarial check, and puts the PR back in the merge queue —
+   where its checks are re-run before anything lands.
 5. **`bin/reap.sh`** (cron) — frees what finished runs leave behind (idle
    sessions, stale claim refs), so the slot budget keeps rotating.
 

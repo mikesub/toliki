@@ -48,12 +48,13 @@ in the same change.
 
 - **Epic**: one autonomous run of `epic-run.mjs` on one issue, ending at an open
   PR or a blocker comment.
-- **Fixer**: a run of `fix-run.mjs` on a `needs-judgment` issue. It reuses the
-  epic's session name on purpose so every guard covers both.
+- **Fixer**: a run of `fix-run.mjs` on a `needs-judgment` issue, or of
+  `ci-run.mjs` on a `needs-ci-fix` issue. Both reuse the epic's session name on
+  purpose so every guard covers them.
 - **Engine**: a top-level key of `etc/engines.json`, selected per issue by the
   `engine:<name>` label. An unlabeled issue uses `EPIC_ENGINE` from
   `etc/dispatch.cron` (claude when unset). The label survives fixer retries.
-- **Step**: one of the six pipeline steps in `STEPS` in
+- **Step**: one of the seven pipeline steps in `STEPS` in
   `workflows/lib/engine.mjs`, each a judgment call. Pipelines name steps; the
   engine file says who runs them; `STEPS` fixes each step's charter and tool
   boundary, so architect, review and confirm-review stay read-only under any
@@ -78,8 +79,10 @@ Lifecycle labels are owned by automation. Do not add or repurpose one.
 | `ready-to-merge` | PR open, gates cleared; the merge worker lands it unattended |
 | `ready-to-review` | PR open, something deferred or judgment-resolved; a human decides |
 | `failed` | blocked; needs a human |
-| `needs-judgment` | beside `failed`: the merge worker declined a judgment-class conflict; the fixer queue |
-| `fix-attempted` / `fix-retried` | the fixer's attempt ladder (one retry, then a human); never reset by automation |
+| `needs-judgment` | beside `failed`: the merge worker declined a judgment-class conflict; the conflict fixer's queue |
+| `needs-ci-fix` | beside `failed`: checks were red on the rebased head; the CI fixer's queue |
+| `fix-attempted` / `fix-retried` | the conflict fixer's attempt ladder (one retry, then a human); never reset by automation |
+| `ci-attempted` / `ci-retried` | the CI fixer's own ladder, same shape — one PR can need both repairs |
 | issue closed | merged |
 
 `engine:<name>` is the separate routing namespace and is never cleared by a
@@ -88,8 +91,8 @@ lifecycle change. Follow-up issues ship with no labels and link back with a
 
 ## Architecture boundaries
 
-- `workflows/epic-run.mjs` and `workflows/fix-run.mjs` are plain Node
-  orchestrators. They must not name a vendor.
+- `workflows/epic-run.mjs`, `workflows/fix-run.mjs` and `workflows/ci-run.mjs`
+  are plain Node orchestrators. They must not name a vendor.
 - `workflows/lib/engine.mjs` is the only file that knows how a vendor CLI is
   invoked. Its loader validates `etc/engines.json` before any phase touches
   GitHub. A Codex phase is ephemeral, sandboxed from the charter's tools, and
@@ -159,9 +162,15 @@ lifecycle change. Follow-up issues ship with no labels and link back with a
   required.
 - Mechanical conflict resolution stays containment-gated. If both sides' intent
   cannot be proven to survive, escalate instead of guessing.
-- A fixer never merges and never restores unattended eligibility: it lands
-  `ready-to-review`, and its push is the last step after verify and the
-  adversarial check.
+- The conflict fixer never merges and never restores unattended eligibility:
+  it lands `ready-to-review`, and its push is the last step after verify and
+  the adversarial check.
+- The CI fixer does restore it — it lands `ready-to-merge` — and that is only
+  safe because the merge worker rebases and RE-RUNS the real checks before
+  anything merges, so a fix that is still red cannot land. What that cannot
+  catch is a fix that is green and wrong, which is why the fixer is forbidden
+  to weaken a test and its diff goes to an adversarial check that refutes by
+  default. Gated by `tests/epic-run.test.sh`.
 - Every cleanup needs a positive proof of staleness: a claim ref only while its
   tip is still the claim commit and no session is live; a worktree only when its
   issue has no `epic/<N>-*` ref on origin at all. Liveness is read from tmux

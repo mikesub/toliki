@@ -181,6 +181,7 @@ export const STEPS = {
   'confirm-review': 'reviewer',
   'fixes-after-review': 'coder',
   'fix-conflicts': 'coder',
+  'fix-ci': 'coder',
 }
 
 // etc/engines.json: named engines, each mapping every step to
