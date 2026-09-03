@@ -35,6 +35,23 @@ source "$_LIB_DIR/repos.conf"
 # The first registry entry is the default when -r/--repo isn't given.
 DEFAULT_REPO="${REPOS[0]%%=*}"
 
+# The engine a run gets when nothing names one: no engine:* label on the issue,
+# no --engine on launch.sh. EPIC_ENGINE is the one knob (the Node side reads the
+# same name), and unset means claude, so a host without it behaves as before.
+# Checked with engine_known by the scripts that launch (dispatch, launch,
+# remote-control), not here: reap, merge and update never route anything and
+# should not read the engines file to do their job.
+DEFAULT_ENGINE="${EPIC_ENGINE:-claude}"
+
+# The engines a run can be routed to are the top-level keys of etc/engines.json,
+# tracked beside this file (a label must mean the same on every machine). The
+# full table — vendor/model/effort per step — is the orchestrator's to read;
+# the shell only ever needs the names. A missing or unparseable file makes
+# engine_known false for every name, so nothing launches on it.
+ENGINES_FILE="$_LIB_DIR/engines.json"
+engine_names() { jq -r 'keys[]' "$ENGINES_FILE" 2>/dev/null || true; }
+engine_known() { jq -e --arg e "$1" 'has($e)' "$ENGINES_FILE" >/dev/null 2>&1; }
+
 repo_names() {
   local e
   for e in "${REPOS[@]}"; do printf '%s\n' "${e%%=*}"; done

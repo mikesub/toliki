@@ -112,7 +112,7 @@ Your output is schema-enforced JSON — populate every field, do not cram everyt
 - tradeoffs: what this approach deliberately accepts.`,
 
   // Transcription only — the design is already decided and arrives whole in the prompt. Kept separate from the
-  // design agent because that one is read-only by charter (agentType 'architect' has no Write tool), and the
+  // design agent because that one is read-only by charter (the architect step is read-only: no Write tool), and the
   // separation is what stops "design the epic" drifting into "start building it".
   architectWrite: (dir, d) =>
 `Transcribe the design below into ${dir}/architecture.md. It is ALREADY DECIDED — do not redesign it, re-evaluate it, add to it, or read the codebase to check it.
@@ -197,7 +197,7 @@ ${unconfirmedJson}
 Then update ${dir}/epic.md (phase: review → done, phase log). Do not fix anything.`,
 
   triage: (dir, finish, pkgs, grouping) =>
-`Triage phase, autonomous (NO user sign-off). Read ${dir}/review.md and the diff. Apply fixes for the CONFIRMED findings only, highest severity first — NEVER act on anything under "## Unconfirmed — not fixed" (those were refuted; they are listed for human eyes only). For every finding you fix, also add the automated check that would catch its whole CLASS, not just the instance in front of you — a test, a type, a lint rule, or a shared helper that makes the footgun impossible — so the gate fails on any recurrence. Every review finding is a missing gate. Where this project's CLAUDE.md states its own harden-the-gate rule, follow that wording; this instruction stands on its own where it does not.
+`Fixes-after-review phase, autonomous (NO user sign-off). Read ${dir}/review.md and the diff. Apply fixes for the CONFIRMED findings only, highest severity first — NEVER act on anything under "## Unconfirmed — not fixed" (those were refuted; they are listed for human eyes only). For every finding you fix, also add the automated check that would catch its whole CLASS, not just the instance in front of you — a test, a type, a lint rule, or a shared helper that makes the footgun impossible — so the gate fails on any recurrence. Every review finding is a missing gate. Where this project's CLAUDE.md states its own harden-the-gate rule, follow that wording; this instruction stands on its own where it does not.
 When the check that would catch a class is NOT expressible as a test/type/lint but is a convention (a rule about how to write something, a footgun only a human would know to avoid), amend the constitution instead — but only THIS project's own: the relevant section of its CLAUDE.md, or the path-scoped \`.claude/rules/*.md\` covering the code in question, in the file's existing voice and length. Those are the only two places you may write a rule. The skills, agents and this pipeline are shared harness files that live outside this repo and are used by other projects: a rule that belongs to one of them is out of scope for an epic, so do NOT edit or recreate one — record it as DEFERRED in ${dir}/epic.md's phase log, stating the rule you would have written and which harness file it belongs in, and leave the harness untouched. A class with no gate at all is the outcome to avoid — a written rule beats nothing, and a deferred note beats a silent gap. Note any such amendment or deferral in ${dir}/epic.md's phase log so it surfaces in the PR body.
 If a finding is genuinely too risky or expensive to fix safely without a human decision, DO NOT guess — leave it, and record it as deferred (with why) in ${dir}/epic.md's phase log so the summary surfaces it.
 ${grouping}After fixes, re-run \`npm run verify\` in each touched package (this repo's packages: ${pkgs}) until green.
@@ -210,7 +210,7 @@ Update ${dir}/epic.md (phase: review→triaged). Return:
 `Ship phase, autonomous. The work is complete and verified; now record deferrals, squash the branch to one commit, push, and open the PR. ALL git/gh work happens here.
 
 1. Write ${dir}/summary.md (the PR body source) — keep it about THIS diff, not future work. Do NOT include a files-modified/diff-stat listing or a verification/test-results section — the PR's Files tab and checks already show both, so in the body they are pure noise. Capture, against ${dir}/requirements.md: what was built; the architecture approach — "${design?.approach}": ${design?.rationale}; review outcome — OPEN that section with this tally verbatim: "${tally}", then the findings that survived verification and which were fixed (ignore review.md's "Unconfirmed — not fixed" section: those were refuted, not deferred — but the refuted COUNT stays in the tally, which is the only durable record they were ever raised, since review.md is gitignored and dies with the worktree). Do NOT enumerate deferred/out-of-scope work in the PR body — instead add a single pointer line: "Deferred items recorded on #${issue}."
-   **Never write a bare \`#<number>\` for anything except issue #${issue} itself.** GitHub turns every \`#N\` into a live cross-reference and renders it as that issue or PR's TITLE, so numbering findings \`#1\`, \`#2\`, \`#3\` does not produce a list — it produces the titles of three unrelated PRs, splices them into your sentences, and notifies them. Refer to a finding as \`Finding 3\`, or just lead with what it was; the same goes for hunks, steps, requirements and packages. This applies to every body you write here and to the issue comment in step 2. Triage status: ${triageStatus}
+   **Never write a bare \`#<number>\` for anything except issue #${issue} itself.** GitHub turns every \`#N\` into a live cross-reference and renders it as that issue or PR's TITLE, so numbering findings \`#1\`, \`#2\`, \`#3\` does not produce a list — it produces the titles of three unrelated PRs, splices them into your sentences, and notifies them. Refer to a finding as \`Finding 3\`, or just lead with what it was; the same goes for hunks, steps, requirements and packages. This applies to every body you write here and to the issue comment in step 2. Fixes-after-review status: ${triageStatus}
 
 2. Record deferred work on the ISSUE, not the PR. Read ${dir}/epic.md's phase log and ${dir}/review.md (confirmed sections only — refuted "Unconfirmed" findings are NOT deferred work) and collect everything deferred or out of scope: deferred review findings (with why), scope cut, edge cases intentionally skipped, clarifying answers that narrowed scope, uncovered test surfaces.
    a. Filing a follow-up issue is the EXCEPTION, not the default — the comment in (b) is the record, and it costs nothing. An unfiled item is not lost; an over-filed one rots in the backlog forever. An item earns an issue ONLY if it clears BOTH gates:
@@ -249,7 +249,7 @@ Append \`- handoff: queued for merge-worker\` to ${dir}/epic.md's phase log. Ret
 
   summaryManual: (dir, design, triageStatus) =>
 `Write ${dir}/summary.md and return its full contents. This is the manual flow — do NOT commit, push, or open a PR; leave all changes in the working tree.
-Capture, against ${dir}/requirements.md: what was built; the architecture approach — "${design?.approach}": ${design?.rationale}; files modified (\`git diff --stat\`); verify status per package; review outcome (findings that survived verification, which were fixed, which were DEFERRED and why — read ${dir}/review.md and ${dir}/epic.md); anything deferred or out of scope; a suggested next step. Triage status: ${triageStatus}
+Capture, against ${dir}/requirements.md: what was built; the architecture approach — "${design?.approach}": ${design?.rationale}; files modified (\`git diff --stat\`); verify status per package; review outcome (findings that survived verification, which were fixed, which were DEFERRED and why — read ${dir}/review.md and ${dir}/epic.md); anything deferred or out of scope; a suggested next step. Fixes-after-review status: ${triageStatus}
 Update ${dir}/epic.md (phase: ship → done).`,
 
   blocked: (issue, slug, phase, reason, prUrl) => {
@@ -288,28 +288,24 @@ Return confirmation that the comment was posted and the label was swapped to fai
 }
 
 // ───────────────────────── Config ─────────────────────────
-// Stage model tiering. Everything not listed here runs on the engine's own configured default model.
-// MECHANICAL — the prompt is a fully-specified procedure with no judgment call: transport, transcription,
-// scripted git/gh. Deliberately NOT applied to ship:pr (weighs the project's own legal/compliance trigger
-// where it has one, and decides which deferrals become filed issues) or any code/review/triage stage.
-// ship:handoff IS mechanical — the gate it writes down was already decided in the script, and a wrong
-// answer there fails loudly and safely (the issue stays `ready-to-review`, where a human is looking).
-// Downgrade a stage only when a wrong answer would fail loudly.
-// DESIGN — the architect designs the epic in one pass. It is the one stage that fixes the shape of everything
-// downstream (red writes its tests from that contract), so a weak call here is the most expensive kind. The
-// transcription half of the phase is MECHANICAL.
-// ADJUDICATE — the adversarial verifier is the last judgment before triage AUTO-APPLIES a fix with no human
-// sign-off, so a wrong "real" here becomes a committed change and a wrong "not real" buries a live bug. It
-// runs once per file cluster (a handful of spawns), not once per lens, which is what makes upgrading it cheap.
-// The five finders stay at the default tier deliberately: they drive recall, and more cheap finders beat fewer
-// expensive ones. If recall proves weak, add a sixth lens rather than upgrading the existing five.
-//
-// These are engine-neutral tiers. The selected adapter in lib/engine.mjs maps
-// each tier to that vendor's model and reasoning effort, so model names never
-// leak into the orchestrator.
-const MECHANICAL = 'mechanical'
-const DESIGN = 'design'
-const ADJUDICATE = 'adjudicate'
+// Every agent() call below names one STEP (lib/engine.mjs STEPS); which vendor, model and effort runs it is
+// that step's row in the run's engine in etc/engines.json (--engine, or the issue's engine:<name> label).
+// What a row is written against:
+// bookkeeping — the prompt is a fully-specified procedure with no judgment call: transport, transcription,
+// scripted git/gh. Deliberately NOT ship:pr (weighs the project's own legal/compliance trigger where it has
+// one, and decides which deferrals become filed issues), which is a `code` step. ship:handoff IS bookkeeping —
+// the gate it writes down was already decided in the script, and a wrong answer there fails loudly and safely
+// (the issue stays `ready-to-review`, where a human is looking). Downgrade a step only when a wrong answer
+// would fail loudly.
+// architect — designs the epic in one pass. It is the one step that fixes the shape of everything downstream
+// (red writes its tests from that contract), so a weak call here is the most expensive kind. The transcription
+// half of the phase is bookkeeping.
+// confirm-review — the adversarial verifier is the last judgment before fixes-after-review AUTO-APPLIES a fix
+// with no human sign-off, so a wrong "real" here becomes a committed change and a wrong "not real" buries a
+// live bug. It runs once per file cluster (a handful of spawns), not once per lens, which is what makes
+// upgrading it cheap.
+// review — the five finders drive recall, and more cheap finders beat fewer expensive ones. If recall proves
+// weak, add a sixth lens rather than upgrading the existing five.
 
 // This pipeline used to run its own real-database gate: an agent listed the changed paths, the script
 // path-matched them, and a second agent ran the project's `test:db` suite. That whole tier is gone — the
@@ -472,7 +468,7 @@ initRuntime({ scriptName: 'epic-run', sessionName: ARGS.session, defaultEngine: 
 // The issue's live status comment mirrors the pane's narration: the label says
 // WHICH state the issue is in, this says whether the run is alive and where it
 // got to. Issue mode only — slug mode has no issue to report on.
-initStatus({ issue: ARGS.issue, script: 'epic-run', session: ARGS.session, phases: ['Prepare', 'Architect', 'Code', 'Review', 'Triage', 'Ship'] })
+initStatus({ issue: ARGS.issue, script: 'epic-run', session: ARGS.session, phases: ['Prepare', 'Architect', 'Code', 'Review', 'Fixes after review', 'Ship'] })
 onPhase(statusPhase)
 onLog(statusNote)
 
@@ -493,7 +489,7 @@ async function fail(phase, reason) {
     if (!blockerPosted) {
       blockerPosted = true
       await agent(PROMPTS.blocked(issue, slug, phase, reason, openPr),
-        { label: 'ship:blocked', phase: 'Ship', agentType: 'coder', tier: MECHANICAL })
+        { label: 'ship:blocked', phase: 'Ship', step: 'bookkeeping' })
     }
     return { blocked: true, issue, slug, phase, reason, prUrl: openPr || undefined }
   }
@@ -531,7 +527,7 @@ try {
   if (gitMode) {
     phase('Prepare')
     const prep = await agent(PROMPTS.prepare(issue),
-      { label: 'prepare', phase: 'Prepare', agentType: 'coder', tier: MECHANICAL, schema: PREP_SCHEMA })
+      { label: 'prepare', phase: 'Prepare', step: 'bookkeeping', schema: PREP_SCHEMA })
     if (!prep) return await fail('prepare', 'Prepare failed — could not fetch the issue or reach git/gh.')
     if (prep.refused) {
       log(`Prepare refused to start: ${prep.refused}`)
@@ -568,7 +564,7 @@ try {
   // manual mode has no Prepare, so one agent reads the file (the orchestrator itself has no FS access to it).
   if (!gitMode) {
     const reqRes = await agent(PROMPTS.readRequirement(dir),
-      { label: 'read:requirement', phase: 'Architect', agentType: 'coder', tier: MECHANICAL, effort: 'low', schema: REQ_SCHEMA })
+      { label: 'read:requirement', phase: 'Architect', step: 'bookkeeping', schema: REQ_SCHEMA })
     if (!reqRes || !reqRes.requirement) return await fail('architect', 'Could not read requirements.md — aborting before code.')
     const badLayout = applyDiscovery(reqRes)
     if (badLayout) return await fail('architect', badLayout)
@@ -577,14 +573,14 @@ try {
   }
 
   const design = await agent(PROMPTS.architectDesign(dir),
-    { label: 'architect:design', phase: 'Architect', agentType: 'architect', tier: DESIGN, schema: DESIGN_SCHEMA },
+    { label: 'architect:design', phase: 'Architect', step: 'architect', schema: DESIGN_SCHEMA },
   )
   if (!design) return await fail('architect', 'Architect design failed — aborting before code.')
 
   // Fail closed if the artifact never lands: red and green both read architecture.md, so building on a missing
   // one means implementing against nothing but the requirements — silently, and only visible in the diff.
   const wrote = await agent(PROMPTS.architectWrite(dir, design),
-    { label: 'architect:write', phase: 'Architect', agentType: 'coder', tier: MECHANICAL },
+    { label: 'architect:write', phase: 'Architect', step: 'bookkeeping' },
   )
   if (!wrote) return await fail('architect', 'architecture.md was not written — aborting before code, which reads it.')
   log(`Architecture: ${design.approach} — ${design.rationale}`)
@@ -595,14 +591,14 @@ try {
 
   // Red: tests only, written blind to any implementation (none exists yet), from requirements + the public contract.
   const red = await agent(PROMPTS.codeRed(dir),
-    { label: 'code:red', phase: 'Code', agentType: 'coder' },
+    { label: 'code:red', phase: 'Code', step: 'code' },
   )
   if (!red) return await fail('code', 'Red step failed — no tests written, aborting before implementation.')
   log('Code: red tests written and failing for the right reason.')
 
   // Green: implement against architecture + the red tests, then pass the gate. Single agent to keep the working tree coherent.
   const green = await agent(PROMPTS.codeGreen(dir, red, checkpoint('code'), pkgList()),
-    { label: 'code:green', phase: 'Code', agentType: 'coder' },
+    { label: 'code:green', phase: 'Code', step: 'code' },
   )
   if (!green) return await fail('code', 'Green step failed — implementation did not complete, aborting before review.')
   log('Code: implementation complete, verify gate run.')
@@ -622,7 +618,7 @@ try {
   const shortLens = i => LENSES[i].split(' (')[0]
   const runLens = async (lens, i, attempt = 1) => {
     const r = await agent(PROMPTS.review(requirement, lens, DIFF),
-      { label: `review:${i}${attempt > 1 ? ':retry' : ''}`, phase: 'Review', agentType: 'reviewer', schema: FINDINGS_SCHEMA },
+      { label: `review:${i}${attempt > 1 ? ':retry' : ''}`, phase: 'Review', step: 'review', schema: FINDINGS_SCHEMA },
     ).catch(() => null)
     if (r && Array.isArray(r.findings)) return r.findings
     if (attempt === 1) {
@@ -683,7 +679,7 @@ try {
   })
   const verdicts = (await parallel(batches.map((group, bi) => () =>
     agent(PROMPTS.verify(group, DIFF),
-      { label: `verify:${bi + 1}/${batches.length}`, phase: 'Review', agentType: 'reviewer', tier: ADJUDICATE, schema: VERDICT_SCHEMA },
+      { label: `verify:${bi + 1}/${batches.length}`, phase: 'Review', step: 'confirm-review', schema: VERDICT_SCHEMA },
     ).then(v => group.map((f, i) => {
       const got = v && Array.isArray(v.verdicts) ? v.verdicts.find(x => Number(x.index) === i + 1) : null
       if (!got || typeof got.real !== 'boolean') return noVerdict(f)
@@ -736,12 +732,12 @@ try {
 
   // Write review.md from the surviving findings (+ the unconfirmed record).
   await agent(PROMPTS.reviewWrite(dir, JSON.stringify(verified, null, 2), JSON.stringify(unconfirmed, null, 2)),
-    { label: 'review:write', phase: 'Review', agentType: 'coder', tier: MECHANICAL },
+    { label: 'review:write', phase: 'Review', step: 'bookkeeping' },
   )
 
-  // ───────────────────────── Phase 4: Triage (auto-apply, no sign-off) ─────────────────────────
+  // ───────────────────────── Phase 4: Fixes after review (auto-apply, no sign-off) ─────────────────────────
   currentPhase = 'triage'
-  phase('Triage')
+  phase('Fixes after review')
 
   let triageStatus = 'No confirmed findings — nothing to triage.'
   let triageDeferred = []
@@ -754,7 +750,7 @@ try {
       ? `\nSeveral findings are the SAME underlying defect, reported by different review lenses looking at different files. An independent verifier grouped them; one fix and one gate should resolve each group, so do NOT fix or gate the same fault once per finding:\n${multi.map((g, i) => `- Defect ${i + 1}:\n${g.map(f => `  - "${f.title}" (${f.location})`).join('\n')}`).join('\n')}\nThis grouping is a hint, not an instruction: if the findings in a group are genuinely distinct faults needing separate fixes, treat them separately and say so in your status. Every finding above must still end up either fixed or reported as deferred.\n`
       : ''
     const triaged = await agent(PROMPTS.triage(dir, checkpoint('triage'), pkgList(), grouping),
-      { label: 'triage:fix', phase: 'Triage', agentType: 'coder', schema: TRIAGE_SCHEMA },
+      { label: 'fixes-after-review', phase: 'Fixes after review', step: 'fixes-after-review', schema: TRIAGE_SCHEMA },
     )
     // Fail closed: a dead triage agent leaves confirmed findings in an unknown state — some fixed, some not,
     // verify possibly never re-run — and the merge gate below reads exactly that list to decide whether main
@@ -763,7 +759,7 @@ try {
     triageStatus = triaged.status
     triageDeferred = Array.isArray(triaged.deferred) ? triaged.deferred : []
   }
-  log(`Triage: ${triageStatus}`)
+  log(`Fixes after review: ${triageStatus}`)
 
   // ───────────────────────── Phase 5: Ship ─────────────────────────
   // Issue mode: write summary.md, squash to one commit (Closes #N), push, open the PR. Slug mode: summary.md only, no git.
@@ -772,13 +768,13 @@ try {
 
   if (!gitMode) {
     const summary = await agent(PROMPTS.summaryManual(dir, design, triageStatus),
-      { label: 'summary:write', phase: 'Ship', agentType: 'coder', tier: MECHANICAL },
+      { label: 'summary:write', phase: 'Ship', step: 'bookkeeping' },
     )
     return { slug, approach: design?.approach, greenStatus: green, findingsConfirmed: verified.length, findingsUnconfirmed: unconfirmed.length, triageStatus, summary }
   }
 
   const shipped = await agent(PROMPTS.ship(dir, issue, slug, design, triageStatus, reviewTally),
-    { label: 'ship:pr', phase: 'Ship', agentType: 'coder', schema: SHIP_SCHEMA },
+    { label: 'ship:pr', phase: 'Ship', step: 'code', schema: SHIP_SCHEMA },
   )
   if (!shipped || !shipped.prUrl) return await fail('ship', 'Ship failed — commit/push/PR did not complete; the change is on epic/' + slug + ' (checkpoint commits + working tree).')
   openPr = shipped.prUrl
@@ -827,7 +823,7 @@ try {
   // step can go wrong leaves the issue in front of a human rather than in an unattended merge queue. That
   // asymmetry is the reason it is a separate step instead of something ship decided for itself.
   const handed = await agent(PROMPTS.handoff(dir, issue),
-    { label: 'ship:handoff', phase: 'Ship', agentType: 'coder', tier: MECHANICAL, schema: HANDOFF_SCHEMA },
+    { label: 'ship:handoff', phase: 'Ship', step: 'bookkeeping', schema: HANDOFF_SCHEMA },
   ).catch(() => null)
   if (!handed || !handed.labelled) {
     const why = `merge gate was clear but ready-to-merge could not be applied${handed?.summary ? ` (${handed.summary})` : ''} — the PR is complete and stays ready-to-review`

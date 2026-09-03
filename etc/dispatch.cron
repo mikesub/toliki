@@ -54,6 +54,11 @@
 # shows up as `dead (at bash prompt)` in `./remote-control.sh ls` — the same
 # symptom as the workspace-trust trap, from a completely different cause.
 PATH=/home/ubuntu/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# The engine an unlabeled issue runs on: dispatch.sh's default, and launch.sh's
+# when --engine is absent. A name from etc/engines.json (the vendor/model/effort
+# table per pipeline step); unset means claude. A name the file does not know
+# stops every tick loudly rather than route work to a table nobody chose.
+EPIC_ENGINE=claude
 * * * * * ubuntu /home/ubuntu/toliki/bin/dispatch.sh >> /home/ubuntu/dispatch.log 2>&1
 * * * * * ubuntu /home/ubuntu/toliki/bin/reap.sh >> /home/ubuntu/reap.log 2>&1
 * * * * * ubuntu /home/ubuntu/toliki/bin/merge-tick.sh >> /home/ubuntu/merge.log 2>&1
@@ -80,8 +85,8 @@ PATH=/home/ubuntu/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/
 # Nothing else keeps that binary current: a headless `claude -p` never
 # self-updates and provision.sh never upgrades a version already present, so
 # without this line the CLI every phase spawns quietly ages until someone
-# updates it by hand — and with it, the model aliases the pipelines' tier
-# tables are written in. It holds dispatch's lock for the length of the
+# updates it by hand — and with it, the model aliases the Claude rows of
+# etc/engines.json are written in. It holds dispatch's lock for the length of the
 # install, so a tick landing in that window logs "previous tick still running"
 # and moves on. A busy hour is simply skipped; the queue drains to empty often
 # enough to catch up. Minute 37 is arbitrary — the lock, not the offset, keeps

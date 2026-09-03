@@ -39,7 +39,7 @@ Commands:
                            the manual override for dispatch's fixer walk. Same
                            session name as dispatch would use, which is what
                            keeps it visible to reap and to the next tick.
-  next <claude|codex>      Route the first unrouted, unblocked ready issue to
+  next <engine>            Route the first unrouted, unblocked ready issue to
                            this engine. With -r, only considers that repo;
                            otherwise uses dispatch's host-wide interleaving.
   <name> [-m msg]          Shorthand for: start <name> [-m msg]
@@ -58,7 +58,8 @@ Commands:
                            are host-wide. Every session is named <repo>-<name>, so
                            "epic 63 -r otherapp" -> otherapp-epic-63. Names are given
                            short (epic-63) or full (otherapp-epic-63) interchangeably.
-  --engine <claude|codex>  Required for manual epic/fix launches. Queue-driven
+  --engine <engine>        Required for manual epic/fix launches; a name from
+                           etc/engines.json ($(engine_names | tr '\n' ' ')). Queue-driven
                            launches get the engine from the issue label instead.
 EOF
 }
@@ -177,8 +178,8 @@ else
     next)
       ACTION="next"
       NEXT_ENGINE="${POSITIONAL[1]:-}"
-      if [[ "$NEXT_ENGINE" != "claude" && "$NEXT_ENGINE" != "codex" ]]; then
-        echo "[control] next requires exactly one engine: claude or codex" >&2
+      if ! engine_known "$NEXT_ENGINE"; then
+        echo "[control] next requires an engine from etc/engines.json ($(engine_names | tr '\n' ' '))" >&2
         exit 1
       fi
       if [[ -n "${POSITIONAL[2]:-}" ]]; then
@@ -192,12 +193,12 @@ else
   esac
 fi
 
-if [[ $HAVE_ENGINE -eq 1 && "$ENGINE" != "claude" && "$ENGINE" != "codex" ]]; then
-  echo "[control] --engine must be claude or codex" >&2
+if [[ $HAVE_ENGINE -eq 1 ]] && ! engine_known "$ENGINE"; then
+  echo "[control] --engine must name an engine in etc/engines.json ($(engine_names | tr '\n' ' ')), got '$ENGINE'" >&2
   exit 1
 fi
 if [[ -n "$PIPELINE" && $HAVE_ENGINE -eq 0 ]]; then
-  echo "[control] manual $PIPELINE requires --engine claude|codex; queue launches inherit the issue's engine label" >&2
+  echo "[control] manual $PIPELINE requires --engine <name from etc/engines.json>; queue launches inherit the issue's engine label" >&2
   exit 1
 fi
 if [[ -z "$PIPELINE" && $HAVE_ENGINE -eq 1 ]]; then
@@ -310,8 +311,8 @@ EOF
     if [[ $HAVE_MESSAGE -eq 0 && "$SESSION" =~ -epic-([0-9]+)$ ]]; then
       N="${BASH_REMATCH[1]}"
       echo "[control] '$SESSION' is a pipeline session — 'restart' can't tell an epic from a fixer." >&2
-      echo "[control] Relaunch it explicitly:  $0 stop $SESSION && $0 epic $N --engine <claude|codex>" >&2
-      echo "[control] Or use: $0 fix $N --engine <claude|codex>" >&2
+      echo "[control] Relaunch it explicitly:  $0 stop $SESSION && $0 epic $N --engine <engine>" >&2
+      echo "[control] Or use: $0 fix $N --engine <engine>" >&2
       echo "[control] Or just stop it: dispatch relaunches an unfinished issue on its next tick." >&2
       exit 1
     fi

@@ -134,6 +134,20 @@ assert_rc "exits 0" 0 "$RUN_RC"
 assert_contains "the Codex engine tag is set" "$(tmux_log)" "set-option -t testrepo-epic-64 @engine codex"
 assert_contains "Codex reaches the orchestrator" "$(tmux_log)" "--engine 'codex'"
 
+printf '\nlaunch --epic: EPIC_ENGINE is the default when --engine is absent\n'
+export EPIC_ENGINE=codex
+run_launch --epic 65 --repo testrepo
+unset EPIC_ENGINE
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_contains "the env default is tagged" "$(tmux_log)" "set-option -t testrepo-epic-65 @engine codex"
+assert_contains "and reaches the orchestrator" "$(tmux_log)" "--engine 'codex'"
+export EPIC_ENGINE=nope
+run_launch --epic 66 --repo testrepo
+unset EPIC_ENGINE
+assert_rc "an unknown EPIC_ENGINE exits 1" 1 "$RUN_RC"
+assert_contains "and names the knob" "$RUN_OUT" "EPIC_ENGINE must name an engine"
+assert_not_contains "before any session is created" "$(tmux_log)" "new-session -d -s testrepo-epic-66"
+
 printf '\nlaunch --epic: a reused worktree is scrubbed but keeps ignored files\n'
 WT="$WT_ROOT/testrepo/testrepo-epic-63"
 mkdir -p "$WT/frontend/node_modules/left-pad" "$WT/.epics/63-slug"
@@ -175,7 +189,7 @@ assert_contains "and says why" "$RUN_OUT" "takes an issue number"
 
 run_launch --epic 63 --engine unknown --repo testrepo
 assert_rc "an unknown engine exits 1" 1 "$RUN_RC"
-assert_contains "and names the allowed engines" "$RUN_OUT" "must be claude or codex"
+assert_contains "and names the allowed engines" "$RUN_OUT" "must name an engine"
 assert_not_contains "validation happens before any session is created" "$(tmux_log)" "new-session"
 
 run_launch --engine codex --repo testrepo

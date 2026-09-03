@@ -27,8 +27,8 @@ source "$HERE/../etc/lib.sh"
 usage() {
   cat <<EOF
 Usage: $0 [session-name] [-m <message>] [-r <repo>] [--check-capacity|--check-idle]
-       $0 --epic <N> [-r <repo>] [--engine <claude|codex>]
-       $0 --fix <N>  [-r <repo>] [--engine <claude|codex>]
+       $0 --epic <N> [-r <repo>] [--engine <engine>]
+       $0 --fix <N>  [-r <repo>] [--engine <engine>]
 
 Creates a detached tmux session in the named repo (default: $DEFAULT_REPO).
 
@@ -36,7 +36,9 @@ Creates a detached tmux session in the named repo (default: $DEFAULT_REPO).
 this script creates its git worktree under \${EPIC_WORKTREE_ROOT:-\$HOME/.epic-worktrees},
 and the pane runs workflows/epic-run.mjs (or fix-run.mjs) there. They take no
 session name and no -m — both are derived from the issue number.
---engine is pipeline-only and selects one engine for every phase (default: claude).
+--engine is pipeline-only: a name from etc/engines.json, the vendor/model/effort
+table the run uses per step (default: \$EPIC_ENGINE from the environment,
+claude when unset). Currently: $(engine_names | tr '\n' ' ')
 
 Without them the session is an interactive claude. Name resolution when no name
 is given: with -m, the session is named after the message (slugified); otherwise
@@ -60,7 +62,7 @@ CHECK_IDLE=0
 REPO="$DEFAULT_REPO"
 MODE=""       # "" = interactive claude; "epic" or "fix" = a pipeline run
 ISSUE=""
-ENGINE="claude"
+ENGINE="$DEFAULT_ENGINE"   # from etc/lib.sh: EPIC_ENGINE, claude when unset
 HAVE_ENGINE=0
 
 POSITIONAL=()
@@ -159,12 +161,11 @@ if [[ ${#POSITIONAL[@]} -gt 1 ]]; then
 fi
 SESSION="${POSITIONAL[0]:-}"
 
-case "$ENGINE" in
-  claude|codex) ;;
-  *)
-    echo "[launch] --engine must be claude or codex, got '$ENGINE'" >&2
-    exit 1 ;;
-esac
+if ! engine_known "$ENGINE"; then
+  src="--engine"; [[ $HAVE_ENGINE -eq 1 ]] || src="EPIC_ENGINE"
+  echo "[launch] $src must name an engine in etc/engines.json ($(engine_names | tr '\n' ' ')), got '$ENGINE'" >&2
+  exit 1
+fi
 if [[ $HAVE_ENGINE -eq 1 && -z "$MODE" ]]; then
   echo "[launch] --engine only applies to --epic/--fix pipeline runs" >&2
   exit 1

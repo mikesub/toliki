@@ -26,6 +26,8 @@ holds live processes; git worktrees isolate runs.
 - `skills/spec/ISSUE-TRACKING.md`: issue slicing and dependency rules.
 - `workflows/*.mjs`: executable pipeline behavior and merge-gate inputs.
 - `etc/repos.conf.template` plus `etc/lib.sh`: tracked configuration contract.
+- `etc/engines.json`: the named engines — vendor/model/effort per pipeline
+  step. Tracked; an `engine:<name>` label resolves against it on every machine.
 - `etc/repos.conf`: private, machine-local data. It is gitignored; never commit
   it or replace the template with its contents.
 - Tests are the regression contract for shell and pipeline behavior.
@@ -37,8 +39,9 @@ choosing one. Fix the stale side in the same change.
 
 - `workflows/epic-run.mjs` and `workflows/fix-run.mjs` are plain Node
   orchestrators. They must not name a model vendor directly.
-- `workflows/lib/engine.mjs` is the engine boundary and currently the only file
-  that should know how a vendor CLI is invoked.
+- `workflows/lib/engine.mjs` is the vendor boundary and the only file that
+  should know how a vendor CLI is invoked. Which vendor, model and effort runs
+  each pipeline step is a row of `etc/engines.json`; pipelines name only steps.
 - `workflows/lib/runtime.mjs` owns phase execution, concurrency, timeouts, and
   signal forwarding. Keep deterministic control flow here or in ordinary
   scripts, not inside model judgment.
@@ -137,8 +140,9 @@ The suites cover:
 
 - `tests/epic-run.test.sh`: both pipelines through a stub engine, including
   model/charter/schema arguments and fail-closed paths.
-- `tests/engine-codex.test.sh`: Codex argv, tier mapping, sandbox/charter
-  boundaries, strict-schema normalization, cleanup, and failure paths.
+- `tests/engine-codex.test.sh`: Codex argv, model/effort pass-through,
+  sandbox/charter boundaries, strict-schema normalization, cleanup, and
+  failure paths.
 - `tests/dispatch-engine.test.sh`: next-epic selection, durable routing labels,
   default/fixer inheritance, and unknown/conflicting-label refusal.
 - `tests/launch-epic.test.sh`: worktree/session launch shapes and capacity

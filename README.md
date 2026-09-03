@@ -65,7 +65,11 @@ few interactive steps it cannot do for you (logins, per-clone workspace
 trust, the bypass-permissions consent). It installs and authenticates both
 agent CLIs. Route the next unassigned epic with
 `./remote-control.sh next codex` or `./remote-control.sh next claude`; add
-`-r <repo>` to restrict selection. Unlabeled issues default to Claude.
+`-r <repo>` to restrict selection. An engine is a named table in
+`etc/engines.json` saying which vendor, model and effort runs each pipeline
+step, so one engine can code on Claude and review on Codex. Unlabeled issues
+run on the host's `EPIC_ENGINE` default, set in `etc/dispatch.cron` (claude
+when unset).
 Turning the box autonomous is a deliberate last step: install the cron file
 per the comment at the top of `etc/dispatch.cron`.
 

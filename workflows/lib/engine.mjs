@@ -1,11 +1,12 @@
 // The engine adapter: the one place that knows how a coding-agent CLI is
 // invoked. Every pipeline step is a short-lived process spawned through here,
-// so the pipeline itself never names a vendor — swapping or mixing engines is
-// a registry entry plus a per-stage `{engine, tier}` tuple, not a rewrite.
+// so the pipeline itself never names a vendor. Which vendor, model and effort
+// runs each pipeline step is a row in etc/engines.json (see loadEngines), so
+// swapping or mixing vendors is an edit to that file, not to a pipeline.
 //
 // The contract every adapter implements:
 //
-//   run({ prompt, agentType, tier, effort, schema, cwd, timeoutMs, label })
+//   run({ prompt, agentType, model, effort, schema, cwd, timeoutMs, label })
 //     -> { ok, output, exitCode, timedOut, reason, stderrTail }
 //
 //   ok === true  ⇔  the process exited 0 AND a payload was extracted
@@ -201,44 +202,73 @@ function execute({ bin, args, prompt, cwd, timeoutMs, onStart }) {
 const AGENTS_DIR = new URL('../../agents/', import.meta.url)
 const charterCache = new Map()
 
-const CLAUDE_TIERS = {
-  default: { model: 'opus', effort: 'xhigh' },
-  mechanical: { model: 'sonnet', effort: 'xhigh' },
-  design: { model: 'fable', effort: 'xhigh' },
-  adjudicate: { model: 'fable', effort: 'xhigh' },
+// Which tool boundary each pipeline step runs under. Fixed by the pipeline,
+// never by etc/engines.json: the file picks a vendor, model and effort per
+// step, not whether the step may write files. architect, review and
+// confirm-review are read-only under both vendors; the rest carry the coder
+// charter and may edit the worktree.
+export const STEPS = {
+  bookkeeping: 'coder',
+  architect: 'architect',
+  code: 'coder',
+  review: 'reviewer',
+  'confirm-review': 'reviewer',
+  'fixes-after-review': 'coder',
+  'fix-conflicts': 'coder',
 }
 
-// Every tier runs the strongest catalog model at high effort until an eval says
-// a cheaper tier is safe (decided 2026-09-02). The IDs were verified against the
-// authenticated Codex catalog on the host. Environment overrides let an operator
-// move a tier after a deliberate eval without teaching the engine-neutral
-// pipelines model names.
-const CODEX_TIERS = {
-  default: {
-    model: process.env.CODEX_MODEL_DEFAULT || 'gpt-5.6-sol',
-    effort: process.env.CODEX_EFFORT_DEFAULT || 'high',
-  },
-  mechanical: {
-    model: process.env.CODEX_MODEL_MECHANICAL || 'gpt-5.6-sol',
-    effort: process.env.CODEX_EFFORT_MECHANICAL || 'high',
-  },
-  design: {
-    model: process.env.CODEX_MODEL_DESIGN || 'gpt-5.6-sol',
-    effort: process.env.CODEX_EFFORT_DESIGN || 'high',
-  },
-  adjudicate: {
-    model: process.env.CODEX_MODEL_ADJUDICATE || 'gpt-5.6-sol',
-    effort: process.env.CODEX_EFFORT_ADJUDICATE || 'high',
-  },
-}
+// etc/engines.json: named engines, each mapping every step to
+// "<vendor>/<model>/<effort>". Tracked rather than machine-local because an
+// engine name on an issue label has to resolve identically on whichever
+// machine launches the run. Read once and validated in full: a missing step,
+// an unregistered vendor, an effort that vendor's CLI does not accept, or an
+// unknown step name refuses the whole file, so a run cannot start on a
+// half-read table. EPIC_ENGINES_FILE points the tests at a throwaway copy.
+const ENGINES_FILE = process.env.EPIC_ENGINES_FILE || path.join(HARNESS_DIR, 'etc', 'engines.json')
+let enginesCache = null
 
-function resolveTier(engineName, table, tier, effort) {
-  const key = tier || 'default'
-  const selected = table[key]
-  if (!selected) {
-    throw new Error(`unknown ${engineName} tier '${key}' (known: ${Object.keys(table).join(', ')})`)
+export function loadEngines() {
+  if (enginesCache) return enginesCache
+  let raw
+  try {
+    raw = JSON.parse(readFileSync(ENGINES_FILE, 'utf8'))
+  } catch (e) {
+    throw new Error(`engines file ${ENGINES_FILE} could not be read: ${e.message}`)
   }
-  return { ...selected, effort: effort || selected.effort }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw) || !Object.keys(raw).length) {
+    throw new Error(`engines file ${ENGINES_FILE} must be an object of named engines`)
+  }
+  const engines = {}
+  for (const [name, table] of Object.entries(raw)) {
+    // The name becomes the engine:<name> issue label and a --engine value.
+    if (!/^[a-z0-9][a-z0-9+-]*$/.test(name)) {
+      throw new Error(`engines file: engine name '${name}' must match [a-z0-9+-]`)
+    }
+    if (!table || typeof table !== 'object' || Array.isArray(table)) {
+      throw new Error(`engines file: engine '${name}' must map steps to "vendor/model/effort"`)
+    }
+    for (const step of Object.keys(table)) {
+      if (!STEPS[step]) throw new Error(`engines file: engine '${name}' names unknown step '${step}' (known: ${Object.keys(STEPS).join(', ')})`)
+    }
+    engines[name] = {}
+    for (const step of Object.keys(STEPS)) {
+      const spec = table[step]
+      if (typeof spec !== 'string') throw new Error(`engines file: engine '${name}' has no entry for step '${step}'`)
+      const parts = spec.split('/')
+      if (parts.length !== 3 || parts.some(p => !p)) {
+        throw new Error(`engines file: engine '${name}' step '${step}' must be "vendor/model/effort", got "${spec}"`)
+      }
+      const [vendorName, model, effort] = parts
+      const vendor = VENDORS[vendorName]
+      if (!vendor) throw new Error(`engines file: engine '${name}' step '${step}' names unknown vendor '${vendorName}' (known: ${Object.keys(VENDORS).join(', ')})`)
+      if (!vendor.efforts.includes(effort)) {
+        throw new Error(`engines file: engine '${name}' step '${step}': ${vendorName} does not accept effort '${effort}' (accepts: ${vendor.efforts.join(', ')})`)
+      }
+      engines[name][step] = { vendor: vendorName, model, effort }
+    }
+  }
+  enginesCache = engines
+  return engines
 }
 
 function loadCharter(agentType) {
@@ -303,12 +333,13 @@ function loadProjectInstructions(cwd) {
   ].join('\n\n')
 }
 
-const claudeEngine = {
+const claudeVendor = {
   name: 'claude',
   bin: process.env.CLAUDE_BIN || 'claude',
+  // What --effort accepts on the 2.1.x CLI; loadEngines checks the file against it.
+  efforts: ['low', 'medium', 'high', 'xhigh', 'max'],
 
-  buildArgs({ agentType, tier, effort, schema }) {
-    const selected = resolveTier(this.name, CLAUDE_TIERS, tier, effort)
+  buildArgs({ agentType, model, effort, schema }) {
     const args = ['-p', '--output-format', 'json', '--dangerously-skip-permissions']
     // Charter + tool restrictions, applied as a system prompt plus an explicit
     // tool list rather than with `--agent <name>`.
@@ -337,16 +368,15 @@ const claudeEngine = {
       // follow it here.
       if (tools.length) args.push('--tools', tools.join(','))
     }
-    // Every tier names a model and an effort explicitly: the default tier is no
-    // longer "whatever the CLI would pick", so two engines can be compared fairly.
-    if (selected.model) args.push('--model', selected.model)
-    if (selected.effort) args.push('--effort', selected.effort)
+    // Model and effort come from the run's engine row, never from the CLI's own
+    // default, so two vendors run comparable work.
+    args.push('--model', model, '--effort', effort)
     if (schema) args.push('--json-schema', JSON.stringify(schema))
     return args
   },
 
-  async run({ prompt, agentType, tier, effort, schema, cwd, timeoutMs, onStart }) {
-    const args = this.buildArgs({ agentType, tier, effort, schema })
+  async run({ prompt, agentType, model, effort, schema, cwd, timeoutMs, onStart }) {
+    const args = this.buildArgs({ agentType, model, effort, schema })
     const r = await execute({ bin: this.bin, args, prompt, cwd, timeoutMs, onStart })
     const stderrTail = String(r.stderr || '').trim().slice(-2000)
 
@@ -401,12 +431,13 @@ const claudeEngine = {
 // therefore injected as developer instructions, and the tool boundary is
 // enforced by the Codex sandbox: charters without Edit/Write are read-only;
 // mutating phases retain the existing autonomous pipeline's full authority.
-const codexEngine = {
+const codexVendor = {
   name: 'codex',
   bin: process.env.CODEX_BIN || 'codex',
+  // The CLI's ReasoningEffort enum (0.152.x); loadEngines checks the file against it.
+  efforts: ['minimal', 'low', 'medium', 'high', 'xhigh'],
 
-  buildArgs({ charter, developerInstructions, tier, effort, schemaFile, outputFile, cwd }) {
-    const selected = resolveTier(this.name, CODEX_TIERS, tier, effort)
+  buildArgs({ charter, developerInstructions, model, effort, schemaFile, outputFile, cwd }) {
     // Derive write authority from the charter itself. A new charter therefore
     // starts read-only unless it explicitly names Edit or Write.
     const sandbox = charter?.tools.some(tool => tool === 'Edit' || tool === 'Write')
@@ -419,8 +450,8 @@ const codexEngine = {
       '-c', 'approval_policy="never"',
       '-c', `developer_instructions=${JSON.stringify(developerInstructions)}`,
       '-C', cwd,
-      '--model', selected.model,
-      '-c', `model_reasoning_effort="${selected.effort}"`,
+      '--model', model,
+      '-c', `model_reasoning_effort="${effort}"`,
       '--output-last-message', outputFile,
     ]
     if (schemaFile) args.push('--output-schema', schemaFile)
@@ -428,7 +459,7 @@ const codexEngine = {
     return args
   },
 
-  async run({ prompt, agentType, tier, effort, schema, cwd, timeoutMs, onStart }) {
+  async run({ prompt, agentType, model, effort, schema, cwd, timeoutMs, onStart }) {
     const work = mkdtempSync(path.join(tmpdir(), 'toliki-codex-'))
     const outputFile = path.join(work, 'final.txt')
     const schemaFile = schema ? path.join(work, 'schema.json') : null
@@ -437,7 +468,7 @@ const codexEngine = {
       const charter = agentType ? loadCharter(agentType) : null
       const projectInstructions = loadProjectInstructions(cwd)
       const developerInstructions = [charter?.body, projectInstructions].filter(Boolean).join('\n\n')
-      const args = this.buildArgs({ charter, developerInstructions, tier, effort, schemaFile, outputFile, cwd })
+      const args = this.buildArgs({ charter, developerInstructions, model, effort, schemaFile, outputFile, cwd })
       const r = await execute({ bin: this.bin, args, prompt, cwd, timeoutMs, onStart })
       const stderrTail = String(r.stderr || '').trim().slice(-2000)
 
@@ -482,14 +513,27 @@ const codexEngine = {
   },
 }
 
-const ENGINES = { claude: claudeEngine, codex: codexEngine }
+// Vendors are the CLIs this file knows how to drive. Engines are the named
+// step tables in etc/engines.json that pick a vendor per step.
+const VENDORS = { claude: claudeVendor, codex: codexVendor }
 
-export function engineNames() {
-  return Object.keys(ENGINES)
+export function vendorNames() {
+  return Object.keys(VENDORS)
 }
 
+export function resolveVendor(name) {
+  const vendor = VENDORS[name]
+  if (!vendor) throw new Error(`unknown vendor '${name}' (known: ${vendorNames().join(', ')})`)
+  return vendor
+}
+
+export function engineNames() {
+  return Object.keys(loadEngines())
+}
+
+// The step table of one named engine, every row resolved and validated.
 export function resolveEngine(name = 'claude') {
-  const engine = ENGINES[name]
+  const engine = loadEngines()[name]
   if (!engine) throw new Error(`unknown engine '${name}' (known: ${engineNames().join(', ')})`)
   return engine
 }

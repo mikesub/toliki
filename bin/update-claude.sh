@@ -8,9 +8,9 @@ set -euo pipefail
 # deliberately never upgrades a version that is already present. Measured: the
 # host sat on 2.1.233 from 2026-08-14 to 2026-09-02 across daily pipeline runs
 # while 25 releases shipped — one of them the release that moved the `fable`
-# alias to a new model. The pipelines name their tiers by alias precisely so a
-# CLI update moves them forward without anyone editing a table; a CLI that
-# never updates quietly turns those aliases into pins.
+# alias to a new model. The Claude rows of etc/engines.json are written in
+# aliases precisely so a CLI update moves them forward without anyone editing
+# the file; a CLI that never updates quietly turns those aliases into pins.
 #
 # Idle is the whole contract. A running process keeps its binary through the
 # swap, but every phase of a pipeline run is a FRESH `claude` process, so an

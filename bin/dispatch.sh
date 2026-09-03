@@ -42,8 +42,11 @@ warn() { echo "$(ts) [dispatch] $*" >&2; }
 usage() {
   cat <<EOF
 Usage: $0 [-r <repo>] [-n|--dry-run]
-       $0 --route-next <claude|codex> [-r <repo>]
-       $0 --route-issue <N> <claude|codex> -r <repo>
+       $0 --route-next <engine> [-r <repo>]
+       $0 --route-issue <N> <engine> -r <repo>
+
+<engine> is a name from etc/engines.json (a vendor/model/effort table per
+pipeline step): currently $(engine_names | tr '\n' ' ').
 
 One dispatch tick. First walks the \`needs-judgment\` queue (judgment-class
 rebase conflicts the merge worker declined) and launches at most one fixer
@@ -108,11 +111,16 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Fail on a bad engine name before the lock, the queue, or any label write.
+if ! engine_known "$DEFAULT_ENGINE"; then
+  warn "EPIC_ENGINE must name an engine in etc/engines.json ($(engine_names | tr '\n' ' ')), got '$DEFAULT_ENGINE'"
+  exit 1
+fi
 if (( HAVE_ROUTE_NEXT )); then
-  case "$ROUTE_NEXT" in
-    claude|codex) ;;
-    *) warn "--route-next must be claude or codex, got '$ROUTE_NEXT'"; exit 1 ;;
-  esac
+  if ! engine_known "$ROUTE_NEXT"; then
+    warn "--route-next must name an engine in etc/engines.json ($(engine_names | tr '\n' ' ')), got '$ROUTE_NEXT'"
+    exit 1
+  fi
   if (( DRY_RUN )); then
     warn "--route-next cannot be combined with --dry-run"
     exit 1
@@ -123,8 +131,8 @@ if (( HAVE_ROUTE_ISSUE )); then
     warn "--route-issue cannot be combined with --route-next/--dry-run"
     exit 1
   fi
-  if [[ ! "$ROUTE_ISSUE" =~ ^[0-9]+$ || ( "$ROUTE_ISSUE_ENGINE" != "claude" && "$ROUTE_ISSUE_ENGINE" != "codex" ) ]]; then
-    warn "--route-issue requires a numeric issue and engine claude|codex"
+  if [[ ! "$ROUTE_ISSUE" =~ ^[0-9]+$ ]] || ! engine_known "$ROUTE_ISSUE_ENGINE"; then
+    warn "--route-issue requires a numeric issue and an engine from etc/engines.json ($(engine_names | tr '\n' ' '))"
     exit 1
   fi
   if [[ -z "$ONLY_REPO" ]]; then
@@ -167,7 +175,7 @@ LAUNCHED=0
 FAILED=0
 
 # Strong-read an issue and resolve its routing label. No engine label means
-# Claude for backward compatibility. Any unknown or conflicting engine label
+# the host default (EPIC_ENGINE via etc/lib.sh, claude when unset). Any unknown or conflicting engine label
 # is an error: silently guessing here would send work to the wrong vendor.
 ISSUE_STATE=""
 ISSUE_LABELS=""
@@ -187,15 +195,16 @@ read_issue_engine() {
     ISSUE_LABEL_LIST=""
   fi
   ISSUE_LABELS="${ISSUE_LABEL_LIST//$'\n'/,}"
-  ISSUE_ENGINE="claude"
+  ISSUE_ENGINE="$DEFAULT_ENGINE"
   ISSUE_ENGINE_EXPLICIT=0
   while IFS= read -r label; do
     case "$label" in
-      engine:claude|engine:codex)
+      engine:*)
+        # Only a name the engines file knows; anything else is a conflict, not a hint.
+        engine_known "${label#engine:}" || return 2
         ISSUE_ENGINE="${label#engine:}"
         ISSUE_ENGINE_EXPLICIT=1
         count=$((count + 1)) ;;
-      engine:*) return 2 ;;
     esac
   done <<<"$ISSUE_LABEL_LIST"
   (( count <= 1 )) || return 2

@@ -84,7 +84,7 @@ case "$prompt" in
   *"Review this change for the lens: security"*)       key=lens-security ;;
   *"Adversarially verify"*)                            key=verify ;;
   *"from the review results below"*)                   key=review-write ;;
-  *"Triage phase, autonomous"*)                        key=triage ;;
+  *"Fixes-after-review phase, autonomous"*)                        key=triage ;;
   *"Ship phase, autonomous"*)                          key=ship ;;
   *"Queue issue #"*)                                   key=handoff ;;
   *"This is the manual flow"*)                         key=summary ;;
@@ -110,8 +110,9 @@ chmod +x "$TMP/bin/claude"
 cat > "$TMP/bin/codex" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
-printf '%s\n' "$*" | tr '\n' ' ' | tr -s ' ' >> "$STUB_CODEX_LOG"
-printf '\n' >> "$STUB_CODEX_LOG"
+# One write per call: five lenses run in parallel and append to the same log,
+# so a two-write line would interleave and undercount.
+printf '%s\n' "$(printf '%s' "$*" | tr '\n' ' ' | tr -s ' ')" >> "$STUB_CODEX_LOG"
 out=""
 schema=""
 while [[ $# -gt 0 ]]; do
@@ -246,12 +247,48 @@ run_pipeline "$EPIC_RUN" "$BASE" --issue 42 --session myapp-epic-42 --engine cod
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_contains "RESULT says readyToMerge" "$RUN_OUT" '"readyToMerge":true'
 CODEX_ARGV="$(cat "$CODEX_LOG")"
-assert_contains "every phase runs at high effort" "$CODEX_ARGV" 'model_reasoning_effort="high"'
+assert_contains "every phase runs at xhigh effort" "$CODEX_ARGV" 'model_reasoning_effort="xhigh"'
 assert_contains "every phase uses Sol" "$CODEX_ARGV" "--model gpt-5.6-sol"
 assert_not_contains "no phase falls to a cheaper Codex model" "$CODEX_ARGV" "gpt-5.6-luna"
 assert_contains "hidden Codex fan-out is disabled" "$CODEX_ARGV" "--disable multi_agent --disable enable_fanout"
 assert_contains "Codex runs are ephemeral" "$CODEX_ARGV" "--ephemeral"
 assert_eq "all five Codex review lenses ran" 5 "$(( $(calls lens-correctness) + $(calls lens-simplicity) + $(calls lens-seam) + $(calls lens-acceptance) + $(calls lens-security) ))"
+
+printf '\nepic-run: EPIC_ENGINE selects the engine when --engine is absent\n'
+export EPIC_ENGINE=codex
+run_pipeline "$EPIC_RUN" "$BASE" --issue 42 --session myapp-epic-42
+unset EPIC_ENGINE
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_contains "the run ships" "$RUN_OUT" '"readyToMerge":true'
+assert_contains "every phase went to Codex" "$(cat "$CODEX_LOG")" "--model gpt-5.6-sol"
+assert_eq "no phase went to Claude directly" 0 "$(grep -c -- '--model' "$RUN_LOG" || true)"
+export EPIC_ENGINE=future
+run_pipeline "$EPIC_RUN" "$BASE" --issue 42
+unset EPIC_ENGINE
+assert_rc "an unknown EPIC_ENGINE exits 1 (usage)" 1 "$RUN_RC"
+assert_contains "and names the allowed engines" "$RUN_OUT" '--engine must be one of claude, codex'
+
+printf '\nepic-run: an engine can mix vendors per step\n'
+jq '. + {mixed: (.claude | .review = "codex/gpt-5.6-sol/high" | ."confirm-review" = "codex/gpt-5.6-sol/high")}' "$ROOT/etc/engines.json" > "$TMP/engines.json"
+export EPIC_ENGINES_FILE="$TMP/engines.json"
+run_pipeline "$EPIC_RUN" "$BASE" --issue 42 --session myapp-epic-42 --engine mixed
+unset EPIC_ENGINES_FILE
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_contains "the run ships" "$RUN_OUT" '"readyToMerge":true'
+assert_contains "review went to Codex" "$(cat "$CODEX_LOG")" 'model_reasoning_effort="high"'
+assert_eq "exactly the five lenses and the confirm batches ran on Codex" "$(( 5 + $(calls verify) ))" "$(grep -c -- '--model gpt-5.6-sol' "$CODEX_LOG" || true)"
+assert_contains "coding stayed on Claude" "$(cat "$RUN_LOG")" "--model opus"
+assert_contains "the architect stayed on Claude" "$(cat "$RUN_LOG")" "--model fable"
+assert_contains "the pane names the vendor and model per step" "$RUN_OUT" "[codex gpt-5.6-sol/high]"
+
+printf '\nepic-run: a broken engines file stops the run before any side effect\n'
+jq 'del(.claude.review)' "$ROOT/etc/engines.json" > "$TMP/engines-broken.json"
+export EPIC_ENGINES_FILE="$TMP/engines-broken.json"
+run_pipeline "$EPIC_RUN" "$BASE" --issue 42
+unset EPIC_ENGINES_FILE
+assert_rc "exits 1" 1 "$RUN_RC"
+assert_contains "and names the hole" "$RUN_OUT" "has no entry for step 'review'"
+assert_eq "no agent process was spawned" 0 "$(calls prepare)"
 
 printf '\nepic-run: prepare refuses (claimed by another run)\n'
 REFUSED="$TMP/fixtures-refused"; cp -R "$BASE" "$REFUSED"

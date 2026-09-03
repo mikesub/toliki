@@ -189,13 +189,12 @@ Return confirmation that the comment was posted and the label was swapped to fai
 }
 
 // ───────────────────────── Config ─────────────────────────
-// Same engine-neutral tiering rationale as epic-run.mjs. MECHANICAL runs the
-// fully-scripted stages. RESOLVE is the judgment core — the entire reason a model is in the
-// loop — and ADJUDICATE is the last gate before a rewritten merge ships to a
-// force-push, so both get the strong model.
-const MECHANICAL = 'mechanical'
-const RESOLVE = 'design'
-const ADJUDICATE = 'adjudicate'
+// Which vendor, model and effort each step runs on is a row of the run's
+// engine in etc/engines.json; every agent() call names only its step.
+// bookkeeping covers the fully-scripted stages. fix-conflicts is the judgment
+// core — the entire reason a model is in the loop — and confirm-review is the
+// last gate before a rewritten merge ships to a force-push, so a row for
+// either wants the strong model.
 
 // ───────────────────────── Schemas ─────────────────────────
 const PREP_SCHEMA = {
@@ -297,7 +296,7 @@ async function fail(phase, reason) {
   if (!blockerPosted) {
     blockerPosted = true
     await agent(PROMPTS.blocked(issue, phase, reason, prUrl, attempt),
-      { label: 'ship:blocked', phase: 'Ship', agentType: 'coder', tier: MECHANICAL })
+      { label: 'ship:blocked', phase: 'Ship', step: 'bookkeeping' })
   }
   return { blocked: true, issue, phase, reason, prUrl: prUrl || undefined, attempt }
 }
@@ -345,7 +344,7 @@ async function main() {
 try {
   phase('Prepare')
   const prep = await agent(PROMPTS.prepare(issue),
-    { label: 'prepare', phase: 'Prepare', agentType: 'coder', tier: MECHANICAL, schema: PREP_SCHEMA })
+    { label: 'prepare', phase: 'Prepare', step: 'bookkeeping', schema: PREP_SCHEMA })
   if (!prep) return await fail('prepare', 'Prepare produced no result — could not reach git/gh.')
   if (prep.refused) {
     log(`Prepare refused: ${prep.refused}`)
@@ -376,7 +375,7 @@ try {
     currentPhase = 'resolve'
     phase('Resolve')
     const res = await agent(PROMPTS.resolve(issue, prep),
-      { label: 'resolve', phase: 'Resolve', agentType: 'coder', tier: RESOLVE, schema: RESOLVE_SCHEMA })
+      { label: 'resolve', phase: 'Resolve', step: 'fix-conflicts', schema: RESOLVE_SCHEMA })
     if (!res) return await fail('resolve', 'the resolver produced no result — the rebase is aborted for a clean retry.')
     if (res.escalate) return await fail('resolve', `escalated rather than guessed: ${res.escalate}`)
     if (!res.completed) return await fail('resolve', 'the resolver did not complete the rebase.')
@@ -394,7 +393,7 @@ try {
   currentPhase = 'verify'
   phase('Verify')
   const v = await agent(PROMPTS.verify(pkgList),
-    { label: 'verify', phase: 'Verify', agentType: 'coder', tier: MECHANICAL, schema: VERIFY_SCHEMA })
+    { label: 'verify', phase: 'Verify', step: 'bookkeeping', schema: VERIFY_SCHEMA })
   if (!v) return await fail('verify', 'the verify agent produced no result — an unverified resolution must not ship.')
   if (!v.green) return await fail('verify', `npm run verify is red after the resolution (${v.detail}) — the fixer never fixes code, so nothing was pushed and the PR branch is untouched.`)
   log(`Verify: green — ${v.detail}`)
@@ -408,7 +407,7 @@ try {
     currentPhase = 'check'
     phase('Check')
     check = await agent(PROMPTS.check(issue, prep),
-      { label: 'check', phase: 'Check', agentType: 'reviewer', tier: ADJUDICATE, schema: CHECK_SCHEMA })
+      { label: 'check', phase: 'Check', step: 'confirm-review', schema: CHECK_SCHEMA })
     if (!check) return await fail('check', 'the adversarial checker produced no result — an unchecked resolution must not ship.')
     if (!check.survives || check.confidence < 75) {
       return await fail('check', `the adversarial check refuted the resolution (survives=${check.survives}, confidence ${check.confidence}): ${check.reasoning}`)
@@ -421,7 +420,7 @@ try {
   phase('Ship')
   const comment = buildComment(prep, resolutions, v.detail, check)
   const shipped = await agent(PROMPTS.ship(issue, prep, comment),
-    { label: 'ship', phase: 'Ship', agentType: 'coder', tier: MECHANICAL, schema: SHIP_SCHEMA })
+    { label: 'ship', phase: 'Ship', step: 'bookkeeping', schema: SHIP_SCHEMA })
   if (!shipped || !shipped.pushed) {
     return await fail('ship', `the force-with-lease push did not land${shipped?.note ? ` (${shipped.note})` : ''} — the branch on origin is untouched.`)
   }

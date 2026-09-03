@@ -24,10 +24,14 @@
 // is the direction the merge gate is designed to fail in.
 
 import os from 'node:os'
-import { resolveEngine, terminateAll } from './engine.mjs'
+import { resolveEngine, resolveVendor, STEPS, terminateAll } from './engine.mjs'
 import { validate } from './schema.mjs'
 
-let DEFAULT_ENGINE = process.env.EPIC_ENGINE || 'claude'
+// The run's engine: a name in etc/engines.json, chosen by --engine (dispatch
+// passes the issue's label) or EPIC_ENGINE, claude when neither is set. Every
+// agent() call reads its vendor, model and effort from that one table.
+let ENGINE_NAME = process.env.EPIC_ENGINE || 'claude'
+let ENGINE = null
 
 // Matches the concurrency the workflow engine used to impose, now ours to
 // hold: every agent spawn passes this gate, so no fan-out anywhere in a
@@ -49,11 +53,12 @@ const ts = () => new Date().toISOString().replace(/\.\d{3}Z$/, 'Z')
 export function initRuntime({ scriptName, sessionName, defaultEngine } = {}) {
   if (scriptName) SCRIPT = scriptName
   if (sessionName) SESSION = sessionName
-  if (defaultEngine) DEFAULT_ENGINE = defaultEngine
-  // Validate before status hooks or the first phase can touch GitHub. Letting
-  // an unknown engine degrade to a null first step also leaves the blocker
-  // reporter on that same unknown engine, stranding the issue without a label.
-  resolveEngine(DEFAULT_ENGINE)
+  if (defaultEngine) ENGINE_NAME = defaultEngine
+  // Resolve — and so validate the whole engines file — before status hooks or
+  // the first phase can touch GitHub. Letting a bad table degrade to a null
+  // first step would also leave the blocker reporter on that same table,
+  // stranding the issue without a label.
+  ENGINE = resolveEngine(ENGINE_NAME)
   installSignalHandlers()
 }
 
@@ -108,20 +113,24 @@ function release() {
 }
 
 // ───────────────────────── agent ─────────────────────────
-// One pipeline step = one engine process. opts:
+// One pipeline step = one vendor process. opts:
 //   label      short name for the log line (e.g. 'review:2')
 //   phase      the phase it belongs to — logging only, kept for parity
-//   agentType  charter from the shared agents/ registry ('coder' | 'architect' | 'reviewer')
-//   tier       engine-neutral model tier; omitted means the adapter's default
-//   effort     reasoning effort, when a stage wants it lowered
+//   step       which row of the run's engine this is (a key of STEPS): picks
+//              the vendor, model and effort, and fixes the tool boundary
 //   schema     JSON Schema; its presence is what makes the return value an object
-//   engine     which adapter runs it (defaults to the run's selected engine)
 //   timeoutMs  per-step ceiling
 export async function agent(prompt, opts = {}) {
-  const { label = 'agent', agentType, tier, effort, schema, engine: engineName, timeoutMs = DEFAULT_TIMEOUT_MS } = opts
-  let engine
+  const { label = 'agent', step, schema, timeoutMs = DEFAULT_TIMEOUT_MS } = opts
+  const agentType = STEPS[step]
+  if (!ENGINE || !agentType) {
+    log(`${label}: ${!ENGINE ? 'initRuntime() has not selected an engine' : `unknown step '${step}' (known: ${Object.keys(STEPS).join(', ')})`}`)
+    return null
+  }
+  const { vendor: vendorName, model, effort } = ENGINE[step]
+  let vendor
   try {
-    engine = resolveEngine(engineName || DEFAULT_ENGINE)
+    vendor = resolveVendor(vendorName)
   } catch (e) {
     log(`${label}: ${e.message}`)
     return null
@@ -131,7 +140,7 @@ export async function agent(prompt, opts = {}) {
     await acquire()
     const started = Date.now()
     try {
-      return await engine.run({ prompt, agentType, tier, effort, schema, cwd: process.cwd(), timeoutMs })
+      return await vendor.run({ prompt, agentType, model, effort, schema, cwd: process.cwd(), timeoutMs })
     } catch (e) {
       // An adapter is contracted not to throw; if one ever does, it must still
       // arrive at the call site as a null, not as an unwinding exception.
@@ -139,7 +148,9 @@ export async function agent(prompt, opts = {}) {
     } finally {
       release()
       const secs = Math.round((Date.now() - started) / 1000)
-      log(`${label}${why ? ` (${why})` : ''}: ${secs}s`)
+      // Name what ran it: engines can mix vendors per step, so the pane is the
+      // record of which model produced which artifact.
+      log(`${label}${why ? ` (${why})` : ''}: ${secs}s [${vendorName} ${model}/${effort}]`)
     }
   }
 

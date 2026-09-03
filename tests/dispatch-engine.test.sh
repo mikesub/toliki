@@ -161,6 +161,25 @@ run_dispatch
 assert_rc "tick exits 0" 0 "$RUN_RC"
 assert_contains "Claude is passed to launch" "$(cat "$TMP/launch.log")" '--epic 1 --repo testrepo --engine claude'
 
+printf '\ndispatch: EPIC_ENGINE sets the default for unlabeled work\n'
+reset_state
+READY_QUEUE=1
+printf 'ready' > "$TMP/labels/1"
+export EPIC_ENGINE=codex
+run_dispatch
+unset EPIC_ENGINE
+assert_rc "tick exits 0" 0 "$RUN_RC"
+assert_contains "the env default reaches launch" "$(cat "$TMP/launch.log")" '--epic 1 --repo testrepo --engine codex'
+reset_state
+READY_QUEUE=1
+printf 'ready' > "$TMP/labels/1"
+export EPIC_ENGINE=future
+run_dispatch
+unset EPIC_ENGINE
+assert_rc "an unknown EPIC_ENGINE stops the tick" 1 "$RUN_RC"
+assert_contains "and names the knob" "$RUN_OUT" "EPIC_ENGINE must name an engine"
+assert_not_contains "nothing is launched on it" "$(cat "$TMP/launch.log")" '--epic'
+
 printf '\ndispatch: an explicit Codex route is preserved\n'
 reset_state
 READY_QUEUE=2
@@ -189,6 +208,16 @@ COMMA_LABEL_ISSUE=8
 run_dispatch
 assert_rc "a comma inside another label is harmless" 0 "$RUN_RC"
 assert_contains "it does not invent a Codex route" "$(cat "$TMP/launch.log")" '--epic 8 --repo testrepo --engine claude'
+
+printf '\ndispatch: any engine named in etc/engines.json is routable\n'
+reset_state
+jq '. + {mixed: .claude}' "$ROOT/etc/engines.json" > "$HARNESS/etc/engines.json"
+READY_QUEUE=15
+printf 'ready,engine:mixed' > "$TMP/labels/15"
+run_dispatch
+assert_rc "tick exits 0" 0 "$RUN_RC"
+assert_contains "the engine name is forwarded as-is" "$(cat "$TMP/launch.log")" '--epic 15 --repo testrepo --engine mixed'
+cp "$ROOT/etc/engines.json" "$HARNESS/etc/engines.json"
 
 printf '\nroute-next: exact queue order, blockers, and explicit routes are respected\n'
 reset_state

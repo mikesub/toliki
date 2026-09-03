@@ -48,7 +48,7 @@ STUB
 chmod +x "$TMP/bin/codex"
 
 cat > "$TMP/run.mjs" <<'NODE'
-const { resolveEngine } = await import(process.env.ENGINE_MODULE)
+const { resolveVendor } = await import(process.env.ENGINE_MODULE)
 const schema = process.env.USE_SCHEMA === '1' ? {
   type: 'object', additionalProperties: false, required: ['name'],
   properties: {
@@ -57,10 +57,11 @@ const schema = process.env.USE_SCHEMA === '1' ? {
     maybe: { type: ['string', 'null'] },
   },
 } : undefined
-const result = await resolveEngine('codex').run({
+const result = await resolveVendor('codex').run({
   prompt: 'adapter probe',
   agentType: process.env.AGENT_TYPE,
-  tier: process.env.TIER || undefined,
+  model: process.env.MODEL,
+  effort: process.env.EFFORT,
   schema,
   cwd: process.cwd(),
   timeoutMs: Number(process.env.TIMEOUT_MS || 5000),
@@ -82,22 +83,22 @@ run_adapter() {
     CODEX_ARG_LOG="$TMP/args" \
     CODEX_PROMPT_LOG="$TMP/prompt" \
     CODEX_SCHEMA_LOG="$TMP/schema" \
-    AGENT_TYPE="$1" TIER="$2" USE_SCHEMA="$3" \
-    CODEX_STUB_MODE="${4:-structured}" TIMEOUT_MS="${5:-5000}" \
+    AGENT_TYPE="$1" MODEL="$2" EFFORT="$3" USE_SCHEMA="$4" \
+    CODEX_STUB_MODE="${5:-structured}" TIMEOUT_MS="${6:-5000}" \
     node "$TMP/run.mjs" 2>&1
   )" || RUN_RC=$?
 }
 
 printf '\nCodex adapter: structured coder phase\n'
-run_adapter coder mechanical 1
+run_adapter coder gpt-5.6-sol xhigh 1
 assert_rc "runner exits 0" 0 "$RUN_RC"
 assert_contains "structured output is returned" "$RUN_OUT" '"output":{"name":"ok"'
 assert_not_contains "the optional field does not leak" "$RUN_OUT" '"note":null'
 assert_contains "an originally nullable optional null survives" "$RUN_OUT" '"maybe":null'
 assert_contains "an unknown null survives for the shared validator to reject" "$RUN_OUT" '"extra":null'
 ARGS="$(cat "$TMP/args")"
-assert_contains "mechanical maps to Sol" "$ARGS" 'ARG:gpt-5.6-sol'
-assert_contains "mechanical effort is high" "$ARGS" 'ARG:model_reasoning_effort="high"'
+assert_contains "the model reaches argv verbatim" "$ARGS" 'ARG:gpt-5.6-sol'
+assert_contains "the effort reaches argv verbatim" "$ARGS" 'ARG:model_reasoning_effort="xhigh"'
 assert_contains "a write charter gets full sandbox authority" "$ARGS" 'ARG:danger-full-access'
 assert_contains "approval prompts are disabled" "$ARGS" 'ARG:approval_policy="never"'
 PHYSICAL_TMP="$(cd "$TMP" && pwd -P)"
@@ -115,33 +116,33 @@ OUT_PATH="$(awk '/^ARG:--output-last-message$/{getline; sub(/^ARG:/, ""); print;
 if [[ -n "$OUT_PATH" && ! -d "$(dirname "$OUT_PATH")" ]]; then ok "temporary artifacts are removed"; else nok "temporary artifacts are removed"; fi
 
 printf '\nCodex adapter: read-only strong phase\n'
-run_adapter architect design 0 text
+run_adapter architect gpt-5.6-sol high 0 text
 ARGS="$(cat "$TMP/args")"
-assert_contains "design maps to Sol" "$ARGS" 'ARG:gpt-5.6-sol'
-assert_contains "design effort is high" "$ARGS" 'ARG:model_reasoning_effort="high"'
+assert_contains "a second pair: model" "$ARGS" 'ARG:gpt-5.6-sol'
+assert_contains "a second pair: effort" "$ARGS" 'ARG:model_reasoning_effort="high"'
 assert_contains "an architect is read-only" "$ARGS" 'ARG:read-only'
 assert_contains "schema-less final text is returned" "$RUN_OUT" '"output":"plain final answer"'
 
-printf '\nCodex adapter: default tier\n'
-run_adapter reviewer '' 0 text
+printf '\nCodex adapter: a third model/effort pair\n'
+run_adapter reviewer gpt-5.6-terra medium 0 text
 ARGS="$(cat "$TMP/args")"
-assert_contains "default maps to Sol" "$ARGS" 'ARG:gpt-5.6-sol'
-assert_contains "default effort is high" "$ARGS" 'ARG:model_reasoning_effort="high"'
+assert_contains "a third pair: model" "$ARGS" 'ARG:gpt-5.6-terra'
+assert_contains "a third pair: effort" "$ARGS" 'ARG:model_reasoning_effort="medium"'
 
 printf '\nCodex adapter: fail-closed process and payload errors\n'
-run_adapter coder mechanical 1 nonzero
+run_adapter coder gpt-5.6-sol xhigh 1 nonzero
 assert_contains "nonzero exit is a failed result" "$RUN_OUT" '"ok":false'
 assert_contains "the exit code survives" "$RUN_OUT" '"exitCode":7'
-run_adapter coder mechanical 1 malformed
+run_adapter coder gpt-5.6-sol xhigh 1 malformed
 assert_contains "malformed structured output fails" "$RUN_OUT" 'final output was not the expected schema JSON'
-run_adapter coder mechanical 1 no-output
+run_adapter coder gpt-5.6-sol xhigh 1 no-output
 assert_contains "a missing final file fails" "$RUN_OUT" 'final output file was not written'
-run_adapter coder mechanical 1 timeout 50
+run_adapter coder gpt-5.6-sol xhigh 1 timeout 50
 assert_contains "a timed-out process is marked" "$RUN_OUT" '"timedOut":true'
 
 printf '\nCodex adapter: missing project constitution fails closed\n'
 mv "$TMP/CLAUDE.md" "$TMP/CLAUDE.saved"
-run_adapter coder mechanical 1 structured
+run_adapter coder gpt-5.6-sol xhigh 1 structured
 assert_rc "adapter returns a failure record" 0 "$RUN_RC"
 assert_contains "the phase is refused" "$RUN_OUT" 'Codex project constitution could not be read'
 assert_not_contains "the CLI was never spawned" "$(cat "$TMP/args")" 'CALL'
