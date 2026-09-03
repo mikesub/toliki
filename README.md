@@ -1,5 +1,7 @@
 # toliki
 
+![piglets.png](piglets.png)
+
 A self-hosted coding-agent harness that turns GitHub issues into merged PRs unattended.
 A VPS runs detached pipelines in tmux; cron drains the issue queue, runs one
 autonomous "epic" per issue to an open green PR, and a serial merge worker
