@@ -457,6 +457,23 @@ const codexVendor = {
 // step tables in etc/engines.json that pick a vendor per step.
 const VENDORS = { claude: claudeVendor, codex: codexVendor }
 
+// Whether a failed result looks like the infrastructure rather than the model:
+// true for a rate limit, a 5xx, an overload or a dropped connection in what the
+// CLI printed; false for a missing binary, a bad spawn, a timeout or a spent
+// turn budget; undefined when the output says nothing either way (runtime.mjs
+// then falls back to how fast the process died). Vendor knowledge stays here;
+// the retry policy lives in runtime.mjs.
+const TRANSIENT = /\b(429|500|502|503|504|529)\b|rate.?limit|overloaded|too many requests|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|EPIPE|socket hang up|fetch failed|network error|service unavailable|internal server error|bad gateway|gateway timeout|api_error/i
+const NOT_TRANSIENT = /not found on PATH|could not spawn|timed out|max.?turns|budget|adapter threw/i
+export function isTransient(result) {
+  if (!result || result.ok) return false
+  if (result.timedOut) return false
+  const text = `${result.reason || ''}\n${result.stderrTail || ''}`
+  if (NOT_TRANSIENT.test(text)) return false
+  if (TRANSIENT.test(text)) return true
+  return undefined
+}
+
 export function vendorNames() {
   return Object.keys(VENDORS)
 }

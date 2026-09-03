@@ -24,7 +24,7 @@
 // is the direction the merge gate is designed to fail in.
 
 import os from 'node:os'
-import { resolveEngine, resolveVendor, STEPS, terminateAll } from './engine.mjs'
+import { resolveEngine, resolveVendor, STEPS, terminateAll, isTransient } from './engine.mjs'
 import { validate } from './schema.mjs'
 
 // The run's engine: a name in etc/engines.json, chosen by --engine (dispatch
@@ -43,6 +43,13 @@ const MAX_PARALLEL_AGENTS = Number(process.env.EPIC_MAX_PARALLEL_AGENTS) ||
 // can legitimately boot a database tier. A step this long is pathological,
 // not slow.
 const DEFAULT_TIMEOUT_MS = Number(process.env.EPIC_AGENT_TIMEOUT_MS) || 90 * 60 * 1000
+
+// A step that died this quickly with no payload never got to work: an auth or
+// rate error, a crash at startup, a dropped connection. The one respawn below
+// covers those; a step that failed after minutes of work is usually the model
+// failing, and a timeout is never retried — a ninety-minute verify must not
+// double.
+const FAST_DEATH_MS = Number(process.env.EPIC_FAST_DEATH_MS) || 60 * 1000
 
 let SCRIPT = 'run'
 let SESSION = ''
@@ -140,11 +147,12 @@ export async function agent(prompt, opts = {}) {
     await acquire()
     const started = Date.now()
     try {
-      return await vendor.run({ prompt, agentType, model, effort, schema, cwd: process.cwd(), timeoutMs })
+      const r = await vendor.run({ prompt, agentType, model, effort, schema, cwd: process.cwd(), timeoutMs })
+      return { ...r, elapsedMs: Date.now() - started }
     } catch (e) {
       // An adapter is contracted not to throw; if one ever does, it must still
       // arrive at the call site as a null, not as an unwinding exception.
-      return { ok: false, output: null, reason: `adapter threw: ${e && e.message || e}`, stderrTail: '' }
+      return { ok: false, output: null, reason: `adapter threw: ${e && e.message || e}`, stderrTail: '', elapsedMs: Date.now() - started }
     } finally {
       release()
       const secs = Math.round((Date.now() - started) / 1000)
@@ -154,7 +162,22 @@ export async function agent(prompt, opts = {}) {
     }
   }
 
+  // One respawn for a transient death, then null. The adapter says what it can
+  // (a rate limit, a 5xx, a dropped connection); when it cannot tell, a death
+  // faster than FAST_DEATH_MS counts. Timeouts and a run that is shutting down
+  // are never retried. Every call site keeps its fail-closed branch: a step
+  // that dies twice is a dead step.
+  const retryable = (r) => {
+    if (shuttingDown || r.timedOut) return false
+    const verdict = isTransient(r)
+    return verdict === true || (verdict === undefined && r.elapsedMs < FAST_DEATH_MS)
+  }
+
   let r = await attempt()
+  if (!r.ok && retryable(r)) {
+    log(`${label}: ${r.reason} — respawning once (transient)`)
+    r = await attempt('transient retry')
+  }
   if (!r.ok) {
     log(`${label}: FAILED — ${r.reason}`)
     return null

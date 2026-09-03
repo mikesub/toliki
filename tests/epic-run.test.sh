@@ -128,6 +128,7 @@ n="$(cat "$STUB_STATE/$key.n" 2>/dev/null || echo 0)"
 printf '%s' "$((n + 1))" > "$STUB_STATE/$key.n"
 printf '%s' "$prompt" > "$STUB_STATE/$key.$n.prompt"
 
+if [[ -f "$STUB_FIXTURES/$key.$n.sleep" ]]; then sleep "$(cat "$STUB_FIXTURES/$key.$n.sleep")"; fi
 if [[ -f "$STUB_FIXTURES/$key.$n.rc" ]]; then exit "$(cat "$STUB_FIXTURES/$key.$n.rc")"; fi
 for f in "$STUB_FIXTURES/$key.$n.sh" "$STUB_FIXTURES/$key.sh"; do
   if [[ -f "$f" ]]; then bash "$f"; break; fi
@@ -483,7 +484,8 @@ run_pipeline "$EPIC_RUN" "$DEADLENS" --issue 42
 assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
 assert_contains "the blocker names the review phase" "$RUN_OUT" '"phase":"review"'
 assert_contains "the reason names the unreviewed lens" "$RUN_OUT" 'security + authorization'
-assert_eq "the lens was retried exactly once" 2 "$(calls lens-security)"
+assert_eq "the lens was respawned exactly once" 2 "$(calls lens-security)"
+assert_contains "the respawn was announced as transient" "$RUN_OUT" "respawning once (transient)"
 assert_contains "a blocker comment was posted" "$(gh_comments)" "🤖 epic-run blocked"
 assert_contains "it names the phase" "$(gh_comments)" "- phase: review"
 assert_contains "it says how to resume" "$(gh_comments)" "re-running /epic #42 resumes from it"
@@ -582,6 +584,32 @@ assert_contains "it blocks in the fixes phase" "$RUN_OUT" '"phase":"triage"'
 assert_contains "the reason names the red verify" "$RUN_OUT" 'red after the fixes and their retry'
 assert_eq "the fixer was spawned twice" 2 "$(calls triage)"
 assert_eq "nothing shipped a PR" "" "$(gh_pr_created)"
+
+scenario 'transient retry: a step that dies once is respawned once, then accepted'
+FLAKY="$TMP/fixtures-flaky"; cp -R "$BASE" "$FLAKY"
+printf '1' > "$FLAKY/design.0.rc"          # dies instantly, no payload
+run_pipeline "$EPIC_RUN" "$FLAKY" --issue 42
+assert_rc "the run still completes" 0 "$RUN_RC"
+assert_eq "design was spawned twice" 2 "$(calls design)"
+assert_contains "the respawn was announced" "$RUN_OUT" "design: exited 1"
+assert_contains "and named transient" "$RUN_OUT" "respawning once (transient)"
+
+scenario 'transient retry: a step that dies twice is a dead step'
+DEAD2="$TMP/fixtures-dead2"; cp -R "$BASE" "$DEAD2"
+printf '1' > "$DEAD2/design.0.rc"; printf '1' > "$DEAD2/design.1.rc"
+run_pipeline "$EPIC_RUN" "$DEAD2" --issue 42
+assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
+assert_eq "exactly two attempts, never a third" 2 "$(calls design)"
+assert_contains "it blocks in the architect phase" "$RUN_OUT" '"phase":"architect"'
+
+scenario 'transient retry: a timeout is never retried'
+SLOW="$TMP/fixtures-slow"; cp -R "$BASE" "$SLOW"
+printf '3' > "$SLOW/design.0.sleep"        # outlives a 1-second ceiling
+EPIC_AGENT_TIMEOUT_MS=1000 run_pipeline "$EPIC_RUN" "$SLOW" --issue 42
+assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
+assert_eq "one attempt only" 1 "$(calls design)"
+assert_contains "the reason says it timed out" "$RUN_OUT" "timed out"
+assert_not_contains "no respawn on a timeout" "$RUN_OUT" "respawning once (transient)"
 
 scenario 'epic-run: an off-schema payload is respawned once, then accepted'
 RETRY="$TMP/fixtures-retry"; cp -R "$BASE" "$RETRY"

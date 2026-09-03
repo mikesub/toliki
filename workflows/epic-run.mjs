@@ -728,26 +728,22 @@ try {
 
   // A finder that DIED must never look like a finder that found nothing. Coercing a null agent straight to []
   // hands the rest of the phase a clean bill of health for a lens that never ran, and the tally then ASSERTS a
-  // full N-lens review in the PR body — the diff ships looking reviewed through a lens it never saw. Retry once
-  // (these die from transient agent/API failures far more often than from anything reproducible), then fail
-  // closed: review is the only gate between code and an auto-opened PR, so a hole in it stops the run.
+  // full N-lens review in the PR body — the diff ships looking reviewed through a lens it never saw. The
+  // runtime respawns a transient death once; after that, fail closed: review is the only gate between code
+  // and an auto-opened PR, so a hole in it stops the run.
   const shortLens = i => LENSES[i].split(' (')[0]
-  const runLens = async (lens, i, attempt = 1) => {
+  const runLens = async (lens, i) => {
     const r = await agent(PROMPTS.review(requirement, lens, DIFF),
-      { label: `review:${i}${attempt > 1 ? ':retry' : ''}`, phase: 'Review', step: 'review', schema: FINDINGS_SCHEMA },
+      { label: `review:${i}`, phase: 'Review', step: 'review', schema: FINDINGS_SCHEMA },
     ).catch(() => null)
     if (r && Array.isArray(r.findings)) return r.findings
-    if (attempt === 1) {
-      log(`Review: lens "${shortLens(i)}" returned no result — retrying once.`)
-      return runLens(lens, i, 2)
-    }
     return null // sentinel: the lens died. Distinct from [], which means "ran, found nothing".
   }
 
   const lensResults = await parallel(LENSES.map((lens, i) => () => runLens(lens, i)))
   const deadLenses = lensResults.map((r, i) => (r === null ? i : -1)).filter(i => i >= 0)
   if (deadLenses.length) {
-    return await fail('review', `${deadLenses.length} of ${LENSES.length} review lenses produced no result after a retry (${deadLenses.map(shortLens).map(n => `"${n}"`).join(', ')}) — the diff was never reviewed through them. Refusing to ship a PR whose body would claim a full ${LENSES.length}-lens review.`)
+    return await fail('review', `${deadLenses.length} of ${LENSES.length} review lenses produced no result after a respawn (${deadLenses.map(shortLens).map(n => `"${n}"`).join(', ')}) — the diff was never reviewed through them. Refusing to ship a PR whose body would claim a full ${LENSES.length}-lens review.`)
   }
   const reviews = lensResults.flat()
 
