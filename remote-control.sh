@@ -32,6 +32,10 @@ Commands:
                            Refuses on a <repo>-epic-<N> session: use epic/fix.
   stop-all                 Stop every tmux session on the host.
   ls                       List all sessions with their repo and running/dead status.
+  usage [days] [engine]    Per-step token and time report from the host's
+                           ~/epic-usage.jsonl (read-only): which steps an average
+                           run spends its tokens on. Optional window in days and
+                           engine name, e.g. "usage 7 codex".
   epic <ref> --engine <e>  Run the epic pipeline on an issue, as session
                            <repo>-epic-<ref>. The manual override for dispatch's
                            ready queue. A ref starting with # isn't doubled.
@@ -143,6 +147,19 @@ else
     start|restart|ls|stop-all)
       ACTION="${POSITIONAL[0]}"
       SESSION="${POSITIONAL[1]:-}"
+      ;;
+    usage)
+      ACTION="usage"
+      USAGE_DAYS="${POSITIONAL[1]:-}"
+      USAGE_ENGINE="${POSITIONAL[2]:-}"
+      if [[ -n "$USAGE_DAYS" && ! "$USAGE_DAYS" =~ ^[0-9]+$ ]]; then
+        echo "[control] usage takes an optional number of days, then an optional engine" >&2
+        exit 1
+      fi
+      if [[ -n "$USAGE_ENGINE" ]] && ! engine_known "$USAGE_ENGINE"; then
+        echo "[control] usage: unknown engine '$USAGE_ENGINE' ($(engine_names | tr '\n' ' '))" >&2
+        exit 1
+      fi
       ;;
     stop|rm)
       ACTION="stop"                        # `rm` is an alias for stop
@@ -260,6 +277,13 @@ case "$ACTION" in
 esac
 
 case "$ACTION" in
+  usage)
+    # Read-only: the report script only reads the usage log.
+    REMOTE="node $HOST_CONTROL_DIR/workflows/usage-report.mjs"
+    [[ -z "$USAGE_DAYS" ]] || REMOTE+=" --since $(sq "${USAGE_DAYS}d")"
+    [[ -z "$USAGE_ENGINE" ]] || REMOTE+=" --engine $(sq "$USAGE_ENGINE")"
+    ssh "$HOST" "$REMOTE"
+    ;;
   next)
     REMOTE="$HOST_CONTROL_DIR/bin/dispatch.sh --route-next $(sq "$NEXT_ENGINE")"
     if [[ $HAVE_REPO -eq 1 ]]; then

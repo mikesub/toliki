@@ -29,6 +29,28 @@ export { terminateAll }
 
 export const HARNESS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..')
 
+// What a run cost, from each CLI's own report. Nulls where a CLI says nothing;
+// the usage log records them as unknown rather than as zero.
+const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null)
+function claudeUsage(envelope) {
+  const u = envelope && typeof envelope.usage === 'object' ? envelope.usage : null
+  const input = num(u?.input_tokens), output = num(u?.output_tokens)
+  const cacheRead = num(u?.cache_read_input_tokens), cacheCreate = num(u?.cache_creation_input_tokens)
+  const parts = [input, output, cacheRead, cacheCreate].filter(x => x !== null)
+  return {
+    tokens: { input, output, cacheRead, cacheCreate, total: parts.length ? parts.reduce((a, b) => a + b, 0) : null },
+    costUsd: num(envelope?.total_cost_usd),
+    turns: num(envelope?.num_turns),
+  }
+}
+// codex exec ends its progress stream with "Token usage: total=N input=N (+ N cached) output=N".
+function codexUsage(stderr) {
+  const m = String(stderr || '').match(/Token usage:\s*total=([\d,]+)(?:\s+input=([\d,]+))?(?:\s*\(\+\s*([\d,]+)\s*cached\))?(?:\s+output=([\d,]+))?/i)
+  const n = (s) => (s === undefined ? null : Number(String(s).replace(/,/g, '')))
+  if (!m) return { tokens: { input: null, output: null, cacheRead: null, cacheCreate: null, total: null }, costUsd: null, turns: null }
+  return { tokens: { input: n(m[2]), output: n(m[4]), cacheRead: n(m[3]), cacheCreate: null, total: n(m[1]) }, costUsd: null, turns: null }
+}
+
 // Pull the payload out of whatever the CLI printed. Tolerant on purpose: the
 // envelope is pinned (see the claude adapter's notes) but a version skew
 // between laptop and host must degrade to "could not parse", never to a wrong
@@ -342,22 +364,23 @@ const claudeVendor = {
     if (!envelope || typeof envelope !== 'object') {
       return { ok: false, output: null, exitCode: 0, timedOut: false, stderrTail, reason: 'output was not the expected JSON envelope' }
     }
+    const usage = claudeUsage(envelope)
     if (envelope.is_error) {
       const detail = Array.isArray(envelope.errors) && envelope.errors.length
         ? envelope.errors.join('; ')
         : String(envelope.result || envelope.subtype || 'unknown error')
-      return { ok: false, output: null, exitCode: 0, timedOut: false, stderrTail, reason: `${envelope.subtype || 'error'}: ${detail}` }
+      return { ok: false, output: null, exitCode: 0, timedOut: false, stderrTail, reason: `${envelope.subtype || 'error'}: ${detail}`, usage }
     }
 
     if (schema) {
       const structured = envelope.structured_output ?? jsonFromText(envelope.result)
       if (!structured || typeof structured !== 'object') {
-        return { ok: false, output: null, exitCode: 0, timedOut: false, stderrTail, reason: 'no structured output in a schema-carrying result' }
+        return { ok: false, output: null, exitCode: 0, timedOut: false, stderrTail, reason: 'no structured output in a schema-carrying result', usage }
       }
-      return { ok: true, output: structured, exitCode: 0, timedOut: false, stderrTail, reason: null }
+      return { ok: true, output: structured, exitCode: 0, timedOut: false, stderrTail, reason: null, usage }
     }
 
-    return { ok: true, output: String(envelope.result ?? ''), exitCode: 0, timedOut: false, stderrTail, reason: null }
+    return { ok: true, output: String(envelope.result ?? ''), exitCode: 0, timedOut: false, stderrTail, reason: null, usage }
   },
 }
 
@@ -411,6 +434,7 @@ const codexVendor = {
       const args = this.buildArgs({ charter, developerInstructions, model, effort, schemaFile, outputFile, cwd })
       const r = await execute({ bin: this.bin, args, prompt, cwd, timeoutMs, onStart })
       const stderrTail = String(r.stderr || '').trim().slice(-2000)
+      const usage = codexUsage(r.stderr)
 
       if (r.spawnError) {
         const enoent = r.spawnError.code === 'ENOENT'
@@ -422,26 +446,26 @@ const codexVendor = {
         }
       }
       if (r.timedOut) {
-        return { ok: false, output: null, exitCode: r.code, timedOut: true, stderrTail, reason: `timed out after ${Math.round(timeoutMs / 60000)} min (process group killed)` }
+        return { ok: false, output: null, exitCode: r.code, timedOut: true, stderrTail, reason: `timed out after ${Math.round(timeoutMs / 60000)} min (process group killed)`, usage }
       }
       if (r.code !== 0) {
-        return { ok: false, output: null, exitCode: r.code, timedOut: false, stderrTail, reason: `exited ${r.code}${stderrTail ? `: ${stderrTail.split('\n').pop()}` : ''}` }
+        return { ok: false, output: null, exitCode: r.code, timedOut: false, stderrTail, reason: `exited ${r.code}${stderrTail ? `: ${stderrTail.split('\n').pop()}` : ''}`, usage }
       }
 
       let finalText
       try {
         finalText = readFileSync(outputFile, 'utf8')
       } catch (e) {
-        return { ok: false, output: null, exitCode: 0, timedOut: false, stderrTail, reason: `final output file was not written: ${e.message}` }
+        return { ok: false, output: null, exitCode: 0, timedOut: false, stderrTail, reason: `final output file was not written: ${e.message}`, usage }
       }
       if (schema) {
         const structured = jsonFromText(finalText)
         if (!structured) {
-          return { ok: false, output: null, exitCode: 0, timedOut: false, stderrTail, reason: 'final output was not the expected schema JSON' }
+          return { ok: false, output: null, exitCode: 0, timedOut: false, stderrTail, reason: 'final output was not the expected schema JSON', usage }
         }
-        return { ok: true, output: stripCodexOptionalNulls(structured, schema), exitCode: 0, timedOut: false, stderrTail, reason: null }
+        return { ok: true, output: stripCodexOptionalNulls(structured, schema), exitCode: 0, timedOut: false, stderrTail, reason: null, usage }
       }
-      return { ok: true, output: finalText.trim(), exitCode: 0, timedOut: false, stderrTail, reason: null }
+      return { ok: true, output: finalText.trim(), exitCode: 0, timedOut: false, stderrTail, reason: null, usage }
     } catch (e) {
       return {
         ok: false, output: null, exitCode: null, timedOut: false, stderrTail: '',

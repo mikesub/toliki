@@ -105,6 +105,12 @@ lifecycle change. Follow-up issues ship with no labels and link back with a
   executed there by the orchestrator, never delegated to a model. The merge
   gate's inputs are counted from ship's structured deferral kinds. Gated by
   `tests/epic-run.test.sh`.
+- `workflows/lib/usage.mjs` appends one JSON line per agent spawn (step,
+  vendor, model, effort, tokens, seconds, cost) to `EPIC_USAGE_LOG`, default
+  `~/epic-usage.jsonl` on whichever machine ran the pipeline. Tuning data for
+  `etc/engines.json`, host-local, never written to GitHub.
+  `node workflows/usage-report.mjs` summarizes it per step;
+  `./remote-control.sh usage` runs that on the host.
 - `bin/launch.sh` is the only session-creation primitive; `bin/dispatch.sh` and
   `remote-control.sh` both go through it. It owns the pipeline worktree and
   the slot cap, refusing with exit 3. Gated by `tests/launch-epic.test.sh`.
@@ -245,7 +251,7 @@ an explicit request, never run:
 - `bin/update-claude.sh` except `-n`;
 - `bin/merge-worker.sh` or `bin/merge-tick.sh` in any mode.
 
-Safe on your own initiative: `remote-control.sh ls`, `bin/reap.sh -n`,
+Safe on your own initiative: `remote-control.sh ls`, `remote-control.sh usage`, `bin/reap.sh -n`,
 `bin/update-claude.sh -n`, `bin/resource-report.sh`, GitHub reads, and
 read-only tmux inspection (`ssh toliki 'tmux capture-pane -p -t <session>'`).
 If you think you may have touched the host, `ls` shows what is running and a

@@ -167,6 +167,7 @@ payload="$(printf '%s' "$prompt" | STUB_LOG=/dev/null "$STUB_CLAUDE")"
 rc=$?
 set -e
 (( rc == 0 )) || exit "$rc"
+printf 'Token usage: total=1,234 input=1,000 (+ 300 cached) output=234\n' >&2
 if [[ -n "$schema" ]]; then
   printf '%s' "$payload" | jq -c '.structured_output' > "$out"
 else
@@ -256,12 +257,13 @@ chmod +x "$TMP/bin/npm"
 
 # A success envelope carrying structured output, exactly the shape the CLI's
 # own result schema describes (see lib/engine.mjs).
+USAGE='"duration_ms":1200,"num_turns":3,"total_cost_usd":0.05,"usage":{"input_tokens":1000,"output_tokens":200,"cache_read_input_tokens":300,"cache_creation_input_tokens":100}'
 fixture() { # dir key structured-json
-  printf '{"type":"result","subtype":"success","is_error":false,"result":"ok","structured_output":%s}\n' "$3" > "$1/$2.json"
+  printf '{"type":"result","subtype":"success","is_error":false,"result":"ok",%s,"structured_output":%s}\n' "$USAGE" "$3" > "$1/$2.json"
 }
 # A success envelope with no structured output — what a schema-less step returns.
 fixture_text() { # dir key text
-  printf '{"type":"result","subtype":"success","is_error":false,"result":"%s"}\n' "$3" > "$1/$2.json"
+  printf '{"type":"result","subtype":"success","is_error":false,%s,"result":"%s"}\n' "$USAGE" "$3" > "$1/$2.json"
 }
 # What a step would have written to the worktree.
 fixture_sh() { # dir key script
@@ -320,11 +322,13 @@ run_pipeline() { # script fixtures-dir args...   (scenario knobs via GH_* env)
     GH_ISSUE_LABELS="${GH_ISSUE_LABELS:-ready}" \
     GH_BLOCKED_BY="${GH_BLOCKED_BY:-[]}" \
     GH_OPEN_PR_BRANCH="${GH_OPEN_PR_BRANCH:-}" \
+    EPIC_USAGE_LOG="$state/usage.jsonl" \
     node "$script" "$@" 2>&1
   )" || RUN_RC=$?
   STATE_DIR="$state"
 }
 calls() { cat "$STATE_DIR/$1.n" 2>/dev/null || echo 0; }
+usage_log() { cat "$STATE_DIR/usage.jsonl" 2>/dev/null || true; }
 gh_labels() { sort "$STATE_DIR/gh/labels" 2>/dev/null | tr '\n' ',' ; }
 gh_comments() { cat "$STATE_DIR/gh/comments" 2>/dev/null || true; }
 gh_issues_created() { cat "$STATE_DIR/gh/issues-created" 2>/dev/null || true; }
@@ -342,6 +346,17 @@ assert_eq "the fixes were checked once" 1 "$(calls fixcheck)"
 assert_contains "the tally records the fix check" "$RUN_OUT" "fix check: 1/1 fixes confirmed, 0 regression(s)"
 assert_contains "the fix check was handed the exact delta" "$(cat "$STATE_DIR/fixcheck.0.prompt")" "git diff "
 assert_contains "review.md carries the post-fix section" "$(cat "$WT/.epics/42-add-widget/review.md")" "## Post-fix check"
+# The usage log: one line per spawn, keyed by the engines.json step, never on GitHub.
+assert_eq "one usage record per spawn" 12 "$(usage_log | wc -l | tr -d ' ')"
+assert_eq "records name the engines.json steps" "architect:1 code:3 confirm-review:2 fixes-after-review:1 review:5" "$(usage_log | jq -r .step | sort | uniq -c | awk '{print $2":"$1}' | tr '\n' ' ' | sed 's/ $//')"
+assert_eq "tokens are what the CLI reported, all four kinds summed" "1600" "$(usage_log | jq -r 'select(.label=="architect:design") | .tokens.total')"
+assert_eq "cost and turns ride along" "0.05 3" "$(usage_log | jq -r 'select(.label=="architect:design") | "\(.costUsd) \(.turns)"')"
+assert_eq "every record carries the run, issue and engine" "12" "$(usage_log | jq -r 'select(.issue==42 and .engine=="claude" and (.runId|length)>0) | .step' | wc -l | tr -d ' ')"
+assert_not_contains "no usage went to GitHub" "$(cat "$GH_LOG")" "tokens"
+REPORT="$(node "$ROOT/workflows/usage-report.mjs" --log "$STATE_DIR/usage.jsonl")"
+assert_contains "the report groups by script" "$REPORT" "epic-run — 1 run(s): claude 1"
+assert_contains "and shows the review lenses as the biggest share" "$REPORT" "review"
+assert_contains "with percentages" "$REPORT" "41.7"
 assert_eq "all five lenses ran" 5 "$(( $(calls lens-correctness) + $(calls lens-simplicity) + $(calls lens-seam) + $(calls lens-acceptance) + $(calls lens-security) ))"
 # What the orchestrator did to the repo and the issue.
 assert_eq "origin holds the branch as ONE commit above main" 1 "$(origin_count epic/42-add-widget)"
@@ -394,6 +409,8 @@ assert_contains "Codex runs are ephemeral" "$CODEX_ARGV" "--ephemeral"
 assert_eq "all five Codex review lenses ran" 5 "$(( $(calls lens-correctness) + $(calls lens-simplicity) + $(calls lens-seam) + $(calls lens-acceptance) + $(calls lens-security) ))"
 assert_eq "no Claude process was spawned" 0 "$(wc -l < "$RUN_LOG" | tr -d ' ')"
 assert_eq "origin holds the squashed branch" 1 "$(origin_count epic/42-add-widget)"
+assert_eq "Codex tokens are parsed from its usage summary" "1234 1000 300 234" "$(usage_log | jq -r 'select(.label=="architect:design") | "\(.tokens.total) \(.tokens.input) \(.tokens.cacheRead) \(.tokens.output)"')"
+assert_eq "Codex records carry no cost" "null" "$(usage_log | jq -r 'select(.label=="architect:design") | .costUsd')"
 
 scenario 'epic-run: EPIC_ENGINE=codex routes every phase without a flag'
 EPIC_ENGINE=codex run_pipeline "$EPIC_RUN" "$BASE" --issue 42
@@ -597,6 +614,7 @@ printf '1' > "$FLAKY/design.0.rc"          # dies instantly, no payload
 run_pipeline "$EPIC_RUN" "$FLAKY" --issue 42
 assert_rc "the run still completes" 0 "$RUN_RC"
 assert_eq "design was spawned twice" 2 "$(calls design)"
+assert_eq "both attempts are in the usage log, the failed one marked" "false true" "$(usage_log | jq -r 'select(.label=="architect:design") | .ok' | tr '\n' ' ' | sed 's/ $//')"
 assert_contains "the respawn was announced" "$RUN_OUT" "design: exited 1"
 assert_contains "and named transient" "$RUN_OUT" "respawning once (transient)"
 

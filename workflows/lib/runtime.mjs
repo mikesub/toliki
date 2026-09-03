@@ -26,6 +26,7 @@
 import os from 'node:os'
 import { resolveEngine, resolveVendor, STEPS, terminateAll, isTransient } from './engine.mjs'
 import { validate } from './schema.mjs'
+import { recordUsage } from './usage.mjs'
 
 // The run's engine: a name in etc/engines.json, chosen by --engine (dispatch
 // passes the issue's label) or EPIC_ENGINE, claude when neither is set. Every
@@ -53,14 +54,18 @@ const FAST_DEATH_MS = Number(process.env.EPIC_FAST_DEATH_MS) || 60 * 1000
 
 let SCRIPT = 'run'
 let SESSION = ''
+let ISSUE = null
+// Groups the usage records of one run; unique per process, and a relaunch is a new run.
+const RUN_ID = `${Date.now().toString(36)}-${process.pid}`
 let shuttingDown = false
 
 const ts = () => new Date().toISOString().replace(/\.\d{3}Z$/, 'Z')
 
-export function initRuntime({ scriptName, sessionName, defaultEngine } = {}) {
+export function initRuntime({ scriptName, sessionName, defaultEngine, issue } = {}) {
   if (scriptName) SCRIPT = scriptName
   if (sessionName) SESSION = sessionName
   if (defaultEngine) ENGINE_NAME = defaultEngine
+  if (issue != null) ISSUE = issue
   // Resolve — and so validate the whole engines file — before status hooks or
   // the first phase can touch GitHub. Letting a bad table degrade to a null
   // first step would also leave the blocker reporter on that same table,
@@ -143,16 +148,19 @@ export async function agent(prompt, opts = {}) {
     return null
   }
 
+  let attempts = 0
   const attempt = async (why) => {
     await acquire()
     const started = Date.now()
+    attempts++
+    let r
     try {
-      const r = await vendor.run({ prompt, agentType, model, effort, schema, cwd: process.cwd(), timeoutMs })
-      return { ...r, elapsedMs: Date.now() - started }
+      r = await vendor.run({ prompt, agentType, model, effort, schema, cwd: process.cwd(), timeoutMs })
+      r = { ...r, elapsedMs: Date.now() - started }
     } catch (e) {
       // An adapter is contracted not to throw; if one ever does, it must still
       // arrive at the call site as a null, not as an unwinding exception.
-      return { ok: false, output: null, reason: `adapter threw: ${e && e.message || e}`, stderrTail: '', elapsedMs: Date.now() - started }
+      r = { ok: false, output: null, reason: `adapter threw: ${e && e.message || e}`, stderrTail: '', elapsedMs: Date.now() - started }
     } finally {
       release()
       const secs = Math.round((Date.now() - started) / 1000)
@@ -160,6 +168,16 @@ export async function agent(prompt, opts = {}) {
       // record of which model produced which artifact.
       log(`${label}${why ? ` (${why})` : ''}: ${secs}s [${vendorName} ${model}/${effort}]`)
     }
+    // One line in the usage log per spawn, failed ones included: they cost
+    // tokens too, and a retry that always costs a second spawn should show.
+    recordUsage({
+      ts: new Date(started).toISOString(), runId: RUN_ID, script: SCRIPT, session: SESSION || null, issue: ISSUE,
+      engine: ENGINE_NAME, step, label, attempt: attempts, vendor: vendorName, model, effort,
+      ok: !!r.ok, timedOut: !!r.timedOut, ms: r.elapsedMs,
+      tokens: r.usage?.tokens || { input: null, output: null, cacheRead: null, cacheCreate: null, total: null },
+      costUsd: r.usage?.costUsd ?? null, turns: r.usage?.turns ?? null,
+    })
+    return r
   }
 
   // One respawn for a transient death, then null. The adapter says what it can

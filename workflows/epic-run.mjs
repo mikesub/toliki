@@ -366,7 +366,7 @@ try {
   }
   throw e
 }
-initRuntime({ scriptName: 'epic-run', sessionName: ARGS.session, defaultEngine: ARGS.engine })
+initRuntime({ scriptName: 'epic-run', sessionName: ARGS.session, defaultEngine: ARGS.engine, issue: ARGS.issue })
 // The issue's live status comment mirrors the pane's narration: the label says
 // WHICH state the issue is in, this says whether the run is alive and where it
 // got to. Issue mode only — slug mode has no issue to report on.
