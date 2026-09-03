@@ -312,9 +312,20 @@ merge_one() {
   NEEDS_JUDGMENT=0
   NEEDS_CI_FIX=0
 
-  pr="$(gh pr list -R "$ORIGIN" --state open --json number,headRefName --limit 100 2>/dev/null \
-        | jq -r --arg pfx "epic/$issue-" '[.[] | select(.headRefName | startswith($pfx))][0].number // empty')" \
+  # Every open PR on the issue's branch prefix, not just the first: one issue is
+  # one branch is one PR, so two of them means something outside this worker's
+  # model happened, and picking one to merge would be a guess about which change
+  # the issue actually asked for.
+  local pr_nums pr_count
+  pr_nums="$(gh pr list -R "$ORIGIN" --state open --json number,headRefName --limit 100 2>/dev/null \
+        | jq -r --arg pfx "epic/$issue-" '[.[] | select(.headRefName | startswith($pfx))][].number')" \
     || die "$REPO: could not list open PRs — aborting the run"
+  pr_count="$(grep -c . <<<"$pr_nums" || true)"
+  if (( pr_count > 1 )); then
+    FAIL="$pr_count open PRs on epic/$issue-* branches (#$(tr '\n' ' ' <<<"$pr_nums" | sed 's/ $//' | sed 's/ / #/g')) — ambiguous, so nothing was merged; close the ones that do not deliver this issue"
+    return 1
+  fi
+  pr="$(head -n 1 <<<"$pr_nums")"
 
   if [[ -z "$pr" ]]; then
     # No open PR. Either it already merged and the issue simply did not close,

@@ -122,7 +122,9 @@ lifecycle change. Follow-up issues ship with no labels and link back with a
 - `bin/merge-worker.sh` is serial per repo, because every merge invalidates
   every other queued PR's green, and merges in its own worktree, never in the
   clone. Its one repair is `bin/merge-autoresolve.sh`; exit 4 is the judgment
-  class. Gated by `tests/merge-autoresolve.test.sh`.
+  class. Two open PRs on one issue is ambiguous and merges nothing. Gated by
+  `tests/merge-autoresolve.test.sh` for the resolver and
+  `tests/merge-worker.test.sh` for the state machine around it.
 - `setup.sh` (laptop) and `bin/provision.sh` (host) wire the same per-item
   symlinks for `skills/` and `agents/`. Keep them aligned.
 - `remote-control.sh` is the one script that runs on the laptop; everything in
@@ -228,7 +230,7 @@ lifecycle change. Follow-up issues ship with no labels and link back with a
 4. When the contract or its rationale changes, update this file, DOCTRINE.md,
    README, the template or the script header. Never leave an invariant only in
    a commit message.
-5. Run every relevant suite; run all eight before handing off a broad change.
+5. Run every relevant suite; run all nine before handing off a broad change.
 
 Trunk-based: when asked to commit or push, commit straight to `main` and push.
 No feature branches or PRs unless explicitly requested. Never commit or push
@@ -248,7 +250,7 @@ merely because the code is ready.
 
 ## Tests
 
-All eight suites are hermetic and need no network or credentials:
+All nine suites are hermetic and need no network or credentials:
 
 ```bash
 for t in tests/*.test.sh; do bash "$t" || exit; done
