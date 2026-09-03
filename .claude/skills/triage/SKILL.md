@@ -10,7 +10,7 @@ computed from current state only, with no look-back window and nothing written
 anywhere, so it reports the same truth whether it ran an hour ago or a week
 ago. This skill surfaces and suggests; it never relabels, merges, kills or
 launches sessions, and never runs `dispatch.sh`, `reap.sh` or
-`merge-worker.sh`. The allowed surface is exactly the harness CLAUDE.md's safe
+`merge-worker.sh`. The allowed surface is exactly the harness AGENTS.md's safe
 list: `gh` reads, `./remote-control.sh ls`, read-only `ssh` queries
 (`tmux capture-pane`, log tails). Laptop-side, like `remote-control.sh`.
 

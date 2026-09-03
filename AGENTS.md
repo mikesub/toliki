@@ -1,193 +1,249 @@
-# Codex project instructions
+# toliki project instructions
 
-## Start here
+Instructions for any agent working in this repository. Claude Code reaches this
+file through the pointer in `CLAUDE.md`; Codex reads it natively. Links are
+relative markdown links, never `@file` includes.
 
-Toliki is a self-hosted coding-agent harness. A VPS turns prepared GitHub
-issues into reviewed, verified pull requests using cron, tmux, git worktrees,
-plain Node orchestrators, and short-lived headless agent processes.
+## What this is
 
-Before changing the repository:
+Toliki is a self-hosted coding-agent harness. A VPS turns `ready` GitHub issues
+into reviewed, verified pull requests using cron, tmux, git worktrees, plain
+Node orchestrators and short-lived headless agent processes. There is no
+daemon, database, web UI or npm dependency tree. GitHub holds durable state;
+tmux holds live processes; git worktrees isolate runs.
 
-1. Read `DOCTRINE.md` before proposing a change to the pipeline's shape,
-   adding configuration, relaxing a gate, or revisiting a rejected design.
-2. Read the relevant section of `CLAUDE.md`. It is the detailed operational
-   manual and records production traps that are not obvious from the code.
-3. Trace the actual scripts and tests involved. Comments near the code often
-   explain a production incident or a load-bearing ordering choice.
+Two session kinds exist, and they must never be conflated:
 
-Do not treat this repository as a conventional application. It has no daemon,
-database, web UI, or npm dependency tree. GitHub holds durable state; tmux
-holds live processes; git worktrees isolate runs.
+- **Pipeline sessions** (`<repo>-epic-<N>`), launched by dispatch. The pane runs
+  `workflows/epic-run.mjs` or `workflows/fix-run.mjs`, which spawns one headless
+  agent process per step through the engine adapter. No interactive agent wraps
+  it and there is no steering channel; the only intervention is kill. Read one
+  with `tmux attach` or `capture-pane`: the pane holds the whole phase log and a
+  final `RESULT <json>` line.
+- **Interactive sessions** (pool names, or any `-m` message): a normal Claude
+  Code session started with `--remote-control`. The only place Remote Control
+  applies.
 
-## Sources of truth
+## Reading order
 
-- `DOCTRINE.md`: architectural principles and deliberately rejected options.
-- `CLAUDE.md`: detailed architecture, operations, and host safety rules.
-- `skills/spec/ISSUE-TRACKING.md`: issue slicing and dependency rules.
-- `workflows/*.mjs`: executable pipeline behavior and merge-gate inputs.
-- `etc/repos.conf.template` plus `etc/lib.sh`: tracked configuration contract.
-- `etc/engines.json`: the named engines — vendor/model/effort per pipeline
-  step. Tracked; an `engine:<name>` label resolves against it on every machine.
-- `etc/repos.conf`: private, machine-local data. It is gitignored; never commit
-  it or replace the template with its contents.
-- Tests are the regression contract for shell and pipeline behavior.
+- [DOCTRINE.md](DOCTRINE.md): why the harness has this shape and what was
+  rejected, with reasons. Read it before changing the pipeline's shape, adding
+  a config file, relaxing a gate or reopening a settled trade-off.
+- [skills/spec/ISSUE-TRACKING.md](skills/spec/ISSUE-TRACKING.md): authoritative
+  on how work is sliced and filed.
+- Script and module headers. Every `bin/*.sh` and `workflows/**/*.mjs` header
+  states its contract, its ordering choices and the incident behind them. The
+  code and its comments are the operational manual; this file holds only what
+  the code cannot show.
+- `etc/repos.conf.template` plus `etc/lib.sh`: the tracked configuration
+  contract. `etc/repos.conf` is machine-local and gitignored; never commit it or
+  overwrite the template with it.
+- `etc/engines.json`: the tracked table of named engines, one
+  `"<vendor>/<model>/<effort>"` row per pipeline step.
 
-When prose and executable behavior disagree, investigate rather than silently
-choosing one. Fix the stale side in the same change.
+When prose and executable behavior disagree, investigate and fix the stale side
+in the same change.
+
+## Glossary
+
+- **Epic**: one autonomous run of `epic-run.mjs` on one issue, ending at an open
+  PR or a blocker comment.
+- **Fixer**: a run of `fix-run.mjs` on a `needs-judgment` issue. It reuses the
+  epic's session name on purpose so every guard covers both.
+- **Engine**: a top-level key of `etc/engines.json`, selected per issue by the
+  `engine:<name>` label. An unlabeled issue uses `EPIC_ENGINE` from
+  `etc/dispatch.cron` (claude when unset). The label survives fixer retries.
+- **Step**: one of the seven pipeline steps in `STEPS` in
+  `workflows/lib/engine.mjs`. Pipelines name steps; the engine file says who
+  runs them; `STEPS` fixes each step's charter and tool boundary, so
+  architect, review and confirm-review stay read-only under any vendor.
+- **Charter**: an `agents/*.md` file, read on every phase. Missing or malformed
+  refuses the run.
+- **Package**: a directory whose `package.json` declares `scripts.verify`. The
+  only per-project contract; the pipeline discovers everything else from the
+  repo.
+- **Claim**: the unique commit prepare pushes to `epic/<N>-<slug>`. The ref is
+  the lock; labels are reporting.
+- **Slot**: one running tmux session, whoever started it. `MAX_PARALLEL_EPICS`
+  in `etc/repos.conf` is the budget, enforced only in `bin/launch.sh`.
+
+Lifecycle labels are owned by automation. Do not add or repurpose one.
+
+| label | meaning |
+| --- | --- |
+| `ready` | queued, unclaimed: the build queue |
+| `in-progress` | a run has claimed it |
+| `ready-to-merge` | PR open, gates cleared; the merge worker lands it unattended |
+| `ready-to-review` | PR open, something deferred or judgment-resolved; a human decides |
+| `failed` | blocked; needs a human |
+| `needs-judgment` | beside `failed`: the merge worker declined a judgment-class conflict; the fixer queue |
+| `fix-attempted` / `fix-retried` | the fixer's attempt ladder (one retry, then a human); never reset by automation |
+| issue closed | merged |
+
+`engine:<name>` is the separate routing namespace and is never cleared by a
+lifecycle change. Follow-up issues ship with no labels and link back with a
+`Follow-up to #N` line in the body.
 
 ## Architecture boundaries
 
 - `workflows/epic-run.mjs` and `workflows/fix-run.mjs` are plain Node
-  orchestrators. They must not name a model vendor directly.
-- `workflows/lib/engine.mjs` is the vendor boundary and the only file that
-  should know how a vendor CLI is invoked. Which vendor, model and effort runs
-  each pipeline step is a row of `etc/engines.json`; pipelines name only steps.
-- `workflows/lib/runtime.mjs` owns phase execution, concurrency, timeouts, and
-  signal forwarding. Keep deterministic control flow here or in ordinary
-  scripts, not inside model judgment.
-- `bin/launch.sh` is the only session-creation primitive. Both dispatch and the
-  laptop operator interface must continue to go through it.
-- `bin/dispatch.sh`, `bin/reap.sh`, and `bin/merge-tick.sh` are one operating
-  loop. A change to one must be checked against the other two.
-- `bin/merge-worker.sh` is serial per repository because every merge invalidates
-  the other queued PRs' prior green state.
-- `setup.sh` and `bin/provision.sh` install the same shared skills and agent
-  charters in different environments. Keep their wiring semantics aligned.
-
-Preserve the two session types:
-
-- Pipeline sessions run a Node orchestrator in a harness-owned worktree. They
-  are non-interactive and have no steering channel; the only live intervention
-  is to kill the run.
-- Interactive sessions run Claude Code with Remote Control. Do not accidentally
-  wrap a pipeline in an interactive agent or add a steering path.
+  orchestrators. They must not name a vendor.
+- `workflows/lib/engine.mjs` is the only file that knows how a vendor CLI is
+  invoked. Its loader validates `etc/engines.json` before any phase touches
+  GitHub. A Codex phase is ephemeral, sandboxed from the charter's tools, and
+  receives the target project's `CLAUDE.md` and `.claude/rules` as developer
+  instructions; a missing `CLAUDE.md` refuses the phase. Gated by
+  `tests/engine-codex.test.sh`.
+- `workflows/lib/runtime.mjs` owns phase execution, the concurrency gate,
+  timeouts and signal forwarding. Deterministic control flow lives here or in
+  scripts, never inside model judgment.
+- `bin/launch.sh` is the only session-creation primitive; `bin/dispatch.sh` and
+  `remote-control.sh` both go through it. It owns the pipeline worktree and
+  the slot cap, refusing with exit 3. Gated by `tests/launch-epic.test.sh`.
+- `bin/dispatch.sh`, `bin/reap.sh` and `bin/merge-tick.sh` are one operating
+  loop on a one-minute cron. Check a change to one against the other two.
+- `bin/merge-worker.sh` is serial per repo, because every merge invalidates
+  every other queued PR's green, and merges in its own worktree, never in the
+  clone. Its one repair is `bin/merge-autoresolve.sh`; exit 4 is the judgment
+  class. Gated by `tests/merge-autoresolve.test.sh`.
+- `setup.sh` (laptop) and `bin/provision.sh` (host) wire the same per-item
+  symlinks for `skills/` and `agents/`. Keep them aligned.
+- `remote-control.sh` is the one script that runs on the laptop; everything in
+  `bin/` runs on the host and never sshes.
+- `.claude/skills/triage` is deliberately project-level rather than in
+  `skills/`: an operator-only skill must not surface in every project.
 
 ## Non-negotiable behavior
 
 - Fail closed. A failed or unreadable dependency check, review lens, schema,
-  CI result, or conflict classification must never become a green gate.
-- Merge eligibility is computed from structured values in code. Do not replace
-  it with a model's qualitative sign-off.
-- GitHub issues, labels, `blocked_by` dependencies, refs, and PRs are the state
-  store. Do not add a second state database or duplicate project facts in
-  harness configuration.
-- Keep the issue model flat: one issue is one autonomous, mergeable,
-  independently verifiable change. Do not invent tracking labels, milestones,
-  parent issues, or sub-issues.
-- The lifecycle label namespace belongs to automation. Its current meanings are
-  documented in `CLAUDE.md`; do not add or repurpose a label casually.
-- A target package is discovered by a `package.json` containing
-  `scripts.verify`. An empty discovery must fail, never silently skip checks.
-- Verification owns only its worktree. Any external resource used by a target
-  project's verification—ports, containers, `/tmp` paths, global caches, or
-  remote fixtures—must be namespaced per worktree or protected by a host-wide
-  lock in that target project.
-- Crons observe and deterministic scripts gate; models act only where judgment
-  is required.
-- Mechanical conflict resolution must remain containment-gated. If both sides'
-  intent cannot be proven to survive, escalate instead of guessing.
-- A fixer never merges and never restores unattended merge eligibility. A
-  judgment-resolved PR returns as `ready-to-review`.
+  CI conclusion, ref listing, routing label or conflict classification is never
+  a green gate. Gated by `tests/dispatch-engine.test.sh` and
+  `tests/epic-run.test.sh`.
+- Merge eligibility is computed from structured counts in `epic-run.mjs`.
+  Never replace it with a model's sign-off.
+- GitHub is the state store: issues, labels, `blocked_by`, claim refs, PRs. No
+  second database, and no per-project facts in harness configuration.
+- Flat issue model: one issue is one autonomous, mergeable, independently
+  verifiable change. No milestones, boards, parent issues or sub-issues.
+- Verification owns only its worktree and runs concurrently with other
+  worktrees and other repos on one box. Anything a project's verify reaches
+  outside (ports, containers, `/tmp` paths, caches, remote fixtures) must be
+  namespaced per worktree or serialized on a host-wide `flock`, in that
+  project, and must stay correct where the harness is absent.
+- Crons watch, deterministic scripts gate, models act only where judgment is
+  required.
+- Mechanical conflict resolution stays containment-gated. If both sides' intent
+  cannot be proven to survive, escalate instead of guessing.
+- A fixer never merges and never restores unattended eligibility: it lands
+  `ready-to-review`, and its push is the last step after verify and the
+  adversarial check.
+- Every cleanup needs a positive proof of staleness: a claim ref only while its
+  tip is still the claim commit and no session is live; a worktree only when its
+  issue has no `epic/<N>-*` ref on origin at all. Liveness is read from tmux
+  before any GitHub query. Gated by `tests/reap-worktree.test.sh`.
+- Terminal is the label, and a terminal label must settle for
+  `TERMINAL_SETTLE_MINUTES` before a session is killed.
+- Dispatch launches but never claims. Two ticks racing on one issue is safe
+  because the ref push decides.
+- The CLI binary moves only on an idle host, under dispatch's lock. Gated by
+  `tests/update-claude.test.sh`.
+- Provisioning never upgrades a version already present, and never sets a
+  consent flag. Gated by `tests/provision-agent-clis.test.sh`.
+
+## Traps the code cannot show you
+
+- Adding a repo takes `REPOS` and `REPO_ORIGINS` lines in the host's
+  `etc/repos.conf`, a `bin/provision.sh` run, and one interactive `claude` in
+  the clone to accept workspace trust. An untrusted clone makes every
+  interactive session die instantly while `start` reports success.
+- Bypass-permissions consent is per host and deadlocks interactive sessions
+  silently. Accept it once by hand; `provision.sh` reports it but never sets it.
+- Every registered repo must auto-delete merged branches (Settings, General).
+  With it off, reap never collects a worktree and the disk fills.
+- Install `etc/dispatch.cron` by hand, all three pipeline lines or none. Its
+  `PATH=` must reach `node`, `claude` and `codex`.
+- `EPIC_ENGINE` must be a key of `etc/engines.json`, or `etc/lib.sh` refuses to
+  load on every tick.
+- Claude model names in `etc/engines.json` are CLI aliases resolved by the
+  installed binary, so a stale binary silently turns them into pins.
+- The Docker GC policy loads only on a full daemon restart, and unknown keys
+  are dropped silently. Verify with `docker buildx inspect`.
+- Shared skills and agents are user-level symlinks per item; a project-local
+  copy silently shadows the shared one. Only `spec` is model-invocable.
+- Never invent a second session-name pattern: reap, dispatch and the cap all key
+  on `<repo>-epic-<N>`.
 
 ## Change workflow
 
-1. Inspect the working tree first and preserve unrelated user changes.
-2. Make the smallest coherent change that respects the doctrine and existing
-   boundaries.
-3. Add or update a hermetic regression test for behavior changes. If a gate or
-   refusal path is added, add a scenario proving both its pass and stop paths.
-4. Update `CLAUDE.md`, `DOCTRINE.md`, README, templates, or script comments when
-   the operational contract or rationale changes. Do not leave a new invariant
-   only in a commit message.
+1. Inspect the working tree first and preserve unrelated changes.
+2. Make the smallest coherent change that respects the doctrine and the
+   boundaries above.
+3. A behavior change gets a hermetic regression test. A new gate or refusal
+   path gets both its pass and its stop scenario.
+4. When the contract or its rationale changes, update this file, DOCTRINE.md,
+   README, the template or the script header. Never leave an invariant only in
+   a commit message.
 5. Run every relevant suite; run all eight before handing off a broad change.
 
-This repository uses trunk-based development. If the user asks for a commit or
-push, commit directly on `main` and push normally; do not create a feature
-branch or PR unless explicitly requested. Never commit or push merely because
-the code is ready.
+Trunk-based: when asked to commit or push, commit straight to `main` and push.
+No feature branches or PRs unless explicitly requested. Never commit or push
+merely because the code is ready.
 
-## Implementation conventions
+## Conventions
 
-- Shell scripts are Bash and generally use `set -euo pipefail`. Quote paths and
-  variables, preserve explicit exit-code contracts, and keep macOS Bash 3.2
-  portability where the existing code supports laptop-side execution.
-- `flock` is host-side/Linux behavior. Hermetic macOS tests must stub it.
-- Node workflow code is ESM and intentionally has no npm dependencies. Prefer
-  the standard library and the small modules in `workflows/lib/`.
-- Structured agent output must have an explicit schema and be validated. A
-  missing or malformed response must have a bounded retry or blocker path.
-- Preserve signal forwarding and process-group cleanup when changing process
-  execution or timeouts.
-- Prefer idempotent operations and force-with-lease over unguarded destructive
-  writes. Every cleanup action needs a positive proof that the target is stale
-  or delivered.
-- Keep machine-local values in `etc/repos.conf`; keep helpers and defaults in
-  tracked files.
-- Do not copy shared skills or agent charters into a target project. A
-  project-local copy can silently shadow the canonical user-level version.
+- Preserve exit-code contracts and bash 3.2 portability wherever the laptop
+  runs a script. `flock` is Linux-only; hermetic tests stub it.
+- No npm dependencies.
+- Structured agent output has an explicit schema and a bounded retry or blocker
+  path.
+- Keep signal forwarding and process-group cleanup intact.
+- Idempotent operations and `--force-with-lease` over unguarded writes.
+- Machine-local values live in `etc/repos.conf`, never in tracked files.
+- Never copy a shared skill or charter into a target project.
 
 ## Tests
 
-All suites are hermetic and require no credentials or network:
+All eight suites are hermetic and need no network or credentials:
 
 ```bash
-for test_file in tests/*.test.sh; do
-  bash "$test_file" || exit
-done
+for t in tests/*.test.sh; do bash "$t" || exit; done
 ```
 
-The suites cover:
-
-- `tests/epic-run.test.sh`: both pipelines through a stub engine, including
-  model/charter/schema arguments and fail-closed paths.
-- `tests/engine-codex.test.sh`: Codex argv, model/effort pass-through,
-  sandbox/charter boundaries, strict-schema normalization, cleanup, and
-  failure paths.
-- `tests/dispatch-engine.test.sh`: next-epic selection, durable routing labels,
-  default/fixer inheritance, and unknown/conflicting-label refusal.
-- `tests/launch-epic.test.sh`: worktree/session launch shapes and capacity
-  probes.
-- `tests/merge-autoresolve.test.sh`: conflict classification, containment, and
-  real throwaway rebase stops.
-- `tests/reap-worktree.test.sh`: worktree collection and every deletion guard.
-- `tests/update-claude.test.sh`: idle-gated updater behavior.
-- `tests/provision-agent-clis.test.sh`: Claude/Codex installation and PATH
-  discovery plus Codex's headless authentication gate, all against fake
-  binaries and throwaway homes.
-
-Never weaken or delete a test to make a change pass. Test the host-facing shell
-scripts using fake executables placed first on `PATH` and throwaway repositories
-under `mktemp`; never point a test at the real registry or host.
+Stub host-facing binaries with fake executables placed first on `PATH` and use
+throwaway repositories under `mktemp`; never point a test at the real registry
+or host. Never weaken or delete a test to make a change pass. Do not stub with
+zsh shell functions: zsh cannot export them, so a child Bash calls the real
+`ssh`.
 
 ## Live-host safety
 
 The user's tmux sessions and GitHub queues are live production state. Without
-an explicit request, never run or invoke:
+an explicit request, never run:
 
-- `remote-control.sh start`, `epic`, `fix`, `next`, `stop`, `restart`, or `stop-all`;
-- `bin/dispatch.sh` except with `--dry-run` (`--route-next` and `--route-issue` mutate labels);
-- `bin/reap.sh` except with `-n`;
-- `bin/update-claude.sh` except with `-n`;
+- `remote-control.sh start`, `epic`, `fix`, `next`, `stop`, `restart`,
+  `stop-all`, or a bare `<name>`;
+- `bin/dispatch.sh` except `--dry-run` (`--route-next` and `--route-issue`
+  mutate labels);
+- `bin/reap.sh` except `-n`;
+- `bin/update-claude.sh` except `-n`;
 - `bin/merge-worker.sh` or `bin/merge-tick.sh` in any mode.
 
-Safe read-only operations include `remote-control.sh ls`, `bin/reap.sh -n`,
-`bin/update-claude.sh -n`, `bin/resource-report.sh`, GitHub queue reads, and
-plain tmux inspection over SSH.
-
-Do not use shell-function stubs from zsh for host-facing tests: zsh cannot
-export them to a child Bash process, which can silently call the real `ssh`.
-Use fake executables on `PATH` instead.
+Safe on your own initiative: `remote-control.sh ls`, `bin/reap.sh -n`,
+`bin/update-claude.sh -n`, `bin/resource-report.sh`, GitHub reads, and
+read-only tmux inspection (`ssh toliki 'tmux capture-pane -p -t <session>'`).
+If you think you may have touched the host, `ls` shows what is running and a
+clone's `.git/FETCH_HEAD` mtime marks its last launch.
 
 ## Review focus
 
 When reviewing changes, prioritize:
 
 - a failure path that accidentally becomes success;
-- a race between dispatch, reap, launch, and merge;
-- stale-green CI being accepted after a rebase;
+- a race between dispatch, reap, launch and merge;
+- stale-green CI accepted after a rebase;
 - cleanup without a positive safety proof;
 - loss of one side's intent during conflict resolution;
-- unbounded retries, parallelism, or host resource use;
+- unbounded retries, parallelism or host resource use;
 - divergence between laptop setup and host provisioning;
 - vendor-specific behavior leaking outside the engine adapter;
-- tests that could reach SSH, GitHub, a real clone, or a live tmux server.
+- tests that could reach SSH, GitHub, a real clone or a live tmux server.

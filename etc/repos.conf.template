@@ -8,7 +8,7 @@
 # host>. The first entry is the default when -r/--repo isn't given. To add a
 # repo: add a line here AND one to REPO_ORIGINS below, re-run bin/provision.sh
 # on the host to clone it, then run `claude` once in the clone over ssh to
-# accept the workspace-trust dialog (see CLAUDE.md — skipping that makes every
+# accept the workspace-trust dialog (see AGENTS.md — skipping that makes every
 # session in it die instantly and look started).
 # A plain array rather than `declare -A` so this stays portable to bash 3.2
 # (macOS) and the order is stable for usage/error text.

@@ -83,12 +83,13 @@ gh repo clone mikesub/toliki && cd toliki
 
 ## Reading order
 
-- **`AGENTS.md`** — Codex's project-development instructions: source-of-truth
-  map, architecture boundaries, verification workflow, and live-host safety.
+- **`AGENTS.md`** — the project instructions for any agent (`CLAUDE.md` is a
+  pointer to it): reading order, glossary, boundaries, invariants, the
+  operational traps the code cannot show, and live-host safety.
 - **`DOCTRINE.md`** — why this exists, the principles, and the alternatives
   that were considered and rejected, with reasons.
-- **`CLAUDE.md`** — how every piece actually works, including the operational
-  traps that only show up when you run it.
+- **`bin/`, `etc/`** — the host-side scripts and config; each header states
+  its contract and the incident behind it.
 - **`workflows/`** — the two pipelines and the small runtime they sit on
   (the engine adapter, the concurrency gate, structured-output validation).
 - **`skills/`, `agents/`** — the shared content: `/spec` (the human gate), the

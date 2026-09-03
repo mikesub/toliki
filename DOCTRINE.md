@@ -2,10 +2,10 @@
 
 Typing code is no longer the constraint; deciding what to build and checking
 what comes back is. The harness splits those two jobs and puts a durable queue
-between them: a human writes specs, a VPS builds them unattended. `CLAUDE.md`
-says how the pieces work; this file says why they have this shape, and records
-what was considered and turned down — so rejections don't get re-litigated
-from memory.
+between them: a human writes specs, a VPS builds them unattended. `AGENTS.md`
+and the script headers say how the pieces work; this file says why they have
+this shape, and records what was considered and turned down — so rejections
+don't get re-litigated from memory.
 
 ## What it does
 
@@ -123,6 +123,7 @@ Declined:
 
 ## The rest
 
-- `CLAUDE.md` — how every piece works today, including the operational traps.
+- `AGENTS.md` — the working rules, the glossary, and the traps the code cannot
+  show; the script headers in `bin/` and `workflows/` hold the rest.
 - `skills/spec/ISSUE-TRACKING.md` — authoritative on how work is sliced and
   filed.
