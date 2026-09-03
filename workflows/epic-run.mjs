@@ -5,7 +5,8 @@
 // Issue mode (`--issue N`): preflight (closed? blocked_by?) → branch
 // epic/<N>-<slug> off origin/main and claim it by pushing the ref (atomic; a
 // run that loses the race skips), resuming an existing branch when one is left
-// over → checkpoint commits after code/fixes → squashed single-commit PR at
+// over — and skipping architect and code when that branch already carries a
+// code checkpoint → checkpoint commits after code/fixes → squashed single-commit PR at
 // ship + blocker-comment → merge gate labels the issue ready-to-merge when
 // nothing was deferred, ready-to-review when a human must decide.
 // Manual mode (`--slug S`): builds on the current tree, no git; needs
@@ -433,6 +434,7 @@ async function prepare(issue) {
     .split('\n').map(l => l.trim().split(/\s+/)[1]).filter(Boolean).map(r => r.replace(/^refs\/heads\//, ''))
   let branch = local[0] || remote[0] || null
   let resumed = false
+  let codeDone = false
   if (branch) {
     slug = branch.slice('epic/'.length)
     let sw
@@ -464,6 +466,10 @@ async function prepare(issue) {
       return { refused: `resume rebase onto origin/main conflicted — resolve manually on ${branch} or delete it for a fresh build` }
     }
     resumed = true
+    // A code checkpoint on the branch means an earlier run finished design and implementation; the
+    // expensive phases are not repeated, the verify gate re-proves the tree and review takes it from there.
+    const subjects = (await gitOut(['log', '--format=%s', 'origin/main..HEAD'], 'git log')).split('\n')
+    codeDone = subjects.some(s => new RegExp(`^wip\\(epic ${slug.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\): (code|triage) checkpoint$`).test(s.trim()))
   } else {
     slug = slugify(issue, view.title)
     branch = `epic/${slug}`
@@ -495,7 +501,7 @@ async function prepare(issue) {
 
   const packages = discoverPackages('.')
   const depLines = packages.length ? await ensureDeps(packages, { pairs: [[base, 'HEAD']] }) : []
-  return { slug, branch, resumed, requirement: readRequirements(dir), packages, depLines }
+  return { slug, branch, resumed, codeDone, requirement: readRequirements(dir), packages, depLines }
 }
 
 // Squash, push, open the PR, record deferrals, label — from ship's JSON.
@@ -645,6 +651,8 @@ async function fail(phase, reason) {
 // are the deferred list (nothing else records it) and the blocker report.
 
 let requirement
+// True when the resumed branch already carries a code checkpoint: architect, red and green are skipped.
+let codeDone = false
 // Discovered layout: which packages the verify gate runs in. Fail closed, like every other gate in this
 // file: an empty package list would make the verify gate a silent no-op — the run finishes "green"
 // having verified nothing.
@@ -675,7 +683,8 @@ try {
     if (badLayout) return await fail('prepare', badLayout)
     slug = prep.slug
     requirement = prep.requirement
-    log(`Prepare: requirements written, branch epic/${slug} ${prep.resumed ? 'resumed and rebased onto origin/main' : 'created off origin/main'}, deps checked (${prep.depLines.join('; ')}). Packages: ${pkgList(packages)}.`)
+    codeDone = !!prep.codeDone
+    log(`Prepare: requirements written, branch epic/${slug} ${prep.resumed ? 'resumed and rebased onto origin/main' : 'created off origin/main'}${codeDone ? ' (a code checkpoint is on it)' : ''}, deps checked (${prep.depLines.join('; ')}). Packages: ${pkgList(packages)}.`)
   }
 
   const dir = epicDir(slug)
@@ -704,17 +713,29 @@ try {
     log(`Packages: ${pkgList(packages)}.`)
   }
 
-  const design = await agent(PROMPTS.architectDesign(dir),
-    { label: 'architect:design', phase: 'Architect', step: 'architect', schema: DESIGN_SCHEMA },
-  )
-  if (!design) return await fail('architect', 'Architect design failed — aborting before code.')
+  let design
+  if (codeDone) {
+    // The design was made by the run that left the checkpoint. Its architecture.md survives when the
+    // worktree was reused (the host reuses one per issue); otherwise the PR body says where the
+    // approach came from.
+    const archFile = path.join(dir, 'architecture.md')
+    const m = existsSync(archFile) ? readFileSync(archFile, 'utf8').match(/^Approach: (.+?) — (.+)$/m) : null
+    design = m ? { approach: m[1], rationale: m[2] } : { approach: 'resumed from a code checkpoint', rationale: 'design and implementation were completed by an earlier run of this branch.' }
+    updateEpicMd(dir, { phase: 'architect → skipped', approach: design.approach, log: 'architect: skipped, the branch carries a code checkpoint' })
+    log(`Architect: skipped — the branch carries a code checkpoint (${design.approach}).`)
+  } else {
+    design = await agent(PROMPTS.architectDesign(dir),
+      { label: 'architect:design', phase: 'Architect', step: 'architect', schema: DESIGN_SCHEMA },
+    )
+    if (!design) return await fail('architect', 'Architect design failed — aborting before code.')
 
-  // Rendered here from the decided design: red and green both read architecture.md, so it exists
-  // before either runs, verbatim to what the architect returned.
-  renderArchitecture(dir, design)
-  updateEpicMd(dir, { phase: 'architect → done', approach: design.approach, log: `architect: ${design.approach}` })
-  if (!existsSync(path.join(dir, 'architecture.md'))) return await fail('architect', 'architecture.md was not written — aborting before code, which reads it.')
-  log(`Architecture: ${design.approach} — ${design.rationale}`)
+    // Rendered here from the decided design: red and green both read architecture.md, so it exists
+    // before either runs, verbatim to what the architect returned.
+    renderArchitecture(dir, design)
+    updateEpicMd(dir, { phase: 'architect → done', approach: design.approach, log: `architect: ${design.approach}` })
+    if (!existsSync(path.join(dir, 'architecture.md'))) return await fail('architect', 'architecture.md was not written — aborting before code, which reads it.')
+    log(`Architecture: ${design.approach} — ${design.rationale}`)
+  }
 
   // ───────────────────────── Phase 2: Code (red → green → checkpoint) ─────────────────────────
   currentPhase = 'code'
@@ -732,29 +753,41 @@ try {
   // — they test nothing, and every later gate would be verifying against them. Necessary, not sufficient:
   // an exit code cannot tell an unmet assertion from a missing import, which is why the prompt still asks
   // the agent to confirm the reason.
-  let red = await agent(PROMPTS.codeRed(dir),
-    { label: 'code:red', phase: 'Code', step: 'code' },
-  )
-  if (!red) return await fail('code', 'Red step failed — no tests written, aborting before implementation.')
-  let gate = await verifyGate('Code: red gate')
-  if (gate.green) {
-    log('Code: the red tests pass against a tree with no implementation — respawning the red step once.')
-    red = await agent(PROMPTS.codeRed(dir) + PROMPTS.redRetry(gate),
-      { label: 'code:red:retry', phase: 'Code', step: 'code' },
+  let red = null
+  let green = null
+  let gate
+  if (codeDone) {
+    // The checkpoint is the implementation. Re-prove it rather than trust it: the branch was rebased
+    // onto a main that may have moved, so the gate runs exactly as it would after green.
+    log('Code: resumed from a code checkpoint — architect, red and green skipped; re-running the verify gate.')
+    red = 'the tests already on this branch'
+    green = 'resumed from a code checkpoint'
+    gate = await verifyGate('Code: verify gate (resumed)')
+  } else {
+    red = await agent(PROMPTS.codeRed(dir),
+      { label: 'code:red', phase: 'Code', step: 'code' },
     )
-    if (!red) return await fail('code', 'Red step failed on its retry — no tests written, aborting before implementation.')
-    gate = await verifyGate('Code: red gate (retry)')
-    if (gate.green) return await fail('code', `the red tests pass before any implementation exists, twice (${gate.detail}) — they do not test the change, so nothing downstream would be verified against it.`)
-  }
-  log('Code: red tests written; verify is red as it should be.')
+    if (!red) return await fail('code', 'Red step failed — no tests written, aborting before implementation.')
+    gate = await verifyGate('Code: red gate')
+    if (gate.green) {
+      log('Code: the red tests pass against a tree with no implementation — respawning the red step once.')
+      red = await agent(PROMPTS.codeRed(dir) + PROMPTS.redRetry(gate),
+        { label: 'code:red:retry', phase: 'Code', step: 'code' },
+      )
+      if (!red) return await fail('code', 'Red step failed on its retry — no tests written, aborting before implementation.')
+      gate = await verifyGate('Code: red gate (retry)')
+      if (gate.green) return await fail('code', `the red tests pass before any implementation exists, twice (${gate.detail}) — they do not test the change, so nothing downstream would be verified against it.`)
+    }
+    log('Code: red tests written; verify is red as it should be.')
 
-  // Green: implement against architecture + the red tests, then pass the gate. Single agent to keep the
-  // working tree coherent. Then the gate: verify must be GREEN, by this script's own run.
-  let green = await agent(PROMPTS.codeGreen(dir, red, pkgList(packages)),
-    { label: 'code:green', phase: 'Code', step: 'code' },
-  )
-  if (!green) return await fail('code', 'Green step failed — implementation did not complete, aborting before review.')
-  gate = await verifyGate('Code: verify gate')
+    // Green: implement against architecture + the red tests, then pass the gate. Single agent to keep the
+    // working tree coherent. Then the gate: verify must be GREEN, by this script's own run.
+    green = await agent(PROMPTS.codeGreen(dir, red, pkgList(packages)),
+      { label: 'code:green', phase: 'Code', step: 'code' },
+    )
+    if (!green) return await fail('code', 'Green step failed — implementation did not complete, aborting before review.')
+    gate = await verifyGate('Code: verify gate')
+  }
   if (!gate.green) {
     log('Code: verify is red after the green step — respawning green once with the failure.')
     green = await agent(PROMPTS.codeGreen(dir, red, pkgList(packages)) + PROMPTS.verifyRetry(gate),

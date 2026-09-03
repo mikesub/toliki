@@ -494,13 +494,38 @@ assert_eq "nothing was designed" 0 "$(calls design)"
 assert_eq "no branch landed on origin" "" "$(origin_ref epic/42-add-widget)"
 
 scenario 'epic-run: a leftover branch with real work is resumed, not restarted'
-seed_branch epic/42-add-widget main 'printf "leftover\n" > frontend/src/leftover.ts && git add -A && git commit -qm "wip(epic 42-add-widget): code checkpoint"'
+seed_branch epic/42-add-widget main 'printf "leftover\n" > frontend/src/leftover.ts && git add -A && git commit -qm "wip: epic blocked at architect"'
 run_pipeline "$EPIC_RUN" "$BASE" --issue 42
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_contains "prepare resumed the branch" "$RUN_OUT" 'resumed and rebased onto origin/main'
+assert_eq "design ran: the branch held no code checkpoint" 1 "$(calls design)"
 assert_eq "the resumed branch still squashes to one commit" 1 "$(origin_count epic/42-add-widget)"
 assert_contains "the leftover work is in the squashed tree" "$(git -C "$ORIGIN" ls-tree -r --name-only epic/42-add-widget)" "frontend/src/leftover.ts"
 assert_contains "and so is the new work" "$(git -C "$ORIGIN" ls-tree -r --name-only epic/42-add-widget)" "frontend/src/widget.ts"
+
+scenario 'resume: a branch with a code checkpoint skips architect, red and green'
+seed_branch epic/42-add-widget main 'printf "test(\"widget\", () => {})\n" > frontend/src/widget.test.ts && printf "export const createWidget = () => ({})\n" > frontend/src/widget.ts && git add -A && git commit -qm "wip(epic 42-add-widget): code checkpoint"'
+run_pipeline "$EPIC_RUN" "$BASE" --issue 42
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_contains "prepare saw the checkpoint" "$RUN_OUT" "a code checkpoint is on it"
+assert_contains "the code phase says what it skipped" "$RUN_OUT" "resumed from a code checkpoint — architect, red and green skipped"
+assert_eq "no design" 0 "$(calls design)"
+assert_eq "no red" 0 "$(calls red)"
+assert_eq "no green" 0 "$(calls green)"
+assert_contains "the gate still ran on the resumed tree" "$RUN_OUT" "Code: verify gate (resumed): verify green"
+assert_eq "review still ran in full" 5 "$(( $(calls lens-correctness) + $(calls lens-simplicity) + $(calls lens-seam) + $(calls lens-acceptance) + $(calls lens-security) ))"
+assert_contains "the run ships" "$RUN_OUT" '"readyToMerge":true'
+assert_eq "as one commit above main" 1 "$(origin_count epic/42-add-widget)"
+assert_contains "the PR body names where the design came from" "$(cat "$STATE_DIR/ship.0.prompt")" "resumed from a code checkpoint"
+
+scenario 'resume: a red code checkpoint gets one green attempt, then review'
+seed_branch epic/42-add-widget main 'printf "test(\"widget\", () => {})\n" > frontend/src/widget.test.ts && git add -A && git commit -qm "wip(epic 42-add-widget): code checkpoint"'
+run_pipeline "$EPIC_RUN" "$BASE" --issue 42
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_eq "no red" 0 "$(calls red)"
+assert_eq "green ran once, handed the failure" 1 "$(calls green)"
+assert_contains "the retry prompt carries the verify output" "$(cat "$STATE_DIR/green.0.prompt")" "missing export createWidget"
+assert_contains "the run ships" "$RUN_OUT" '"readyToMerge":true'
 
 scenario 'epic-run: a dead review lens fails the run closed and preserves the work'
 DEADLENS="$TMP/fixtures-deadlens"; cp -R "$BASE" "$DEADLENS"
