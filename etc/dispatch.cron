@@ -48,12 +48,15 @@
 #
 # cron hands a job PATH=/usr/bin:/bin and nothing else, which has neither agent
 # CLI (~/.local/bin, see provision.sh) nor node's global bins. This line has to
-# carry all three: node is the pane's orchestrator, and claude/codex are the
-# short-lived phase processes selected by the issue's routing label.
+# carry all of them: node is the pane's orchestrator, claude/codex are the
+# short-lived phase processes selected by the issue's routing label, and
+# ~/.bun/bin covers any registered repo whose scripts.verify shells out to
+# bun (bun's own installer puts it there, not ~/.local/bin — see
+# provision_bun in bin/provision-agent-clis.lib.sh).
 # Without it the session launches, the pane can't find its command, and it
 # shows up as `dead (at bash prompt)` in `./remote-control.sh ls` — the same
 # symptom as the workspace-trust trap, from a completely different cause.
-PATH=/home/ubuntu/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+PATH=/home/ubuntu/.local/bin:/home/ubuntu/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # The engine an unlabeled issue runs on: dispatch.sh's default, and launch.sh's
 # when --engine is absent. A name from etc/engines.json (the vendor/model/effort
 # table per pipeline step); unset means claude. A name the file does not know

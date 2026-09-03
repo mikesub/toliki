@@ -34,9 +34,9 @@ Usage: $0 [-h]
 
 Provisions this Ubuntu host for the coding-agent harness: system packages,
 node 24, gh, docker (+ build-cache GC), supabase CLI, Claude Code, Codex CLI,
-clones of the control repo and every repo in etc/repos.conf, and the ~/.claude
-wiring (skills/agents symlinks, CLAUDE_HARNESS_DIR). Safe to re-run; reports
-state and exits non-zero while any manual step is outstanding.
+Bun, clones of the control repo and every repo in etc/repos.conf, and the
+~/.claude wiring (skills/agents symlinks, CLAUDE_HARNESS_DIR). Safe to re-run;
+reports state and exits non-zero while any manual step is outstanding.
 EOF
 }
 
@@ -387,6 +387,13 @@ provision_claude_cli
 # under a fleet of live sessions. The engine adapter invokes this binary for
 # issues routed with engine:codex.
 provision_codex_cli
+
+# ------------------------------------------------------------------- Bun --
+
+# Not every registered repo is Node-only; a bun project's scripts.verify can
+# shell out to `bun test` etc. npm just execs the string regardless of
+# runtime, but the binary itself has to exist on the host.
+provision_bun
 
 # ------------------------------------------------------------- gh auth gate --
 

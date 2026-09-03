@@ -41,6 +41,15 @@ cat > "$HOME/.local/bin/claude" <<'CLAUDE'
 CLAUDE
 chmod +x "$HOME/.local/bin/claude"
 INSTALLER
+elif [[ "$*" == *"bun.sh/install"* ]]; then
+cat <<'INSTALLER'
+mkdir -p "$HOME/.bun/bin"
+cat > "$HOME/.bun/bin/bun" <<'BUN'
+#!/usr/bin/env bash
+[[ "$*" == "--version" ]] && echo "1.1.42"
+BUN
+chmod +x "$HOME/.bun/bin/bun"
+INSTALLER
 else
 cat <<'INSTALLER'
 mkdir -p "$HOME/.local/bin"
@@ -140,6 +149,64 @@ run_claude_case() {
       '
   )"
 }
+
+cat > "$TMP/bun-template" <<'BUN'
+#!/usr/bin/env bash
+[[ "$*" == "--version" ]] && echo "1.1.42"
+BUN
+
+run_bun_case() {
+  local name="$1" setup="${2:-}"
+  local home="$TMP/bun-home-$name" path="$TMP/bin:/usr/bin:/bin"
+  mkdir -p "$home"
+  rm -f "$INSTALL_LOG"
+
+  if [[ "$setup" == "path" ]]; then
+    mkdir -p "$home/on-path"
+    cp "$TMP/bun-template" "$home/on-path/bun"
+    chmod +x "$home/on-path/bun"
+    path="$home/on-path:$path"
+  elif [[ "$setup" == "local" ]]; then
+    mkdir -p "$home/.bun/bin"
+    cp "$TMP/bun-template" "$home/.bun/bin/bun"
+    chmod +x "$home/.bun/bin/bun"
+  fi
+
+  RUN_OUT="$(
+    HOME="$home" PATH="$path" INSTALL_LOG="$INSTALL_LOG" \
+      LIB="$ROOT/bin/provision-agent-clis.lib.sh" bash -c '
+        set -euo pipefail
+        say() { printf "SAY|%s\n" "$*"; }
+        ok() { printf "OK|%s\n" "$*"; }
+        changed() { printf "CHANGED|%s\n" "$*"; }
+        warn() { printf "WARN|%s\n" "$*"; }
+        blocked() { printf "BLOCKED|%s\n" "$*"; }
+        ver() { local out; out="$("$@" 2>/dev/null | head -n1)" || out=""; printf "%s" "${out:-?}"; }
+        source "$LIB"
+        provision_bun
+      '
+  )"
+}
+
+printf '\nexisting Bun on PATH\n'
+run_bun_case existing path
+assert_contains "reports the installed version" "$RUN_OUT" "OK|bun 1.1.42"
+assert_eq "does not invoke the installer" "" "$(cat "$INSTALL_LOG" 2>/dev/null || true)"
+
+printf '\nexisting local Bun outside PATH\n'
+run_bun_case local local
+assert_contains "finds the existing local binary" "$RUN_OUT" "OK|bun 1.1.42"
+assert_contains "warns that the persistent PATH is missing" "$RUN_OUT" "WARN|~/.bun/bin is not on PATH"
+assert_eq "does not reinstall the hidden existing binary" "" "$(cat "$INSTALL_LOG" 2>/dev/null || true)"
+
+printf '\nmissing Bun installs\n'
+run_bun_case install ""
+assert_contains "records the Bun install" "$RUN_OUT" "CHANGED|installed bun 1.1.42"
+assert_contains "uses Bun's installer URL" "$(cat "$INSTALL_LOG")" "https://bun.sh/install"
+
+printf '\nBun installer failure\n'
+INSTALL_FAIL=1 run_bun_case failure ""
+assert_contains "the install failure is a blocker" "$RUN_OUT" "BLOCKED|Bun install failed"
 
 printf '\nexisting Claude outside PATH\n'
 run_claude_case local local
