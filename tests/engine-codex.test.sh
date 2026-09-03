@@ -18,7 +18,7 @@ assert_rc() { if [[ "$2" == "$3" ]]; then ok "$1"; else nok "$1 (want rc $2, got
 
 mkdir -p "$TMP/bin"
 mkdir -p "$TMP/.claude/rules"
-printf 'PROJECT_CONSTITUTION_MARKER\n' > "$TMP/CLAUDE.md"
+printf 'PROJECT_INSTRUCTIONS_MARKER\n' > "$TMP/AGENTS.md"
 printf 'PROJECT_RULE_MARKER\n' > "$TMP/.claude/rules/safety.md"
 cat > "$TMP/bin/codex" <<'STUB'
 #!/usr/bin/env bash
@@ -106,7 +106,7 @@ assert_contains "the working root is explicit" "$ARGS" "ARG:$PHYSICAL_TMP"
 assert_contains "hidden multi-agent fan-out is disabled" "$ARGS" 'ARG:multi_agent'
 assert_contains "the secondary fan-out flag is disabled" "$ARGS" 'ARG:enable_fanout'
 assert_contains "the coder charter has developer-role delivery" "$ARGS" 'ARG:developer_instructions='
-assert_contains "the target CLAUDE.md reaches developer instructions" "$ARGS" 'PROJECT_CONSTITUTION_MARKER'
+assert_contains "the target AGENTS.md reaches developer instructions" "$ARGS" 'PROJECT_INSTRUCTIONS_MARKER'
 assert_contains "the target .claude/rules reach developer instructions" "$ARGS" 'PROJECT_RULE_MARKER'
 assert_contains "the task itself stays on stdin" "$(cat "$TMP/prompt")" 'adapter probe'
 SCHEMA="$(cat "$TMP/schema")"
@@ -140,13 +140,13 @@ assert_contains "a missing final file fails" "$RUN_OUT" 'final output file was n
 run_adapter coder gpt-5.6-sol xhigh 1 timeout 50
 assert_contains "a timed-out process is marked" "$RUN_OUT" '"timedOut":true'
 
-printf '\nCodex adapter: missing project constitution fails closed\n'
-mv "$TMP/CLAUDE.md" "$TMP/CLAUDE.saved"
+printf '\nCodex adapter: missing project instructions fail closed\n'
+mv "$TMP/AGENTS.md" "$TMP/AGENTS.saved"
 run_adapter coder gpt-5.6-sol xhigh 1 structured
 assert_rc "adapter returns a failure record" 0 "$RUN_RC"
-assert_contains "the phase is refused" "$RUN_OUT" 'Codex project constitution could not be read'
+assert_contains "the phase is refused" "$RUN_OUT" 'Codex project instructions could not be read'
 assert_not_contains "the CLI was never spawned" "$(cat "$TMP/args")" 'CALL'
-mv "$TMP/CLAUDE.saved" "$TMP/CLAUDE.md"
+mv "$TMP/AGENTS.saved" "$TMP/AGENTS.md"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

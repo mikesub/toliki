@@ -293,19 +293,21 @@ function loadCharter(agentType) {
   return charter
 }
 
-// Claude Code loads a target repo's CLAUDE.md and .claude/rules itself. Codex
-// discovers AGENTS.md instead, so relying on its native discovery would give
-// the two engines different project constitutions. Read the existing Claude
-// contract explicitly for Codex; missing/unreadable instructions fail closed.
+// A target project's instructions live in its AGENTS.md (CLAUDE.md is a
+// pointer to it) plus any .claude/rules it still keeps. Claude Code loads both
+// itself; Codex's own AGENTS.md discovery is a CLI setting rather than a
+// guarantee and never covers .claude/rules, so read both explicitly for Codex
+// so a Codex phase gets what a Claude phase gets. Missing or unreadable
+// instructions fail closed.
 function loadProjectInstructions(cwd) {
-  const constitution = path.join(cwd, 'CLAUDE.md')
+  const instructions = path.join(cwd, 'AGENTS.md')
   let body
   try {
-    body = readFileSync(constitution, 'utf8').trim()
+    body = readFileSync(instructions, 'utf8').trim()
   } catch (e) {
-    throw new Error(`Codex project constitution could not be read at ${constitution}: ${e.message}`)
+    throw new Error(`Codex project instructions could not be read at ${instructions}: ${e.message}`)
   }
-  if (!body) throw new Error(`Codex project constitution is empty at ${constitution}`)
+  if (!body) throw new Error(`Codex project instructions are empty at ${instructions}`)
 
   const ruleRoot = path.join(cwd, '.claude', 'rules')
   const rules = []
@@ -328,7 +330,7 @@ function loadProjectInstructions(cwd) {
   visit(ruleRoot)
 
   return [
-    `<project-constitution source="CLAUDE.md">\n${body}\n</project-constitution>`,
+    `<project-instructions source="AGENTS.md">\n${body}\n</project-instructions>`,
     ...rules.map(rule => `<project-rule source="${rule.file}">\n${rule.body}\n</project-rule>`),
   ].join('\n\n')
 }

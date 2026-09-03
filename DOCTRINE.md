@@ -69,7 +69,7 @@ don't get re-litigated from memory.
   already declares and goes stale silently. `etc/repos.conf` carries only
   what can't be discovered: clone paths and machine facts.
 - **No project rules here.** Compliance, deploy policy, conventions live in
-  each project's own `CLAUDE.md` and `.claude/rules/`; the harness asserts
+  each project's own `AGENTS.md` and `.claude/rules/`; the harness asserts
   only what is universal.
 - **No shared-resource guards here**, though the harness does assert the
   constraint that makes them necessary: a verify run owns its worktree and

@@ -77,19 +77,19 @@ const PROMPTS = {
    Issue #${issue} is labelled needs-judgment but no open PR delivers it (branch epic/${issue}-*). Resolve by hand; strip needs-judgment to take it out of the fixer queue.
 
    then \`gh issue edit ${issue} --remove-label in-progress --add-label failed 2>/dev/null || true\`, refused="no open PR on an epic/${issue}-* branch", refusalFinal=true, return. More than one → same treatment with refused="multiple open PRs on epic/${issue}-* branches — ambiguous".
-3. Attempt ladder + start signal, and this one is VERIFIED, not best-effort — it is the bound that keeps the fixer loop finite. attempt = 2 if \`fix-attempted\` is already in the labels, else 1. Ensure the labels exist (idempotent, each with \`2>/dev/null || true\`): \`gh label create fix-attempted --color FEF2C0 --description "a fixer session has attempted this conflict once"\`, \`gh label create fix-retried --color F9D0C4 --description "the fixer retry is spent — the next failure waits for a human"\`, \`gh label create in-progress --color FBCA04 --description "Actively being worked by epic-run"\`. Then ONE edit: \`gh issue edit ${issue} --add-label in-progress --add-label <fix-attempted|fix-retried by attempt> --remove-label failed\`. Then verify: \`gh issue view ${issue} --json labels --jq '[.labels[].name]'\` must contain in-progress and the ladder label you added, and not failed. If it does not, set refused="could not record the attempt (label write failed)" and return — an uncounted attempt must not run.
+3. Attempt ladder + start signal, VERIFIED, not best-effort — it is the bound that keeps the fixer loop finite. attempt = 2 if \`fix-attempted\` is already in the labels, else 1. Ensure the labels exist (idempotent, each with \`2>/dev/null || true\`): \`gh label create fix-attempted --color FEF2C0 --description "a fixer session has attempted this conflict once"\`, \`gh label create fix-retried --color F9D0C4 --description "the fixer retry is spent — the next failure waits for a human"\`, \`gh label create in-progress --color FBCA04 --description "Actively being worked by epic-run"\`. Then ONE edit: \`gh issue edit ${issue} --add-label in-progress --add-label <fix-attempted|fix-retried by attempt> --remove-label failed\`. Then verify: \`gh issue view ${issue} --json labels --jq '[.labels[].name]'\` must contain in-progress and the ladder label you added, and not failed. If it does not, set refused="could not record the attempt (label write failed)" and return — an uncounted attempt must not run.
 4. Git setup, in the session's own worktree (wherever you are — never cd elsewhere):
-   a. First scrub what a killed predecessor may have left: \`git rebase --abort 2>/dev/null || true\` — session name == worktree name, so a relaunched fixer inherits the previous run's worktree, and a leftover mid-rebase state makes every later step fail on cleanup instead of retrying (the same scrub merge-worker's ensure_worktree does). Then \`git fetch origin --prune\`.
+   a. Scrub what a killed predecessor may have left, since a relaunched fixer inherits the previous run's worktree: \`git rebase --abort 2>/dev/null || true\`. Then \`git fetch origin --prune\`.
    b. branch = the PR's headRefName; prHead = its headRefOid. Verify \`git rev-parse refs/remotes/origin/<branch>\` equals prHead — if not, set gitBlocked="branch <branch> moved under the fixer (PR head <prHead>, origin now <sha>)" and return (labels stay; the pipeline files the blocker).
    c. \`git checkout -f --detach <prHead>\` (force: a reused worktree may sit on stale state; everything real is committed).
-   d. mergeBase=$(git merge-base <prHead> origin/main). mainIssues = issue numbers in \`git log --format=%b <mergeBase>..origin/main\` matching 'Closes #<n>' (unique, sorted) — each squash-merged PR carries one, and those issue bodies are the intent record for main's side of the conflict.
+   d. mergeBase=$(git merge-base <prHead> origin/main). mainIssues = issue numbers in \`git log --format=%b <mergeBase>..origin/main\` matching 'Closes #<n>' (unique, sorted) — those issue bodies are the intent record for main's side of the conflict.
    e. \`git -c merge.conflictStyle=diff3 rebase origin/main\`. If it COMPLETES with no stop: cleanRebase=true, skip to step 5 (report="", markedFiles=[]).
       If it stops on conflict: run \`${AUTORESOLVE} --partial "$(git rev-parse --show-toplevel)"\` and capture stdout+exit code. Non-zero exit → the conflict has a shape the fixer does not own (symlink/delete-modify/marker-shaped/unparseable): set gitBlocked="partial autoresolve declined: <its first output line>" and return. Zero → report=its stdout (one line per hunk, mechanical and judgment alike; keep it verbatim), markedFiles = \`git diff --name-only --diff-filter=U\` (the files still holding diff3 markers).
-      If markedFiles is EMPTY (the conflict turned fully mechanical since the merge worker saw it — main moved): \`GIT_EDITOR=true git rebase --continue\`; if the rebase is then still in progress, gitBlocked="more than one commit conflicted — an epic branch holds exactly one" and return.
+      If markedFiles is EMPTY (the conflict turned fully mechanical since the merge worker saw it): \`GIT_EDITOR=true git rebase --continue\`; if the rebase is then still in progress, gitBlocked="more than one commit conflicted — an epic branch holds exactly one" and return.
    f. Do NOT touch the content inside any conflict markers, do NOT stage marked files, do NOT continue a rebase that still has marked files — the Resolve phase owns that.
 5. Discover the layout (needed for the verify gate later):
 ${DISCOVERY}
-6. Deps for the verify gate: in EACH discovered package, run \`npm ci\` if \`node_modules\` is missing, or if \`git diff --quiet <mergeBase> HEAD -- <package>/package-lock.json\` or \`git diff --quiet <mergeBase> origin/main -- <package>/package-lock.json\` reports a change (either side moved the lockfile; a stale install makes the gate lie).
+6. Deps for the verify gate: in EACH discovered package, run \`npm ci\` if \`node_modules\` is missing, or if \`git diff --quiet <mergeBase> HEAD -- <package>/package-lock.json\` or \`git diff --quiet <mergeBase> origin/main -- <package>/package-lock.json\` reports a change (either side may have moved the lockfile).
 Return: attempt, branch, prUrl, prNumber, prHead, mergeBase, cleanRebase, report, markedFiles, mainIssues, packages — plus refused/refusalFinal/gitBlocked only when set.`,
 
   // The judgment core — the one stage that exists because a model is needed.
@@ -109,10 +109,10 @@ Evidence — read BOTH sides' intent before touching anything:
 
 For EACH marker block (<<<<<<< ours is origin/main's side, >>>>>>> theirs is the PR's side, ||||||| holds the common base):
 1. State what origin/main intended with these lines, and what the PR intended — from the evidence, not from guesswork.
-2. Write the resolution in which BOTH intents survive, replacing the whole marker block. Both intents surviving does not always mean both sides' every line survives verbatim — when both sides re-derived the same thing (say, two retypings of one mock), the better derivation stands for both — but nothing either side MEANT may be lost.
-3. Watch for merge artifacts a lazy concatenation produces: duplicate object keys, doubled imports, re-declared symbols, a call updated on one side of the block and stale on the other. The verify gate catches some of these; do not lean on it.
+2. Write the resolution in which BOTH intents survive, replacing the whole marker block. When both sides re-derived the same thing (say, two retypings of one mock), the better derivation stands for both — but nothing either side MEANT may be lost.
+3. Watch for merge artifacts a lazy concatenation produces: duplicate object keys, doubled imports, re-declared symbols, a call updated on one side of the block and stale on the other. Do not lean on the verify gate to catch these.
 
-**Escalate instead of guessing.** If for ANY hunk you cannot honestly state both intents and show both surviving — the two sides genuinely contradict, or the evidence does not say what a side meant — resolve NOTHING further, return escalate="<file> hunk <n>: <why both intents cannot both survive>". A wrong-but-plausible merge is the failure mode this whole design exists to prevent; a \`failed\` label is recoverable, a silently dropped intent is not.
+**Escalate instead of guessing.** If for ANY hunk you cannot honestly state both intents and show both surviving — the two sides genuinely contradict, or the evidence does not say what a side meant — resolve NOTHING further, return escalate="<file> hunk <n>: <why both intents cannot both survive>". A \`failed\` label is recoverable; a silently dropped intent is not.
 
 Boundaries: edit ONLY between and including marker lines, ONLY in the files listed above; never revisit the mechanical resolutions or any other file; never commit anything new; never push.
 
@@ -122,7 +122,7 @@ Return: completed (true only when the rebase finished clean), escalate (INSTEAD 
 
   verify: (pkgs) =>
 `Verify phase, autonomous. Run \`npm run verify\` in each of: ${pkgs}. Report the outcome — that is the whole job.
-The fixer NEVER fixes code: if verify is red, do not repair anything, do not re-run flaky-looking suites more than once, do not touch a single file. A red verify here means the conflict resolution (or the combination of the two sides) broke something, and that goes to a human with this report.
+The fixer NEVER fixes code: if verify is red, do not repair anything, do not re-run flaky-looking suites more than once, do not touch a single file. A red verify goes to a human with this report.
 Return: green (true only if every package's verify exited 0), detail (one line per package: package — pass/fail, and for a fail the first genuinely failing thing).`,
 
   // Blind on purpose, and refute-by-default on purpose: this is the same
@@ -141,7 +141,7 @@ Gather the evidence yourself:
 - What actually shipped: \`git diff origin/main HEAD -- <the files>\` and the files at HEAD.
 Do NOT open anything under \`.epics/\` — it carries a builder's framing and would anchor you.
 
-Hunt specifically for: a side's change silently dropped (picking a side is the classic failure — and often no test covers the loss); duplicate object keys, doubled imports or re-declared symbols from a lazy keep-both; an edit placed at the wrong spot so the code runs in a changed order; one side's rename or retype applied in the hunk but not to the lines the other side contributed.
+Hunt specifically for: a side's change silently dropped (picking a side is the classic failure, and often no test covers the loss); duplicate object keys, doubled imports or re-declared symbols from a lazy keep-both; an edit placed at the wrong spot so the code runs in a changed order; one side's rename or retype applied in the hunk but not to the lines the other side contributed.
 
 Default to refuted: if you cannot positively confirm, from the code in front of you, that both sides' intents survive, say survives=false. An over-cautious refute costs one human review; a wrong pass ships a silently mangled merge.
 
@@ -157,7 +157,7 @@ Return: survives, confidence (0-100), reasoning (name the hunk and the evidence,
 
 ${comment.split('\n').map(l => '   ' + l).join('\n')}
 
-3. Relabel — ready-to-review, NEVER ready-to-merge: whether this PR may merge unattended was a gate computed before the conflict existed, and a rewritten resolution resets that to "a human glances". \`gh label create ready-to-review --color 0E8A16 --description "epic-run finished; PR is open and awaiting review" 2>/dev/null || true\`, then \`gh issue edit ${issue} --remove-label in-progress --remove-label needs-judgment --add-label ready-to-review\`. Leave fix-attempted/fix-retried in place — the ladder deliberately does not reset. Then verify: \`gh issue view ${issue} --json labels --jq '[.labels[].name]'\` must contain ready-to-review and neither in-progress nor needs-judgment.
+3. Relabel — ready-to-review, NEVER ready-to-merge: a rewritten resolution needs a human glance before it may merge unattended. \`gh label create ready-to-review --color 0E8A16 --description "epic-run finished; PR is open and awaiting review" 2>/dev/null || true\`, then \`gh issue edit ${issue} --remove-label in-progress --remove-label needs-judgment --add-label ready-to-review\`. Leave fix-attempted/fix-retried in place — the ladder deliberately does not reset. Then verify: \`gh issue view ${issue} --json labels --jq '[.labels[].name]'\` must contain ready-to-review and neither in-progress nor needs-judgment.
 Return: pushed, labelled (true only if step 3's verification held), note (any error text).`,
 
   // What happens next is the LADDER's call, never the phase's — so it is a

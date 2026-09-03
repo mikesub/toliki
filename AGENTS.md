@@ -91,8 +91,8 @@ lifecycle change. Follow-up issues ship with no labels and link back with a
 - `workflows/lib/engine.mjs` is the only file that knows how a vendor CLI is
   invoked. Its loader validates `etc/engines.json` before any phase touches
   GitHub. A Codex phase is ephemeral, sandboxed from the charter's tools, and
-  receives the target project's `CLAUDE.md` and `.claude/rules` as developer
-  instructions; a missing `CLAUDE.md` refuses the phase. Gated by
+  receives the target project's `AGENTS.md` and `.claude/rules` as developer
+  instructions; a missing `AGENTS.md` refuses the phase. Gated by
   `tests/engine-codex.test.sh`.
 - `workflows/lib/runtime.mjs` owns phase execution, the concurrency gate,
   timeouts and signal forwarding. Deterministic control flow lives here or in
@@ -161,7 +161,8 @@ lifecycle change. Follow-up issues ship with no labels and link back with a
 - Every registered repo must auto-delete merged branches (Settings, General).
   With it off, reap never collects a worktree and the disk fills.
 - Install `etc/dispatch.cron` by hand, all three pipeline lines or none. Its
-  `PATH=` must reach `node`, `claude` and `codex`.
+  `PATH=` must reach `node`, `claude` and `codex`, plus `bun` for any
+  registered repo whose `scripts.verify` shells out to it.
 - `EPIC_ENGINE` must be a key of `etc/engines.json`, or `etc/lib.sh` refuses to
   load on every tick.
 - Claude model names in `etc/engines.json` are CLI aliases resolved by the

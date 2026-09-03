@@ -28,20 +28,14 @@ issue rather than burning a run on it.
 
 ## Relating without gating: a plain `#N` cross-reference
 
-A link that carries no ordering — a follow-up and the issue it came out of, two
-issues worth reading together — is a plain `#N` mention in the body, which
-GitHub records as a cross-reference on that issue's timeline.
-
-GitHub's own **"relates to"** relationship (issue sidebar → Relationships → *Add
-relates to*) is precisely what that link means, and a human should reach for it.
-The pipeline can't: it entered public preview on 2026-08-07 **UI-only** — no
-REST path, no GraphQL field or mutation, no timeline event type, no `gh`
-subcommand — so there is nothing for a scripted run to call. Re-check when it
-leaves preview; the cross-reference is the stand-in until then, not a rejection
-of it.
-
-Do **not** substitute `blocked_by` — that would hold the queue back on work
-nobody is waiting for — and do not invent a label for it.
+A link that carries no ordering (a follow-up and the issue it came out of, two
+issues worth reading together) is a plain `#N` mention in the body, which
+GitHub records as a cross-reference on that issue's timeline. GitHub's own
+**"relates to"** relationship (issue sidebar → Relationships) means the same
+thing and a human may set it, but as of 2026-08 it is UI-only with no REST,
+GraphQL or `gh` surface, so a scripted run uses the cross-reference instead.
+Do **not** substitute `blocked_by`, which would hold the queue back on work
+nobody is waiting for, and do not invent a label for it.
 
 ## Allowed primitives — do not extend
 
@@ -51,11 +45,9 @@ native `Bug` issue type (an org-level primitive, distinct from labels — it mar
 the standalone bug track, filed by `/bugreport`; never `Task`/`Feature` types
 for roadmap issues). No custom fields, no status taxonomies.
 
-**Do not create labels by hand.** The entire label namespace belongs to the
-pipeline's lifecycle (`ready` → `in-progress` → `ready-to-merge` /
-`ready-to-review` / `failed`), which is defined in the shared harness's
-`workflows/epic-run.mjs` and `bin/merge-worker.sh` and is its own source of truth
-— don't re-enumerate the states here. No `area:*`, `type:*`, `track:*`, or `priority:*`
+**Do not create labels by hand.** The label namespace belongs to the pipeline's
+lifecycle, defined in the shared harness's `workflows/epic-run.mjs` and
+`bin/merge-worker.sh`; no `area:*`, `type:*`, `track:*` or `priority:*`
 scheme. The one label you ever apply is **`ready`, at filing**: it is the build
 queue, and a spec issue is filed carrying it and nothing else.
 

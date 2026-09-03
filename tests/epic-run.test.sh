@@ -18,7 +18,7 @@ EPIC_RUN="$ROOT/workflows/epic-run.mjs"
 FIX_RUN="$ROOT/workflows/fix-run.mjs"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-printf '# Stub project constitution\n' > "$TMP/CLAUDE.md"
+printf '# Stub project instructions\n' > "$TMP/AGENTS.md"
 
 PASS=0
 FAIL=0

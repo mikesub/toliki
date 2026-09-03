@@ -4,40 +4,29 @@ description: Capture a reproducible bug report from the current context. Use whe
 disable-model-invocation: true
 ---
 
-Turn an observed problem into a **durable, reproducible** report. The goal: someone with no access to this session can reproduce it later. **Capture how to reproduce — do not diagnose or propose a fix.**
+Turn an observed problem into a durable, reproducible report that someone with no access to this session can reproduce later. Capture how to reproduce; do not diagnose or propose a fix.
 
 Bug description: $ARGUMENTS
 
-## 1. Gather from context (no questions yet)
+## 1. Gather from context, no questions yet
 
-Pull everything reproducible already visible in this session — don't make the user repeat what's on screen:
+Pull everything reproducible that is already visible in this session; do not make the user repeat what is on screen:
 
 - What the user was doing and the symptom they hit.
-- Error messages, stack traces, failing assertions, console / network output.
-- IDs to capture **verbatim**: agent-run/session UUIDs, request IDs, version/build/host identifiers — above all any ID the project's own tooling (a log-fetching skill, a dashboard) can later resolve into full logs or transcripts.
+- Error messages, stack traces, failing assertions, console and network output.
+- IDs, verbatim: agent-run or session UUIDs, request IDs, version, build and host identifiers, above all any ID the project's own tooling (a log-fetching skill, a dashboard) can later resolve into full logs or transcripts.
 - `file:line` pointers where the symptom surfaces (a location, not a root-cause claim).
-
-Collect environment facts yourself — don't ask:
-
-- `git rev-parse --short HEAD` and `git branch --show-current`
-- `git status --short` — note uncommitted changes; they affect reproducibility.
+- Environment facts, collected yourself: `git rev-parse --short HEAD`, `git branch --show-current`, and `git status --short` (uncommitted changes affect reproducibility).
 
 ## 2. Ask only for the gaps
 
-If — and only if — these reproduction essentials are still missing, ask the user concisely (use `AskUserQuestion` when it fits):
-
-- **Exact steps** to reproduce, in order.
-- **Expected vs. actual** behavior.
-- **Reproducibility**: always / intermittent / saw it once.
-- Minimal preconditions: which site, which account/data state.
-
-Ask the fewest questions that make it reproducible. Never ask for a cause or a fix.
+Only if these reproduction essentials are still missing, ask concisely (`AskUserQuestion` when it fits): the exact steps in order, expected versus actual behavior, reproducibility (always, intermittent, saw it once), and the minimal preconditions (which site, which account or data state). Ask the fewest questions that make it reproducible. Never ask for a cause or a fix.
 
 ## 3. Compose the issue
 
-**Title** — concise symptom, e.g. `Canvas: site node duplicates on rapid re-spawn`.
+**Title**: a concise symptom, e.g. `Canvas: site node duplicates on rapid re-spawn`.
 
-**Body** — fill this template; omit a section only if genuinely N/A. Write it to a temp file and use `--body-file` to avoid shell-escaping issues with backticks/markdown.
+**Body**: fill this template, omitting a section only if genuinely N/A. Write it to a temp file and use `--body-file` to avoid shell-escaping backticks and markdown.
 
 ```
 ## Summary
@@ -68,20 +57,12 @@ Ask the fewest questions that make it reproducible. Never ask for a cause or a f
 
 ## 4. File it
 
-**Preferred — GitHub issue via `gh`.** If `command -v gh` succeeds and `gh auth status` is OK:
-   `gh issue create -t "<title>" --type Bug --body-file <tmpfile>`
-   The native `Bug` issue type marks the standalone bug track — no milestone, no sub-issue link, no labels. Report the issue URL it prints.
+**Preferred: a GitHub issue via `gh`.** If `command -v gh` succeeds and `gh auth status` is OK:
+`gh issue create -t "<title>" --type Bug --body-file <tmpfile>`
+The native `Bug` issue type marks the standalone bug track: no milestone, no sub-issue link, no labels. Report the issue URL it prints.
 
-**Fallback — local file in `bugs/` (no `gh`, or `gh` not authed).** Save the report into the repo so it's durable and committable; nothing else required:
-   - Path: `bugs/$(date +%F)-<slug>.md`, where `<slug>` is the title lowercased, non-alphanumerics → `-` (e.g. `bugs/2026-06-22-canvas-site-node-duplicates.md`). Create `bugs/` if missing.
-   - Contents: the title as an H1, then the same body template from step 3:
-     ```
-     # <title>
-
-     <full markdown body>
-     ```
-   - Tell the user the path and that it's a bug report sitting in the working tree.
+**Fallback: a local file in `bugs/`** when `gh` is missing or not authed. Path: `bugs/$(date +%F)-<slug>.md`, where `<slug>` is the title lowercased with non-alphanumerics as `-` (e.g. `bugs/2026-06-22-canvas-site-node-duplicates.md`); create `bugs/` if missing. Contents: the title as an H1, then the same body template from step 3. Tell the user the path and that the report sits uncommitted in the working tree.
 
 ## Out of scope
 
-No diagnosis, no fix, no patch. If you have a strong hunch about the cause, put at most a one-line pointer under **Notes**. The issue exists so the bug can be fixed *later*, by whoever picks it up.
+No diagnosis, no fix, no patch. A strong hunch about the cause is at most a one-line pointer under Notes. The issue exists so the bug can be fixed later, by whoever picks it up.
