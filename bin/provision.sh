@@ -33,7 +33,7 @@ usage() {
 Usage: $0 [-h]
 
 Provisions this Ubuntu host for the coding-agent harness: system packages,
-node 24, gh, docker (+ build-cache GC), supabase CLI, Claude Code, Codex CLI, Bun,
+node 24, gh, docker (+ build-cache GC), supabase CLI, Claude Code, Codex CLI,
 Bun, clones of the control repo and every repo in etc/repos.conf, and the
 ~/.claude wiring (skills/agents symlinks, CLAUDE_HARNESS_DIR). Safe to re-run;
 reports state and exits non-zero while any manual step is outstanding.
