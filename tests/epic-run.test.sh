@@ -89,12 +89,14 @@ seed_branch() {
 scenario() { printf '\n%s\n' "$1"; reset_origin; }
 
 # ───────────────────────── the stub engine ─────────────────────────
-# Keys a fixture off a marker in the prompt (read from stdin, exactly as the
-# adapter feeds a real CLI), counts calls per key so a scenario can make the
-# first attempt fail and the second succeed, runs a side-effect script when the
-# fixture set carries one (<key>.sh — the files a real step would have written
-# to the worktree), and logs its own argv so the tiering assertions have
-# something to read.
+# Keys a fixture off the step label the runtime exports as EPIC_STEP_LABEL
+# (never off prompt wording, so a prompt can be rephrased without touching a
+# test), saves the prompt it was fed (read from stdin, exactly as the adapter
+# feeds a real CLI) for the content assertions, counts calls per key so a
+# scenario can make the first attempt fail and the second succeed, runs a
+# side-effect script when the fixture set carries one (<key>.sh — the files a
+# real step would have written to the worktree), and logs its own argv so the
+# tiering assertions have something to read.
 mkdir -p "$TMP/bin"
 cat > "$TMP/bin/claude" <<'STUB'
 #!/usr/bin/env bash
@@ -107,22 +109,22 @@ printf '\n' >> "$STUB_LOG"
 prompt="$(cat)"
 
 key=unknown
-case "$prompt" in
-  *"design the implementation approach for it"*)       key=design ;;
-  *"Code phase, RED step"*)                            key=red ;;
-  *"Code phase, GREEN step"*)                          key=green ;;
-  *"Review this change for the lens: correctness"*)    key=lens-correctness ;;
-  *"Review this change for the lens: simplicity"*)     key=lens-simplicity ;;
-  *"Review this change for the lens: test honesty"*)   key=lens-seam ;;
-  *"Review this change for the lens: requirements"*)   key=lens-acceptance ;;
-  *"Review this change for the lens: security"*)       key=lens-security ;;
-  *"Adversarially verify"*)                            key=verify ;;
-  *"Check the fixes applied after review"*)            key=fixcheck ;;
-  *"Fixes-after-review phase, autonomous"*)            key=triage ;;
-  *"Ship phase, autonomous"*)                          key=ship ;;
-  *'return it in the "summary" field'*)                key=summary ;;
-  *"Resolve the JUDGMENT hunks"*)                      key=fix-resolve ;;
-  *"Adversarially check a rebase-conflict resolution"*) key=fix-check ;;
+case "${EPIC_STEP_LABEL:-}" in
+  architect:design)                            key=design ;;
+  code:red|code:red:retry)                     key=red ;;
+  code:green|code:green:retry)                 key=green ;;
+  review:0)                                    key=lens-correctness ;;
+  review:1)                                    key=lens-simplicity ;;
+  review:2)                                    key=lens-seam ;;
+  review:3)                                    key=lens-acceptance ;;
+  review:4)                                    key=lens-security ;;
+  verify:*)                                    key=verify ;;
+  fix-check)                                   key=fixcheck ;;
+  fixes-after-review|fixes-after-review:retry) key=triage ;;
+  ship:pr)                                     key=ship ;;
+  summary:write)                               key=summary ;;
+  resolve)                                     key=fix-resolve ;;
+  check)                                       key=fix-check ;;
 esac
 
 n="$(cat "$STUB_STATE/$key.n" 2>/dev/null || echo 0)"
@@ -395,6 +397,7 @@ assert_contains "architect and reviewer cannot write" "$ARGV" "--tools Glob,Grep
 assert_contains "the reviewer charter reaches the model" "$ARGV" "Review code against project guidelines"
 assert_contains "schemas are enforced by the engine" "$ARGV" "--json-schema"
 assert_contains "permissions are pre-granted for autonomy" "$ARGV" "--dangerously-skip-permissions"
+assert_contains "the review lens prompt still names its lens (routing did not rely on it)" "$(cat "$STATE_DIR/lens-security.0.prompt")" "security + authorization"
 
 scenario 'epic-run: --engine codex routes every step to the Codex CLI'
 run_pipeline "$EPIC_RUN" "$BASE" --issue 42 --engine codex

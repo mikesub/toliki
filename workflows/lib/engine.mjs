@@ -6,8 +6,13 @@
 //
 // The contract every adapter implements:
 //
-//   run({ prompt, agentType, model, effort, schema, cwd, timeoutMs, label })
-//     -> { ok, output, exitCode, timedOut, reason, stderrTail }
+//   run({ prompt, agentType, model, effort, schema, cwd, timeoutMs, label, step })
+//     -> { ok, output, exitCode, timedOut, reason, stderrTail, usage }
+//
+// Every spawned process gets EPIC_STEP (the engines.json row) and
+// EPIC_STEP_LABEL (the pipeline's label, e.g. review:2) in its environment.
+// The CLIs ignore them; the test stub routes its fixtures on the label, so a
+// prompt can be reworded without touching a test.
 //
 //   ok === true  ⇔  the process exited 0 AND a payload was extracted
 //                   (the validated object when a schema was asked for, else text)
@@ -139,8 +144,9 @@ function schemaAllowsNull(schema) {
 // The prompt goes on stdin rather than argv: requirement bodies and review
 // prompts run to tens of KB, and stdin has neither an ARG_MAX ceiling nor a
 // quoting story to get wrong.
-function execute({ bin, args, prompt, cwd, timeoutMs, onStart }) {
-  return run(bin, args, { cwd, stdin: prompt, timeoutMs, onStart })
+function execute({ bin, args, prompt, cwd, timeoutMs, onStart, label, step }) {
+  const env = { ...process.env, EPIC_STEP: step || '', EPIC_STEP_LABEL: label || '' }
+  return run(bin, args, { cwd, stdin: prompt, timeoutMs, onStart, env })
 }
 
 // ───────────────────────── claude ─────────────────────────
@@ -337,9 +343,9 @@ const claudeVendor = {
     return args
   },
 
-  async run({ prompt, agentType, model, effort, schema, cwd, timeoutMs, onStart }) {
+  async run({ prompt, agentType, model, effort, schema, cwd, timeoutMs, onStart, label, step }) {
     const args = this.buildArgs({ agentType, model, effort, schema })
-    const r = await execute({ bin: this.bin, args, prompt, cwd, timeoutMs, onStart })
+    const r = await execute({ bin: this.bin, args, prompt, cwd, timeoutMs, onStart, label, step })
     const stderrTail = String(r.stderr || '').trim().slice(-2000)
 
     if (r.spawnError) {
@@ -422,7 +428,7 @@ const codexVendor = {
     return args
   },
 
-  async run({ prompt, agentType, model, effort, schema, cwd, timeoutMs, onStart }) {
+  async run({ prompt, agentType, model, effort, schema, cwd, timeoutMs, onStart, label, step }) {
     const work = mkdtempSync(path.join(tmpdir(), 'toliki-codex-'))
     const outputFile = path.join(work, 'final.txt')
     const schemaFile = schema ? path.join(work, 'schema.json') : null
@@ -432,7 +438,7 @@ const codexVendor = {
       const projectInstructions = loadProjectInstructions(cwd)
       const developerInstructions = [charter?.body, projectInstructions].filter(Boolean).join('\n\n')
       const args = this.buildArgs({ charter, developerInstructions, model, effort, schemaFile, outputFile, cwd })
-      const r = await execute({ bin: this.bin, args, prompt, cwd, timeoutMs, onStart })
+      const r = await execute({ bin: this.bin, args, prompt, cwd, timeoutMs, onStart, label, step })
       const stderrTail = String(r.stderr || '').trim().slice(-2000)
       const usage = codexUsage(r.stderr)
 

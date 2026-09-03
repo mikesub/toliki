@@ -234,9 +234,10 @@ for t in tests/*.test.sh; do bash "$t" || exit; done
 
 Stub host-facing binaries with fake executables placed first on `PATH` and use
 throwaway repositories under `mktemp`; never point a test at the real registry
-or host. Never weaken or delete a test to make a change pass. Do not stub with
-zsh shell functions: zsh cannot export them, so a child Bash calls the real
-`ssh`.
+or host. The stub engine routes its fixtures on `EPIC_STEP_LABEL`, which the
+adapter exports to every spawn, never on prompt wording. Never weaken or
+delete a test to make a change pass. Do not stub with zsh shell functions: zsh
+cannot export them, so a child Bash calls the real `ssh`.
 
 ## Live-host safety
 

@@ -155,7 +155,7 @@ export async function agent(prompt, opts = {}) {
     attempts++
     let r
     try {
-      r = await vendor.run({ prompt, agentType, model, effort, schema, cwd: process.cwd(), timeoutMs })
+      r = await vendor.run({ prompt, agentType, model, effort, schema, cwd: process.cwd(), timeoutMs, label, step })
       r = { ...r, elapsedMs: Date.now() - started }
     } catch (e) {
       // An adapter is contracted not to throw; if one ever does, it must still
