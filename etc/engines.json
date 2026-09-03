@@ -16,5 +16,14 @@
     "confirm-review":     "codex/gpt-5.6-sol/xhigh",
     "fixes-after-review": "codex/gpt-5.6-sol/xhigh",
     "fix-conflicts":      "codex/gpt-5.6-sol/xhigh"
+  },
+  "codex+claude": {
+    "bookkeeping":        "codex/gpt-5.6-terra/xhigh",
+    "architect":          "claude/fable/xhigh",
+    "code":               "claude/opus/xhigh",
+    "review":             "codex/gpt-5.6-sol/xhigh",
+    "confirm-review":     "codex/gpt-5.6-sol/xhigh",
+    "fixes-after-review": "claude/opus/xhigh",
+    "fix-conflicts":      "codex/gpt-5.6-sol/xhigh"
   }
 }
