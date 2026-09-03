@@ -58,7 +58,7 @@ PATH=/home/ubuntu/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/
 # when --engine is absent. A name from etc/engines.json (the vendor/model/effort
 # table per pipeline step); unset means claude. A name the file does not know
 # stops every tick loudly rather than route work to a table nobody chose.
-EPIC_ENGINE=claude
+EPIC_ENGINE=codex+claude
 * * * * * ubuntu /home/ubuntu/toliki/bin/dispatch.sh >> /home/ubuntu/dispatch.log 2>&1
 * * * * * ubuntu /home/ubuntu/toliki/bin/reap.sh >> /home/ubuntu/reap.log 2>&1
 * * * * * ubuntu /home/ubuntu/toliki/bin/merge-tick.sh >> /home/ubuntu/merge.log 2>&1
