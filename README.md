@@ -1,6 +1,6 @@
-# toliki
-
 ![piglets.png](piglets.png)
+
+# toliki
 
 A self-hosted coding-agent harness that turns GitHub issues into merged PRs unattended.
 A VPS runs detached pipelines in tmux; cron drains the issue queue, runs one
@@ -8,12 +8,11 @@ autonomous "epic" per issue to an open green PR, and a serial merge worker
 rebases, re-verifies and lands them. You write specs; the box does the rest.
 
 The pipeline is a plain Node script that spawns one headless agent process per
-phase behind a small engine adapter. Claude Code and Codex are both supported;
-one engine is selected for an epic and retained through its fixer retries.
+phase behind a small engine adapter. Claude Code and Codex are both supported.
 
 ## The loop
 
-1. **`/spec`** (interactive, the one human gate) — design a change with Claude,
+1. **`/spec`** (interactive, the one human gate) — design a change,
    file it as one or more GitHub issues labeled `ready`, ordered by real
    `blocked_by` dependencies.
 2. **`bin/dispatch.sh`** (cron, on the VPS) — walks each repo's `ready` queue
@@ -46,8 +45,7 @@ refs are the entire state store.
 ## What it expects
 
 - An Ubuntu VPS you can ssh into.
-- `gh` authenticated on the VPS; a Claude Code subscription for today's
-  pipeline, plus a ChatGPT account for Codex pipeline runs.
+- `gh` authenticated on the VPS; a Claude Code and/or Codex subscriptions for pipeline runs.
 - Projects that define verification as a contract: a *package* is any
   directory whose `package.json` declares `scripts.verify`, and that script is
   the gate an epic must turn green.
@@ -108,7 +106,7 @@ with `--dangerously-skip-permissions` inside git worktrees on your own VPS —
 read `DOCTRINE.md` and decide for yourself before pointing it at anything you
 care about.
 
-It might not work with your setup — if so, ask Claude to fix it; the docs
+It might not work with your setup — if so, ask Claude/Codex to fix it; the docs
 here are written to give it everything it needs. If the fix is something
 others would benefit from (not just local customization), a PR here is a
 welcome courtesy.
