@@ -84,18 +84,22 @@ export async function ensureDeps(packages, { pairs = [] } = {}) {
 
 // ───────────────────────── verify ─────────────────────────
 // The project's whole gate, package by package. The exit code is the verdict;
-// the detail line carries the first genuinely failing thing for a human.
-export async function runVerify(packages, { timeoutMs = VERIFY_TIMEOUT_MS } = {}) {
+// the detail line carries the first genuinely failing thing for a human, and
+// the tail carries the last lines of each failing run for an agent's retry.
+export async function runVerify(packages, { timeoutMs = VERIFY_TIMEOUT_MS, tailLines = 40 } = {}) {
   const details = []
+  const tails = []
   let green = true
   for (const pkg of packages) {
     const r = await sh('npm', ['run', 'verify'], { cwd: pkg === '.' ? '.' : pkg, timeoutMs, stdoutCap: 256 * 1024 })
     if (r.ok) { details.push(`${pkg} — pass`); continue }
     green = false
-    const tail = r.timedOut ? 'timed out' : ((r.err || r.out).split('\n').filter(l => l.trim()).slice(-3).join(' | ') || `exit ${r.code}`)
-    details.push(`${pkg} — fail: ${tail}`)
+    const lines = `${r.out}\n${r.err}`.split('\n').filter(l => l.trim())
+    const last = r.timedOut ? 'timed out' : (lines.slice(-3).join(' | ') || `exit ${r.code}`)
+    details.push(`${pkg} — fail: ${last}`)
+    tails.push(`--- ${pkg}: npm run verify ${r.timedOut ? 'timed out' : `exited ${r.code}`} ---\n${lines.slice(-tailLines).join('\n')}`)
   }
-  return { green, detail: details.join('; ') }
+  return { green, detail: details.join('; '), tail: tails.join('\n') }
 }
 
 // ───────────────────────── git state ─────────────────────────

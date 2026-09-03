@@ -239,6 +239,13 @@ case "$*" in
       printf 'verify: widget.test.ts expected 2 got 1\n' >&2
       exit "$(cat "$STUB_FIXTURES/verify.rc")"
     fi
+    # Like a real test run against the stub project: red exactly while a test
+    # exists without its implementation (red wrote widget.test.ts, green has
+    # not yet written widget.ts).
+    if [[ -f src/widget.test.ts && ! -f src/widget.ts ]]; then
+      printf 'FAIL src/widget.test.ts: missing export createWidget\n' >&2
+      exit 1
+    fi
     printf 'verify ok\n'; exit 0 ;;
 esac
 exit 0
@@ -341,6 +348,10 @@ assert_eq "the issue ends ready-to-merge and nothing else" "ready-to-merge," "$(
 assert_not_contains "no deferred record was posted" "$(gh_comments)" "deferred / not done"
 assert_not_contains "no blocker was posted" "$(gh_comments)" "epic-run blocked"
 assert_eq "deps were installed once for the discovered package" 1 "$(grep -c '^ci$' "$NPM_LOG")"
+assert_eq "the orchestrator ran verify after red, green and the fixes" 3 "$(grep -c '^run verify$' "$NPM_LOG")"
+assert_contains "the red gate saw red" "$RUN_OUT" "Code: red gate: verify RED"
+assert_contains "the green gate saw green" "$RUN_OUT" "Code: verify gate: verify green"
+assert_contains "the fixes gate saw green" "$RUN_OUT" "Fixes after review: verify gate: verify green"
 assert_contains "summary.md is the PR body plus the Closes line" "$(cat "$WT/.epics/42-add-widget/summary.md")" "Closes #42"
 assert_contains "architecture.md was rendered from the design" "$(cat "$WT/.epics/42-add-widget/architecture.md")" "Approach: Thin widget module"
 assert_contains "review.md was rendered from the verdicts" "$(cat "$WT/.epics/42-add-widget/review.md")" "Null deref on empty list"
@@ -515,6 +526,62 @@ assert_contains "the record says how many qualified versus filed" "$(gh_comments
 assert_contains "the PR body points at the record" "$(cat "$WT/.epics/42-add-widget/summary.md")" "Deferred items recorded on #42."
 assert_contains "the legal marker reaches the PR body" "$(cat "$WT/.epics/42-add-widget/summary.md")" "LEGAL-REVIEW: required"
 assert_contains "and the commit body" "$(git -C "$ORIGIN" log -1 --format=%B epic/42-add-widget)" "LEGAL-REVIEW: required"
+
+scenario 'verify gate: red tests that pass are sent back once, then accepted'
+VACUOUS="$TMP/fixtures-vacuous"; cp -R "$BASE" "$VACUOUS"
+rm -f "$VACUOUS/red.sh"
+fixture_sh "$VACUOUS" red.0 'true'   # writes no test: verify stays green
+cp "$BASE/red.sh" "$VACUOUS/red.1.sh"
+run_pipeline "$EPIC_RUN" "$VACUOUS" --issue 42
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_eq "red was spawned twice" 2 "$(calls red)"
+assert_contains "the retry was announced" "$RUN_OUT" "respawning the red step once"
+assert_contains "the retry prompt says why" "$(cat "$STATE_DIR/red.1.prompt")" "pass against a tree with NO implementation"
+assert_contains "the run still ships" "$RUN_OUT" '"readyToMerge":true'
+
+scenario 'verify gate: red tests that pass twice block the run'
+VACUOUS2="$TMP/fixtures-vacuous2"; cp -R "$BASE" "$VACUOUS2"
+rm -f "$VACUOUS2/red.sh"
+run_pipeline "$EPIC_RUN" "$VACUOUS2" --issue 42
+assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
+assert_contains "it blocks in the code phase" "$RUN_OUT" '"phase":"code"'
+assert_contains "the reason says the tests test nothing" "$RUN_OUT" 'do not test the change'
+assert_eq "green never ran" 0 "$(calls green)"
+assert_eq "the issue ends failed" "failed," "$(gh_labels)"
+
+scenario 'verify gate: a red verify after green is sent back once, then accepted'
+LATE="$TMP/fixtures-late"; cp -R "$BASE" "$LATE"
+rm -f "$LATE/green.sh"
+fixture_sh "$LATE" green.0 'true'    # claims green, writes nothing
+cp "$BASE/green.sh" "$LATE/green.1.sh"
+run_pipeline "$EPIC_RUN" "$LATE" --issue 42
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_eq "green was spawned twice" 2 "$(calls green)"
+assert_contains "the retry was announced" "$RUN_OUT" "respawning green once with the failure"
+assert_contains "the retry prompt carries the verify output" "$(cat "$STATE_DIR/green.1.prompt")" "missing export createWidget"
+assert_contains "and says it is the one retry" "$(cat "$STATE_DIR/green.1.prompt")" "This is your one retry"
+assert_contains "the run still ships" "$RUN_OUT" '"readyToMerge":true'
+
+scenario 'verify gate: a red verify after green twice blocks the run'
+NEVER="$TMP/fixtures-never"; cp -R "$BASE" "$NEVER"
+rm -f "$NEVER/green.sh"
+run_pipeline "$EPIC_RUN" "$NEVER" --issue 42
+assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
+assert_contains "it blocks in the code phase" "$RUN_OUT" '"phase":"code"'
+assert_contains "the reason names the red verify" "$RUN_OUT" 'npm run verify is red after the green step and its retry'
+assert_eq "green was spawned twice" 2 "$(calls green)"
+assert_eq "no review lens ran on an unverified tree" 0 "$(calls lens-correctness)"
+assert_contains "the blocker comment says so" "$(gh_comments)" "red after the green step"
+
+scenario 'verify gate: fixes that leave verify red twice block the run'
+BROKEN="$TMP/fixtures-broken"; cp -R "$BASE" "$BROKEN"
+fixture_sh "$BROKEN" triage 'rm -f frontend/src/widget.ts'   # the "fix" deletes the implementation
+run_pipeline "$EPIC_RUN" "$BROKEN" --issue 42
+assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
+assert_contains "it blocks in the fixes phase" "$RUN_OUT" '"phase":"triage"'
+assert_contains "the reason names the red verify" "$RUN_OUT" 'red after the fixes and their retry'
+assert_eq "the fixer was spawned twice" 2 "$(calls triage)"
+assert_eq "nothing shipped a PR" "" "$(gh_pr_created)"
 
 scenario 'epic-run: an off-schema payload is respawned once, then accepted'
 RETRY="$TMP/fixtures-retry"; cp -R "$BASE" "$RETRY"

@@ -19,6 +19,12 @@
 // checkpoint or an open PR is a fact the script established, never a claim a
 // model reported. A model runs only where a judgment is needed: design, code,
 // the review lenses and their skeptic, the fixes, and what the PR says.
+//
+// `npm run verify` is likewise the orchestrator's to run: after the red step
+// it must be red (tests that pass against no implementation test nothing),
+// after green and after fixes it must be green. An agent's word that it ran
+// is never the gate; a wrong answer is handed back to that agent once, with
+// the output, then blocks the run.
 
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
@@ -31,7 +37,7 @@ import {
   openPrs, searchOpenPrs, prCreate, issueCreate, withBodyFile,
 } from './lib/github.mjs'
 import {
-  git, gitOut, discoverPackages, pkgList, ensureDeps, ensureEpicsIgnored, checkpoint, intentToAdd,
+  git, gitOut, discoverPackages, pkgList, ensureDeps, runVerify, ensureEpicsIgnored, checkpoint, intentToAdd,
   pushRejected, slugify, epicDir, writeRequirements, readRequirements, initEpicMd, updateEpicMd,
   renderArchitecture, renderReview,
 } from './lib/repo.mjs'
@@ -66,14 +72,14 @@ Your output is schema-enforced JSON — populate every field, do not cram everyt
 
   codeRed: (dir) =>
 `Code phase, RED step. Write tests ONLY (no implementation). Read ${dir}/requirements.md and ${dir}/architecture.md, and derive tests from the requirements + the public contract/API surface. Cover what is genuinely testable in this stack (units, pure logic, backend handlers, frontend component behavior); for hard-to-test surfaces (canvas/visual, external I/O), SKIP and note in ${dir}/epic.md what is uncovered and why — do not fake a test.
-Return the list of test files you created and a one-line confirmation they fail for the right reason.`,
+Return the list of test files you created and a one-line confirmation they fail for the right reason. The pipeline then runs \`npm run verify\` itself and expects it to be red.`,
 
   codeGreen: (dir, red, pkgs) =>
 `Code phase, GREEN step. Read ${dir}/architecture.md and ${dir}/requirements.md and the existing failing tests:
 ${red}
 
 Implement the feature to make those tests pass, following architecture.md's build steps. Note any scope decision or wrong-test fix in ${dir}/epic.md's phase log. Run \`npm run verify\` in EACH touched package (this repo's packages: ${pkgs}) until green — that script is the project's whole gate, so whatever it runs (including any real-database tier it triggers for itself) has to be green, not just the unit tests.
-Leave everything in the working tree: do NOT commit or push; the pipeline checkpoints your work itself. Return a short status: packages verified green, and any in-flight decisions or remaining failures you could not resolve.`,
+Leave everything in the working tree: do NOT commit or push; the pipeline checkpoints your work itself, and re-runs \`npm run verify\` after you return — a red run comes back to you once, then blocks the run. Return a short status: packages verified green, and any in-flight decisions or remaining failures you could not resolve.`,
 
   review: (requirement, lens, diffCmd) =>
 `Review this change for the lens: ${lens}.
@@ -106,9 +112,22 @@ These were reported independently by different review lenses, so several may be 
 When the check that would catch a class is NOT expressible as a test/type/lint but is a convention (a rule about how to write something, a footgun only a human would know to avoid), write the rule into THIS project's own instructions instead: the relevant section of its AGENTS.md — the root one, or the per-directory AGENTS.md covering the code in question (or a \`.claude/rules/*.md\` file where this project still keeps those) — in the file's existing voice and length. Those are the only places you may write a rule. The skills, agents and this pipeline are shared harness files that live outside this repo and are used by other projects: a rule that belongs to one of them is out of scope for an epic, so do NOT edit or recreate one — record it as DEFERRED in ${dir}/epic.md's phase log, stating the rule you would have written and which harness file it belongs in, and leave the harness untouched. Note every amendment or deferral in ${dir}/epic.md's phase log so it surfaces in the PR body.
 If a finding is genuinely too risky or expensive to fix safely without a human decision, DO NOT guess — leave it, and record it as deferred (with why) in ${dir}/epic.md's phase log so the summary surfaces it.
 ${grouping}After fixes, re-run \`npm run verify\` in each touched package (this repo's packages: ${pkgs}) until green.
-Leave everything in the working tree: do NOT commit or push; the pipeline checkpoints your work itself. Return:
+Leave everything in the working tree: do NOT commit or push; the pipeline checkpoints your work itself, and re-runs \`npm run verify\` after you return — a red run comes back to you once, then blocks the run. Return:
 - status: a short summary — which findings were fixed, which were deferred and why, and the final verify result.
 - deferred: one entry per CONFIRMED finding you did NOT fix; empty array when you fixed them all. This list is a MERGE GATE: an empty list queues the PR to be merged to main unattended, so omitting something you left unfixed ships it. Report every one.`,
+
+  // Appended to a step's own prompt when the orchestrator's verify run disagreed with it.
+  redRetry: (gate) =>
+`
+
+The pipeline ran \`npm run verify\` after your previous RED step and it came back GREEN (${gate.detail}): the tests you wrote pass against a tree with NO implementation, so they test nothing. This is your one retry. Rewrite them so they fail for the right reason — an unmet assertion against the public contract in architecture.md — and confirm they fail before you return.`,
+
+  verifyRetry: (gate) =>
+`
+
+The pipeline ran \`npm run verify\` after your previous attempt and it is RED. This is your one retry; a second red blocks the run for a human.
+${gate.tail}
+Fix the cause — never by weakening, skipping or deleting a test — and leave every package's verify green.`,
 
   // Judgment only: what the PR says, what was left undone and how each item is
   // classed. The pipeline squashes, pushes, opens the PR, files the follow-ups
@@ -652,18 +671,50 @@ try {
   currentPhase = 'code'
   phase('Code')
 
-  // Red: tests only, written blind to any implementation (none exists yet), from requirements + the public contract.
-  const red = await agent(PROMPTS.codeRed(dir),
+  // The verify gate, run here. A step's own verify run is its feedback loop; this one is the verdict.
+  const verifyGate = async (label) => {
+    const v = await runVerify(packages)
+    log(`${label}: verify ${v.green ? 'green' : 'RED'} — ${v.detail}`)
+    return v
+  }
+
+  // Red: tests only, written blind to any implementation (none exists yet), from requirements + the public
+  // contract. Then the gate: verify must be RED. Green here means the tests pass against no implementation
+  // — they test nothing, and every later gate would be verifying against them. Necessary, not sufficient:
+  // an exit code cannot tell an unmet assertion from a missing import, which is why the prompt still asks
+  // the agent to confirm the reason.
+  let red = await agent(PROMPTS.codeRed(dir),
     { label: 'code:red', phase: 'Code', step: 'code' },
   )
   if (!red) return await fail('code', 'Red step failed — no tests written, aborting before implementation.')
-  log('Code: red tests written and failing for the right reason.')
+  let gate = await verifyGate('Code: red gate')
+  if (gate.green) {
+    log('Code: the red tests pass against a tree with no implementation — respawning the red step once.')
+    red = await agent(PROMPTS.codeRed(dir) + PROMPTS.redRetry(gate),
+      { label: 'code:red:retry', phase: 'Code', step: 'code' },
+    )
+    if (!red) return await fail('code', 'Red step failed on its retry — no tests written, aborting before implementation.')
+    gate = await verifyGate('Code: red gate (retry)')
+    if (gate.green) return await fail('code', `the red tests pass before any implementation exists, twice (${gate.detail}) — they do not test the change, so nothing downstream would be verified against it.`)
+  }
+  log('Code: red tests written; verify is red as it should be.')
 
-  // Green: implement against architecture + the red tests, then pass the gate. Single agent to keep the working tree coherent.
-  const green = await agent(PROMPTS.codeGreen(dir, red, pkgList(packages)),
+  // Green: implement against architecture + the red tests, then pass the gate. Single agent to keep the
+  // working tree coherent. Then the gate: verify must be GREEN, by this script's own run.
+  let green = await agent(PROMPTS.codeGreen(dir, red, pkgList(packages)),
     { label: 'code:green', phase: 'Code', step: 'code' },
   )
   if (!green) return await fail('code', 'Green step failed — implementation did not complete, aborting before review.')
+  gate = await verifyGate('Code: verify gate')
+  if (!gate.green) {
+    log('Code: verify is red after the green step — respawning green once with the failure.')
+    green = await agent(PROMPTS.codeGreen(dir, red, pkgList(packages)) + PROMPTS.verifyRetry(gate),
+      { label: 'code:green:retry', phase: 'Code', step: 'code' },
+    )
+    if (!green) return await fail('code', 'Green step failed on its retry — implementation did not complete, aborting before review.')
+    gate = await verifyGate('Code: verify gate (retry)')
+    if (!gate.green) return await fail('code', `npm run verify is red after the green step and its retry (${gate.detail}) — refusing to review an unverified change.`)
+  }
   const codeCheckpoint = await checkpointWork('code')
   updateEpicMd(dir, { phase: 'code → done', log: `code: done (${codeCheckpoint})` })
   log(`Code: implementation complete, verify gate run, work checkpointed (${codeCheckpoint}).`)
@@ -813,13 +864,24 @@ try {
     const grouping = multi.length
       ? `\nSeveral findings are the SAME underlying defect, reported by different review lenses looking at different files. An independent verifier grouped them; one fix and one gate should resolve each group, so do NOT fix or gate the same fault once per finding:\n${multi.map((g, i) => `- Defect ${i + 1}:\n${g.map(f => `  - "${f.title}" (${f.location})`).join('\n')}`).join('\n')}\nThis grouping is a hint, not an instruction: if the findings in a group are genuinely distinct faults needing separate fixes, treat them separately and say so in your status. Every finding above must still end up either fixed or reported as deferred.\n`
       : ''
-    const triaged = await agent(PROMPTS.triage(dir, pkgList(packages), grouping),
+    let triaged = await agent(PROMPTS.triage(dir, pkgList(packages), grouping),
       { label: 'fixes-after-review', phase: 'Fixes after review', step: 'fixes-after-review', schema: TRIAGE_SCHEMA },
     )
     // Fail closed: a dead agent leaves confirmed findings in an unknown state — some fixed, some not,
     // verify possibly never re-run — and the merge gate below reads exactly that list to decide whether main
     // gets this change unattended. "We don't know what it left unfixed" must never merge.
     if (!triaged) return await fail('triage', `fixes-after-review produced no result for ${verified.length} confirmed finding(s) — their state is unknown (partially applied fixes may sit in the tree) and the merge gate has nothing to read.`)
+    // The gate again: the fixes must leave verify GREEN, by this script's own run.
+    let fixGate = await verifyGate('Fixes after review: verify gate')
+    if (!fixGate.green) {
+      log('Fixes after review: verify is red after the fixes — respawning once with the failure.')
+      triaged = await agent(PROMPTS.triage(dir, pkgList(packages), grouping) + PROMPTS.verifyRetry(fixGate),
+        { label: 'fixes-after-review:retry', phase: 'Fixes after review', step: 'fixes-after-review', schema: TRIAGE_SCHEMA },
+      )
+      if (!triaged) return await fail('triage', `fixes-after-review produced no result on its retry for ${verified.length} confirmed finding(s) — their state is unknown and the merge gate has nothing to read.`)
+      fixGate = await verifyGate('Fixes after review: verify gate (retry)')
+      if (!fixGate.green) return await fail('triage', `npm run verify is red after the fixes and their retry (${fixGate.detail}) — refusing to ship an unverified change.`)
+    }
     triageStatus = triaged.status
     triageDeferred = Array.isArray(triaged.deferred) ? triaged.deferred : []
     const fixCheckpoint = await checkpointWork('triage')

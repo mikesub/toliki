@@ -129,6 +129,10 @@ lifecycle change. Follow-up issues ship with no labels and link back with a
   `tests/epic-run.test.sh`.
 - Merge eligibility is computed from structured counts in `epic-run.mjs`.
   Never replace it with a model's sign-off.
+- `npm run verify` is run by the orchestrator: red after the red step, green
+  after green and after fixes-after-review, each with one retry that hands the
+  output back to the agent, then a blocker. An agent's report that verify
+  passed is never the gate. Gated by `tests/epic-run.test.sh`.
 - GitHub is the state store: issues, labels, `blocked_by`, claim refs, PRs. No
   second database, and no per-project facts in harness configuration.
 - Flat issue model: one issue is one autonomous, mergeable, independently
