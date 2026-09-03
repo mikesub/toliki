@@ -14,18 +14,18 @@ don't get re-litigated from memory.
   the system.
 - **Build** — cron dispatches one detached run per unblocked `ready` issue: a
   plain Node orchestrator that walks a fixed sequence — architecture →
-  red-green TDD → review → triage → an open, green PR — spawning one
-  short-lived headless agent process per phase. The issue body is the only
-  requirement the run is judged against; nobody answers follow-up questions at
-  3 a.m., so a spec that needs clarification is a spec that fails.
+  red-green TDD → blind review → fixes after review → an open, green PR —
+  spawning one short-lived headless agent process per judgment. The issue body
+  is the only requirement the run is judged against; nobody answers follow-up
+  questions at 3 a.m., so a spec that needs clarification is a spec that fails.
 - **The pipeline outlives its engine.** Every phase is a process behind one
   adapter, so which vendor's CLI runs an epic is a routing value, not an
   architecture. That is worth the orchestration we now own outright (a
-  concurrency gate, timeouts, signal forwarding — a few hundred lines, under
-  test): the alternative was writing the pipeline twice, once per vendor, and
-  watching the copies drift. It also moves the deterministic half — the merge
-  gate, the fail-closed branches — out of a vendor's runtime and into ordinary
-  code we can run in a test harness.
+  concurrency gate, timeouts, signal forwarding, and the whole deterministic
+  half below — under test): the alternative was writing the pipeline twice,
+  once per vendor, and watching the copies drift. It also moves the merge gate
+  and the fail-closed branches out of a vendor's runtime and into ordinary code
+  we can run in a test harness.
 - **Review** — blind and adversarial. Five lenses judge the diff against the
   issue body alone, barred from the builder's notes; every finding goes to a
   skeptic instructed to refute it; survivors are auto-fixed, refuted ones
@@ -43,6 +43,15 @@ don't get re-litigated from memory.
   retry.
 - **Crons watch, models act.** Dispatch, reap and merge ticks are plain shell
   reading labels; the first model to run is the epic that got launched.
+- **Models judge, the script acts.** The same split inside a run. Everything
+  deterministic — the claim, the labels, the checkpoints, the squash, the push,
+  the PR, the follow-up issues, the layout discovery, `npm run verify` — is the
+  orchestrator's own work, so what a run did is a fact it established rather
+  than a claim a model reported. Models are spawned only where a judgment is
+  needed: the design, the code, the review lenses and their skeptic, the fixes,
+  what the PR says. The rule that falls out of it: an agent's word that it ran
+  a gate is never the gate. Verify is red after the red step and green after
+  the green one because the orchestrator ran it, not because a step said so.
 - **State is GitHub.** Issues, lifecycle and engine-routing labels,
   `blocked_by` edges, claim refs, PRs.
   Workers are disposable: kill any run at any moment, re-run without cleanup.

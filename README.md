@@ -7,8 +7,10 @@ A VPS runs detached pipelines in tmux; cron drains the issue queue, runs one
 autonomous "epic" per issue to an open green PR, and a serial merge worker
 rebases, re-verifies and lands them. You write specs; the box does the rest.
 
-The pipeline is a plain Node script that spawns one headless agent process per
-phase behind a small engine adapter. Claude Code and Codex are both supported.
+The pipeline is a plain Node script. It does everything deterministic itself —
+the claim, the labels, the commits, the push, the PR, `npm run verify` — and
+spawns a short-lived headless agent process, behind a small engine adapter,
+only where a judgment is needed. Claude Code and Codex are both supported.
 
 ## The loop
 
@@ -19,9 +21,10 @@ phase behind a small engine adapter. Claude Code and Codex are both supported.
    and launches a tmux session per unblocked issue, up to the host's slot
    budget.
 3. **`workflows/epic-run.mjs`** (the session's pane) — claims the issue,
-   architects, implements with TDD, reviews under five blind lenses plus an
-   adversarial verifier, and ends at an open PR with `ready-to-merge` (gates
-   cleared, lands unattended) or `ready-to-review` (a human decides).
+   architects, implements with TDD under a verify gate the orchestrator runs
+   itself, reviews under five blind lenses plus an adversarial verifier, and
+   ends at an open PR with `ready-to-merge` (gates cleared, lands unattended)
+   or `ready-to-review` (a human decides).
 4. **`bin/merge-worker.sh`** (cron) — one PR at a time per repo: rebase onto
    current main, wait for checks to re-run on the rebased head, squash-merge.
    Mechanical rebase conflicts it resolves itself under a line-containment
@@ -34,7 +37,8 @@ phase behind a small engine adapter. Claude Code and Codex are both supported.
 5. **`bin/reap.sh`** (cron) — frees what finished runs leave behind (idle
    sessions, stale claim refs), so the slot budget keeps rotating.
 
-The operator watches from a laptop with `./remote-control.sh ls`, and reads a
+The operator watches from a laptop with `./remote-control.sh ls` (and
+`./remote-control.sh usage` for what the steps cost), and reads a
 run with `tmux attach` / `capture-pane` — the pane carries its phase log and a
 final `RESULT` line. (Interactive sessions, started by hand, still connect via
 the Claude Code Desktop app's remote control; pipeline runs have no such
@@ -45,7 +49,7 @@ refs are the entire state store.
 ## What it expects
 
 - An Ubuntu VPS you can ssh into.
-- `gh` authenticated on the VPS; a Claude Code and/or Codex subscriptions for pipeline runs.
+- `gh` authenticated on the VPS; a Claude Code and/or Codex subscription for pipeline runs.
 - Projects that define verification as a contract: a *package* is any
   directory whose `package.json` declares `scripts.verify`, and that script is
   the gate an epic must turn green.
@@ -93,9 +97,10 @@ gh repo clone mikesub/toliki && cd toliki
   that were considered and rejected, with reasons.
 - **`bin/`, `etc/`** — the host-side scripts and config; each header states
   its contract and the incident behind it.
-- **`workflows/`** — the two pipelines and the small runtime they sit on
-  (the engine adapter, the git/gh transport, the concurrency gate,
-  structured-output validation).
+- **`workflows/`** — the three pipelines (`epic-run`, and the two fixers
+  `fix-run` and `ci-run`) and the small runtime they sit on: the engine
+  adapter, the git/gh/npm transport, the concurrency gate, structured-output
+  validation, and the per-spawn usage log `usage-report.mjs` summarizes.
 - **`skills/`, `agents/`** — the shared content: `/spec` (the human gate), the
   agent charters each phase runs under, and the manual entry points.
 
