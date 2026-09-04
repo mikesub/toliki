@@ -11,8 +11,11 @@ set -euo pipefail
 # merge moves origin/main, so each PR still queued behind it is left holding CI
 # that was computed against a base that no longer exists. Each PR is therefore
 # rebased onto the current main, re-pushed, and its checks RE-RUN before it
-# merges — merging on the pre-rebase green would assert a check that never ran
-# against what is landing. Two workers on one repo would each invalidate the
+# merges when the repo publishes checks — merging on the pre-rebase green would
+# assert a check that never ran against what is landing. A repo that publishes
+# no checks is allowed through after a short registration grace; the grace keeps
+# an asynchronous workflow start from looking like a no-CI repo. Two workers on
+# one repo would each invalidate the
 # very run the other is waiting on, so there is no parallelism to recover here:
 # flock keeps invocations from overlapping, the drain loop keeps it to one PR
 # at a time inside a run. Across repos there is nothing to serialize — separate
@@ -34,9 +37,10 @@ set -euo pipefail
 # and lands the issue ready-to-review; a RED check on the rebased head also
 # gets `needs-ci-fix`, whose fixer repairs the cause under an adversarial
 # check and lands it back on ready-to-merge — where this worker rebases and
-# re-runs those same checks before anything merges. A check that timed out or
-# never registered is infrastructure, not a red check, and waits for a human
-# like every other failure.
+# re-runs those same checks before anything merges. A registered check that
+# times out is infrastructure, not a red check, and waits for a human like every
+# other failure. No registered checks after the grace is the supported no-CI
+# case and clears the check gate without inventing a green result.
 #
 # Infrastructure failures (fetch, gh API) abort the run instead of labelling
 # anything: cron retries on the next tick, and a network hiccup must never
@@ -55,6 +59,10 @@ REPO="$DEFAULT_REPO"
 # needs to see, not a reason to hold the queue open indefinitely.
 CI_TIMEOUT="${MERGE_CI_TIMEOUT:-1800}"   # ~30 min
 CI_POLL="${MERGE_CI_POLL:-20}"
+# GitHub briefly reports an empty check rollup after a force-push even in repos
+# with CI. Only treat the empty rollup as a no-CI repo once the exact rebased
+# head has stayed visible for this long.
+CI_REGISTRATION_GRACE="${MERGE_CI_REGISTRATION_GRACE:-60}"
 # Backstop only. The loop terminates on its own (merging closes the issue,
 # failing strips the label, so either way it leaves the queue) — this bounds a
 # bug, and a run that hits it says so rather than looking like a clean drain.
@@ -87,10 +95,11 @@ Usage: $0 [-r <repo>]
 
 Merges every open PR whose issue carries \`ready-to-merge\`, oldest issue first,
 one at a time, into $DEFAULT_REPO's main (or -r <repo>: $(repo_names | tr '\n' ' ')).
-Each PR is rebased onto the current origin/main and its CI re-run before it
-merges. A rebase conflict whose hunks are all mechanical (both sides added at
-the same point, or one side edited base lines the other only added around) is
-auto-resolved, containment-verified and CI-gated; a conflict that needs
+Each PR is rebased onto the current origin/main. Repos that publish checks wait
+for them to re-run; repos with no checks clear that gate after a short
+registration grace. A rebase conflict whose hunks are all mechanical (both
+sides added at the same point, or one side edited base lines the other only
+added around) is auto-resolved, containment-verified and CI-gated; a conflict that needs
 judgment flips its issue to \`failed\` plus \`needs-judgment\`, and a red check to
 \`failed\` plus \`needs-ci-fix\` (both automated fixer queues
 dispatch drains); anything else that fails leaves the PR open and flips its
@@ -232,20 +241,23 @@ judgment involved, so none was exercised:
 $(sed 's/^/- /' <<<"$details")
 
 The resolution was verified by literal line containment (every line of both
-sides survived) before anything was pushed, and CI re-runs on the rebased
-head before the merge.
+sides survived) before anything was pushed. CI re-runs on the rebased head
+before the merge when this repo publishes checks; a no-CI repo is recognized
+only after the check-registration grace.
 EOF
 }
 
 # ------------------------------------------------------------------- checks --
 
-# Wait for the checks on exactly $2 (the rebased head). Keyed on the sha rather
-# than "the PR's checks" on purpose: right after a force-push the PR still
-# reports the pre-rebase run, and treating that as this commit's result is the
-# stale-green merge the rebase exists to prevent.
+# Evaluate checks on exactly $2 (the rebased head). Keyed on the sha rather than
+# "the PR's checks" on purpose: right after a force-push the PR still reports
+# the pre-rebase run, and treating that as this commit's result is the
+# stale-green merge the rebase exists to prevent. Once that exact head remains
+# visible with an empty rollup for CI_REGISTRATION_GRACE, the repo is treated as
+# having no CI and the gate clears without fabricating a check result.
 wait_for_ci() {
   local pr="$1" want="$2"
-  local deadline=$(( SECONDS + CI_TIMEOUT )) saw_any=0
+  local deadline=$(( SECONDS + CI_TIMEOUT )) saw_any=0 head_visible_at=-1
   # `bad` rather than `failed` on purpose — the drain loop below counts into a
   # global of that name, and a local would quietly shadow it.
   local json head total pending bad
@@ -258,10 +270,21 @@ wait_for_ci() {
     if [[ "$head" != "$want" ]]; then
       sleep "$CI_POLL"; continue          # the force-push has not registered yet
     fi
+    if (( head_visible_at < 0 )); then head_visible_at=$SECONDS; fi
 
     total="$(jq '(.statusCheckRollup // []) | length' <<<"$json")"
     if (( total == 0 )); then
-      sleep "$CI_POLL"; continue          # workflows have not started yet
+      # Once a check has appeared, an empty rollup is not evidence that this is
+      # a no-CI repo. Keep waiting so a disappearing or incomplete API view
+      # cannot erase a real gate.
+      if (( saw_any )); then
+        sleep "$CI_POLL"; continue
+      fi
+      if (( SECONDS - head_visible_at < CI_REGISTRATION_GRACE )); then
+        sleep "$CI_POLL"; continue        # give asynchronous workflows time to register
+      fi
+      say "$REPO: PR #$pr has no checks after ${CI_REGISTRATION_GRACE}s on $want — treating it as a no-CI repo"
+      return 0
     fi
     saw_any=1
 
@@ -284,8 +307,8 @@ wait_for_ci() {
 
     if [[ -n "$bad" ]]; then
       # The one decline class where the code is genuinely wrong and a fixer has
-      # something to act on. A timeout or a check that never registered is
-      # infrastructure, and both fall through to a plain `failed` below.
+      # something to act on. A registered check timeout is infrastructure and
+      # falls through to a plain `failed` below.
       NEEDS_CI_FIX=1
       FAIL="PR checks failed on the rebased head $want: $bad"
       return 1
@@ -293,10 +316,15 @@ wait_for_ci() {
     return 0
   done
 
-  if (( saw_any )); then
+  if (( head_visible_at < 0 )); then
+    FAIL="PR head did not become the rebased head $want within $((CI_TIMEOUT / 60)) minutes"
+  elif (( saw_any )); then
     FAIL="PR checks did not conclude within $((CI_TIMEOUT / 60)) minutes of the rebase"
   else
-    FAIL="no PR checks ever registered on the rebased head $want within $((CI_TIMEOUT / 60)) minutes"
+    # A configured grace longer than the overall timeout must not turn no CI
+    # back into a failure. The timeout itself is enough registration grace.
+    say "$REPO: PR #$pr has no checks within the ${CI_TIMEOUT}s check window on $want — treating it as a no-CI repo"
+    return 0
   fi
   return 1
 }
@@ -427,8 +455,8 @@ merge_one() {
   # The branch holds exactly one commit (ship squashed it; rebasing one commit
   # yields one), so --squash preserves its message and its `Closes #N`.
   #
-  # --match-head-commit pins the merge to the EXACT sha whose checks this run
-  # watched go green. Without it, the window between wait_for_ci returning and
+  # --match-head-commit pins the merge to the EXACT sha whose check gate this
+  # run evaluated. Without it, the window between wait_for_ci returning and
   # this call is a stale-green hole: anything that pushed to the branch in
   # between — a fixer session, a human, a racing worker — would merge on the
   # previous head's result, which is the one failure this script exists to
@@ -447,7 +475,7 @@ merge_one() {
     if transient_gh_error "$merge_err"; then
       die "$REPO: squash-merge of PR #$pr hit a transient GitHub error — aborting the run, the next tick retries ($(head -n 1 <<<"$merge_err"))"
     fi
-    FAIL="squash-merge of PR #$pr failed after its checks passed: $(head -n 1 <<<"$merge_err")"
+    FAIL="squash-merge of PR #$pr failed after its check gate cleared: $(head -n 1 <<<"$merge_err")"
     return 1
   fi
 

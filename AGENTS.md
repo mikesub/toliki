@@ -133,8 +133,11 @@ than made launchable against a main without the code it describes.
   loop on a one-minute cron. Check a change to one against the other two.
 - `bin/merge-worker.sh` is serial per repo, because every merge invalidates
   every other queued PR's green, and merges in its own worktree, never in the
-  clone. Its one repair is `bin/merge-autoresolve.sh`; exit 4 is the judgment
-  class. Two open PRs on one issue is ambiguous and merges nothing. Gated by
+  clone. It gives checks a short registration grace after the rebased head is
+  visible; every check that appears must conclude green, while an empty rollup
+  after the grace is the supported no-CI case. Its one repair is
+  `bin/merge-autoresolve.sh`; exit 4 is the judgment class. Two open PRs on one
+  issue is ambiguous and merges nothing. Gated by
   `tests/merge-autoresolve.test.sh` for the resolver and
   `tests/merge-worker.test.sh` for the state machine around it.
 - `setup.sh` (laptop) and `bin/provision.sh` (host) both source
@@ -158,7 +161,7 @@ than made launchable against a main without the code it describes.
   `tests/epic-run.test.sh`.
 - Merge eligibility is computed from structured counts in `epic-run.mjs`.
   Never replace it with a model's sign-off.
-- The merge is pinned to the sha whose checks were watched
+- The merge is pinned to the sha whose check gate was evaluated
   (`--match-head-commit`). Anything pushed between green and merge makes
   GitHub refuse rather than land on a result it never earned.
 - Session admission is one critical section in `bin/launch.sh`: the capacity

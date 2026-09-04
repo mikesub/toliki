@@ -160,6 +160,7 @@ run_worker() {
     GH_DIR="$GH_DIR" GH_LOG="$GH_LOG" \
     MERGE_WORKTREE_ROOT="$TMP/wt" \
     MERGE_CI_TIMEOUT="${MERGE_CI_TIMEOUT:-2}" MERGE_CI_POLL="${MERGE_CI_POLL:-1}" \
+    MERGE_CI_REGISTRATION_GRACE="${MERGE_CI_REGISTRATION_GRACE:-1}" \
     FLOCK_BUSY="${FLOCK_BUSY:-}" \
     bash "$WORKER" --repo myapp 2>&1
   )" || RUN_RC=$?
@@ -181,6 +182,7 @@ run_prepared() {
     GH_DIR="$GH_DIR" GH_LOG="$GH_LOG" \
     MERGE_WORKTREE_ROOT="$TMP/wt" \
     MERGE_CI_TIMEOUT="${MERGE_CI_TIMEOUT:-2}" MERGE_CI_POLL="${MERGE_CI_POLL:-1}" \
+    MERGE_CI_REGISTRATION_GRACE="${MERGE_CI_REGISTRATION_GRACE:-1}" \
     FLOCK_BUSY="${FLOCK_BUSY:-}" \
     bash "$WORKER" --repo myapp 2>&1
   )" || RUN_RC=$?
@@ -238,11 +240,11 @@ standard_pr "$HEAD_SHA"
 gh_set pr-checks.0 "{\"headRefOid\":\"$HEAD_SHA\",\"statusCheckRollup\":[]}"
 gh_set pr-checks.1 "{\"headRefOid\":\"$REBASED\",\"statusCheckRollup\":[]}"
 gh_set pr-checks   "{\"headRefOid\":\"$REBASED\",\"statusCheckRollup\":[{\"__typename\":\"CheckRun\",\"name\":\"build\",\"status\":\"COMPLETED\",\"conclusion\":\"SUCCESS\"}]}"
-MERGE_CI_TIMEOUT=10 run_prepared
+MERGE_CI_TIMEOUT=10 MERGE_CI_REGISTRATION_GRACE=3 run_prepared
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_contains "it merged once the checks appeared" "$RUN_OUT" "squash-merged"
 
-scenario 'merge-worker: checks that never register fail the PR, and are NOT a fixer queue'
+scenario 'merge-worker: no checks after the registration grace means no CI and merges'
 HEAD_SHA="$(seed_epic epic/42-change app.txt 'one
 two
 three
@@ -253,10 +255,42 @@ standard_pr "$HEAD_SHA"
 gh_set pr-checks "{\"headRefOid\":\"$REBASED\",\"statusCheckRollup\":[]}"
 run_prepared
 assert_rc "exits 0 (the drain completes)" 0 "$RUN_RC"
-assert_contains "the reason says no check ever registered" "$(comments)" "no PR checks ever registered"
+assert_contains "the log identifies the no-CI outcome" "$RUN_OUT" "treating it as a no-CI repo"
+assert_contains "the no-CI PR is squash-merged" "$RUN_OUT" "squash-merged"
+assert_contains "the merge stays pinned to the evaluated head" "$(gh_log)" "--squash --match-head-commit $REBASED"
+assert_eq "nothing was marked failed" "" "$(comments)"
+
+scenario 'merge-worker: a registered check that never concludes still fails closed'
+HEAD_SHA="$(seed_epic epic/42-change app.txt 'one
+two
+three
+epic')"
+advance_main other.txt 'main moved'
+REBASED="$(rebased_sha epic/42-change)"
+standard_pr "$HEAD_SHA"
+gh_set pr-checks "{\"headRefOid\":\"$REBASED\",\"statusCheckRollup\":[{\"__typename\":\"CheckRun\",\"name\":\"build\",\"status\":\"IN_PROGRESS\",\"conclusion\":null}]}"
+run_prepared
+assert_rc "exits 0 (the drain completes)" 0 "$RUN_RC"
+assert_contains "the reason says the registered check timed out" "$(comments)" "PR checks did not conclude"
 assert_contains "the issue is marked failed" "$(edits)" "--add-label failed"
-assert_not_contains "infrastructure is not the CI fixer's queue" "$(edits)" "needs-ci-fix"
-assert_not_contains "nor the conflict fixer's" "$(edits)" "needs-judgment"
+assert_eq "nothing was merged" 0 "$(grep -c 'pr merge' "$STATE/log")"
+
+scenario 'merge-worker: a registered check cannot disappear into the no-CI path'
+HEAD_SHA="$(seed_epic epic/42-change app.txt 'one
+two
+three
+epic')"
+advance_main other.txt 'main moved'
+REBASED="$(rebased_sha epic/42-change)"
+standard_pr "$HEAD_SHA"
+gh_set pr-checks.0 "{\"headRefOid\":\"$REBASED\",\"statusCheckRollup\":[{\"__typename\":\"CheckRun\",\"name\":\"build\",\"status\":\"IN_PROGRESS\",\"conclusion\":null}]}"
+gh_set pr-checks "{\"headRefOid\":\"$REBASED\",\"statusCheckRollup\":[]}"
+run_prepared
+assert_rc "exits 0 (the drain completes)" 0 "$RUN_RC"
+assert_contains "the vanished registered check still times out" "$(comments)" "PR checks did not conclude"
+assert_contains "the issue is marked failed" "$(edits)" "--add-label failed"
+assert_not_contains "the log never calls it no-CI" "$RUN_OUT" "treating it as a no-CI repo"
+assert_eq "nothing was merged" 0 "$(grep -c 'pr merge' "$STATE/log")"
 
 scenario 'merge-worker: a red check queues the issue for the CI fixer'
 HEAD_SHA="$(seed_epic epic/42-change app.txt 'one

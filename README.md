@@ -26,7 +26,9 @@ only where a judgment is needed. Claude Code and Codex are both supported.
    ends at an open PR with `ready-to-merge` (gates cleared, lands unattended)
    or `ready-to-review` (a human decides).
 4. **`bin/merge-worker.sh`** (cron) — one PR at a time per repo: rebase onto
-   current main, wait for checks to re-run on the rebased head, squash-merge.
+   current main, give checks time to register, then wait for every published
+   check on the rebased head and squash-merge. An empty rollup after the grace
+   is accepted for repos with no CI.
    Mechanical rebase conflicts it resolves itself under a line-containment
    gate; a conflict that needs judgment is labeled for **`fix-run.mjs`**, a
    dispatched fixer run that resolves it under an adversarial check and

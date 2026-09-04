@@ -35,7 +35,10 @@ don't get re-litigated from memory.
   and adjudication, where being wrong is expensive; implementation runs on a
   cheaper model under the test gate.
 - **Merge** — a serial per-repo worker rebases each finished PR onto current
-  `main`, waits for checks to re-run on the rebased head, squash-merges.
+  `main`, gives checks a short registration window, waits for every published
+  check on the rebased head, then squash-merges. An empty check rollup after
+  that window is the supported no-CI case: there is no result to invent, while
+  every check a repo does publish remains binding.
   Serial is not caution: every merge invalidates every other PR's green, so
   there is no parallelism to be had. Its two decline classes that a machine can
   own — a judgment-class conflict and a red check — go to fixer runs rather
@@ -74,8 +77,9 @@ don't get re-litigated from memory.
 - **No cheerful defaults.** "Couldn't check" never becomes "fine": a dead
   review lens blocks the run, an unreadable CI conclusion fails the merge, a
   lost verdict is written down for a human. A gate that lies is worse than no
-  gate — an absent check is a known hole; a lying one is trusted exactly when
-  it matters.
+  gate. An empty, readable check rollup is different: after the registration
+  grace it means this repo publishes no CI, so there is no check verdict to
+  invent; any check that does register remains binding.
 - **No stub gates**, same reason. A repo with no database tier doesn't get a
   `test:db: exit 0` stub for uniformity's sake — that writes a green result
   into merged PRs for a check that doesn't exist.
