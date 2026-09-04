@@ -181,7 +181,7 @@ payload="$(printf '%s' "$prompt" | STUB_LOG=/dev/null "$STUB_CLAUDE")"
 rc=$?
 set -e
 (( rc == 0 )) || exit "$rc"
-printf 'Token usage: total=1,234 input=1,000 (+ 300 cached) output=234\n' >&2
+printf '{"type":"turn.completed","usage":{"input_tokens":1000,"cached_input_tokens":300,"cache_write_input_tokens":0,"output_tokens":234,"reasoning_output_tokens":100}}\n'
 if [[ -n "$schema" ]]; then
   printf '%s' "$payload" | jq -c '.structured_output' > "$out"
 else
@@ -487,7 +487,7 @@ assert_contains "Codex runs are ephemeral" "$CODEX_ARGV" "--ephemeral"
 assert_eq "all five Codex review lenses ran" 5 "$(( $(calls lens-correctness) + $(calls lens-simplicity) + $(calls lens-seam) + $(calls lens-acceptance) + $(calls lens-security) ))"
 assert_eq "no Claude process was spawned" 0 "$(wc -l < "$RUN_LOG" | tr -d ' ')"
 assert_eq "origin holds the squashed branch" 1 "$(origin_count epic/42-add-widget)"
-assert_eq "Codex tokens are parsed from its usage summary" "1234 1000 300 234" "$(usage_log | jq -r 'select(.label=="architect:design") | "\(.tokens.total) \(.tokens.input) \(.tokens.cacheRead) \(.tokens.output)"')"
+assert_eq "Codex tokens are parsed from its event stream" "1234 1000 300 234" "$(usage_log | jq -r 'select(.label=="architect:design") | "\(.tokens.total) \(.tokens.input) \(.tokens.cacheRead) \(.tokens.output)"')"
 assert_eq "Codex records carry no cost" "null" "$(usage_log | jq -r 'select(.label=="architect:design") | .costUsd')"
 
 scenario 'epic-run: EPIC_ENGINE=codex routes every phase without a flag'

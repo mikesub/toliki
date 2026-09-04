@@ -36,12 +36,29 @@ while [[ $# -gt 0 ]]; do
 done
 cat > "$CODEX_PROMPT_LOG"
 [[ -z "$schema" ]] || cp "$schema" "$CODEX_SCHEMA_LOG"
+# --json puts the event stream on stdout; the CLI leaves stderr empty there,
+# API errors included, which is why the adapter reads its diagnostics here too.
+events() {
+  printf '{"type":"thread.started","thread_id":"t1"}\n'
+  printf '{"type":"turn.started"}\n'
+  printf '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"final"}}\n'
+}
+usage_event() {
+  printf '{"type":"turn.completed","usage":{"input_tokens":15882,"cached_input_tokens":10624,"cache_write_input_tokens":40,"output_tokens":218,"reasoning_output_tokens":96}}\n'
+}
 case "${CODEX_STUB_MODE:-structured}" in
-  structured) printf '{"name":"ok","note":null,"maybe":null,"extra":null}\n' > "$out" ;;
-  text) printf 'plain final answer\n' > "$out" ;;
-  malformed) printf 'not json\n' > "$out" ;;
-  no-output) ;;
+  structured) events; usage_event; printf '{"name":"ok","note":null,"maybe":null,"extra":null}\n' > "$out" ;;
+  text) events; usage_event; printf 'plain final answer\n' > "$out" ;;
+  malformed) events; usage_event; printf 'not json\n' > "$out" ;;
+  no-output) events; usage_event ;;
   nonzero) printf 'simulated failure\n' >&2; exit 7 ;;
+  api-error)
+    # A refused request: the CLI reports it only as events, with nothing on
+    # stderr at all, and exits nonzero.
+    events
+    printf '{"type":"error","message":"Unsupported value: bad effort"}\n'
+    printf '{"type":"turn.failed","error":{"message":"Unsupported value: bad effort"}}\n'
+    exit 1 ;;
   timeout) trap 'exit 143' TERM; sleep 5 ;;
 esac
 STUB
@@ -129,10 +146,29 @@ ARGS="$(cat "$TMP/args")"
 assert_contains "a third pair: model" "$ARGS" 'ARG:gpt-5.6-terra'
 assert_contains "a third pair: effort" "$ARGS" 'ARG:model_reasoning_effort="medium"'
 
+printf '\nCodex adapter: usage comes from the event stream\n'
+run_adapter coder gpt-5.6-sol xhigh 1
+ARGS="$(cat "$TMP/args")"
+assert_contains "the event stream is requested" "$ARGS" 'ARG:--json'
+assert_contains "input tokens are recorded" "$RUN_OUT" '"input":15882'
+assert_contains "output tokens are recorded" "$RUN_OUT" '"output":218'
+assert_contains "cache reads are recorded" "$RUN_OUT" '"cacheRead":10624'
+assert_contains "cache writes are recorded" "$RUN_OUT" '"cacheCreate":40'
+# OpenAI nests cached inside input and reasoning inside output, so the total is
+# input+output — adding the cache counters again would bill them twice.
+assert_contains "the total does not double-count cached input" "$RUN_OUT" '"total":16100'
+assert_contains "no cost is invented for a CLI that reports none" "$RUN_OUT" '"costUsd":null'
+
 printf '\nCodex adapter: fail-closed process and payload errors\n'
 run_adapter coder gpt-5.6-sol xhigh 1 nonzero
 assert_contains "nonzero exit is a failed result" "$RUN_OUT" '"ok":false'
 assert_contains "the exit code survives" "$RUN_OUT" '"exitCode":7'
+assert_contains "stderr still carries the diagnostic when there are no events" "$RUN_OUT" 'simulated failure'
+run_adapter coder gpt-5.6-sol xhigh 1 api-error
+assert_contains "an API error is a failed result" "$RUN_OUT" '"ok":false'
+# Under --json the CLI writes nothing to stderr, so a phase whose diagnostic
+# was only read from there would report a bare exit code to the blocker comment.
+assert_contains "the error event reaches the failure reason" "$RUN_OUT" 'Unsupported value: bad effort'
 run_adapter coder gpt-5.6-sol xhigh 1 malformed
 assert_contains "malformed structured output fails" "$RUN_OUT" 'final output was not the expected schema JSON'
 run_adapter coder gpt-5.6-sol xhigh 1 no-output

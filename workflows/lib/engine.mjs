@@ -48,12 +48,51 @@ function claudeUsage(envelope) {
     turns: num(envelope?.num_turns),
   }
 }
-// codex exec ends its progress stream with "Token usage: total=N input=N (+ N cached) output=N".
-function codexUsage(stderr) {
-  const m = String(stderr || '').match(/Token usage:\s*total=([\d,]+)(?:\s+input=([\d,]+))?(?:\s*\(\+\s*([\d,]+)\s*cached\))?(?:\s+output=([\d,]+))?/i)
-  const n = (s) => (s === undefined ? null : Number(String(s).replace(/,/g, '')))
-  if (!m) return { tokens: { input: null, output: null, cacheRead: null, cacheCreate: null, total: null }, costUsd: null, turns: null }
-  return { tokens: { input: n(m[2]), output: n(m[4]), cacheRead: n(m[3]), cacheCreate: null, total: n(m[1]) }, costUsd: null, turns: null }
+// `codex exec --json` streams JSONL events on stdout: thread.started,
+// turn.started, item.completed, then turn.completed (carrying usage) or
+// turn.failed. Under --json the CLI's progress AND its API errors leave stderr
+// entirely, so both the usage numbers and a failed phase's diagnostic are read
+// from these events. Scraping the human-readable stream instead is what this
+// replaced: 0.152.1 prints "tokens used\n<N>", never the "Token usage: total=…"
+// line the old regex wanted, so every Codex spawn logged its cost as unknown.
+function codexEvents(stdout) {
+  const events = []
+  for (const line of String(stdout || '').split('\n')) {
+    const trimmed = line.trim()
+    if (!trimmed.startsWith('{')) continue
+    try { events.push(JSON.parse(trimmed)) } catch { /* a partial or truncated line */ }
+  }
+  return events
+}
+
+// OpenAI counts cached input inside input_tokens and reasoning inside
+// output_tokens, so a turn's total is input+output. Claude's four counters are
+// separate additive pools summed instead — same record shape, each vendor's own
+// arithmetic, so a mixed engine's rows stay comparable.
+function codexUsage(events) {
+  const add = (a, b) => (b === null ? a : (a === null ? b : a + b))
+  let input = null, output = null, cacheRead = null, cacheCreate = null
+  for (const e of events) {
+    if (e?.type !== 'turn.completed' || !e.usage || typeof e.usage !== 'object') continue
+    input = add(input, num(e.usage.input_tokens))
+    output = add(output, num(e.usage.output_tokens))
+    cacheRead = add(cacheRead, num(e.usage.cached_input_tokens))
+    cacheCreate = add(cacheCreate, num(e.usage.cache_write_input_tokens))
+  }
+  const total = input === null && output === null ? null : (input ?? 0) + (output ?? 0)
+  // The CLI reports no cost, and its "turn" is one exec call rather than an
+  // agentic loop iteration, so neither is invented here.
+  return { tokens: { input, output, cacheRead, cacheCreate, total }, costUsd: null, turns: null }
+}
+
+// Why a Codex phase failed, for the blocker comment: its own error events, or
+// stderr when the CLI died before emitting any (a spawn or config failure).
+function codexDiagnostic(events, stderr) {
+  const messages = events
+    .filter(e => e?.type === 'error' || e?.type === 'turn.failed')
+    .map(e => String(e.message ?? e.error?.message ?? '').trim())
+    .filter(Boolean)
+  return (messages.join('\n') || String(stderr || '').trim()).slice(-2000)
 }
 
 // Pull the payload out of whatever the CLI printed. Tolerant on purpose: the
@@ -144,9 +183,9 @@ function schemaAllowsNull(schema) {
 // The prompt goes on stdin rather than argv: requirement bodies and review
 // prompts run to tens of KB, and stdin has neither an ARG_MAX ceiling nor a
 // quoting story to get wrong.
-function execute({ bin, args, prompt, cwd, timeoutMs, onStart, label, step }) {
+function execute({ bin, args, prompt, cwd, timeoutMs, onStart, label, step, stdoutCap = 0 }) {
   const env = { ...process.env, EPIC_STEP: step || '', EPIC_STEP_LABEL: label || '' }
-  return run(bin, args, { cwd, stdin: prompt, timeoutMs, onStart, env })
+  return run(bin, args, { cwd, stdin: prompt, timeoutMs, onStart, env, stdoutCap })
 }
 
 // ───────────────────────── claude ─────────────────────────
@@ -397,10 +436,19 @@ const claudeVendor = {
 // schema-validated JSON object. A fresh temp directory per process prevents
 // concurrent review lenses from racing on either artifact.
 //
+// --json moves progress from the human-readable stream onto stdout as JSONL
+// events, which is where the usage numbers and the API errors live; the payload
+// still comes from the file, so stdout is only ever read for those two.
+//
 // The CLI has no Claude-style per-run tool allow-list. The charter body is
 // therefore injected as developer instructions, and the tool boundary is
 // enforced by the Codex sandbox: charters without Edit/Write are read-only;
 // mutating phases retain the existing autonomous pipeline's full authority.
+// --json makes stdout the event stream, which a long phase runs into megabytes.
+// Only its tail is ever read — turn.completed and the error events come last —
+// and the payload comes from --output-last-message, so a bounded tail is whole.
+const CODEX_STDOUT_CAP = 1024 * 1024
+
 const codexVendor = {
   name: 'codex',
   bin: process.env.CODEX_BIN || 'codex',
@@ -414,7 +462,7 @@ const codexVendor = {
       ? 'danger-full-access'
       : 'read-only'
     const args = [
-      'exec', '--ephemeral', '--ignore-user-config', '--color', 'never',
+      'exec', '--ephemeral', '--ignore-user-config', '--color', 'never', '--json',
       '--disable', 'multi_agent', '--disable', 'enable_fanout',
       '--sandbox', sandbox,
       '-c', 'approval_policy="never"',
@@ -439,9 +487,10 @@ const codexVendor = {
       const projectInstructions = loadProjectInstructions(cwd)
       const developerInstructions = [charter?.body, projectInstructions].filter(Boolean).join('\n\n')
       const args = this.buildArgs({ charter, developerInstructions, model, effort, schemaFile, outputFile, cwd })
-      const r = await execute({ bin: this.bin, args, prompt, cwd, timeoutMs, onStart, label, step })
-      const stderrTail = String(r.stderr || '').trim().slice(-2000)
-      const usage = codexUsage(r.stderr)
+      const r = await execute({ bin: this.bin, args, prompt, cwd, timeoutMs, onStart, label, step, stdoutCap: CODEX_STDOUT_CAP })
+      const events = codexEvents(r.stdout)
+      const stderrTail = codexDiagnostic(events, r.stderr)
+      const usage = codexUsage(events)
 
       if (r.spawnError) {
         const enoent = r.spawnError.code === 'ENOENT'
