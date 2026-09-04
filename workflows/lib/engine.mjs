@@ -122,6 +122,30 @@ function parseJsonLoose(text) {
   return null
 }
 
+// Claude emits the useful API failure as a normal JSON result envelope. It
+// may pair is_error:true with subtype:"success" (observed on a live exhausted
+// session), so neither the subtype nor the process exit code is the diagnosis.
+// Prefer the API status/terminal reason and preserve result verbatim: that is
+// where Claude includes the provider-local reset time.
+function claudeDiagnostic(envelope, stdout, stderr) {
+  const details = []
+  if (envelope && typeof envelope === 'object') {
+    if (Array.isArray(envelope.errors)) details.push(...envelope.errors.map(String))
+    const nested = envelope.error && typeof envelope.error === 'object' ? envelope.error.message : null
+    if (nested) details.push(String(nested))
+    if (envelope.message) details.push(String(envelope.message))
+    if (envelope.result) details.push(String(envelope.result))
+  }
+  const fallback = String(stderr || stdout || '').trim()
+  return (details.map(s => s.trim()).filter(Boolean).join('; ') || fallback).slice(-2000)
+}
+
+function claudeErrorName(envelope) {
+  const status = num(envelope?.api_error_status)
+  if (envelope?.terminal_reason === 'api_error' || status !== null) return `API error${status === null ? '' : ` ${status}`}`
+  return String(envelope?.subtype || 'error')
+}
+
 // A structured payload the model wrote as text rather than as structured
 // output — fenced or bare JSON. Only consulted as a fallback.
 function jsonFromText(text) {
@@ -395,6 +419,9 @@ const claudeVendor = {
     const args = this.buildArgs({ agentType, model, effort, schema })
     const r = await execute({ bin: this.bin, args, prompt, cwd, timeoutMs, onStart, label, step })
     const stderrTail = String(r.stderr || '').trim().slice(-2000)
+    const envelope = parseJsonLoose(r.stdout)
+    const usage = claudeUsage(envelope)
+    const diagnostic = claudeDiagnostic(envelope, r.stdout, r.stderr)
 
     if (r.spawnError) {
       const enoent = r.spawnError.code === 'ENOENT'
@@ -408,22 +435,18 @@ const claudeVendor = {
       }
     }
     if (r.timedOut) {
-      return { ok: false, output: null, exitCode: r.code, timedOut: true, stderrTail, reason: `timed out after ${Math.round(timeoutMs / 60000)} min (process group killed)` }
+      return { ok: false, output: null, exitCode: r.code, timedOut: true, stderrTail, reason: `timed out after ${Math.round(timeoutMs / 60000)} min (process group killed)`, usage }
     }
     if (r.code !== 0) {
-      return { ok: false, output: null, exitCode: r.code, timedOut: false, stderrTail, reason: `exited ${r.code}${stderrTail ? `: ${stderrTail.split('\n').pop()}` : ''}` }
+      return { ok: false, output: null, exitCode: r.code, timedOut: false, stderrTail, reason: `exited ${r.code}${diagnostic ? `: ${diagnostic}` : ''}`, usage }
     }
 
-    const envelope = parseJsonLoose(r.stdout)
     if (!envelope || typeof envelope !== 'object') {
       return { ok: false, output: null, exitCode: 0, timedOut: false, stderrTail, reason: 'output was not the expected JSON envelope' }
     }
-    const usage = claudeUsage(envelope)
     if (envelope.is_error) {
-      const detail = Array.isArray(envelope.errors) && envelope.errors.length
-        ? envelope.errors.join('; ')
-        : String(envelope.result || envelope.subtype || 'unknown error')
-      return { ok: false, output: null, exitCode: 0, timedOut: false, stderrTail, reason: `${envelope.subtype || 'error'}: ${detail}`, usage }
+      const detail = diagnostic || 'unknown error'
+      return { ok: false, output: null, exitCode: 0, timedOut: false, stderrTail, reason: `${claudeErrorName(envelope)}: ${detail}`, usage }
     }
 
     if (schema) {

@@ -21,7 +21,7 @@
 // ladder write, the log gathering, verify, the amend, the push, the audit
 // comment, the labels — is the orchestrator's own work.
 
-import { agent, phase, log, initRuntime, onPhase, onLog } from './lib/runtime.mjs'
+import { agent, phase, log, initRuntime, onPhase, onLog, withAgentFailure } from './lib/runtime.mjs'
 import { parseArgs, finish, UsageError, EXIT } from './lib/cli.mjs'
 import { initStatus, statusPhase, statusNote, statusFinish } from './lib/status.mjs'
 import { failureReason } from './lib/proc.mjs'
@@ -290,6 +290,7 @@ let blockerPosted = false
 let prUrl = null
 let attempt = 0
 async function fail(phase, reason) {
+  reason = withAgentFailure(reason)
   if (!blockerPosted) {
     blockerPosted = true
     try {

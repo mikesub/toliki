@@ -5,7 +5,7 @@
 // written to GitHub. Best effort: recording never fails a run.
 //
 // A record: { ts, runId, script, session, issue, engine, step, label, attempt,
-//             vendor, model, effort, ok, timedOut, ms,
+//             vendor, model, effort, ok, timedOut, ms, failureKind, failureReason,
 //             tokens: { input, output, cacheRead, cacheCreate, total },
 //             costUsd, costSource, turns }
 // Token fields are null when the CLI did not report them. `costSource` says who

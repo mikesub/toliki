@@ -352,6 +352,12 @@ fixture() { # dir key structured-json
 fixture_text() { # dir key text
   printf '{"type":"result","subtype":"success","is_error":false,%s,"result":"%s"}\n' "$USAGE" "$3" > "$1/$2.json"
 }
+# A provider-side refusal. Claude currently calls its subtype "success" even
+# with is_error:true, so the adapter must use terminal_reason/api_error_status
+# and preserve result, where the reset window is reported.
+fixture_error() { # dir key api-error-result
+  printf '%s\n' "$3" > "$1/$2.json"
+}
 # What a step would have written to the worktree.
 fixture_sh() { # dir key script
   printf '%s\n' "$3" > "$1/$2.sh"
@@ -812,6 +818,22 @@ run_pipeline "$EPIC_RUN" "$DEAD2" --issue 42
 assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
 assert_eq "exactly two attempts, never a third" 2 "$(calls design)"
 assert_contains "it blocks in the architect phase" "$RUN_OUT" '"phase":"architect"'
+
+scenario 'provider quota: exact reset time reaches the durable blocker'
+QUOTA="$TMP/fixtures-quota"; cp -R "$BASE" "$QUOTA"
+rm -f "$QUOTA/red.sh"
+fixture_error "$QUOTA" red '{"type":"result","subtype":"success","is_error":true,"terminal_reason":"api_error","api_error_status":429,"result":"You\u0027ve hit your session limit · resets 3:50pm (Europe/Amsterdam)","duration_ms":386,"num_turns":1,"total_cost_usd":0,"usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
+run_pipeline "$EPIC_RUN" "$QUOTA" --issue 42
+assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
+assert_eq "the rejected step is tried exactly twice" 2 "$(calls red)"
+assert_eq "implementation never starts" 0 "$(calls green)"
+assert_contains "the result names quota exhaustion" "$RUN_OUT" "Provider usage quota exhausted"
+assert_contains "Claude's exact message survives" "$RUN_OUT" "You've hit your session limit"
+assert_contains "the provider's reset time survives" "$RUN_OUT" "resets 3:50pm (Europe/Amsterdam)"
+assert_contains "the blocker carries the exact reset time" "$(gh_comments)" "resets 3:50pm (Europe/Amsterdam)"
+assert_contains "the misleading success subtype is ignored" "$(gh_comments)" "API error 429"
+assert_eq "failed usage records are classified durably" "quota-exhausted quota-exhausted" "$(usage_log | jq -r 'select(.label=="code:red") | .failureKind' | tr '\n' ' ' | sed 's/ $//')"
+assert_contains "usage retains the provider reason" "$(usage_log)" "resets 3:50pm (Europe/Amsterdam)"
 
 scenario 'transient retry: a timeout is never retried'
 SLOW="$TMP/fixtures-slow"; cp -R "$BASE" "$SLOW"

@@ -39,7 +39,7 @@
 
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
-import { agent, parallel, phase, log, initRuntime, onPhase, onLog } from './lib/runtime.mjs'
+import { agent, parallel, phase, log, initRuntime, onPhase, onLog, withAgentFailure } from './lib/runtime.mjs'
 import { parseArgs, finish, UsageError, EXIT } from './lib/cli.mjs'
 import { initStatus, statusPhase, statusNote, statusFinish } from './lib/status.mjs'
 import { failureReason, must } from './lib/proc.mjs'
@@ -707,6 +707,7 @@ let currentPhase = 'prepare'
 let blockerPosted = false
 let openPr = null
 async function fail(phase, reason) {
+  reason = withAgentFailure(reason)
   if (gitMode) {
     if (!blockerPosted) {
       blockerPosted = true

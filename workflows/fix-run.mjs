@@ -17,7 +17,7 @@
 // lib/github.mjs and lib/repo.mjs, so what got pushed and what got labelled is
 // a fact this script established, not a claim a model reported.
 
-import { agent, phase, log, initRuntime, onPhase, onLog } from './lib/runtime.mjs'
+import { agent, phase, log, initRuntime, onPhase, onLog, withAgentFailure } from './lib/runtime.mjs'
 import { HARNESS_DIR } from './lib/engine.mjs'
 import { parseArgs, finish, UsageError, EXIT } from './lib/cli.mjs'
 import { initStatus, statusPhase, statusNote, statusFinish } from './lib/status.mjs'
@@ -315,6 +315,7 @@ let blockerPosted = false
 let prUrl = null
 let attempt = 0
 async function fail(phase, reason) {
+  reason = withAgentFailure(reason)
   if (!blockerPosted) {
     blockerPosted = true
     try {

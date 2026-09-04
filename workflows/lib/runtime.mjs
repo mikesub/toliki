@@ -5,9 +5,11 @@
 //
 //   - agent() NEVER rejects. A step that died, timed out, or came back the
 //     wrong shape resolves null, which is what every `if (!x) return fail(…)`
-//     in the pipelines already reads. An exception here would unwind PAST
-//     those fail-closed branches — the one failure mode this design cannot
-//     have, since they are what stop a half-run from shipping.
+//     in the pipelines already reads. withAgentFailure() lets those branches
+//     append the adapter's final diagnostic without changing that null/output
+//     contract. An exception here would unwind PAST those fail-closed branches
+//     — the one failure mode this design cannot have, since they are what stop
+//     a half-run from shipping.
 //   - parallel() never rejects either: a thunk that throws lands as null in
 //     its slot, and its siblings keep running.
 //
@@ -58,6 +60,31 @@ let ISSUE = null
 // Groups the usage records of one run; unique per process, and a relaunch is a new run.
 const RUN_ID = `${Date.now().toString(36)}-${process.pid}`
 let shuttingDown = false
+let lastAgentFailure = null
+
+// A hard provider allowance is different from a momentary 429. Keep this
+// deliberately narrow: normal request throttling remains a transient error,
+// while the phrases used for an exhausted rolling window get a durable,
+// explicit category. The raw reason remains attached because it carries the
+// reset time or credit detail when the CLI supplies one. Toliki #11 exposed
+// that this previously survived only in tmux and the vendor's own transcript.
+const QUOTA_EXHAUSTED = /you(?:'ve| have) hit your (?:session|usage) limit|(?:session|usage) (?:limit|quota) (?:was )?(?:reached|exhausted)|quota (?:was )?(?:exceeded|exhausted)|out[_ -]of[_ -]credits|insufficient[_ -]quota|credit balance/i
+const failureKind = (r) => QUOTA_EXHAUSTED.test(`${r?.reason || ''}\n${r?.stderrTail || ''}`)
+  ? 'quota-exhausted'
+  : r?.timedOut ? 'timeout' : 'agent-failure'
+
+// Starting a later agent clears a stale soft failure, so a dead check that
+// merely holds a PR cannot be blamed for a later deterministic gate. Every
+// member of a parallel batch starts before any one settles; a terminal failure
+// is therefore still present for the batch's immediate fail-closed branch.
+export function withAgentFailure(reason) {
+  const f = lastAgentFailure
+  lastAgentFailure = null
+  if (!f) return reason
+  const category = f.kind === 'quota-exhausted' ? 'Provider usage quota exhausted' : 'Agent failure'
+  const tries = `${f.attempts} attempt${f.attempts === 1 ? '' : 's'}`
+  return `${reason} ${category}: ${f.label} failed after ${tries} [${f.vendor} ${f.model}/${f.effort}] — ${f.reason}`
+}
 
 const ts = () => new Date().toISOString().replace(/\.\d{3}Z$/, 'Z')
 
@@ -134,6 +161,7 @@ function release() {
 //   timeoutMs  per-step ceiling
 export async function agent(prompt, opts = {}) {
   const { label = 'agent', step, schema, timeoutMs = DEFAULT_TIMEOUT_MS } = opts
+  lastAgentFailure = null
   const agentType = STEPS[step]
   if (!ENGINE || !agentType) {
     log(`${label}: ${!ENGINE ? 'initRuntime() has not selected an engine' : `unknown step '${step}' (known: ${Object.keys(STEPS).join(', ')})`}`)
@@ -149,6 +177,12 @@ export async function agent(prompt, opts = {}) {
   }
 
   let attempts = 0
+  const rememberFailure = (r, reason = r?.reason, kind = failureKind({ ...r, reason })) => {
+    lastAgentFailure = {
+      label, vendor: vendorName, model, effort, attempts, kind,
+      reason: String(reason || 'unknown agent failure').replace(/\s+/g, ' ').trim(),
+    }
+  }
   const attempt = async (why) => {
     await acquire()
     const started = Date.now()
@@ -176,6 +210,7 @@ export async function agent(prompt, opts = {}) {
       ok: !!r.ok, timedOut: !!r.timedOut, ms: r.elapsedMs,
       tokens: r.usage?.tokens || { input: null, output: null, cacheRead: null, cacheCreate: null, total: null },
       costUsd: r.usage?.costUsd ?? null, costSource: r.usage?.costSource ?? null, turns: r.usage?.turns ?? null,
+      failureKind: r.ok ? null : failureKind(r), failureReason: r.ok ? null : r.reason || null,
     })
     return r
   }
@@ -197,6 +232,7 @@ export async function agent(prompt, opts = {}) {
     r = await attempt('transient retry')
   }
   if (!r.ok) {
+    rememberFailure(r)
     log(`${label}: FAILED — ${r.reason}`)
     return null
   }
@@ -212,12 +248,15 @@ export async function agent(prompt, opts = {}) {
     log(`${label}: structured output did not match the schema (${errors.slice(0, 3).join('; ')}) — respawning once`)
     r = await attempt('schema retry')
     if (!r.ok) {
+      rememberFailure(r)
       log(`${label}: FAILED on the schema retry — ${r.reason}`)
       return null
     }
     errors = validateOrEmpty(schema, r.output)
     if (errors.length) {
-      log(`${label}: FAILED — structured output still off-schema (${errors.slice(0, 3).join('; ')})`)
+      const reason = `structured output still off-schema (${errors.slice(0, 3).join('; ')})`
+      rememberFailure(r, reason, 'invalid-output')
+      log(`${label}: FAILED — ${reason}`)
       return null
     }
   }

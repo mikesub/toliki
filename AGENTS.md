@@ -112,7 +112,8 @@ than made launchable against a main without the code it describes.
   gate's inputs are counted from ship's structured deferral kinds. Gated by
   `tests/epic-run.test.sh`.
 - `workflows/lib/usage.mjs` appends one JSON line per agent spawn (step,
-  vendor, model, effort, tokens, seconds, cost) to `EPIC_USAGE_LOG`, default
+  vendor, model, effort, tokens, seconds, cost, and the failure kind/reason when
+  a spawn fails) to `EPIC_USAGE_LOG`, default
   `~/epic-usage.jsonl` on whichever machine ran the pipeline. Tuning data for
   `etc/engines.json`, host-local, never written to GitHub.
   `node workflows/usage-report.mjs` summarizes it per step;

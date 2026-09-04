@@ -59,6 +59,11 @@ case "${CODEX_STUB_MODE:-structured}" in
     printf '{"type":"error","message":"Unsupported value: bad effort"}\n'
     printf '{"type":"turn.failed","error":{"message":"Unsupported value: bad effort"}}\n'
     exit 1 ;;
+  quota-error)
+    events
+    printf '{"type":"error","message":"You have hit your usage limit; resets 3:50pm (Europe/Amsterdam)"}\n'
+    printf '{"type":"turn.failed","error":{"message":"You have hit your usage limit; resets 3:50pm (Europe/Amsterdam)"}}\n'
+    exit 1 ;;
   timeout) trap 'exit 143' TERM; sleep 5 ;;
 esac
 STUB
@@ -180,6 +185,9 @@ assert_contains "an API error is a failed result" "$RUN_OUT" '"ok":false'
 # Under --json the CLI writes nothing to stderr, so a phase whose diagnostic
 # was only read from there would report a bare exit code to the blocker comment.
 assert_contains "the error event reaches the failure reason" "$RUN_OUT" 'Unsupported value: bad effort'
+run_adapter coder gpt-5.6-sol xhigh 1 quota-error
+assert_contains "a Codex quota error reaches the failure reason" "$RUN_OUT" 'You have hit your usage limit'
+assert_contains "a Codex reset time is preserved when the CLI supplies one" "$RUN_OUT" 'resets 3:50pm (Europe/Amsterdam)'
 run_adapter coder gpt-5.6-sol xhigh 1 malformed
 assert_contains "malformed structured output fails" "$RUN_OUT" 'final output was not the expected schema JSON'
 run_adapter coder gpt-5.6-sol xhigh 1 no-output
