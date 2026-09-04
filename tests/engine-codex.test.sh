@@ -157,7 +157,18 @@ assert_contains "cache writes are recorded" "$RUN_OUT" '"cacheCreate":40'
 # OpenAI nests cached inside input and reasoning inside output, so the total is
 # input+output — adding the cache counters again would bill them twice.
 assert_contains "the total does not double-count cached input" "$RUN_OUT" '"total":16100'
-assert_contains "no cost is invented for a CLI that reports none" "$RUN_OUT" '"costUsd":null'
+# gpt-5.6-sol at the short-context rates in lib/prices.mjs: 5218 fresh input
+# tokens at $4, 10624 cached at $0.40, 40 cache writes at $5, 218 output at $20
+# per 1M — cached and cache-write tokens billed out of input, not added to it.
+assert_contains "the spawn is priced from the table" "$RUN_OUT" '"costUsd":0.0296816'
+assert_contains "and the estimate is labelled as computed" "$RUN_OUT" '"costSource":"table"'
+
+printf '\nCodex adapter: a model with no price row stays unpriced\n'
+run_adapter coder gpt-5.6-unpriced xhigh 1
+assert_contains "its tokens are still recorded" "$RUN_OUT" '"total":16100'
+# A zero would quietly drag every average that includes it toward free.
+assert_contains "cost is unknown, not zero" "$RUN_OUT" '"costUsd":null'
+assert_contains "and carries no source" "$RUN_OUT" '"costSource":null'
 
 printf '\nCodex adapter: fail-closed process and payload errors\n'
 run_adapter coder gpt-5.6-sol xhigh 1 nonzero

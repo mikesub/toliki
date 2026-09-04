@@ -175,7 +175,7 @@ export async function agent(prompt, opts = {}) {
       engine: ENGINE_NAME, step, label, attempt: attempts, vendor: vendorName, model, effort,
       ok: !!r.ok, timedOut: !!r.timedOut, ms: r.elapsedMs,
       tokens: r.usage?.tokens || { input: null, output: null, cacheRead: null, cacheCreate: null, total: null },
-      costUsd: r.usage?.costUsd ?? null, turns: r.usage?.turns ?? null,
+      costUsd: r.usage?.costUsd ?? null, costSource: r.usage?.costSource ?? null, turns: r.usage?.turns ?? null,
     })
     return r
   }

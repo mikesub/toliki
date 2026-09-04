@@ -29,22 +29,27 @@ import { fileURLToPath } from 'node:url'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { run, terminateAll } from './proc.mjs'
+import { codexCostUsd } from './prices.mjs'
 
 export { terminateAll }
 
 export const HARNESS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..')
 
-// What a run cost, from each CLI's own report. Nulls where a CLI says nothing;
-// the usage log records them as unknown rather than as zero.
+// What a run cost. Nulls where a CLI says nothing; the usage log records them
+// as unknown rather than as zero. `costSource` says who produced the dollars —
+// "cli" is the vendor's own accounting, "table" is lib/prices.mjs applied to
+// reported tokens — so a computed estimate is never read back as a bill.
 const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null)
 function claudeUsage(envelope) {
   const u = envelope && typeof envelope.usage === 'object' ? envelope.usage : null
   const input = num(u?.input_tokens), output = num(u?.output_tokens)
   const cacheRead = num(u?.cache_read_input_tokens), cacheCreate = num(u?.cache_creation_input_tokens)
   const parts = [input, output, cacheRead, cacheCreate].filter(x => x !== null)
+  const costUsd = num(envelope?.total_cost_usd)
   return {
     tokens: { input, output, cacheRead, cacheCreate, total: parts.length ? parts.reduce((a, b) => a + b, 0) : null },
-    costUsd: num(envelope?.total_cost_usd),
+    costUsd,
+    costSource: costUsd === null ? null : 'cli',
     turns: num(envelope?.num_turns),
   }
 }
@@ -69,7 +74,7 @@ function codexEvents(stdout) {
 // output_tokens, so a turn's total is input+output. Claude's four counters are
 // separate additive pools summed instead — same record shape, each vendor's own
 // arithmetic, so a mixed engine's rows stay comparable.
-function codexUsage(events) {
+function codexUsage(events, model) {
   const add = (a, b) => (b === null ? a : (a === null ? b : a + b))
   let input = null, output = null, cacheRead = null, cacheCreate = null
   for (const e of events) {
@@ -80,9 +85,12 @@ function codexUsage(events) {
     cacheCreate = add(cacheCreate, num(e.usage.cache_write_input_tokens))
   }
   const total = input === null && output === null ? null : (input ?? 0) + (output ?? 0)
-  // The CLI reports no cost, and its "turn" is one exec call rather than an
-  // agentic loop iteration, so neither is invented here.
-  return { tokens: { input, output, cacheRead, cacheCreate, total }, costUsd: null, turns: null }
+  const tokens = { input, output, cacheRead, cacheCreate, total }
+  // The CLI reports no cost, so it is priced from the published table; its
+  // "turn" is one exec call rather than an agentic loop iteration, so the turn
+  // count Claude reports has no honest equivalent and is left unknown.
+  const costUsd = codexCostUsd(model, tokens)
+  return { tokens, costUsd, costSource: costUsd === null ? null : 'table', turns: null }
 }
 
 // Why a Codex phase failed, for the blocker comment: its own error events, or
@@ -490,7 +498,7 @@ const codexVendor = {
       const r = await execute({ bin: this.bin, args, prompt, cwd, timeoutMs, onStart, label, step, stdoutCap: CODEX_STDOUT_CAP })
       const events = codexEvents(r.stdout)
       const stderrTail = codexDiagnostic(events, r.stderr)
-      const usage = codexUsage(events)
+      const usage = codexUsage(events, model)
 
       if (r.spawnError) {
         const enoent = r.spawnError.code === 'ENOENT'

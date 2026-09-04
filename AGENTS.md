@@ -114,6 +114,14 @@ lifecycle change. Follow-up issues ship with no labels and link back with a
   `etc/engines.json`, host-local, never written to GitHub.
   `node workflows/usage-report.mjs` summarizes it per step;
   `./remote-control.sh usage` runs that on the host.
+- `workflows/lib/prices.mjs` holds the published per-model prices for vendors
+  whose CLI reports no cost. Claude bills itself and is not in the table; a
+  Codex spawn is priced from it and stamped `costSource:"table"`, so a computed
+  figure is never read back as a vendor's own. Short-context rates only: the
+  long column bills per request, and a usage record has one turn's tokens
+  summed across every request it made. A model with no row records an unknown
+  cost, never a zero. Adding a Codex model to `etc/engines.json` means adding
+  its row here too.
 - `bin/launch.sh` is the only session-creation primitive; `bin/dispatch.sh` and
   `remote-control.sh` both go through it. It owns the pipeline worktree and
   the slot cap, refusing with exit 3. Gated by `tests/launch-epic.test.sh`.

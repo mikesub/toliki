@@ -74,6 +74,9 @@ for (const [script, recs] of [...byScript.entries()].sort()) {
   }
   const steps = new Map()
   let allTokens = 0, allOut = 0, allMs = 0, allCost = 0, costRuns = new Set(), unknown = []
+  // Dollars a price table produced, tracked apart from the total so the report
+  // can say how much of it is an estimate rather than a vendor's own number.
+  let estimated = 0, unpriced = new Map()
   for (const r of recs) {
     const t = r.tokens || {}
     const total = typeof t.total === 'number' ? t.total : null
@@ -90,11 +93,25 @@ for (const [script, recs] of [...byScript.entries()].sort()) {
     allTokens += total || 0
     allOut += typeof t.output === 'number' ? t.output : 0
     allMs += r.ms || 0
-    if (typeof r.costUsd === 'number') { allCost += r.costUsd; costRuns.add(r.runId) }
+    if (typeof r.costUsd === 'number') {
+      allCost += r.costUsd
+      costRuns.add(r.runId)
+      if (r.costSource === 'table') estimated += r.costUsd
+    } else if (total !== null) {
+      // Tokens but no price: a model with no row in lib/prices.mjs. Worth
+      // naming — its spend is silently missing from every figure below.
+      unpriced.set(r.model, (unpriced.get(r.model) || 0) + 1)
+    }
   }
   const n = runs.size
   console.log(`${script} — ${n} run(s): ${[...engines.entries()].map(([e, c]) => `${e} ${c}`).join(', ')}`)
   console.log(`avg per run: ${fmt(allTokens / n)} tokens (out ${fmt(allOut / n)}) · ${fmt(allMs / n / 60000, 1)} min${costRuns.size ? ` · $${fmt(allCost / costRuns.size, 2)} (${costRuns.size} run(s) with cost)` : ''}`)
+  if (estimated) {
+    console.log(`  of which $${fmt(estimated / costRuns.size, 2)}/run priced from lib/prices.mjs at short-context rates, not billed by the vendor`)
+  }
+  for (const [model, spawns] of [...unpriced.entries()].sort()) {
+    console.log(`  ${spawns} spawn(s) on ${model} have tokens but no price row — their spend is missing from every $ below`)
+  }
   console.log('')
   const header = `${pad('step', 20, true)} ${pad('spawns/run', 10)} ${pad('tokens/run', 12)} ${pad('%', 6)} ${pad('out/run', 9)} ${pad('min/run', 8)} ${pad('$/run', 7)}`
   console.log(header)

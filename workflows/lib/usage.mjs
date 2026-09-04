@@ -6,9 +6,12 @@
 //
 // A record: { ts, runId, script, session, issue, engine, step, label, attempt,
 //             vendor, model, effort, ok, timedOut, ms,
-//             tokens: { input, output, cacheRead, cacheCreate, total }, costUsd, turns }
-// Token fields are null when the CLI did not report them (Codex reports a
-// total and input/output; cost is Claude-only).
+//             tokens: { input, output, cacheRead, cacheCreate, total },
+//             costUsd, costSource, turns }
+// Token fields are null when the CLI did not report them. `costSource` says who
+// produced the dollars: "cli" is the vendor's own figure (Claude), "table" is
+// lib/prices.mjs applied to reported tokens (Codex, which prices nothing
+// itself). Null cost, null source — an unpriced model is unknown, not free.
 
 import { appendFileSync } from 'node:fs'
 import { homedir } from 'node:os'

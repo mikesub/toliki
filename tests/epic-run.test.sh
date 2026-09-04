@@ -488,7 +488,9 @@ assert_eq "all five Codex review lenses ran" 5 "$(( $(calls lens-correctness) + 
 assert_eq "no Claude process was spawned" 0 "$(wc -l < "$RUN_LOG" | tr -d ' ')"
 assert_eq "origin holds the squashed branch" 1 "$(origin_count epic/42-add-widget)"
 assert_eq "Codex tokens are parsed from its event stream" "1234 1000 300 234" "$(usage_log | jq -r 'select(.label=="architect:design") | "\(.tokens.total) \(.tokens.input) \(.tokens.cacheRead) \(.tokens.output)"')"
-assert_eq "Codex records carry no cost" "null" "$(usage_log | jq -r 'select(.label=="architect:design") | .costUsd')"
+# 700 fresh input at $4, 300 cached at $0.40, 234 output at $20, per 1M.
+assert_eq "Codex records are priced from the table" "0.0076" "$(usage_log | jq -r 'select(.label=="architect:design") | .costUsd')"
+assert_eq "and say the figure was computed, not billed" "table" "$(usage_log | jq -r 'select(.label=="architect:design") | .costSource')"
 
 scenario 'epic-run: EPIC_ENGINE=codex routes every phase without a flag'
 EPIC_ENGINE=codex run_pipeline "$EPIC_RUN" "$BASE" --issue 42
@@ -512,6 +514,14 @@ assert_eq "exactly the five lenses, the confirm batches and the fix check ran on
 assert_contains "coding stayed on Claude" "$(cat "$RUN_LOG")" "--model opus"
 assert_contains "the architect stayed on Claude" "$(cat "$RUN_LOG")" "--model fable"
 assert_contains "the pane names the vendor and model per step" "$RUN_OUT" "[codex gpt-5.6-sol/xhigh]"
+# A mixed run's dollars come from two places: Claude bills itself, Codex is
+# priced from lib/prices.mjs. The report has to say which is which, or a
+# computed floor reads as an invoice.
+assert_eq "Claude spawns carry the vendor's own figure" "cli" "$(usage_log | jq -r 'select(.vendor=="claude") | .costSource' | sort -u)"
+assert_eq "Codex spawns are priced from the table" "table" "$(usage_log | jq -r 'select(.vendor=="codex") | .costSource' | sort -u)"
+MIXED_REPORT="$(node "$ROOT/workflows/usage-report.mjs" --log "$STATE_DIR/usage.jsonl")"
+assert_contains "the report separates the computed share" "$MIXED_REPORT" "priced from lib/prices.mjs"
+assert_contains "and says it is not the vendor's number" "$MIXED_REPORT" "not billed by the vendor"
 
 scenario 'epic-run: an engines file with a hole is refused before any side effect'
 jq 'del(.claude.review)' "$ROOT/etc/engines.json" > "$TMP/engines-broken.json"
