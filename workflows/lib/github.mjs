@@ -15,10 +15,36 @@ import { sh, must } from './proc.mjs'
 
 const GH_TIMEOUT_MS = 5 * 60 * 1000
 
-export const gh = (args, opts = {}) => sh('gh', args, { timeoutMs: GH_TIMEOUT_MS, ...opts })
+// A terminal label write and everything a run does after it run inside reap's
+// settle window: bin/reap.sh starts that clock at the write GitHub processes —
+// which it can process while the client is still waiting for the response — and
+// kills the session once the issue has been still for TERMINAL_SETTLE_MINUTES. A
+// call left on the default timeout is exactly as long as the default window, so
+// one stalled swap, readback or comment is enough for a sweep to kill a run
+// before it says why it stopped. Those calls take a budget instead, and reap
+// floors its window at MIN_TERMINAL_SETTLE_MINUTES so the two cannot be
+// configured into a race. The env override exists so a test can inject a short
+// budget; the default is the contract.
+export const TERMINAL_REPORT_BUDGET_MS = Number(process.env.EPIC_TERMINAL_REPORT_MS) || 60 * 1000
 
-export async function ghJson(args, what) {
-  const out = must(await gh(args), what)
+// ONE window shared by the whole stretch, not a timeout per call: the clock does
+// not restart between them, so N calls each bounded by the budget are N budgets.
+// A budget hands out a SHARE per call — a quarter of the window, so a single
+// stall cannot eat the whole thing and starve the report that carries the
+// guidance — capped by what is LEFT of the window, so a path with more calls
+// than that runs out of window rather than extending it. An exhausted window
+// still runs its call, with a millisecond, so it fails fast and is reported
+// rather than skipped in silence.
+export const terminalBudget = (budgetMs = TERMINAL_REPORT_BUDGET_MS) =>
+  ({ deadline: Date.now() + budgetMs, share: Math.max(1, Math.round(budgetMs / 4)) })
+
+const budgeted = ({ deadline, share }) => Math.max(1, Math.min(share, deadline - Date.now()))
+
+export const gh = (args, { budget, ...opts } = {}) =>
+  sh('gh', args, { timeoutMs: budget ? budgeted(budget) : GH_TIMEOUT_MS, ...opts })
+
+export async function ghJson(args, what, opts) {
+  const out = must(await gh(args, opts), what)
   try {
     return JSON.parse(out)
   } catch {
@@ -49,11 +75,11 @@ export const LABELS = {
 
 // Idempotent and best-effort: `gh label create` fails when the label exists,
 // which is the common case and not an error.
-export async function ensureLabels(names) {
+export async function ensureLabels(names, opts) {
   for (const name of names) {
     const def = LABELS[name]
     if (!def) throw new Error(`ensureLabels: '${name}' is not a pipeline label`)
-    await gh(['label', 'create', name, '--color', def.color, '--description', def.description])
+    await gh(['label', 'create', name, '--color', def.color, '--description', def.description], opts)
   }
 }
 
@@ -61,24 +87,24 @@ export async function ensureLabels(names) {
 // call: two calls allow a lossy half-success (the add lands, the strip fails)
 // that leaves `ready` beside a terminal label, where dispatch re-picks the
 // issue every tick.
-export async function editLabels(issue, { add = [], remove = [] } = {}) {
+export async function editLabels(issue, { add = [], remove = [] } = {}, opts) {
   const args = ['issue', 'edit', String(issue)]
   for (const l of add) args.push('--add-label', l)
   for (const l of remove) args.push('--remove-label', l)
-  return gh(args)
+  return gh(args, opts)
 }
 
-export async function issueLabels(issue) {
-  const v = await ghJson(['issue', 'view', String(issue), '--json', 'labels'], `gh issue view ${issue} --json labels`)
+export async function issueLabels(issue, opts) {
+  const v = await ghJson(['issue', 'view', String(issue), '--json', 'labels'], `gh issue view ${issue} --json labels`, opts)
   return Array.isArray(v.labels) ? v.labels.map(l => l.name) : []
 }
 
-export async function issueView(issue, fields) {
-  return ghJson(['issue', 'view', String(issue), '--json', fields], `gh issue view ${issue}`)
+export async function issueView(issue, fields, opts) {
+  return ghJson(['issue', 'view', String(issue), '--json', fields], `gh issue view ${issue}`, opts)
 }
 
-export async function authenticatedLogin() {
-  const value = await ghJson(['api', 'user'], 'gh api user')
+export async function authenticatedLogin(opts) {
+  const value = await ghJson(['api', 'user'], 'gh api user', opts)
   const login = String(value?.login || '').trim()
   if (!login) throw new Error('gh api user returned no authenticated login')
   return login
@@ -110,9 +136,9 @@ export async function withBodyFile(body, fn) {
   }
 }
 
-export async function comment(issue, body) {
+export async function comment(issue, body, opts) {
   return withBodyFile(body, async (file) =>
-    must(await gh(['issue', 'comment', String(issue), '--body-file', file]), `gh issue comment ${issue}`))
+    must(await gh(['issue', 'comment', String(issue), '--body-file', file], opts), `gh issue comment ${issue}`))
 }
 
 // Whether a run already posted the deferred record on this issue. Read-only and

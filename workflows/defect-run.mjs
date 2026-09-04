@@ -16,7 +16,7 @@ import { agent, phase, log, initRuntime, onPhase, onLog } from './lib/runtime.mj
 import { parseArgs, finish, UsageError, EXIT } from './lib/cli.mjs'
 import { initStatus, statusPhase, statusNote, statusFinish } from './lib/status.mjs'
 import { failureReason } from './lib/proc.mjs'
-import { ensureLabels, editLabels, issueLabels, issueView, comment, openPrs, prView, repositoryView, authenticatedLogin } from './lib/github.mjs'
+import { ensureLabels, editLabels, issueLabels, issueView, comment, openPrs, prView, repositoryView, authenticatedLogin, terminalBudget } from './lib/github.mjs'
 import { git, gitOut, discoverPackages, pkgList, ensureDeps, runVerify, pushRejected, intentToAdd } from './lib/repo.mjs'
 import { matchingDefectEvidence } from './lib/defect-evidence.mjs'
 import { finalizeFixerIssue } from './lib/fixer-finalize.mjs'
@@ -117,7 +117,11 @@ async function settle(issue, body, { terminal = 'review', removeQueue = false } 
   const remove = terminal === 'failed'
     ? ['in-progress', 'ready-to-review', 'ready-to-merge', ...(removeQueue ? ['needs-defect-fix'] : [])]
     : ['in-progress', 'failed', 'ready-to-merge', ...(removeQueue ? ['needs-defect-fix'] : [])]
-  const settled = await finalizeFixerIssue({ issue, body, add, remove, required: add, absent: remove })
+  // A body that describes the resting state is a function of the readback, and
+  // it is told which label this swap actually asked for, so its prose cannot
+  // drift from the labels written here.
+  const compose = typeof body === 'function' ? state => body({ ...state, resting: add[0] }) : body
+  const settled = await finalizeFixerIssue({ issue, body: compose, add, remove, required: add, absent: remove })
   if (!settled.reported) log(`blocked: GitHub report failed (${settled.reportError})`)
   if (!settled.settled) log(`blocked: terminal label restoration failed (${settled.stateError})`)
   return settled
@@ -126,6 +130,42 @@ async function settle(issue, body, { terminal = 'review', removeQueue = false } 
 async function refuseFinal(body, reason, options) {
   await settle(issue, body, options)
   return { refused: reason, refusalFinal: true }
+}
+
+// A final refusal that takes the issue out of the fixer queue tells the operator
+// where the issue now rests. That is a claim about labels, so it is composed
+// from the verified readback and never hardcoded: when the swap fails the issue
+// is still dispatchable, and the comment has to say so and name the manual
+// repair instead of the structural action alone. Every removeQueue refusal
+// builds its body here.
+//
+// The situation sentence never describes the issue's labels — the swap has
+// already happened by the time it is written, so "is labelled needs-defect-fix"
+// would contradict the removal reported in the next breath. It states what the
+// fixer found; the label state comes from the readback alone.
+//
+// A half-landed swap is the case worth the care: the readback says per label
+// what is missing and what is stuck, so the guidance names those repairs and
+// only those. Telling an operator to strip a label that is already gone, or to
+// set one that is already there, is exactly as wrong as claiming the swap
+// worked. Only an unreadable readback earns the conservative "check both".
+const queueRefusal = (header, situation, human = '') => ({ settled, readable, missing, stuck, stateError, resting }) => {
+  const then = human ? ` Then: ${human}` : ''
+  if (settled) {
+    return `${header}\n${situation} needs-defect-fix has been removed automatically, so the issue is out of the fixer queue and rests at ${resting}.` +
+      (human ? ` The only remaining step is human: ${human}` : ' A human takes it from there.')
+  }
+  if (!readable) {
+    return `${header}\n${situation} The resulting labels could NOT be read back (${stateError}), so it is unknown whether the issue left the fixer queue: check by hand that needs-defect-fix is gone and ${resting} is set.` + then
+  }
+  const queue = stuck.includes('needs-defect-fix')
+    ? 'needs-defect-fix could NOT be removed, so the issue may still be in the fixer queue and dispatchable'
+    : 'needs-defect-fix has been removed automatically, so the issue is out of the fixer queue, but the transition did not complete'
+  const repairs = [
+    ...(missing.length ? [`set ${missing.join(', ')}`] : []),
+    ...(stuck.length ? [`remove ${stuck.join(', ')}`] : []),
+  ].join(' and ')
+  return `${header}\n${situation} ${queue} (${stateError}): ${repairs} by hand.` + then
 }
 
 const prRepositoryName = pr => {
@@ -149,7 +189,8 @@ async function prepare(issue) {
     repoName = String((await repositoryView('nameWithOwner')).nameWithOwner || '')
     if (!repoName) throw new Error('gh repo view returned no nameWithOwner')
   } catch (e) {
-    return refuseFinal(`🤖 fix-defect refused: repository identity could not be verified\nThe fixer could not bind a PR to the registered origin (${e?.message || e}). The issue has been removed from autonomous repair for a human.`,
+    return refuseFinal(queueRefusal('🤖 fix-defect refused: repository identity could not be verified',
+      `The fixer could not bind a PR to the registered origin (${e?.message || e}).`),
       'repository identity could not be verified', { removeQueue: true })
   }
   const prefix = `epic/${issue}-`
@@ -157,11 +198,15 @@ async function prepare(issue) {
     String(p.headRefName || '').startsWith(prefix) && p.isCrossRepository === false &&
     prRepositoryName(p).toLowerCase() === repoName.toLowerCase())
   if (!prs.length) {
-    return refuseFinal(`🤖 fix-defect refused: no open PR\nIssue #${issue} is labelled needs-defect-fix but no open PR delivers it (branch epic/${issue}-*). Resolve by hand; strip needs-defect-fix to take it out of the fixer queue.`,
+    return refuseFinal(queueRefusal('🤖 fix-defect refused: no open PR',
+      `The defect fixer found no open PR delivering issue #${issue} (branch epic/${issue}-*).`,
+      'restore or open the PR by hand.'),
       `no open PR from the registered repository on an epic/${issue}-* branch`, { terminal: 'failed', removeQueue: true })
   }
   if (prs.length > 1) {
-    return refuseFinal(`🤖 fix-defect refused: multiple open PRs\nIssue #${issue} has ${prs.length} open PRs on epic/${issue}-* branches — ambiguous. Resolve by hand; strip needs-defect-fix to take it out of the fixer queue.`,
+    return refuseFinal(queueRefusal('🤖 fix-defect refused: multiple open PRs',
+      `Issue #${issue} has ${prs.length} open PRs on epic/${issue}-* branches — ambiguous.`,
+      'close the extra PR(s) by hand so one PR delivers the issue.'),
       `multiple open PRs on epic/${issue}-* branches — ambiguous`, { removeQueue: true })
   }
   const pr = prs[0]
@@ -174,14 +219,16 @@ async function prepare(issue) {
     actor = await authenticatedLogin()
     comments = await issueView(issue, 'comments')
   } catch (e) {
-    return refuseFinal(`🤖 fix-defect refused: trusted defect-fix evidence could not be read\nThe authenticated repair brief could not be verified (${e?.message || e}). The issue has been removed from autonomous repair for a human.`,
+    return refuseFinal(queueRefusal('🤖 fix-defect refused: trusted defect-fix evidence could not be read',
+      `The authenticated repair brief could not be verified (${e?.message || e}).`),
       'trusted defect-fix evidence could not be read', { removeQueue: true })
   }
   const evidence = matchingDefectEvidence(comments.comments, {
     actor, issue, prNumber: pr.number, branch: pr.headRefName, head: pr.headRefOid,
   })
   if (!evidence) {
-    return refuseFinal('🤖 fix-defect refused: missing trusted defect-fix evidence\nNo canonical evidence comment authored by the authenticated automation identity matches this issue, PR, branch, and head. The issue has been removed from autonomous repair for a human.',
+    return refuseFinal(queueRefusal('🤖 fix-defect refused: missing trusted defect-fix evidence',
+      'No canonical evidence comment authored by the authenticated automation identity matches this issue, PR, branch, and head.'),
       'missing trusted defect-fix evidence for the selected PR head', { removeQueue: true })
   }
 
@@ -236,11 +283,15 @@ async function ship(issue, prep, body) {
     return { pushed: true, labelled: false, note: `selected PR head did not advance to amended HEAD ${amendedHead} (observed ${observedPr.headRefOid || 'missing'})` }
   }
   await comment(issue, body)
-  await ensureLabels(['ready-to-merge'])
-  const flip = await editLabels(issue, { add: ['ready-to-merge'], remove: ['ready-to-review', 'in-progress', 'failed', 'needs-defect-fix'] })
+  // From here the run is inside reap's settle window: the swap starts the clock
+  // the moment GitHub processes it, so the write and the readback after it share
+  // one budget (see terminalBudget) and the run still has a RESULT line to write.
+  const budget = terminalBudget()
+  await ensureLabels(['ready-to-merge'], { budget })
+  const flip = await editLabels(issue, { add: ['ready-to-merge'], remove: ['ready-to-review', 'in-progress', 'failed', 'needs-defect-fix'] }, { budget })
   let labels
   try {
-    labels = await issueLabels(issue)
+    labels = await issueLabels(issue, { budget })
   } catch (e) {
     return { pushed: true, labelled: false, note: e && e.message || String(e) }
   }

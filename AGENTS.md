@@ -223,7 +223,10 @@ than made launchable against a main without the code it describes.
   defect, and rejoins `ready-to-merge` only after orchestrator-run verify plus
   a blind adversarial check of the complete delta, including intent-added new
   files. Every blocker/refusal restores and verifies its terminal labels even
-  when its reporting comment fails. Autonomous dispatch is opt-in per repo through
+  when its reporting comment fails, and any guidance that names a label is
+  composed from that readback per label — an operator is asked to set what is
+  missing and remove what is stuck, never to repair state that is already
+  right. Autonomous dispatch is opt-in per repo through
   `DEFECT_FIX_REPOS`; manual `defect` remains an explicit override.
 - Every cleanup needs a positive proof of staleness: a claim ref only while its
   tip is still the claim commit and no session is live; a worktree only when its
@@ -232,7 +235,16 @@ than made launchable against a main without the code it describes.
 - Terminal is the label, and a terminal label must settle for
   `TERMINAL_SETTLE_MINUTES` before a session is killed. Dispatch synchronously
   shields a fixer launch by swapping its resting terminal label to
-  `in-progress`, including `ready-to-review` for defect repair.
+  `in-progress`, including `ready-to-review` for defect repair. GitHub can apply
+  a terminal label — starting that clock — while the client still waits on the
+  response, so the write itself and everything after it share ONE budget
+  (`TERMINAL_REPORT_BUDGET_MS`, a share per call capped by what is left of the
+  window): a fixer's swap, the readback its guidance is composed from and the
+  refusal comment; epic-run's merge gate, which runs after ship's
+  `ready-to-review`; the status comment's final edit. Reap floors the window
+  (`MIN_TERMINAL_SETTLE_MINUTES`) so the two cannot be configured into a race.
+  Never add a GitHub call on the default timeout from a terminal label write
+  onward.
 - Dispatch launches but never claims. Two ticks racing on one issue is safe
   because the ref push decides.
 - The CLI binary moves only on an idle host, under dispatch's lock. Gated by

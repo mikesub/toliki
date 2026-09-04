@@ -48,7 +48,7 @@ import { failureReason, must } from './lib/proc.mjs'
 import {
   ensureLabels, editLabels, issueLabels, issueView, openBlockers, comment, assignSelf,
   openPrs, searchOpenPrs, prCreate, issueCreate, withBodyFile, hasDeferredRecord, issueId, addBlockedBy,
-  authenticatedLogin,
+  authenticatedLogin, terminalBudget,
 } from './lib/github.mjs'
 import { matchingDefectEvidence, renderDefectEvidence } from './lib/defect-evidence.mjs'
 import {
@@ -560,6 +560,16 @@ async function prepare(issue) {
   }
 }
 
+// One budget for everything from the run's first terminal label to its last GitHub call. Ship applies
+// `ready-to-review` and the merge gate runs AFTER it — the evidence comment and its readback, the queue
+// label edit, the promotion to `ready-to-merge`, a post-ship blocker report — while bin/reap.sh has
+// already started the settle clock at that label. On the default gh timeout any one of those calls is
+// longer than the shortest window reap will honour, so the sweep can kill a live session between the
+// label and the record of what the gate decided. Opened at the write, spent by every call after it;
+// before the write there is no clock running, so `spend()` is empty and the default timeout stands.
+let terminalWindow = null
+const spend = () => (terminalWindow ? { budget: terminalWindow } : undefined)
+
 // Squash, push, open the PR, record deferrals, label — from ship's JSON.
 async function shipTransport({ issue, slug, dir, decision }) {
   const branch = `epic/${slug}`
@@ -648,8 +658,9 @@ async function shipTransport({ issue, slug, dir, decision }) {
 
   // ready-to-review and nothing else: whether the PR may instead be queued for unattended merge is
   // the gate's decision, downstream of here. The assignee stays (it records ownership).
-  await ensureLabels(['ready-to-review'])
-  const flip = await editLabels(issue, { add: ['ready-to-review'], remove: ['in-progress'] })
+  terminalWindow = terminalBudget()
+  await ensureLabels(['ready-to-review'], spend())
+  const flip = await editLabels(issue, { add: ['ready-to-review'], remove: ['in-progress'] }, spend())
   if (!flip.ok) log(`Ship: label flip to ready-to-review failed (${failureReason(flip)}) — the PR is open; a human finishes the labels`)
   updateEpicMd(dir, { phase: 'ship → done', log: `ship: PR opened ${prUrl}; ${deferred.length} deferred item(s), ${filed} filed, ${deferredDefects} defect(s)` })
   return { prUrl, prNumber, prHead, deferredDefects, deferredCount: deferred.length, filed }
@@ -659,10 +670,10 @@ async function shipTransport({ issue, slug, dir, decision }) {
 // only writes its verdict where bin/merge-worker.sh will read it. Verified by reading the labels
 // back: labelled=true only when ready-to-merge is on and ready-to-review is off.
 async function handoff(issue, dir) {
-  await ensureLabels(['ready-to-merge'])
-  const r = await editLabels(issue, { add: ['ready-to-merge'], remove: ['ready-to-review'] })
+  await ensureLabels(['ready-to-merge'], spend())
+  const r = await editLabels(issue, { add: ['ready-to-merge'], remove: ['ready-to-review'] }, spend())
   if (!r.ok) return { labelled: false, summary: failureReason(r) }
-  const labels = await issueLabels(issue)
+  const labels = await issueLabels(issue, spend())
   const labelled = labels.includes('ready-to-merge') && !labels.includes('ready-to-review')
   if (labelled) updateEpicMd(dir, { log: 'handoff: queued for merge-worker' })
   return { labelled, summary: labelled ? 'ready-to-merge observed' : `observed labels: ${labels.join(', ')}` }
@@ -701,11 +712,11 @@ async function postBlocker({ issue, slug, phase, reason, prUrl }) {
     const m = readFileSync(path.join(epicDir(slug), 'epic.md'), 'utf8').match(/## Phase log[\s\S]*$/)
     if (m) body += `\n${m[0].trim()}\n`
   }
-  await comment(issue, body)
+  await comment(issue, body, spend())
   // Every terminal label comes off — ready-to-merge above all, since leaving it would hand a failed
   // run's PR to the merge worker. The assignee stays.
-  await ensureLabels(['failed'])
-  const flip = await editLabels(issue, { add: ['failed'], remove: ['in-progress', 'ready-to-merge', 'ready-to-review'] })
+  await ensureLabels(['failed'], spend())
+  const flip = await editLabels(issue, { add: ['failed'], remove: ['in-progress', 'ready-to-merge', 'ready-to-review'] }, spend())
   if (!flip.ok) log(`blocked: label flip to failed failed (${failureReason(flip)})`)
 }
 
@@ -1229,7 +1240,7 @@ try {
     if (mergeBlockers.every(b => b.defectClass)) {
       try {
         if (!Number.isInteger(shipped.prNumber)) throw new Error(`could not derive a PR number from ${shipped.prUrl}`)
-        const actor = await authenticatedLogin()
+        const actor = await authenticatedLogin(spend())
         const evidence = {
           version: 1,
           issue,
@@ -1237,15 +1248,15 @@ try {
           requirement: { title: requirementTitle, body: requirementBody },
           blockers: mergeBlockers.map(({ source, reason, items }) => ({ source, reason, items })),
         }
-        await comment(issue, renderDefectEvidence(evidence))
-        const comments = await issueView(issue, 'comments')
+        await comment(issue, renderDefectEvidence(evidence), spend())
+        const comments = await issueView(issue, 'comments', spend())
         if (!matchingDefectEvidence(comments.comments, {
           actor, issue, prNumber: shipped.prNumber, branch: `epic/${slug}`, head: shipped.prHead,
         })) throw new Error('canonical defect-fix evidence was not observed after posting')
-        await ensureLabels(['ready-to-review', 'needs-defect-fix'])
-        const queued = await editLabels(issue, { add: ['ready-to-review', 'needs-defect-fix'] })
+        await ensureLabels(['ready-to-review', 'needs-defect-fix'], spend())
+        const queued = await editLabels(issue, { add: ['ready-to-review', 'needs-defect-fix'] }, spend())
         if (queued.ok) {
-          const labels = await issueLabels(issue)
+          const labels = await issueLabels(issue, spend())
           needsDefectFix = labels.includes('ready-to-review') && labels.includes('needs-defect-fix')
         }
       } catch (e) {

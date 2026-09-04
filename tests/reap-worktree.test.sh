@@ -27,10 +27,15 @@ assert_dir() { if [[ -d "$2" ]]; then ok "$1"; else nok "$1 (gone: $2)"; fi; }
 assert_no_dir() { if [[ ! -d "$2" ]]; then ok "$1"; else nok "$1 (still there: $2)"; fi; }
 
 mkdir -p "$TMP/bin"
-# gh: only the auth preflight matters here — no session reaches pass 1.
+# gh: the auth preflight, plus pass 1's one issue query — state, updatedAt and
+# labels on a single line. Silent unless a scenario sets FAKE_ISSUE, so the
+# worktree passes below can never read a session as terminal.
 cat > "$TMP/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 [[ "${1:-}" == "auth" ]] && exit 0
+if [[ "${1:-} ${2:-}" == "issue view" && -n "${FAKE_ISSUE:-}" ]]; then
+  printf '%s\n' "$FAKE_ISSUE"
+fi
 exit 0
 STUB
 # tmux: reports exactly the sessions named in $FAKE_SESSIONS (newline separated).
@@ -85,9 +90,12 @@ run_reap() {
     PATH="$TMP/bin:$PATH" \
     EPIC_WORKTREE_ROOT="$WT_ROOT" \
     FAKE_SESSIONS="${FAKE_SESSIONS:-}" \
+    FAKE_ISSUE="${FAKE_ISSUE:-}" \
+    TERMINAL_SETTLE_MINUTES="${TERMINAL_SETTLE_MINUTES:-}" \
     bash "$HARNESS/bin/reap.sh" "$@" 2>&1
   )" || true
 }
+ago() { date -u -v-"$1"M +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "$1 minutes ago" +%Y-%m-%dT%H:%M:%SZ; }
 
 printf '\nreap pass 3: a delivered worktree is removed\n'
 mk_worktree testrepo-epic-63 48
@@ -128,6 +136,20 @@ mkdir -p "$WT_ROOT/testrepo/scratch-notes"
 touch -t "$(date -v-48H +%Y%m%d%H%M 2>/dev/null || date -d '48 hours ago' +%Y%m%d%H%M)" "$WT_ROOT/testrepo/scratch-notes"
 FAKE_SESSIONS="" run_reap
 assert_dir "kept — it isn't a <repo>-epic-<N> worktree" "$WT_ROOT/testrepo/scratch-notes"
+
+# A finished run writes its terminal label FIRST and only then reports: the label
+# readback its guidance is composed from, the refusal comment, the status
+# comment's last edit. All of that is inside this window, which is why the knob
+# has a floor — a window shorter than the reporting it is meant to outlast kills
+# the run before the issue ever says why it stopped.
+printf '\nreap pass 1: a settle window under the floor is raised, not honoured\n'
+FAKE_SESSIONS="testrepo-epic-70" FAKE_ISSUE="OPEN $(ago 2) failed" TERMINAL_SETTLE_MINUTES=1 run_reap -n
+assert_contains "the too-short window is reported and raised" "$RUN_OUT" "TERMINAL_SETTLE_MINUTES=1 is below the 3m floor"
+assert_contains "so a run two minutes into its terminal label is left to finish" "$RUN_OUT" "may still be finishing, leaving alone"
+
+printf '\nreap pass 1: a genuinely settled terminal label is still reaped\n'
+FAKE_SESSIONS="testrepo-epic-70" FAKE_ISSUE="OPEN $(ago 30) failed" TERMINAL_SETTLE_MINUTES=1 run_reap -n
+assert_contains "the floor delays a kill, it never prevents one" "$RUN_OUT" "would kill testrepo-epic-70"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
