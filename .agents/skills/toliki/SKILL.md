@@ -1,7 +1,6 @@
 ---
-name: triage
+name: toliki
 description: Surface everything stuck in the epic pipeline — failed and review-waiting issues, stuck queue states, dead sessions, orphaned agent processes and leaked worktrees — across all registered repos. Use when the user asks what got stuck, what needs them, or for a pipeline status check when sitting down to work.
-model: sonnet
 ---
 
 Produce the operator's sit-down brief: everything that needs a human and
@@ -16,11 +15,12 @@ read-only `ssh` queries (`tmux capture-pane`, log tails). Laptop-side, like
 
 ## 0. Setup
 
-The harness checkout is `$CLAUDE_HARNESS_DIR`. Its machine-local
+Run laptop-side commands from the Toliki repository root (the checkout that
+contains this skill at `.agents/skills/toliki/SKILL.md`). Its machine-local
 `etc/repos.conf` is the registry: `REPO_ORIGINS` decides which repos get
 checked (every entry, always), and `SSH_HOST` is how the host is reached. No
 other repo list exists. Source `etc/lib.sh` under bash explicitly, since it
-locates itself via `BASH_SOURCE` and this shell is zsh:
+locates itself via `BASH_SOURCE` and the interactive shell may be zsh:
 
 ```
 bash -c 'source etc/lib.sh && printf "%s\n" "${REPO_ORIGINS[@]}"'
