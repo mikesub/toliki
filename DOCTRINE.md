@@ -30,10 +30,12 @@ don't get re-litigated from memory.
   issue body alone, barred from the builder's notes; every finding goes to a
   skeptic instructed to refute it; survivors are auto-fixed, refuted ones
   recorded as unconfirmed rather than deleted, and the fixes get one pass from
-  the same skeptic — a fix it cannot confirm holds the PR for a human instead
-  of starting another round. The strong model goes to design
-  and adjudication, where being wrong is expensive; implementation runs on a
-  cheaper model under the test gate.
+  the same skeptic — a fix it cannot confirm holds the PR instead of starting
+  another round inside the same epic. A hold made entirely of concrete defects
+  may enter a separate, label-bounded defect-fixer session in repositories that
+  explicitly opt in; uncertainty still goes directly to a human. The strong
+  model goes to design and adjudication, where being wrong is expensive;
+  implementation runs on a cheaper model under the test gate.
 - **Merge** — a serial per-repo worker rebases each finished PR onto current
   `main`, gives checks a short registration window, waits for every published
   check on the rebased head, then squash-merges. An empty check rollup after
@@ -44,6 +46,16 @@ don't get re-litigated from memory.
   own — a judgment-class conflict and a red check — go to fixer runs rather
   than to a human, each under an adversarial check and each bounded by one
   retry.
+- **Repair is a new bounded session, never an in-run loop.** Conflict, CI and
+  ship-gate defect repair each have an independent two-attempt ladder in
+  GitHub labels. The defect rung is additionally per-repo opt-in because it
+  changes an already reviewed PR and returns it to unattended eligibility. It
+  may do that only from a durable named-defect envelope authored by the
+  automation identity and bound to the selected PR head. Epic-run verifies the
+  envelope before queueing; the fixer rejects mutable issue prose, stale heads
+  and fork PRs before spending an attempt. After the project verify gate and a
+  blind adversarial check over the complete delta, the merge worker still
+  rebases and re-runs the real checks before landing it.
 - **Crons watch, models act.** Dispatch, reap and merge ticks are plain shell
   reading labels; the first model to run is the epic that got launched.
 - **Models judge, the script acts.** The same split inside a run. Everything

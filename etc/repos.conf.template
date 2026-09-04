@@ -54,6 +54,13 @@ NAME_MAX_LEN=40
 # pipeline bug.
 MAX_PARALLEL_EPICS=2
 
+# Repositories allowed to run the bounded ship-gate defect fixer
+# autonomously. Empty/unset means the defect queue is only descriptive; an
+# operator can still launch one explicitly with `remote-control.sh defect`.
+# Every name must also appear in REPOS, or dispatch refuses the whole tick
+# before reading or changing any GitHub issue.
+DEFECT_FIX_REPOS=()
+
 # Optional: where etc/docker-daemon.json (the Docker build-cache GC policy
 # provision.sh installs) is vendored FROM, so provisioning can warn when the
 # copy drifts from its source of truth. Leave empty to skip the check; set

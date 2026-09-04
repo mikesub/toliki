@@ -19,7 +19,8 @@ only where a judgment is needed. Claude Code and Codex are both supported.
    `blocked_by` dependencies.
 2. **`bin/dispatch.sh`** (cron, on the VPS) — walks each repo's `ready` queue
    and launches a tmux session per unblocked issue, up to the host's slot
-   budget.
+   budget. Repair queues run first; ship-gate defect repair is walked only for
+   repositories listed in the machine-local `DEFECT_FIX_REPOS` allowlist.
 3. **`workflows/epic-run.mjs`** (the session's pane) — claims the issue,
    architects, implements with TDD under a verify gate the orchestrator runs
    itself, reviews under five blind lenses plus an adversarial verifier, and
@@ -36,6 +37,12 @@ only where a judgment is needed. Claude Code and Codex are both supported.
    for **`ci-run.mjs`**, which reads the failing job logs, repairs the cause
    under its own adversarial check, and puts the PR back in the merge queue —
    where its checks are re-run before anything lands.
+   A PR held only on concrete ship-gate defects is marked for
+   **`defect-run.mjs`**, a separate two-attempt fixer. Epic-run first persists
+   and reads back one automation-authored repair envelope bound to the PR head;
+   the fixer accepts only that envelope, verifies and adversarially checks its
+   exact delta, then returns the PR to that same merge queue. Mixed, missing or
+   stale evidence stays with a human.
 5. **`bin/reap.sh`** (cron) — frees what finished runs leave behind (idle
    sessions, stale claim refs), so the slot budget keeps rotating.
 
@@ -81,6 +88,9 @@ run on the host's `EPIC_ENGINE` default, set in `etc/dispatch.cron` (claude
 when unset).
 Turning the box autonomous is a deliberate last step: install the cron file
 per the comment at the top of `etc/dispatch.cron`.
+Defect repair is empty-by-default: add selected registered repo names to
+`DEFECT_FIX_REPOS=(...)` in the host's `etc/repos.conf`, or launch a marked
+issue explicitly with `./remote-control.sh defect N --engine <engine> -r <repo>`.
 
 On the laptop:
 
@@ -99,8 +109,8 @@ gh repo clone mikesub/toliki && cd toliki
   that were considered and rejected, with reasons.
 - **`bin/`, `etc/`** — the host-side scripts and config; each header states
   its contract and the incident behind it.
-- **`workflows/`** — the three pipelines (`epic-run`, and the two fixers
-  `fix-run` and `ci-run`) and the small runtime they sit on: the engine
+- **`workflows/`** — the epic pipeline and three fixers (`epic-run`, `fix-run`,
+  `ci-run`, and `defect-run`) plus the small runtime they sit on: the engine
   adapter, the git/gh/npm transport, the concurrency gate, structured-output
   validation, and the per-spawn usage log `usage-report.mjs` summarizes.
 - **`skills/`, `agents/`** — `/spec` and its `spec-explorer` are exposed to local

@@ -8,7 +8,8 @@
 // over — and skipping architect and code when that branch already carries a
 // code checkpoint → checkpoint commits after code/fixes → squashed single-commit PR at
 // ship + blocker-comment → merge gate labels the issue ready-to-merge when
-// nothing was deferred, ready-to-review when a human must decide.
+// nothing was deferred, or ready-to-review when the PR is held; a hold made
+// exclusively of concrete defects also enters the separate bounded fixer queue.
 // Manual mode (`--slug S`): builds on the current tree, no git; needs
 // .epics/<slug>/requirements.md to already exist.
 //
@@ -30,7 +31,8 @@
 // The fixes themselves get one skeptic pass (fix-check) over exactly the
 // delta they produced. A fix the skeptic cannot confirm, a regression, a dead
 // check or a claimed fix with no diff holds the PR at ready-to-review; none
-// of them starts a second fix round, which is what keeps it bounded.
+// starts a second round inside this epic. Concrete defect-only holds may be
+// repaired later by defect-run under its independent label-bounded ladder.
 //
 // Ship's deferrals go through the same skeptic before the merge gate counts
 // them: every item ship did not call a defect is re-judged, and the skeptic
@@ -46,7 +48,9 @@ import { failureReason, must } from './lib/proc.mjs'
 import {
   ensureLabels, editLabels, issueLabels, issueView, openBlockers, comment, assignSelf,
   openPrs, searchOpenPrs, prCreate, issueCreate, withBodyFile, hasDeferredRecord, issueId, addBlockedBy,
+  authenticatedLogin,
 } from './lib/github.mjs'
+import { matchingDefectEvidence, renderDefectEvidence } from './lib/defect-evidence.mjs'
 import {
   git, gitOut, discoverPackages, pkgList, ensureDeps, runVerify, ensureEpicsIgnored, checkpoint, intentToAdd,
   pushRejected, slugify, epicDir, writeRequirements, readRequirements, initEpicMd, updateEpicMd,
@@ -426,7 +430,7 @@ const gitMode = issue != null
 // structured outcome the pipeline branches on, or throws with a message that
 // names the command that failed — main()'s catch turns that into a blocker.
 
-const LIFECYCLE = ['in-progress', 'ready-to-merge', 'ready-to-review', 'failed']
+const LIFECYCLE = ['in-progress', 'ready-to-merge', 'ready-to-review', 'failed', 'needs-defect-fix']
 
 // Claiming is what makes it safe to run epics in parallel. The label swap `ready` → `in-progress`
 // can't be the lock — it's a read-modify-write with a wide window — but creating a ref on origin is a
@@ -536,7 +540,7 @@ async function prepare(issue) {
   // Signal on GitHub that autonomous work has started — now, before the slow deps step. Best-effort:
   // a failure is noted in the phase log (so it surfaces in the PR body) and never aborts the run.
   await ensureLabels(LIFECYCLE)
-  const swap = await editLabels(issue, { add: ['in-progress'], remove: ['ready', 'ready-to-merge', 'ready-to-review', 'failed'] })
+  const swap = await editLabels(issue, { add: ['in-progress'], remove: ['ready', 'ready-to-merge', 'ready-to-review', 'failed', 'needs-defect-fix'] })
   if (!swap.ok) notes.push(`prepare: label swap failed: ${failureReason(swap)}`)
   const assigned = await assignSelf(issue)
   if (!assigned.ok) notes.push(`prepare: self-assign failed: ${failureReason(assigned)}`)
@@ -549,7 +553,11 @@ async function prepare(issue) {
 
   const packages = discoverPackages('.')
   const depLines = packages.length ? await ensureDeps(packages, { pairs: [[base, 'HEAD']] }) : []
-  return { slug, branch, resumed, codeDone, requirement: readRequirements(dir), packages, depLines }
+  return {
+    slug, branch, resumed, codeDone, requirement: readRequirements(dir),
+    requirementTitle: String(view.title || ''), requirementBody: String(view.body || ''),
+    packages, depLines,
+  }
 }
 
 // Squash, push, open the PR, record deferrals, label — from ship's JSON.
@@ -588,6 +596,8 @@ async function shipTransport({ issue, slug, dir, decision }) {
   if (!push.ok) throw new Error(pushRejected(push) ? `the force-with-lease push was rejected — ${branch} moved on origin under this run` : `git push failed (${failureReason(push)})`)
 
   const prUrl = await prCreate({ head: branch, title, bodyFile: path.join(dir, 'summary.md') })
+  const prNumber = Number(String(prUrl).trim().split('/').pop())
+  const prHead = await gitOut(['rev-parse', 'HEAD'], 'git rev-parse HEAD')
 
   // Deferred work is recorded on the ISSUE, not the PR — and only now that the PR exists.
   // Everything above is idempotent under a re-run (the branch is rebuilt, the push is a lease, and
@@ -642,7 +652,7 @@ async function shipTransport({ issue, slug, dir, decision }) {
   const flip = await editLabels(issue, { add: ['ready-to-review'], remove: ['in-progress'] })
   if (!flip.ok) log(`Ship: label flip to ready-to-review failed (${failureReason(flip)}) — the PR is open; a human finishes the labels`)
   updateEpicMd(dir, { phase: 'ship → done', log: `ship: PR opened ${prUrl}; ${deferred.length} deferred item(s), ${filed} filed, ${deferredDefects} defect(s)` })
-  return { prUrl, deferredDefects, deferredCount: deferred.length, filed }
+  return { prUrl, prNumber, prHead, deferredDefects, deferredCount: deferred.length, filed }
 }
 
 // Transport, not judgment: the merge gate has already been computed from structured counts, and this
@@ -724,9 +734,12 @@ async function fail(phase, reason) {
 
 // The issue carries no per-phase commentary: the ready → in-progress → ready-to-merge/ready-to-review/failed
 // label lifecycle is the live signal, the PR body is the record of HOW it was built, and the only comments
-// are the deferred list (nothing else records it) and the blocker report.
+// are the deferred list (nothing else records it) and the blocker report. A concrete defect-only review
+// hold also carries needs-defect-fix for the separate bounded repair queue.
 
 let requirement
+let requirementTitle = ''
+let requirementBody = ''
 // True when the resumed branch already carries a code checkpoint: architect, red and green are skipped.
 let codeDone = false
 // Discovered layout: which packages the verify gate runs in. Fail closed, like every other gate in this
@@ -759,6 +772,8 @@ try {
     if (badLayout) return await fail('prepare', badLayout)
     slug = prep.slug
     requirement = prep.requirement
+    requirementTitle = prep.requirementTitle
+    requirementBody = prep.requirementBody
     codeDone = !!prep.codeDone
     log(`Prepare: requirements written, branch epic/${slug} ${prep.resumed ? 'resumed and rebased onto origin/main' : 'created off origin/main'}${codeDone ? ' (a code checkpoint is on it)' : ''}, deps checked (${prep.depLines.join('; ')}). Packages: ${pkgList(packages)}.`)
   }
@@ -1058,7 +1073,12 @@ try {
     let postFix = null
     if (!changed && fixed.length) {
       // A claimed fix with no diff is not a fix. No model needed to say so.
-      fixBlockers.push(`${fixed.length} finding(s) reported fixed but the fixes step changed nothing`)
+      fixBlockers.push({
+        source: 'claimed-fix-without-delta',
+        reason: `${fixed.length} finding(s) reported fixed but the fixes step changed nothing`,
+        defectClass: true,
+        items: fixed,
+      })
       postFix = { confirmed: [], unresolved: fixed.map(f => ({ finding: f, verdict: { resolved: false, confidence: 0, reasoning: 'the fixes step produced no diff' } })), regressions: [], note: 'The fixes step reported fixes but produced no diff' }
     } else if (changed) {
       const c = await agent(PROMPTS.fixCheck(fixed, `git diff ${codeSha} ${fixSha}`, DIFF),
@@ -1067,7 +1087,7 @@ try {
       if (!c) {
         // A dead check leaves the fixes unreviewed; the PR is complete and verified, so it waits for a
         // human rather than failing the run.
-        fixBlockers.push('the post-fix check produced no result — the fixes are unreviewed')
+        fixBlockers.push({ source: 'missing-post-fix-verdict', reason: 'the post-fix check produced no result — the fixes are unreviewed', defectClass: false, items: fixed })
         postFix = { confirmed: [], unresolved: fixed.map(f => ({ finding: f, verdict: { resolved: false, confidence: 0, reasoning: 'the post-fix check produced no result' } })), regressions: [], note: 'The post-fix check produced no result' }
       } else {
         const verdicts = Array.isArray(c.verdicts) ? c.verdicts : []
@@ -1079,8 +1099,18 @@ try {
           else unresolved.push({ finding: f, verdict: v || { resolved: false, confidence: 0, reasoning: 'no verdict returned — recorded as unresolved rather than assumed fixed' } })
         })
         const regressions = (Array.isArray(c.regressions) ? c.regressions : []).filter(r => Number(r.confidence) >= 75)
-        if (unresolved.length) fixBlockers.push(`${unresolved.length} fix(es) not confirmed by the post-fix check (${unresolved.map(u => u.finding.title).join('; ')})`)
-        if (regressions.length) fixBlockers.push(`${regressions.length} regression(s) introduced by the fixes (${regressions.map(r => `${r.severity}: ${r.title}`).join('; ')})`)
+        if (unresolved.length) fixBlockers.push({
+          source: 'unconfirmed-post-review-fix',
+          reason: `${unresolved.length} fix(es) not confirmed by the post-fix check (${unresolved.map(u => u.finding.title).join('; ')})`,
+          defectClass: true,
+          items: unresolved,
+        })
+        if (regressions.length) fixBlockers.push({
+          source: 'post-review-fix-regression',
+          reason: `${regressions.length} regression(s) introduced by the fixes (${regressions.map(r => `${r.severity}: ${r.title}`).join('; ')})`,
+          defectClass: true,
+          items: regressions,
+        })
         postFix = { confirmed, unresolved, regressions, note: null }
       }
     }
@@ -1128,7 +1158,7 @@ try {
       { label: 'deferral-check', phase: 'Ship', step: 'confirm-review', schema: DEFERRAL_CHECK_SCHEMA },
     )
     if (!c) {
-      deferralBlockers.push(`the deferral check produced no result — ${toCheck.length} deferred item(s) are unclassified`)
+      deferralBlockers.push({ source: 'missing-deferral-verdict', reason: `the deferral check produced no result — ${toCheck.length} deferred item(s) are unclassified`, defectClass: false, items: toCheck })
       log('Deferral check: produced no result — the PR will be held.')
     } else {
       const verdicts = Array.isArray(c.verdicts) ? c.verdicts : []
@@ -1176,17 +1206,54 @@ try {
   // the run would park a build slot on a lock while the whole queue waited behind it.
   const mergeBlockers = []
   if (triageDeferred.length) {
-    mergeBlockers.push(`${triageDeferred.length} confirmed review finding(s) left unfixed by fixes-after-review (${triageDeferred.map(d => `${d.severity}: ${d.title}`).join('; ')})`)
+    mergeBlockers.push({
+      source: 'fixes-after-review-deferral',
+      reason: `${triageDeferred.length} confirmed review finding(s) left unfixed by fixes-after-review (${triageDeferred.map(d => `${d.severity}: ${d.title}`).join('; ')})`,
+      defectClass: true,
+      items: triageDeferred,
+    })
   }
   if (shipped.deferredDefects > 0) {
-    mergeBlockers.push(`${shipped.deferredDefects} deferred defect(s) that still exist on main after this merge`)
+    mergeBlockers.push({
+      source: 'ship-deferral',
+      reason: `${shipped.deferredDefects} deferred defect(s) that still exist on main after this merge`,
+      defectClass: true,
+      items: deferred.filter(d => d.kind === 'defect'),
+    })
   }
   mergeBlockers.push(...fixBlockers, ...deferralBlockers)
 
   if (mergeBlockers.length) {
-    const why = mergeBlockers.join(' + ')
+    const why = mergeBlockers.map(b => b.reason).join(' + ')
+    let needsDefectFix = false
+    if (mergeBlockers.every(b => b.defectClass)) {
+      try {
+        if (!Number.isInteger(shipped.prNumber)) throw new Error(`could not derive a PR number from ${shipped.prUrl}`)
+        const actor = await authenticatedLogin()
+        const evidence = {
+          version: 1,
+          issue,
+          pr: { number: shipped.prNumber, url: shipped.prUrl, branch: `epic/${slug}`, head: shipped.prHead },
+          requirement: { title: requirementTitle, body: requirementBody },
+          blockers: mergeBlockers.map(({ source, reason, items }) => ({ source, reason, items })),
+        }
+        await comment(issue, renderDefectEvidence(evidence))
+        const comments = await issueView(issue, 'comments')
+        if (!matchingDefectEvidence(comments.comments, {
+          actor, issue, prNumber: shipped.prNumber, branch: `epic/${slug}`, head: shipped.prHead,
+        })) throw new Error('canonical defect-fix evidence was not observed after posting')
+        await ensureLabels(['ready-to-review', 'needs-defect-fix'])
+        const queued = await editLabels(issue, { add: ['ready-to-review', 'needs-defect-fix'] })
+        if (queued.ok) {
+          const labels = await issueLabels(issue)
+          needsDefectFix = labels.includes('ready-to-review') && labels.includes('needs-defect-fix')
+        }
+      } catch (e) {
+        log(`Merge gate: defect-fixer queue handoff could not be verified (${e && e.message || e}) — the PR remains ready-to-review.`)
+      }
+    }
     log(`Merge gate: held — ${why}. PR stays ready-to-review for a human.`)
-    return { ...result, mergeSkipped: why }
+    return { ...result, mergeSkipped: why, ...(needsDefectFix ? { needsDefectFix: true } : {}) }
   }
 
   // Promotion, never demotion: ship already applied the conservative `ready-to-review`, so every way this

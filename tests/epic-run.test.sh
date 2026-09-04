@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-# Exercises workflows/epic-run.mjs and workflows/fix-run.mjs end to end. The
+# Exercises workflows/epic-run.mjs and its three fixer orchestrators end to end. The
 # orchestrator's own git runs for real against a throwaway bare origin under
 # mktemp; `gh` and `npm` are stubs on PATH; the model steps are a stub engine
 # that answers each prompt with a fixture keyed by a marker in the prompt and
@@ -18,6 +18,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EPIC_RUN="$ROOT/workflows/epic-run.mjs"
 FIX_RUN="$ROOT/workflows/fix-run.mjs"
 CI_RUN="$ROOT/workflows/ci-run.mjs"
+DEFECT_RUN="$ROOT/workflows/defect-run.mjs"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -137,6 +138,8 @@ case "${EPIC_STEP_LABEL:-}" in
   check)                                       key=fix-check ;;
   fix-ci)                                      key=ci-fix ;;
   ci-check)                                    key=ci-check ;;
+  fix-defect)                                  key=defect-fix ;;
+  defect-check)                                key=defect-check ;;
 esac
 
 n="$(cat "$STUB_STATE/$key.n" 2>/dev/null || echo 0)"
@@ -211,30 +214,49 @@ case "${1:-} ${2:-}" in
     # The deferred-record probe reads comments; they are stored as blocks
     # separated by a lone --- line, exactly as the comment case writes them.
     if [[ "$*" == *comments* ]]; then
+      if [[ "${GH_EVIDENCE_READ_FAIL:-}" == "1" ]] && grep -q '^🤖 defect-fix evidence$' "$state/comments" 2>/dev/null; then
+        printf 'HTTP 502\n' >&2
+        exit 1
+      fi
       if [[ -s "$state/comments" ]]; then
-        jq -R -s 'split("\n---\n") | map(select(length > 0) | {body: .}) | {comments: .}' < "$state/comments"
+        authors="$(jq -cn --arg raw "${GH_SEED_COMMENT_AUTHORS:-}" '$raw | split(",") | map(select(length > 0))')"
+        jq -R -s --argjson authors "$authors" --arg login "${GH_AUTH_LOGIN:-toliki-bot}" \
+          'split("\n---\n") | map(select(length > 0)) | to_entries | map({body: .value, author: {login: ($authors[.key] // $login)}}) | {comments: .}' < "$state/comments"
       else
         printf '{"comments":[]}\n'
       fi
       exit 0
     fi
-    printf '{"number":%s,"title":"Add widget","body":"Build a widget.","state":"%s","labels":%s}\n' "${3:-0}" "${GH_ISSUE_STATE:-OPEN}" "$(labels_json)" ;;
+    if [[ "$*" == *"--json labels"* ]]; then
+      n="$(cat "$state/label-reads" 2>/dev/null || echo 0)"; n=$((n + 1)); printf '%s' "$n" > "$state/label-reads"
+      if [[ "$n" == "${GH_LABEL_READ_FAIL_AT:-}" ]]; then printf 'HTTP 502\n' >&2; exit 1; fi
+    fi
+    printf '{"number":%s,"title":"Add widget","body":%s,"state":"%s","labels":%s}\n' "${3:-0}" "$(printf '%s' "${GH_ISSUE_BODY:-Build a widget.}" | jq -Rs .)" "${GH_ISSUE_STATE:-OPEN}" "$(labels_json)" ;;
   "issue edit")
     target="$(labels_for "${3:-}")"
     touch "$target"
     shift 3
     while [[ $# -gt 0 ]]; do
       case "$1" in
-        --add-label) grep -qx -- "$2" "$target" || printf '%s\n' "$2" >> "$target"; shift 2 ;;
+        --add-label)
+          if [[ "$2" != "${GH_DROP_LABEL:-}" ]]; then
+            grep -qx -- "$2" "$target" || printf '%s\n' "$2" >> "$target"
+          fi
+          shift 2 ;;
         --remove-label) grep -vx -- "$2" "$target" > "$target.tmp" || true; mv "$target.tmp" "$target"; shift 2 ;;
         *) shift ;;
       esac
     done ;;
   "issue comment")
-    shift 3; body=""
+    shift 3; body=""; body_file=0
     while [[ $# -gt 0 ]]; do
-      case "$1" in --body-file) body="$(cat "$2")"; shift 2 ;; --body) body="$2"; shift 2 ;; *) shift ;; esac
+      case "$1" in --body-file) body="$(cat "$2")"; body_file=1; shift 2 ;; --body) body="$2"; shift 2 ;; *) shift ;; esac
     done
+    if [[ "${GH_BODY_FILE_COMMENT_FAIL:-}" == "1" && "$body_file" == "1" ]] || \
+       [[ "${GH_EVIDENCE_COMMENT_FAIL:-}" == "1" && "$body" == '🤖 defect-fix evidence'* ]]; then
+      printf 'HTTP 502\n' >&2
+      exit 1
+    fi
     printf '%s\n---\n' "$body" >> "$state/comments"
     printf 'https://github.com/o/r/issues/42#issuecomment-999001\n' ;;
   "issue create")
@@ -246,22 +268,36 @@ case "${1:-} ${2:-}" in
     printf 'https://github.com/o/r/issues/%s\n' "$(( 100 + $(grep -c '^---$' "$state/issues-created") ))" ;;
   "pr list")
     if [[ "$*" == *--search* || -z "${GH_OPEN_PR_BRANCH:-}" ]]; then printf '[]\n'; else
-      sha="$(git -C "$STUB_ORIGIN" rev-parse -q --verify "refs/heads/$GH_OPEN_PR_BRANCH" 2>/dev/null || echo missing)"
+      sha="${GH_PR_HEAD:-$(git -C "$STUB_ORIGIN" rev-parse -q --verify "refs/heads/$GH_OPEN_PR_BRANCH" 2>/dev/null || echo missing)}"
       # statusCheckRollup mirrors what the merge worker reads: GH_RED_CHECKS is a
       # comma-separated list of failing check names, empty for an all-green PR.
       # printf with the trailing newline, or `read` drops the last name.
       rollup="$(printf '%s\n' "${GH_RED_CHECKS:-}" | tr ',' '\n' | sed '/^$/d' | while IFS= read -r c; do
         printf '{"__typename":"CheckRun","name":"%s","status":"COMPLETED","conclusion":"FAILURE","detailsUrl":"https://github.com/o/r/actions/runs/555/job/1"},' "$c"
       done)"
-      printf '[{"number":7,"url":"https://github.com/o/r/pull/7","headRefName":"%s","headRefOid":"%s","statusCheckRollup":[%s{"__typename":"CheckRun","name":"lint","status":"COMPLETED","conclusion":"SUCCESS"}]}]\n' "$GH_OPEN_PR_BRANCH" "$sha" "$rollup"
+      if [[ "${GH_ONLY_FORK_PR:-}" == "1" ]]; then
+        printf '[{"number":8,"url":"https://github.com/fork/r/pull/8","headRefName":"%s","headRefOid":"%s","isCrossRepository":true,"headRepository":{"name":"r"},"headRepositoryOwner":{"login":"fork"},"statusCheckRollup":[]}]\n' "$GH_OPEN_PR_BRANCH" "$sha"
+      elif [[ "${GH_FORK_PR:-}" == "1" ]]; then
+        printf '[{"number":7,"url":"https://github.com/o/r/pull/7","headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"headRepository":{"name":"r"},"headRepositoryOwner":{"login":"o"},"statusCheckRollup":[]},{"number":8,"url":"https://github.com/fork/r/pull/8","headRefName":"%s","headRefOid":"%s","isCrossRepository":true,"headRepository":{"name":"r"},"headRepositoryOwner":{"login":"fork"},"statusCheckRollup":[]}]\n' "$GH_OPEN_PR_BRANCH" "$sha" "$GH_OPEN_PR_BRANCH" "$sha"
+      elif [[ "${GH_OPEN_PR_COUNT:-1}" == "2" ]]; then
+        printf '[{"number":7,"url":"https://github.com/o/r/pull/7","headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"headRepository":{"name":"r"},"headRepositoryOwner":{"login":"o"},"statusCheckRollup":[]},{"number":8,"url":"https://github.com/o/r/pull/8","headRefName":"epic/42-other","headRefOid":"%s","isCrossRepository":false,"headRepository":{"name":"r"},"headRepositoryOwner":{"login":"o"},"statusCheckRollup":[]}]\n' "$GH_OPEN_PR_BRANCH" "$sha" "$sha"
+      else
+        printf '[{"number":7,"url":"https://github.com/o/r/pull/7","headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"headRepository":{"name":"r"},"headRepositoryOwner":{"login":"o"},"statusCheckRollup":[%s{"__typename":"CheckRun","name":"lint","status":"COMPLETED","conclusion":"SUCCESS"}]}]\n' "$GH_OPEN_PR_BRANCH" "$sha" "$rollup"
+      fi
     fi ;;
+  "pr view")
+    sha="${GH_POST_PUSH_PR_HEAD:-$(git -C "$STUB_ORIGIN" rev-parse -q --verify "refs/heads/${GH_OPEN_PR_BRANCH:-missing}" 2>/dev/null || echo missing)}"
+    printf '{"number":7,"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"headRepository":{"name":"r"},"headRepositoryOwner":{"login":"o"}}\n' "${GH_OPEN_PR_BRANCH:-}" "$sha" ;;
+  "repo view") printf '{"nameWithOwner":"o/r"}\n' ;;
   "run view")
     printf '%s\n' "${GH_JOB_LOG:-FAIL src/widget.test.ts: expected createWidget to be exported}" ;;
   "pr create")
     printf '%s\n' "$*" >> "$state/pr-created"
     printf 'https://github.com/o/r/pull/7\n' ;;
   "api "*)
-    if [[ "$*" == *"--method POST"* && "$*" == *dependencies/blocked_by* ]]; then
+    if [[ "$*" == "api user"* ]]; then
+      printf '{"login":"%s"}\n' "${GH_AUTH_LOGIN:-toliki-bot}"
+    elif [[ "$*" == *"--method POST"* && "$*" == *dependencies/blocked_by* ]]; then
       # Ship ordering a follow-up behind the epic's own issue. Records
       # "<follow-up> <blocker id>" so a scenario can assert what was linked.
       [[ "${GH_DEP_WRITE_FAIL:-}" != "1" ]] || { printf 'HTTP 422\n' >&2; exit 1; }
@@ -418,6 +454,19 @@ run_pipeline() { # script fixtures-dir args...   (scenario knobs via GH_* env)
     GH_ISSUE_LABELS="${GH_ISSUE_LABELS:-ready}" \
     GH_BLOCKED_BY="${GH_BLOCKED_BY:-[]}" \
     GH_OPEN_PR_BRANCH="${GH_OPEN_PR_BRANCH:-}" \
+    GH_OPEN_PR_COUNT="${GH_OPEN_PR_COUNT:-}" \
+    GH_PR_HEAD="${GH_PR_HEAD:-}" \
+    GH_POST_PUSH_PR_HEAD="${GH_POST_PUSH_PR_HEAD:-}" \
+    GH_FORK_PR="${GH_FORK_PR:-}" \
+    GH_ONLY_FORK_PR="${GH_ONLY_FORK_PR:-}" \
+    GH_DROP_LABEL="${GH_DROP_LABEL:-}" \
+    GH_LABEL_READ_FAIL_AT="${GH_LABEL_READ_FAIL_AT:-}" \
+    GH_BODY_FILE_COMMENT_FAIL="${GH_BODY_FILE_COMMENT_FAIL:-}" \
+    GH_EVIDENCE_COMMENT_FAIL="${GH_EVIDENCE_COMMENT_FAIL:-}" \
+    GH_EVIDENCE_READ_FAIL="${GH_EVIDENCE_READ_FAIL:-}" \
+    GH_AUTH_LOGIN="${GH_AUTH_LOGIN:-}" \
+    GH_SEED_COMMENT_AUTHORS="${GH_SEED_COMMENT_AUTHORS:-}" \
+    GH_ISSUE_BODY="${GH_ISSUE_BODY:-}" \
     GH_RED_CHECKS="${GH_RED_CHECKS:-}" \
     GH_DEPS_FAIL="${GH_DEPS_FAIL:-}" \
     GH_SLOW_PATCH="${GH_SLOW_PATCH:-}" \
@@ -439,6 +488,7 @@ scenario 'epic-run: happy path ships and queues for merge'
 run_pipeline "$EPIC_RUN" "$BASE" --issue 42
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_contains "RESULT says readyToMerge" "$RUN_OUT" '"readyToMerge":true'
+assert_not_contains "a clear gate never advertises defect repair" "$RUN_OUT" '"needsDefectFix":true'
 assert_contains "RESULT carries the PR url" "$RUN_OUT" '"prUrl":"https://github.com/o/r/pull/7"'
 assert_contains "review tally reported" "$RUN_OUT" '1 confirmed by adversarial verification, 0 refuted'
 assert_eq "exactly the twelve model steps ran" 12 "$(wc -l < "$RUN_LOG" | tr -d ' ')"
@@ -684,7 +734,27 @@ assert_rc "exits 0 (the PR is real, just held)" 0 "$RUN_RC"
 assert_contains "RESULT records why the gate held" "$RUN_OUT" '"mergeSkipped"'
 assert_contains "the held reason names the finding" "$RUN_OUT" 'Critical: Null deref on empty list'
 assert_not_contains "it is not queued for merge" "$RUN_OUT" '"readyToMerge":true'
-assert_eq "the issue stays ready-to-review" "ready-to-review," "$(gh_labels)"
+assert_contains "RESULT marks an exclusively defect-class hold repairable" "$RUN_OUT" '"needsDefectFix":true'
+assert_eq "the issue stays reviewable and enters the defect-fixer queue" "needs-defect-fix,ready-to-review," "$(gh_labels)"
+
+scenario 'epic-run: repairability is reported only after the queue label is observed'
+GH_DROP_LABEL=needs-defect-fix run_pipeline "$EPIC_RUN" "$HELD" --issue 42
+assert_rc "the completed PR is still a clean held result" 0 "$RUN_RC"
+assert_contains "the original gate reason is preserved" "$RUN_OUT" 'Critical: Null deref on empty list'
+assert_not_contains "RESULT cannot claim an unobserved queue handoff" "$RUN_OUT" '"needsDefectFix":true'
+assert_eq "the conservative review label remains" "ready-to-review," "$(gh_labels)"
+
+scenario 'epic-run: an unpersisted repair brief cannot enter the defect queue'
+GH_EVIDENCE_COMMENT_FAIL=1 run_pipeline "$EPIC_RUN" "$HELD" --issue 42
+assert_rc "the completed PR remains a held result" 0 "$RUN_RC"
+assert_not_contains "a failed evidence write prevents queueing" "$RUN_OUT" '"needsDefectFix":true'
+assert_eq "only the review label remains" "ready-to-review," "$(gh_labels)"
+
+scenario 'epic-run: an unreadable repair brief cannot enter the defect queue'
+GH_EVIDENCE_READ_FAIL=1 run_pipeline "$EPIC_RUN" "$HELD" --issue 42
+assert_rc "the completed PR remains a held result" 0 "$RUN_RC"
+assert_not_contains "a failed evidence readback prevents queueing" "$RUN_OUT" '"needsDefectFix":true'
+assert_eq "only the review label remains" "ready-to-review," "$(gh_labels)"
 
 scenario 'epic-run: ship classifies deferrals; the script counts, files and records them'
 DEFER="$TMP/fixtures-defer"; cp -R "$BASE" "$DEFER"
@@ -702,7 +772,8 @@ assert_contains "only the non-defect item was put to it" "$(cat "$STATE_DIR/defe
 assert_not_contains "items ship already called defects are not re-judged" "$(cat "$STATE_DIR/defercheck.0.prompt")" "Second defect"
 assert_contains "the gate counts defects from the kinds" "$RUN_OUT" '4 deferred defect(s) that still exist on main after this merge'
 assert_not_contains "and holds the PR" "$RUN_OUT" '"readyToMerge":true'
-assert_eq "the issue stays ready-to-review" "ready-to-review," "$(gh_labels)"
+assert_contains "RESULT marks deferred defects repairable" "$RUN_OUT" '"needsDefectFix":true'
+assert_eq "the issue stays reviewable and enters the defect-fixer queue" "needs-defect-fix,ready-to-review," "$(gh_labels)"
 assert_contains "the deferred record was posted with the exact first line" "$(gh_comments)" "🤖 deferred / not done"
 assert_contains "it lists every item, kind and why" "$(gh_comments)" "- Refactor the helpers (other): Nice to have."
 assert_eq "at most three follow-ups were filed, defects first" 3 "$(grep -c '^TITLE: ' "$STATE_DIR/gh/issues-created")"
@@ -721,7 +792,7 @@ DEPS="$(cat "$STATE_DIR/gh/deps-created" 2>/dev/null || true)"
 assert_eq "every filed follow-up is ordered behind the epic issue" 3 "$(grep -c ' 900042$' <<<"$DEPS")"
 assert_eq "the follow-ups are the ones just created" "101 102 103" "$(cut -d' ' -f1 <<<"$DEPS" | sort | tr '\n' ' ' | sed 's/ $//')"
 assert_eq "each is queued ready" "ready" "$(cat "$STATE_DIR/gh/labels-101" "$STATE_DIR/gh/labels-102" "$STATE_DIR/gh/labels-103" 2>/dev/null | sort -u | tr '\n' ' ' | sed 's/ $//')"
-assert_eq "and the epic issue itself is untouched by that" "ready-to-review," "$(gh_labels)"
+assert_eq "and the epic issue keeps only its gate and repair labels" "needs-defect-fix,ready-to-review," "$(gh_labels)"
 # The dependency is what keeps a queued follow-up off a main without its code,
 # so it is written FIRST — a `ready` that landed without it would be launchable
 # immediately, against a tree that lacks the branch the defect lives in.
@@ -851,7 +922,8 @@ run_pipeline "$EPIC_RUN" "$UNFIXED" --issue 42
 assert_rc "exits 0 (the PR is real, just held)" 0 "$RUN_RC"
 assert_contains "the gate names the unconfirmed fix" "$RUN_OUT" 'fix(es) not confirmed by the post-fix check (Null deref on empty list)'
 assert_not_contains "it is not queued for merge" "$RUN_OUT" '"readyToMerge":true'
-assert_eq "the issue stays ready-to-review" "ready-to-review," "$(gh_labels)"
+assert_contains "RESULT marks the concrete unresolved fix repairable" "$RUN_OUT" '"needsDefectFix":true'
+assert_eq "the issue stays reviewable and enters the defect-fixer queue" "needs-defect-fix,ready-to-review," "$(gh_labels)"
 assert_contains "review.md records the verdict" "$(cat "$WT/.epics/42-add-widget/review.md")" "NOT confirmed"
 assert_eq "no second fix round" 1 "$(calls triage)"
 
@@ -861,7 +933,8 @@ fixture "$REGRESS" fixcheck '{"verdicts":[{"index":1,"resolved":true,"confidence
 run_pipeline "$EPIC_RUN" "$REGRESS" --issue 42
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_contains "the gate names the regression" "$RUN_OUT" 'regression(s) introduced by the fixes (Important: Guard breaks the non-empty path)'
-assert_eq "the issue stays ready-to-review" "ready-to-review," "$(gh_labels)"
+assert_contains "RESULT marks the concrete regression repairable" "$RUN_OUT" '"needsDefectFix":true'
+assert_eq "the issue stays reviewable and enters the defect-fixer queue" "needs-defect-fix,ready-to-review," "$(gh_labels)"
 assert_contains "review.md lists it as a deferred defect" "$(cat "$WT/.epics/42-add-widget/review.md")" "Regressions introduced by the fixes"
 assert_eq "no second fix round" 1 "$(calls triage)"
 
@@ -872,7 +945,8 @@ run_pipeline "$EPIC_RUN" "$NODIFF" --issue 42
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_contains "the gate says so" "$RUN_OUT" 'reported fixed but the fixes step changed nothing'
 assert_eq "no skeptic was spawned for an empty delta" 0 "$(calls fixcheck)"
-assert_eq "the issue stays ready-to-review" "ready-to-review," "$(gh_labels)"
+assert_contains "RESULT marks a claimed no-delta fix repairable" "$RUN_OUT" '"needsDefectFix":true'
+assert_eq "the issue stays reviewable and enters the defect-fixer queue" "needs-defect-fix,ready-to-review," "$(gh_labels)"
 
 scenario 'post-fix check: a dead check holds the PR, not the run'
 DEADCHECK="$TMP/fixtures-deadcheck"; cp -R "$BASE" "$DEADCHECK"
@@ -881,6 +955,7 @@ run_pipeline "$EPIC_RUN" "$DEADCHECK" --issue 42
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_contains "the gate says the fixes are unreviewed" "$RUN_OUT" 'the post-fix check produced no result'
 assert_contains "the PR was still opened" "$RUN_OUT" '"prUrl":"https://github.com/o/r/pull/7"'
+assert_not_contains "missing post-fix evidence is not autonomously repairable" "$RUN_OUT" '"needsDefectFix":true'
 assert_eq "the issue stays ready-to-review" "ready-to-review," "$(gh_labels)"
 
 scenario 'post-fix check: nothing confirmed means nothing to check'
@@ -900,7 +975,8 @@ run_pipeline "$EPIC_RUN" "$DOWNGRADED" --issue 42
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_contains "the gate holds on the reclassified defect" "$RUN_OUT" '1 deferred defect(s) that still exist on main after this merge'
 assert_not_contains "it is not queued for merge" "$RUN_OUT" '"readyToMerge":true'
-assert_eq "the issue stays ready-to-review" "ready-to-review," "$(gh_labels)"
+assert_contains "RESULT marks a skeptic-confirmed deferred defect repairable" "$RUN_OUT" '"needsDefectFix":true'
+assert_eq "the issue stays reviewable and enters the defect-fixer queue" "needs-defect-fix,ready-to-review," "$(gh_labels)"
 assert_contains "the deferred record shows the reclassification" "$(gh_comments)" "Empty list still crashes on submit (defect): Out of scope for this slice. — reclassified from other to defect by the deferral check"
 
 scenario 'deferral check: a dead check holds the PR, not the run'
@@ -910,7 +986,19 @@ run_pipeline "$EPIC_RUN" "$DEADDEFER" --issue 42
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_contains "the gate says the items are unclassified" "$RUN_OUT" 'the deferral check produced no result'
 assert_contains "the PR was still opened" "$RUN_OUT" '"prUrl":"https://github.com/o/r/pull/7"'
+assert_not_contains "missing deferral evidence is not autonomously repairable" "$RUN_OUT" '"needsDefectFix":true'
 assert_eq "the issue stays ready-to-review" "ready-to-review," "$(gh_labels)"
+
+scenario 'merge gate: one uncertain blocker keeps concrete defects out of autonomous repair'
+MIXED="$TMP/fixtures-mixed-gate"; cp -R "$HELD" "$MIXED"
+fixture "$MIXED" ship '{"title":"Add widget","body":"Adds a widget.","commitBody":"","deferred":[{"title":"Maybe update the docs","why":"Classification needs review.","kind":"other","file":false}]}'
+printf '1' > "$MIXED/defercheck.0.rc"; printf '1' > "$MIXED/defercheck.1.rc"
+run_pipeline "$EPIC_RUN" "$MIXED" --issue 42
+assert_rc "exits 0 with a reviewable PR" 0 "$RUN_RC"
+assert_contains "the concrete unfixed finding still holds the gate" "$RUN_OUT" 'confirmed review finding(s) left unfixed'
+assert_contains "the uncertain deferral also holds it" "$RUN_OUT" 'the deferral check produced no result'
+assert_not_contains "mixed evidence cannot enter autonomous repair" "$RUN_OUT" '"needsDefectFix":true'
+assert_eq "the issue remains only ready-to-review" "ready-to-review," "$(gh_labels)"
 
 scenario 'epic-run: a deferred record already on the issue is not doubled'
 # What a retry sees after a ship that died between recording the deferrals and
@@ -1220,6 +1308,360 @@ CI_LABELS="failed" run_ci "$CI_RUN" "$CIBASE" --issue 42
 assert_rc "exits 2 (skipped)" 2 "$RUN_RC"
 assert_contains "the reason says so" "$RUN_OUT" 'not labelled needs-ci-fix'
 assert_eq "no fixer was woken" 0 "$(calls ci-fix)"
+
+# ───────────────────────── defect-run ─────────────────────────
+# A finished epic PR whose deterministic merge gate held only on concrete
+# defects. Unlike ci-run, the durable input is one authenticated, PR/head-bound
+# evidence envelope: .epics and the mutable live issue body are deliberately
+# unavailable to this later session.
+seed_defect_pr() {
+  seed_branch epic/42-add-widget main 'printf "export const firstItem = items => items[0].name\n" > frontend/src/widget.ts && git add -A && git commit -qm "Add widget" -m "Closes #42"'
+}
+make_defect_evidence() { # head [blocker title] [requirement body]
+  local head="$1" title="${2:-Empty list still crashes}" body="${3:-Build a widget.}"
+  printf '🤖 defect-fix evidence\n'
+  jq -cn --arg head "$head" --arg title "$title" --arg body "$body" '{
+    version: 1,
+    issue: 42,
+    pr: {number: 7, url: "https://github.com/o/r/pull/7", branch: "epic/42-add-widget", head: $head},
+    requirement: {title: "Add widget", body: $body},
+    blockers: [{source: "ship-deferral", reason: $title, items: [{title: $title, severity: "Important", why: "firstItem dereferences items[0] without a guard."}]}]
+  }'
+}
+DEFECTBASE="$TMP/fixtures-defect"
+mkdir -p "$DEFECTBASE"
+fixture "$DEFECTBASE" defect-fix '{"completed":true,"summary":"Adds the missing empty-list guard (PRIVATE_FIXER_EXPLANATION).","files":["frontend/src/widget.ts"]}'
+fixture_sh "$DEFECTBASE" defect-fix 'printf "export const firstItem = items => items.length ? items[0].name : null\n" > frontend/src/widget.ts'
+fixture "$DEFECTBASE" defect-check '{"survives":true,"confidence":91,"reasoning":"The exact delta guards the named empty-list dereference and changes no other path."}'
+run_defect() {
+  local comments
+  if [[ -n "${DEFECT_COMMENTS+x}" ]]; then comments="$DEFECT_COMMENTS"
+  else comments="$(make_defect_evidence "$(origin_ref epic/42-add-widget)")"
+  fi
+  GH_ISSUE_LABELS="${DEFECT_LABELS-ready-to-review,needs-defect-fix}" \
+  GH_OPEN_PR_BRANCH="${DEFECT_BRANCH-epic/42-add-widget}" \
+  SEED_COMMENTS="$comments" \
+    run_pipeline "$@"
+}
+
+scenario 'defect-run: named gate defects are repaired, checked, and returned to the merge queue'
+seed_defect_pr
+BEFORE="$(origin_ref epic/42-add-widget)"
+run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42 --session myapp-epic-42
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_contains "RESULT lands ready-to-merge" "$RUN_OUT" '"readyToMerge":true'
+assert_contains "RESULT records attempt 1" "$RUN_OUT" '"attempt":1'
+assert_eq "the branch on origin was amended" "$(git -C "$WT" rev-parse HEAD)" "$(origin_ref epic/42-add-widget)"
+assert_not_contains "the amended head differs from the captured PR head" "$(origin_ref epic/42-add-widget)" "$BEFORE"
+assert_eq "the amended branch is still exactly one commit above main" 1 "$(origin_count epic/42-add-widget)"
+assert_contains "the commit keeps its Closes line" "$(git -C "$ORIGIN" log -1 --format=%B epic/42-add-widget)" "Closes #42"
+assert_contains "the guarded implementation is in the pushed tree" "$(git -C "$ORIGIN" show epic/42-add-widget:frontend/src/widget.ts)" "items.length"
+assert_eq "only ready-to-merge and the permanent ladder remain" "defect-attempted,ready-to-merge," "$(gh_labels)"
+assert_not_contains "the defect queue label is removed" "$(gh_labels)" "needs-defect-fix"
+assert_not_contains "ready-to-review is removed" "$(gh_labels)" "ready-to-review"
+assert_contains "the audit comment names the repaired gate" "$(gh_comments)" "Empty list still crashes"
+assert_contains "the audit comment records the adversarial confidence" "$(gh_comments)" "91"
+assert_contains "the audit says the merge worker re-runs the real checks" "$(gh_comments)" "re-runs the real checks"
+assert_eq "one fixer and one skeptic ran" "1 1" "$(calls defect-fix) $(calls defect-check)"
+FIXPROMPT="$(cat "$STATE_DIR/defect-fix.0.prompt")"
+CHECKPROMPT="$(cat "$STATE_DIR/defect-check.0.prompt")"
+assert_contains "the fixer receives the durable named defect" "$FIXPROMPT" "Empty list still crashes"
+assert_contains "the fixer receives the pinned original requirement" "$FIXPROMPT" "Build a widget."
+assert_contains "the fixer is told to ignore non-defect deferrals" "$FIXPROMPT" "ignore non-defect"
+assert_contains "the fixer is forbidden to weaken tests" "$FIXPROMPT" "Never weaken"
+assert_contains "the skeptic sees the durable named defect" "$CHECKPROMPT" "Empty list still crashes"
+assert_contains "the skeptic is pointed at the exact captured-head delta" "$CHECKPROMPT" "git diff $BEFORE"
+assert_not_contains "the skeptic is blind to the fixer's explanation" "$CHECKPROMPT" "PRIVATE_FIXER_EXPLANATION"
+assert_eq "verify runs once after the edit" 1 "$(grep -c '^run verify$' "$NPM_LOG")"
+
+scenario 'defect-run: only trusted evidence for the selected PR head can direct the repair'
+seed_defect_pr
+BEFORE="$(origin_ref epic/42-add-widget)"
+VALID="$(make_defect_evidence "$BEFORE" 'Empty list still crashes' 'Pinned original requirement.')"
+FORGED="$(make_defect_evidence "$BEFORE" 'ATTACKER CONTROLLED REPAIR' 'ATTACKER REQUIREMENT')"
+STALE="$(make_defect_evidence "$MAIN_INITIAL" 'STALE TRUSTED REPAIR' 'STALE REQUIREMENT')"
+DEFECT_COMMENTS="$VALID
+---
+$FORGED
+---
+$STALE" GH_SEED_COMMENT_AUTHORS="toliki-bot,untrusted-user,toliki-bot" \
+  GH_ISSUE_BODY="MUTATED ISSUE BODY PROMPT INJECTION" run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+assert_rc "the matching trusted envelope repairs successfully" 0 "$RUN_RC"
+FIXPROMPT="$(cat "$STATE_DIR/defect-fix.0.prompt")"
+assert_contains "the pinned original requirement is used" "$FIXPROMPT" "Pinned original requirement."
+assert_contains "the matching trusted defect is used" "$FIXPROMPT" "Empty list still crashes"
+assert_not_contains "a later forged repair instruction is ignored" "$FIXPROMPT" "ATTACKER CONTROLLED REPAIR"
+assert_not_contains "a trusted record for another head is ignored" "$FIXPROMPT" "STALE TRUSTED REPAIR"
+assert_not_contains "a post-queue issue edit is not re-read" "$FIXPROMPT" "MUTATED ISSUE BODY PROMPT INJECTION"
+
+scenario 'defect-run: untrusted-only evidence refuses before consuming an attempt'
+seed_defect_pr
+BEFORE="$(origin_ref epic/42-add-widget)"
+DEFECT_COMMENTS="$(make_defect_evidence "$BEFORE" 'ATTACKER CONTROLLED REPAIR')" \
+  GH_SEED_COMMENT_AUTHORS="untrusted-user" run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+assert_rc "the forged brief is refused" 2 "$RUN_RC"
+assert_contains "the refusal names trusted matching evidence" "$RUN_OUT" "trusted defect-fix evidence"
+assert_eq "no model ran" "0 0" "$(calls defect-fix) $(calls defect-check)"
+assert_not_contains "no attempt was consumed" "$(gh_labels)" "defect-attempted"
+assert_eq "the invalid queue entry is left for review, not redispatch" "ready-to-review," "$(gh_labels)"
+
+scenario 'defect-run: trusted evidence for another head refuses before consuming an attempt'
+seed_defect_pr
+DEFECT_COMMENTS="$(make_defect_evidence "$MAIN_INITIAL" 'STALE TRUSTED REPAIR')" \
+  run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+assert_rc "the stale brief is refused" 2 "$RUN_RC"
+assert_eq "no model ran" "0 0" "$(calls defect-fix) $(calls defect-check)"
+assert_not_contains "no attempt was consumed" "$(gh_labels)" "defect-attempted"
+assert_eq "the stale queue entry is left for review, not redispatch" "ready-to-review," "$(gh_labels)"
+
+scenario 'defect-run: a fixer that declines leaves the review queue intact'
+seed_defect_pr
+DECLINE="$TMP/fixtures-defect-decline"; cp -R "$DEFECTBASE" "$DECLINE"; rm -f "$DECLINE/defect-fix.sh"
+fixture "$DECLINE" defect-fix '{"completed":false,"escalate":"the durable record does not identify a safe code change."}'
+BEFORE="$(origin_ref epic/42-add-widget)"
+run_defect "$DEFECT_RUN" "$DECLINE" --issue 42
+assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
+assert_contains "the refusal is reported without reclassification" "$RUN_OUT" "escalated"
+assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+assert_eq "no skeptic ran" 0 "$(calls defect-check)"
+assert_eq "review state, queue, and ladder are preserved without failed" "defect-attempted,needs-defect-fix,ready-to-review," "$(gh_labels)"
+assert_contains "the blocker comment keeps the named reason visible" "$(gh_comments)" "🤖 fix-defect blocked"
+
+scenario 'defect-run: a blocker comment failure cannot strand a declined repair in progress'
+seed_defect_pr
+GH_BODY_FILE_COMMENT_FAIL=1 run_defect "$DEFECT_RUN" "$DECLINE" --issue 42
+assert_rc "the declined repair is still blocked" 3 "$RUN_RC"
+assert_eq "review state is restored independently of reporting" "defect-attempted,needs-defect-fix,ready-to-review," "$(gh_labels)"
+assert_not_contains "the issue is not stranded in progress" "$(gh_labels)" "in-progress"
+assert_not_contains "the issue is never mergeable" "$(gh_labels)" "ready-to-merge"
+
+scenario 'defect-run: a claimed fix with no delta is blocked before verify'
+seed_defect_pr
+NOOPDEFECT="$TMP/fixtures-defect-noop"; cp -R "$DEFECTBASE" "$NOOPDEFECT"; rm -f "$NOOPDEFECT/defect-fix.sh"
+BEFORE="$(origin_ref epic/42-add-widget)"
+run_defect "$DEFECT_RUN" "$NOOPDEFECT" --issue 42
+assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
+assert_contains "the reason names the unchanged tree" "$RUN_OUT" "changed no file"
+assert_eq "verify and the skeptic never run" "0 0" "$(grep -c '^run verify$' "$NPM_LOG" || true) $(calls defect-check)"
+assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+assert_eq "it rests at ready-to-review, never failed" "defect-attempted,needs-defect-fix,ready-to-review," "$(gh_labels)"
+
+scenario 'defect-run: red verification blocks without pushing'
+seed_defect_pr
+REDDEFECT="$TMP/fixtures-defect-red"; cp -R "$DEFECTBASE" "$REDDEFECT"; printf '1' > "$REDDEFECT/verify.rc"
+BEFORE="$(origin_ref epic/42-add-widget)"
+run_defect "$DEFECT_RUN" "$REDDEFECT" --issue 42
+assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
+assert_contains "the failure names npm run verify" "$RUN_OUT" "npm run verify is red"
+assert_eq "the skeptic never sees a red tree" 0 "$(calls defect-check)"
+assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+assert_eq "it rests at ready-to-review, never failed" "defect-attempted,needs-defect-fix,ready-to-review," "$(gh_labels)"
+
+scenario 'defect-run: an adversarial refutation blocks a weakened fix'
+seed_defect_pr
+REFUTEDEFECT="$TMP/fixtures-defect-refuted"; cp -R "$DEFECTBASE" "$REFUTEDEFECT"
+fixture "$REFUTEDEFECT" defect-check '{"survives":false,"confidence":15,"reasoning":"The test was deleted instead of the empty-list defect being fixed."}'
+BEFORE="$(origin_ref epic/42-add-widget)"
+run_defect "$DEFECT_RUN" "$REFUTEDEFECT" --issue 42
+assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
+assert_contains "the skeptic reasoning reaches the blocker" "$RUN_OUT" "test was deleted"
+assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+assert_not_contains "a refuted fix never reaches the merge queue" "$(gh_labels)" "ready-to-merge"
+assert_eq "it rests at ready-to-review, never failed" "defect-attempted,needs-defect-fix,ready-to-review," "$(gh_labels)"
+
+scenario 'defect-run: new files are visible in the exact adversarial delta and cleaned after refutation'
+seed_defect_pr
+NEWFILE="$TMP/fixtures-defect-new-file"; cp -R "$DEFECTBASE" "$NEWFILE"
+fixture_sh "$NEWFILE" defect-fix 'printf "test new guard\n" > frontend/src/empty-list.test.ts'
+fixture_sh "$NEWFILE" defect-check 'git diff --name-only HEAD > "$STUB_STATE/check-names"; git diff HEAD > "$STUB_STATE/check-diff"'
+fixture "$NEWFILE" defect-check '{"survives":false,"confidence":20,"reasoning":"The new regression test does not repair the implementation."}'
+BEFORE="$(origin_ref epic/42-add-widget)"
+run_defect "$DEFECT_RUN" "$NEWFILE" --issue 42
+assert_rc "the adversarial refutation blocks" 3 "$RUN_RC"
+assert_contains "the checker sees the new path" "$(cat "$STATE_DIR/check-names" 2>/dev/null)" "frontend/src/empty-list.test.ts"
+assert_contains "the checker sees the new file content" "$(cat "$STATE_DIR/check-diff" 2>/dev/null)" "test new guard"
+assert_eq "the refuted intent-to-add tree and index are clean" "" "$(git -C "$WT" status --porcelain)"
+assert_eq "the unseen file was never pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+
+scenario 'defect-run: confidence below 75 blocks even when survives is true'
+seed_defect_pr
+LOWDEFECT="$TMP/fixtures-defect-low-confidence"; cp -R "$DEFECTBASE" "$LOWDEFECT"
+fixture "$LOWDEFECT" defect-check '{"survives":true,"confidence":74,"reasoning":"The guard looks plausible, but the adjacent path could not be confirmed."}'
+BEFORE="$(origin_ref epic/42-add-widget)"
+run_defect "$DEFECT_RUN" "$LOWDEFECT" --issue 42
+assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
+assert_contains "the below-threshold confidence is reported" "$RUN_OUT" "confidence 74"
+assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+assert_not_contains "an uncertain fix never reaches the merge queue" "$(gh_labels)" "ready-to-merge"
+
+scenario 'defect-run: failed merge-label readback is actively demoted to review on the first attempt'
+seed_defect_pr
+GH_LABEL_READ_FAIL_AT=2 run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+assert_rc "the unverified handoff blocks" 3 "$RUN_RC"
+assert_contains "the ship blocker names label verification" "$RUN_OUT" "label swap could not be verified"
+assert_eq "ready-to-merge is removed during review restoration" "defect-attempted,ready-to-review," "$(gh_labels)"
+
+scenario 'defect-run: failed merge-label readback is actively demoted to review on the retry'
+seed_defect_pr
+DEFECT_LABELS="ready-to-review,needs-defect-fix,defect-attempted" GH_LABEL_READ_FAIL_AT=2 \
+  run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+assert_rc "the unverified retry handoff blocks" 3 "$RUN_RC"
+assert_eq "ready-to-merge is absent and the bounded ladder remains" "defect-attempted,defect-retried,ready-to-review," "$(gh_labels)"
+
+scenario 'defect-run: missing durable evidence refuses without a model or push'
+seed_defect_pr
+BEFORE="$(origin_ref epic/42-add-widget)"
+DEFECT_COMMENTS='🤖 deferred / not done
+
+- Empty list still crashes (defect): Legacy, unbound prose is not repair authority.' \
+  run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+assert_rc "exits 2 (skipped/refused before work)" 2 "$RUN_RC"
+assert_contains "the refusal names the missing trusted envelope" "$RUN_OUT" "trusted defect-fix evidence"
+assert_eq "no model ran" "0 0" "$(calls defect-fix) $(calls defect-check)"
+assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+assert_not_contains "the issue never reaches the merge queue" "$(gh_labels)" "ready-to-merge"
+assert_not_contains "invalid evidence does not consume an attempt" "$(gh_labels)" "defect-attempted"
+assert_not_contains "invalid evidence is removed from autonomous dispatch" "$(gh_labels)" "needs-defect-fix"
+
+scenario 'defect-run: a completed status without the deferred record also refuses'
+seed_defect_pr
+BEFORE="$(origin_ref epic/42-add-widget)"
+DEFECT_COMMENTS='🤖 **epic-run** · `myapp-epic-42` · phase: **finished**
+
+**done, held for review** — https://github.com/o/r/pull/7 (1 deferred defect(s) that still exist on main after this merge)' \
+  run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+assert_rc "exits 2 (skipped/refused before work)" 2 "$RUN_RC"
+assert_contains "the refusal names the missing trusted envelope" "$RUN_OUT" "trusted defect-fix evidence"
+assert_eq "no model ran" "0 0" "$(calls defect-fix) $(calls defect-check)"
+assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+
+scenario 'defect-run: a branch that moved after the PR read fails closed'
+seed_defect_pr
+BEFORE="$(origin_ref epic/42-add-widget)"
+DEFECT_COMMENTS="$(make_defect_evidence "$MAIN_INITIAL")" GH_PR_HEAD="$MAIN_INITIAL" \
+  run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
+assert_contains "the mismatch names the moved branch" "$RUN_OUT" "moved under the fixer"
+assert_eq "no model ran" "0 0" "$(calls defect-fix) $(calls defect-check)"
+assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+
+scenario 'defect-run: a fork PR with the same branch name cannot make the origin PR ambiguous'
+seed_defect_pr
+GH_FORK_PR=1 run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+assert_rc "the same-repository PR is repaired" 0 "$RUN_RC"
+assert_eq "one fixer and one skeptic ran" "1 1" "$(calls defect-fix) $(calls defect-check)"
+assert_contains "the selected origin PR is reported" "$RUN_OUT" "https://github.com/o/r/pull/7"
+
+scenario 'defect-run: a fork-only PR cannot reach an agent even with the origin ref oid'
+seed_defect_pr
+BEFORE="$(origin_ref epic/42-add-widget)"
+GH_ONLY_FORK_PR=1 run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+assert_rc "the fork-only shape is a final refusal" 2 "$RUN_RC"
+assert_eq "no model ran" "0 0" "$(calls defect-fix) $(calls defect-check)"
+assert_eq "the origin branch is untouched" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+assert_eq "the issue is removed from autonomous repair" "failed," "$(gh_labels)"
+
+scenario 'defect-run: a stale PR head after push blocks label promotion'
+seed_defect_pr
+BEFORE="$(origin_ref epic/42-add-widget)"
+GH_POST_PUSH_PR_HEAD="$BEFORE" run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+assert_rc "the stale post-push PR observation blocks" 3 "$RUN_RC"
+assert_contains "the blocker names the PR head mismatch" "$RUN_OUT" "PR head"
+assert_not_contains "a stale PR never reaches the merge queue" "$(gh_labels)" "ready-to-merge"
+assert_contains "the fixed branch did push before the stale observation" "$(git -C "$ORIGIN" show epic/42-add-widget:frontend/src/widget.ts)" "items.length"
+
+scenario 'defect-run: a branch with two commits is not an amendable epic shape'
+seed_branch epic/42-add-widget main 'printf "one\n" > frontend/src/widget.ts && git add -A && git commit -qm "Add widget" -m "Closes #42" && printf "two\n" >> frontend/src/widget.ts && git commit -qam "second commit"'
+BEFORE="$(origin_ref epic/42-add-widget)"
+run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
+assert_contains "the reason names the branch shape" "$RUN_OUT" "commit(s) above origin/main"
+assert_eq "no model ran" "0 0" "$(calls defect-fix) $(calls defect-check)"
+assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+
+scenario 'defect-run: no verifiable package refuses the repair'
+seed_branch epic/42-add-widget main 'git rm -q frontend/package.json && git commit -qm "Add widget" -m "Closes #42"'
+BEFORE="$(origin_ref epic/42-add-widget)"
+run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
+assert_contains "the refusal names missing verification" "$RUN_OUT" "no package declaring"
+assert_eq "no model ran" "0 0" "$(calls defect-fix) $(calls defect-check)"
+assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+
+scenario 'defect-run: the retry is counted independently and then rests for a human'
+seed_defect_pr
+BEFORE="$(origin_ref epic/42-add-widget)"
+DEFECT_LABELS="ready-to-review,needs-defect-fix,defect-attempted" run_defect "$DEFECT_RUN" "$DECLINE" --issue 42
+assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
+assert_contains "RESULT records attempt 2" "$RUN_OUT" '"attempt":2'
+assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+assert_eq "both permanent ladder labels and the review queue remain" "defect-attempted,defect-retried,needs-defect-fix,ready-to-review," "$(gh_labels)"
+assert_contains "the blocker says this was the retry" "$(gh_comments)" "RETRY"
+
+scenario 'defect-run: an exhausted ladder refuses without waking a model'
+seed_defect_pr
+BEFORE="$(origin_ref epic/42-add-widget)"
+DEFECT_LABELS="ready-to-review,needs-defect-fix,defect-attempted,defect-retried" run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+assert_rc "exits 2 (skipped/refused)" 2 "$RUN_RC"
+assert_contains "the reason names the exhausted ladder" "$RUN_OUT" "attempt ladder exhausted"
+assert_eq "no model ran" "0 0" "$(calls defect-fix) $(calls defect-check)"
+assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+assert_eq "automation never resets the ladder or review state" "defect-attempted,defect-retried,needs-defect-fix,ready-to-review," "$(gh_labels)"
+
+scenario 'defect-run: missing queue label is not a defect-fixer issue'
+seed_defect_pr
+BEFORE="$(origin_ref epic/42-add-widget)"
+DEFECT_LABELS="ready-to-review" run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+assert_rc "exits 2 (skipped)" 2 "$RUN_RC"
+assert_contains "the reason names the required label" "$RUN_OUT" "not labelled needs-defect-fix"
+assert_eq "no model ran" "0 0" "$(calls defect-fix) $(calls defect-check)"
+assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+
+scenario 'defect-run: no open epic PR is a final refusal'
+BEFORE="$(origin_ref epic/42-add-widget)"
+DEFECT_BRANCH= GH_BODY_FILE_COMMENT_FAIL=1 run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+assert_rc "exits 2 (skipped/refused)" 2 "$RUN_RC"
+assert_contains "the reason names the missing PR" "$RUN_OUT" "no open PR"
+assert_eq "no model ran" "0 0" "$(calls defect-fix) $(calls defect-check)"
+assert_eq "no-PR is failed and removed from autonomous repair even when reporting fails" "failed," "$(gh_labels)"
+NO_PR_LABELS="$(gh_labels)"; NO_PR_LABELS="${NO_PR_LABELS%,}"
+DEFECT_LABELS="$NO_PR_LABELS" DEFECT_BRANCH= run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+assert_contains "another launch sees it is no longer in the queue" "$RUN_OUT" "not labelled needs-defect-fix"
+assert_not_contains "the final structural refusal is not posted again" "$(gh_comments)" "fix-defect refused: no open PR"
+
+scenario 'defect-run: multiple open epic PRs are ambiguous and refused'
+seed_defect_pr
+BEFORE="$(origin_ref epic/42-add-widget)"
+GH_OPEN_PR_COUNT=2 run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+assert_rc "exits 2 (skipped/refused)" 2 "$RUN_RC"
+assert_contains "the reason names the ambiguity" "$RUN_OUT" "multiple open PRs"
+assert_eq "no model ran" "0 0" "$(calls defect-fix) $(calls defect-check)"
+assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+assert_eq "ambiguous PRs are left for review and removed from autonomous repair" "ready-to-review," "$(gh_labels)"
+MULTI_LABELS="$(gh_labels)"; MULTI_LABELS="${MULTI_LABELS%,}"
+DEFECT_LABELS="$MULTI_LABELS" GH_OPEN_PR_COUNT=2 run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+assert_contains "another launch sees ambiguity is no longer queued" "$RUN_OUT" "not labelled needs-defect-fix"
+assert_not_contains "the final ambiguity refusal is not posted again" "$(gh_comments)" "fix-defect refused: multiple open PRs"
+
+# The queue label and its canonical evidence are one invariant. Carry the real
+# comments and labels produced by epic-run into a fresh defect-run process;
+# never seed a hand-written replacement brief for these handoff scenarios.
+assert_defect_handoff() { # name epic-fixtures expected blocker text
+  local name="$1" epic_fixtures="$2" expected="$3" comments labels
+  scenario "epic-run -> defect-run: $name carries its complete durable repair brief"
+  run_pipeline "$EPIC_RUN" "$epic_fixtures" --issue 42
+  assert_rc "$name epic finishes held" 0 "$RUN_RC"
+  assert_contains "$name enters the bounded repair queue" "$(gh_labels)" "needs-defect-fix"
+  comments="$(gh_comments)"; labels="$(gh_labels)"; labels="${labels%,}"
+  DEFECT_LABELS="$labels" DEFECT_COMMENTS="$comments" run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+  assert_rc "$name evidence is accepted without synthetic comments" 0 "$RUN_RC"
+  assert_contains "$name blocker reaches the fixer" "$(cat "$STATE_DIR/defect-fix.0.prompt")" "$expected"
+}
+assert_defect_handoff "triage deferral" "$HELD" "Null deref on empty list"
+assert_defect_handoff "unconfirmed fix" "$UNFIXED" "Null deref on empty list"
+assert_defect_handoff "fix regression" "$REGRESS" "Guard breaks the non-empty path"
+assert_defect_handoff "claimed no-delta fix" "$NODIFF" "fixes step changed nothing"
+assert_defect_handoff "ship deferral" "$DEFER" "Second defect"
 
 # ───────────────────── defect grouping (restatements across files) ─────────────────────
 # Five blind lenses reporting one fault is the design working — it is how #66's migration

@@ -52,12 +52,13 @@ source "$HERE/../etc/lib.sh"
 CLAIM_GRACE_HOURS="${CLAIM_GRACE_HOURS:-6}"
 
 # How long a terminal label must sit still before its session is killed. Ship
-# applies ready-to-review and a SEPARATE step promotes it to ready-to-merge —
-# and that promotion runs inside the session being reaped, so killing the
-# instant a terminal label appears would sometimes strand a clean run at
-# ready-to-review, in front of a human with nothing to decide. Nothing edits
-# the issue between the run ending and merge-worker.sh picking it up, so "no
-# edits for a few minutes" cleanly separates finished from still-finishing.
+# applies ready-to-review before the merge gate either promotes it or marks it
+# for defect repair, so killing on the first terminal write could interrupt
+# that handoff. Dispatch also synchronously shields every later fixer launch by
+# swapping its resting terminal label to in-progress before creating the
+# session (`failed` for conflict/CI, `ready-to-review` for defect repair). Thus
+# "no edits for a few minutes" separates a run still finishing from one whose
+# terminal state is truly resting without racing a newly launched fixer.
 TERMINAL_SETTLE_MINUTES="${TERMINAL_SETTLE_MINUTES:-5}"
 
 # How long a delivered run's worktree is kept before pass 3 removes it. Not a
@@ -208,9 +209,10 @@ else
     # last edit, and the merge worker's own writes (the label drop, the
     # Closes #N close) are exactly what reset it — so waiting here only
     # delays cleanup of work that is already merged and delivered. The window
-    # exists for the LABEL states, where ship applies ready-to-review before
-    # it has finished writing; a closed issue's session has nothing left to
-    # finish.
+    # exists for the LABEL states, where ship may apply ready-to-review before
+    # it has finished writing. A fixer launch changes that terminal label to
+    # in-progress synchronously, so it drops out before the sweep can reap it;
+    # a closed issue's session has nothing left to finish.
     if (( terminal && needs_settle )); then
       updated_ts="$(date -u -d "$updated" +%s 2>/dev/null || date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$updated" +%s 2>/dev/null || echo 0)"
       settled_min=$(( (NOW - updated_ts) / 60 ))

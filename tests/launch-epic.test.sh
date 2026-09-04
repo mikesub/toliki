@@ -177,6 +177,15 @@ assert_rc "exits 0 (and strips the leading #)" 0 "$RUN_RC"
 assert_contains "session is still <repo>-epic-<N>" "$(tmux_log)" "new-session -d -s testrepo-epic-63"
 assert_contains "the pane runs the CI orchestrator" "$(tmux_log)" "workflows/ci-run.mjs' --issue 63"
 
+printf '\nlaunch --defect: same worktree/session shape, defect fixer script\n'
+run_launch --defect '#63' --repo testrepo --engine codex
+assert_rc "exits 0 (and strips the leading #)" 0 "$RUN_RC"
+assert_contains "session is still <repo>-epic-<N>" "$(tmux_log)" "new-session -d -s testrepo-epic-63"
+assert_contains "the existing pipeline worktree is reused" "$RUN_OUT" "reusing worktree"
+assert_contains "the pane runs the defect orchestrator" "$(tmux_log)" "workflows/defect-run.mjs' --issue 63"
+assert_contains "the session name reaches the defect orchestrator" "$(tmux_log)" "--session 'testrepo-epic-63'"
+assert_contains "the selected engine reaches the defect orchestrator" "$(tmux_log)" "--engine 'codex'"
+
 printf '\nlaunch --epic --engine codex: engine is tagged and forwarded\n'
 run_launch --epic 64 --repo testrepo --engine codex
 assert_rc "exits 0" 0 "$RUN_RC"
@@ -228,6 +237,18 @@ run_launch --fix 63 --ci 64 --repo testrepo
 assert_rc "--fix with --ci exits 1" 1 "$RUN_RC"
 assert_contains "and says why" "$RUN_OUT" "mutually exclusive"
 
+run_launch --defect 63 --ci 64 --repo testrepo
+assert_rc "--defect with --ci exits 1" 1 "$RUN_RC"
+assert_contains "and says why" "$RUN_OUT" "mutually exclusive"
+
+run_launch --defect 63 -m "hello" --repo testrepo
+assert_rc "--defect with -m exits 1" 1 "$RUN_RC"
+assert_contains "and says why" "$RUN_OUT" "takes no -m"
+
+run_launch --defect 63 somename --repo testrepo
+assert_rc "--defect with an explicit name exits 1" 1 "$RUN_RC"
+assert_contains "and says why" "$RUN_OUT" "derives its own session name"
+
 run_launch --epic 63 -m "hello" --repo testrepo
 assert_rc "--epic with -m exits 1" 1 "$RUN_RC"
 assert_contains "and says why" "$RUN_OUT" "takes no -m"
@@ -247,7 +268,7 @@ assert_not_contains "validation happens before any session is created" "$(tmux_l
 
 run_launch --engine codex --repo testrepo
 assert_rc "--engine is refused for interactive sessions" 1 "$RUN_RC"
-assert_contains "and says it is pipeline-only" "$RUN_OUT" "only applies to --epic/--fix/--ci"
+assert_contains "and says it is pipeline-only" "$RUN_OUT" "only applies to --epic/--fix/--ci/--defect"
 
 printf '\nlaunch --check-idle: the cap'"'"'s own count, against zero\n'
 run_launch --check-idle

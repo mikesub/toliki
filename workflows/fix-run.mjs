@@ -24,6 +24,7 @@ import { initStatus, statusPhase, statusNote, statusFinish } from './lib/status.
 import { sh, must, failureReason } from './lib/proc.mjs'
 import { ensureLabels, editLabels, issueLabels, issueView, comment, openPrs } from './lib/github.mjs'
 import { git, gitOut, discoverPackages, pkgList, ensureDeps, runVerify, rebaseInProgress, pushRejected } from './lib/repo.mjs'
+import { finalizeFixerIssue } from './lib/fixer-finalize.mjs'
 
 const USAGE = `Usage: fix-run.mjs --issue <N> [--session <name>] [--engine <name>]
 
@@ -179,8 +180,9 @@ async function prepare(issue) {
 
   // A refusal a retry cannot fix is commented and left `failed` for a human.
   const refuseFinal = async (body, reason) => {
-    await comment(issue, body)
-    await editLabels(issue, { add: ['failed'], remove: ['in-progress'] })
+    const settled = await finalizeFixerIssue({ issue, body, add: ['failed'], remove: ['in-progress'] })
+    if (!settled.reported) log(`blocked: GitHub report failed (${settled.reportError})`)
+    if (!settled.settled) log(`blocked: terminal label restoration failed (${settled.stateError})`)
     return { refused: reason, refusalFinal: true }
   }
   if (labels.includes('fix-retried')) {
@@ -299,11 +301,15 @@ async function postBlocker({ issue, phase, reason, prUrl, attempt }) {
     : attempt === 1
     ? 'This was the first attempt (fix-attempted is on the issue), so dispatch relaunches the fixer once, automatically, a few minutes after this session is reaped. Nothing to do unless the retry also fails.'
     : 'The attempt ladder was not reached, so dispatch will relaunch the fixer on its next tick.'
-  await comment(issue, `🤖 fix-conflict blocked\n- phase: ${phase}\n- reason: ${reason}\n- pr: ${prUrl || 'not resolved'}\n- next: ${ladder}\n`)
   // needs-judgment keeps the issue in the fixer queue and the ladder labels bound the retries; both stay.
-  await ensureLabels(['failed'])
-  const flip = await editLabels(issue, { add: ['failed'], remove: ['in-progress'] })
-  if (!flip.ok) log(`blocked: label flip to failed failed (${failureReason(flip)})`)
+  const settled = await finalizeFixerIssue({
+    issue,
+    body: `🤖 fix-conflict blocked\n- phase: ${phase}\n- reason: ${reason}\n- pr: ${prUrl || 'not resolved'}\n- next: ${ladder}\n`,
+    add: ['failed'],
+    remove: ['in-progress'],
+  })
+  if (!settled.reported) log(`blocked: GitHub report failed (${settled.reportError})`)
+  if (!settled.settled) log(`blocked: terminal label restoration failed (${settled.stateError})`)
 }
 
 // ───────────────────────── Blocker path ─────────────────────────
