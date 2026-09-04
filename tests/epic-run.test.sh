@@ -54,6 +54,7 @@ SEED="$TMP/seed"
 git init -q -b main "$SEED"
 mkdir -p "$SEED/frontend/src"
 printf '{"name":"frontend","scripts":{"verify":"true"}}\n' > "$SEED/frontend/package.json"
+printf '{}\n' > "$SEED/frontend/package-lock.json"
 printf 'export const items = []\n' > "$SEED/frontend/src/index.ts"
 printf '.epics/\nnode_modules/\n' > "$SEED/.gitignore"
 printf '# app\n' > "$SEED/README.md"
@@ -293,6 +294,35 @@ esac
 exit 0
 STUB
 chmod +x "$TMP/bin/npm"
+
+# ───────────────────────── ensureDeps: no lockfile means nothing to install ─────────────────────────
+# Unit-level, not a full pipeline run: repo.mjs's own contract, exercised
+# directly against throwaway directories rather than the shared seed project.
+cat > "$TMP/dep-check.mjs" <<'NODE'
+const { ensureDeps } = await import(process.env.REPO_MODULE)
+process.chdir(process.env.DEP_DIR)
+console.log(JSON.stringify(await ensureDeps(['.'])))
+NODE
+
+# A Bun-only package: scripts.verify shells out to bun test, no
+# package-lock.json anywhere. npm ci requires one by contract and can never
+# succeed without it, so it must be skipped rather than attempted and blocked
+# (this is the exact shape of purplehills#1's prepare failure on 2026-09-04).
+BUN_DIR="$TMP/dep-bun-only"; mkdir -p "$BUN_DIR"
+printf '{"name":"b","scripts":{"verify":"bun test"}}\n' > "$BUN_DIR/package.json"
+NPM_LOG_BUN="$TMP/npm-bun.log"; : > "$NPM_LOG_BUN"
+OUT="$(PATH="$TMP/bin:$PATH" REPO_MODULE="$ROOT/workflows/lib/repo.mjs" DEP_DIR="$BUN_DIR" STUB_NPM_LOG="$NPM_LOG_BUN" node "$TMP/dep-check.mjs")"
+assert_contains "a package with no lockfile is reported as nothing to install" "$OUT" "no package-lock.json, nothing to install"
+assert_eq "npm is never invoked for a lockfile-less package" "0" "$(wc -l < "$NPM_LOG_BUN" | tr -d ' ')"
+
+# A real npm package with a lockfile and no node_modules yet still gets npm ci.
+NPM_DIR="$TMP/dep-npm"; mkdir -p "$NPM_DIR"
+printf '{"name":"n","scripts":{"verify":"true"}}\n' > "$NPM_DIR/package.json"
+printf '{}\n' > "$NPM_DIR/package-lock.json"
+NPM_LOG_REAL="$TMP/npm-real.log"; : > "$NPM_LOG_REAL"
+OUT="$(PATH="$TMP/bin:$PATH" REPO_MODULE="$ROOT/workflows/lib/repo.mjs" DEP_DIR="$NPM_DIR" STUB_NPM_LOG="$NPM_LOG_REAL" node "$TMP/dep-check.mjs")"
+assert_contains "a package with a lockfile still gets npm ci when node_modules is missing" "$OUT" "npm ci (node_modules missing)"
+assert_eq "npm ci ran once for the lockfile-carrying package" "1" "$(grep -c '^ci$' "$NPM_LOG_REAL")"
 
 # A success envelope carrying structured output, exactly the shape the CLI's
 # own result schema describes (see lib/engine.mjs).

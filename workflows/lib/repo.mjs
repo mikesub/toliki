@@ -64,13 +64,22 @@ async function lockfileChanged(pkg, pairs) {
 
 // `npm ci` where node_modules is missing, or where the lockfile moved between
 // the given refs (a worktree made from the clone's HEAD may predate the base).
-// Otherwise skipped: npm ci wipes node_modules first, so a blind re-run is
-// minutes of dead time. A failed install throws — the verify gate downstream
-// is invalid without deps, and an invalid gate must not look like a green one.
+// Skipped entirely when a package carries no package-lock.json: npm ci requires
+// one by contract and can never succeed without it, and a package with none has
+// no npm dependency tree to install (e.g. a Bun-only project whose verify shells
+// out to `bun test`) — `npm run verify` downstream needs no node_modules either.
+// Otherwise skipped when deps are already present: npm ci wipes node_modules
+// first, so a blind re-run is minutes of dead time. A failed install throws —
+// the verify gate downstream is invalid without deps, and an invalid gate must
+// not look like a green one.
 export async function ensureDeps(packages, { pairs = [] } = {}) {
   const lines = []
   for (const pkg of packages) {
     const dir = pkg === '.' ? '.' : pkg
+    if (!existsSync(path.join(dir, 'package-lock.json'))) {
+      lines.push(`${pkg}: no package-lock.json, nothing to install`)
+      continue
+    }
     let why = null
     if (!existsSync(path.join(dir, 'node_modules'))) why = 'node_modules missing'
     else if (pairs.length && await lockfileChanged(dir, pairs)) why = 'lockfile changed'
