@@ -7,11 +7,14 @@ set -euo pipefail
 # `./remote-control.sh epic N` (laptop-side) remains the manual override for
 # jumping the queue.
 #
-# It walks TWO other queues first, both filled by the merge worker:
+# It walks three repair queues first: two filled by the merge worker and one
+# filled by epic-run's deterministic ship gate:
 # `needs-judgment` (a judgment-class rebase conflict, fixed by `--fix`) and
-# `needs-ci-fix` (checks red on the rebased head, fixed by `--ci`). Each
+# `needs-ci-fix` (checks red on the rebased head, fixed by `--ci`), followed by
+# opted-in `needs-defect-fix` work (concrete ship-gate defects, fixed by
+# `--defect`). Each
 # candidate gets a session named `<repo>-epic-<N>` like any epic, at most one
-# of either kind per repo per tick and never while another fixer session in
+# fixer of any kind per repo per tick and never while another fixer session in
 # that repo is still around. First on purpose: both are epics that already ran,
 # one repair away from a landable PR, so finishing them outranks starting new
 # work — and being bounded per repo they cannot starve the ready queue.
@@ -48,10 +51,11 @@ Usage: $0 [-r <repo>] [-n|--dry-run]
 <engine> is a name from etc/engines.json (a vendor/model/effort table per
 pipeline step): currently $(engine_names | tr '\n' ' ').
 
-One dispatch tick. First walks the two fixer queues — \`needs-judgment\`
+One dispatch tick. First walks the repair queues — \`needs-judgment\`
 (judgment-class rebase conflicts) and \`needs-ci-fix\` (checks red on the
-rebased head), both applied by the merge worker — and launches at most one
-fixer session per repo (\`launch.sh --fix N\` or \`--ci N\`, session
+rebased head), both applied by the merge worker, then \`needs-defect-fix\`
+for repos in DEFECT_FIX_REPOS — and launches at most one
+fixer session per repo (\`launch.sh --fix N\`, \`--ci N\`, or \`--defect N\`, session
 \`<repo>-epic-<N>\`). Then walks
 the \`ready\` queue of every registered repo ($(repo_names | tr '\n' ' '))
 oldest-first, skipping issues that have open blocked_by dependencies or
@@ -147,6 +151,24 @@ if [[ -n "$ONLY_REPO" ]] && ! repo_path "$ONLY_REPO" >/dev/null; then
   warn "unknown repo '$ONLY_REPO' (known: $(repo_names | tr '\n' ' '))"
   exit 1
 fi
+
+# Defect repair is deliberately opt-in. Validate the entire allowlist before
+# taking the lock, probing capacity, reading GitHub, or changing a label: a
+# misspelled machine-local name must stop the tick without partial work.
+defect_fix_enabled() {
+  local wanted="$1" configured
+  for configured in "${DEFECT_FIX_REPOS[@]-}"; do
+    [[ "$configured" == "$wanted" ]] && return 0
+  done
+  return 1
+}
+for configured in "${DEFECT_FIX_REPOS[@]-}"; do
+  [[ -z "$configured" ]] && continue
+  if ! repo_path "$configured" >/dev/null; then
+    warn "DEFECT_FIX_REPOS contains unknown repo '$configured' (known: $(repo_names | tr '\n' ' '))"
+    exit 1
+  fi
+done
 
 # Ticks must not overlap. Two dispatchers reading capacity at the same moment
 # would each see the same free slots and both fill them; launch.sh's own count
@@ -262,20 +284,21 @@ if (( HAVE_ROUTE_ISSUE )); then
 fi
 
 # ───────────────────────── Fixer walks ─────────────────────────
-# Two queues, each a label merge-worker.sh applies beside `failed` on exactly
-# one decline class, so a queue is a label query and never a grep of comment
-# prose: `needs-judgment` (a judgment-class rebase conflict, repaired by
-# fix-run.mjs) and `needs-ci-fix` (checks red on the rebased head, repaired by
-# ci-run.mjs). Each carries its OWN attempt ladder — one PR can need both, and
+# Three queues, each selected by a durable label rather than comment prose:
+# `needs-judgment` and `needs-ci-fix` are merge-worker decline classes resting
+# at `failed`; `needs-defect-fix` is an epic-run ship-gate hold resting at
+# `ready-to-review` and is walked only for repos in DEFECT_FIX_REPOS. Each
+# carries its OWN attempt ladder — one PR can need all three, and
 # a shared budget would let the first failure spend the second's retries. An
 # exhausted ladder (the fixer gets one retry, then a human) stays out of its
 # walk until a human strips those labels to grant another round.
 #
-# Walked in order, at most one launch of either kind per repo per tick: both
-# rebase or amend the same branch against the same moving main.
+# Walked in order, at most one launch of any kind per repo per tick: all rebase
+# or amend the same branch against the same moving main.
 FIXER_QUEUES=(
-  "needs-judgment:fix-retried:--fix:conflict"
-  "needs-ci-fix:ci-retried:--ci:CI"
+  "needs-judgment:fix-retried:--fix:conflict:failed"
+  "needs-ci-fix:ci-retried:--ci:CI:failed"
+  "needs-defect-fix:defect-retried:--defect:defect:ready-to-review"
 )
 fixer_queue() {
   local path="$1" label="$2" ladder="$3"
@@ -316,7 +339,10 @@ for repo in $(repo_names); do
   [[ -d "$path/.git" ]] || continue    # the ready walk below reports this
   launched_fixer=0
   for spec in "${FIXER_QUEUES[@]}"; do
-  IFS=: read -r QLABEL QLADDER QFLAG QKIND <<<"$spec"
+  IFS=: read -r QLABEL QLADDER QFLAG QKIND QREST <<<"$spec"
+  if [[ "$QLABEL" == "needs-defect-fix" ]] && ! defect_fix_enabled "$repo"; then
+    continue
+  fi
   # Fail closed like the blocker check: a queue we could not read must not
   # launch — and must not stop the other queue or the other repos.
   if ! fixers="$(fixer_queue "$path" "$QLABEL" "$QLADDER" | tr '\n' ' ')"; then
@@ -360,10 +386,12 @@ for repo in $(repo_names); do
       break
     fi
 
-    # Swap failed → in-progress BEFORE launching, here in the dispatcher. This
+    # Swap the queue's resting terminal label → in-progress BEFORE launching,
+    # here in the dispatcher. This
     # is NOT a claim (the tmux session name is the claim: launch.sh refuses a
     # duplicate, and this tick holds the flock) — it is a shield against the
-    # reaper. `failed` is terminal for reap's sweep, and a fixer necessarily
+    # reaper. Both `failed` and `ready-to-review` are terminal for reap's sweep,
+    # and a fixer necessarily
     # launches more than TERMINAL_SETTLE_MINUTES after that label's last write
     # (its predecessor session had to settle and be reaped first, and nothing
     # touches the issue in between), so a session launched onto a still-failed
@@ -373,8 +401,8 @@ for repo in $(repo_names); do
     # then fails reverts the swap so the issue goes back to the queue.
     (cd "$path" && gh label create in-progress --color FBCA04 \
         --description "Actively being worked by epic-run" >/dev/null 2>&1) || true
-    if ! (cd "$path" && gh issue edit "$num" --remove-label failed --add-label in-progress >/dev/null 2>&1); then
-      warn "  #$num ($repo): could not swap failed → in-progress — not launching (a still-failed issue would be reaped out from under the fixer)"
+    if ! (cd "$path" && gh issue edit "$num" --remove-label "$QREST" --add-label in-progress >/dev/null 2>&1); then
+      warn "  #$num ($repo): could not swap $QREST → in-progress — not launching (a terminal issue would be reaped out from under the fixer)"
       continue
     fi
 
@@ -389,7 +417,7 @@ for repo in $(repo_names); do
     if ! read_issue_engine "$path" "$num" \
         || [[ "$ISSUE_STATE" != "OPEN" ]] || ! has_issue_label "$QLABEL" || has_issue_label "$QLADDER"; then
       say "  #$num ($repo): issue changed under the queue or its engine routing became invalid (state ${ISSUE_STATE:-unreadable}, labels ${ISSUE_LABELS:-none}) — reverting the swap, skipping"
-      (cd "$path" && gh issue edit "$num" --add-label failed --remove-label in-progress >/dev/null 2>&1) \
+      (cd "$path" && gh issue edit "$num" --add-label "$QREST" --remove-label in-progress >/dev/null 2>&1) \
         || warn "  #$num ($repo): the label revert failed too — issue may be stuck in-progress, fix by hand"
       continue
     fi
@@ -403,7 +431,7 @@ for repo in $(repo_names); do
     rc=$?
     set -e
     if (( rc != 0 )); then
-      (cd "$path" && gh issue edit "$num" --add-label failed --remove-label in-progress >/dev/null 2>&1) \
+      (cd "$path" && gh issue edit "$num" --add-label "$QREST" --remove-label in-progress >/dev/null 2>&1) \
         || warn "  #$num ($repo): launch failed AND the label revert failed — issue is stuck in-progress, fix by hand"
     fi
     case "$rc" in
@@ -425,7 +453,7 @@ for repo in $(repo_names); do
   # An `if`, never `(( x )) && break`: that list returns 1 when the flag is 0,
   # and under `set -e` a failing list at statement position ends the whole tick
   # — silently skipping the ready walk on every tick that launched no fixer.
-  if (( launched_fixer )); then break; fi   # ...of either kind
+  if (( launched_fixer )); then break; fi   # ...of any fixer kind
   done
 done
 fi

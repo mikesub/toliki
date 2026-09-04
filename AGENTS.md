@@ -15,7 +15,7 @@ tmux holds live processes; git worktrees isolate runs.
 Two session kinds exist, and they must never be conflated:
 
 - **Pipeline sessions** (`<repo>-epic-<N>`), launched by dispatch. The pane runs
-  `workflows/epic-run.mjs` or `workflows/fix-run.mjs`, which spawns one headless
+  one of `workflows/{epic,fix,ci,defect}-run.mjs`, which spawns one headless
   agent process per step through the engine adapter. No interactive agent wraps
   it and there is no steering channel; the only intervention is kill. Read one
   with `tmux attach` or `capture-pane`: the pane holds the whole phase log and a
@@ -48,9 +48,10 @@ in the same change.
 
 - **Epic**: one autonomous run of `epic-run.mjs` on one issue, ending at an open
   PR or a blocker comment.
-- **Fixer**: a run of `fix-run.mjs` on a `needs-judgment` issue, or of
-  `ci-run.mjs` on a `needs-ci-fix` issue. Both reuse the epic's session name on
-  purpose so every guard covers them.
+- **Fixer**: a run of `fix-run.mjs` on a `needs-judgment` issue,
+  `ci-run.mjs` on a `needs-ci-fix` issue, or `defect-run.mjs` on a
+  `needs-defect-fix` issue. All reuse the epic's session name on purpose so
+  every guard covers them.
 - **Engine**: a top-level key of `etc/engines.json`, selected per issue by the
   `engine:<name>` label. An unlabeled issue uses `EPIC_ENGINE` from
   `etc/dispatch.cron` (claude when unset). The label survives fixer retries.
@@ -77,12 +78,14 @@ Lifecycle labels are owned by automation. Do not add or repurpose one.
 | `ready` | queued, unclaimed: the build queue |
 | `in-progress` | a run has claimed it |
 | `ready-to-merge` | PR open, gates cleared; the merge worker lands it unattended |
-| `ready-to-review` | PR open, something deferred or judgment-resolved; a human decides |
+| `ready-to-review` | PR open, held from unattended merge; a human decides unless an opted-in defect fixer owns its concrete blockers |
 | `failed` | blocked; needs a human |
 | `needs-judgment` | beside `failed`: the merge worker declined a judgment-class conflict; the conflict fixer's queue |
 | `needs-ci-fix` | beside `failed`: checks were red on the rebased head; the CI fixer's queue |
+| `needs-defect-fix` | beside `ready-to-review`: every ship-gate blocker is a concrete defect; the defect fixer's queue |
 | `fix-attempted` / `fix-retried` | the conflict fixer's attempt ladder (one retry, then a human); never reset by automation |
-| `ci-attempted` / `ci-retried` | the CI fixer's own ladder, same shape — one PR can need both repairs |
+| `ci-attempted` / `ci-retried` | the CI fixer's own ladder, same shape |
+| `defect-attempted` / `defect-retried` | the defect fixer's own ladder, same shape — one PR can need all three repairs |
 | issue closed | merged |
 
 `engine:<name>` is the separate routing namespace and is never cleared by a
@@ -94,7 +97,8 @@ than made launchable against a main without the code it describes.
 
 ## Architecture boundaries
 
-- `workflows/epic-run.mjs`, `workflows/fix-run.mjs` and `workflows/ci-run.mjs`
+- `workflows/epic-run.mjs`, `workflows/fix-run.mjs`, `workflows/ci-run.mjs`
+  and `workflows/defect-run.mjs`
   are plain Node orchestrators. They must not name a vendor.
 - `workflows/lib/engine.mjs` is the only file that knows how a vendor CLI is
   invoked. Its loader validates `etc/engines.json` before any phase touches
@@ -171,14 +175,22 @@ than made launchable against a main without the code it describes.
 - GitHub artifacts a retry cannot undo — a filed follow-up, the deferred
   record — are created only after the PR exists, and a record already on the
   issue is left alone. Everything before the PR is idempotent under a re-run.
+- Epic-run adds `needs-defect-fix` only after it posts and reads back a
+  structured repair envelope authored by the authenticated automation identity
+  and bound to the issue, same-repository PR and captured head. Defect-run pins
+  the original requirement from that envelope, rejects mutable issue prose,
+  stale evidence and fork PRs before an attempt, and verifies the selected PR
+  advanced to the pushed head before promotion.
 - `npm run verify` is run by the orchestrator: red after the red step, green
   after green and after fixes-after-review, each with one retry that hands the
   output back to the agent, then a blocker. An agent's report that verify
   passed is never the gate. Gated by `tests/epic-run.test.sh`.
 - The fixes-after-review delta gets one skeptic pass (fix-check). An
   unconfirmed fix, a regression, a dead check or a claimed fix with no diff
-  holds the PR at `ready-to-review`; nothing starts a second fix round. Gated
-  by `tests/epic-run.test.sh`.
+  holds the PR at `ready-to-review`; nothing starts a second fix round inside
+  that epic. If and only if every blocker is defect-class, the completed run
+  may mark it for the separate bounded defect-fixer queue. Gated by
+  `tests/epic-run.test.sh`.
 - Ship's deferral kinds feed the merge gate only after the skeptic re-judges
   every item ship did not call a defect; the skeptic can only escalate, and a
   dead check holds the PR. Gated by `tests/epic-run.test.sh`.
@@ -204,12 +216,23 @@ than made launchable against a main without the code it describes.
   catch is a fix that is green and wrong, which is why the fixer is forbidden
   to weaken a test and its diff goes to an adversarial check that refutes by
   default. Gated by `tests/epic-run.test.sh`.
+- The defect fixer has the same verified-push safety argument as the CI fixer,
+  but repairs only defects already named by the durable ship-gate evidence. It
+  is a separate two-attempt session, and epic-run queues it only when no mixed
+  or missing blocker evidence exists. It cannot weaken a test or reclassify a
+  defect, and rejoins `ready-to-merge` only after orchestrator-run verify plus
+  a blind adversarial check of the complete delta, including intent-added new
+  files. Every blocker/refusal restores and verifies its terminal labels even
+  when its reporting comment fails. Autonomous dispatch is opt-in per repo through
+  `DEFECT_FIX_REPOS`; manual `defect` remains an explicit override.
 - Every cleanup needs a positive proof of staleness: a claim ref only while its
   tip is still the claim commit and no session is live; a worktree only when its
   issue has no `epic/<N>-*` ref on origin at all. Liveness is read from tmux
   before any GitHub query. Gated by `tests/reap-worktree.test.sh`.
 - Terminal is the label, and a terminal label must settle for
-  `TERMINAL_SETTLE_MINUTES` before a session is killed.
+  `TERMINAL_SETTLE_MINUTES` before a session is killed. Dispatch synchronously
+  shields a fixer launch by swapping its resting terminal label to
+  `in-progress`, including `ready-to-review` for defect repair.
 - Dispatch launches but never claims. Two ticks racing on one issue is safe
   because the ref push decides.
 - The CLI binary moves only on an idle host, under dispatch's lock. Gated by
@@ -232,6 +255,8 @@ than made launchable against a main without the code it describes.
   registered repo whose `scripts.verify` shells out to it.
 - `EPIC_ENGINE` must be a key of `etc/engines.json`, or `etc/lib.sh` refuses to
   load on every tick.
+- Every name in `DEFECT_FIX_REPOS` must be registered in `REPOS`; empty or
+  unset disables autonomous defect repair without disabling manual launches.
 - Claude model names in `etc/engines.json` are CLI aliases resolved by the
   installed binary, so a stale binary silently turns them into pins.
 - The Docker GC policy loads only on a full daemon restart, and unknown keys
@@ -291,7 +316,7 @@ cannot export them, so a child Bash calls the real `ssh`.
 The user's tmux sessions and GitHub queues are live production state. Without
 an explicit request, never run:
 
-- `remote-control.sh start`, `epic`, `fix`, `next`, `stop`, `restart`,
+- `remote-control.sh start`, `epic`, `fix`, `ci`, `defect`, `next`, `stop`, `restart`,
   `stop-all`, or a bare `<name>`;
 - `bin/dispatch.sh` except `--dry-run` (`--route-next` and `--route-issue`
   mutate labels);

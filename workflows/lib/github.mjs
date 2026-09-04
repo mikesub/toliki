@@ -42,6 +42,9 @@ export const LABELS = {
   'needs-ci-fix':    { color: 'D93F0B', description: 'checks were red on the rebased head — queued for an automated CI fixer session' },
   'ci-attempted':    { color: 'FEF2C0', description: 'a CI fixer session has attempted this red check once' },
   'ci-retried':      { color: 'F9D0C4', description: 'the CI fixer retry is spent — the next failure waits for a human' },
+  'needs-defect-fix': { color: 'D93F0B', description: 'ship gate held on concrete defects — queued for an automated defect fixer session' },
+  'defect-attempted': { color: 'FEF2C0', description: 'a defect fixer session has attempted this ship-gate repair once' },
+  'defect-retried':   { color: 'F9D0C4', description: 'the defect fixer retry is spent — the next failure waits for a human' },
 }
 
 // Idempotent and best-effort: `gh label create` fails when the label exists,
@@ -72,6 +75,13 @@ export async function issueLabels(issue) {
 
 export async function issueView(issue, fields) {
   return ghJson(['issue', 'view', String(issue), '--json', fields], `gh issue view ${issue}`)
+}
+
+export async function authenticatedLogin() {
+  const value = await ghJson(['api', 'user'], 'gh api user')
+  const login = String(value?.login || '').trim()
+  if (!login) throw new Error('gh api user returned no authenticated login')
+  return login
 }
 
 // Open blockers of an issue. Never throws: the preflight is advisory when the
@@ -126,6 +136,14 @@ export async function assignSelf(issue) {
 export async function openPrs(fields = 'number,url,headRefName,headRefOid') {
   const v = await ghJson(['pr', 'list', '--state', 'open', '--json', fields], 'gh pr list')
   return Array.isArray(v) ? v : []
+}
+
+export async function prView(pr, fields = 'number,url,headRefName,headRefOid') {
+  return ghJson(['pr', 'view', String(pr), '--json', fields], `gh pr view ${pr}`)
+}
+
+export async function repositoryView(fields = 'nameWithOwner') {
+  return ghJson(['repo', 'view', '--json', fields], 'gh repo view')
 }
 
 export async function searchOpenPrs(query, fields = 'number,title') {

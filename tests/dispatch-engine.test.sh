@@ -13,8 +13,10 @@ FAIL=0
 ok() { PASS=$((PASS + 1)); printf '  ok   %s\n' "$1"; }
 nok() { FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$1"; }
 assert_rc() { if [[ "$2" == "$3" ]]; then ok "$1"; else nok "$1 (want rc $2, got $3)"; fi; }
+assert_eq() { if [[ "$2" == "$3" ]]; then ok "$1"; else nok "$1 (want '$2', got '$3')"; fi; }
 assert_contains() { if [[ "$2" == *"$3"* ]]; then ok "$1"; else nok "$1 (missing: $3)"; fi; }
 assert_not_contains() { if [[ "$2" != *"$3"* ]]; then ok "$1"; else nok "$1 (unexpected: $3)"; fi; }
+issue_labels() { tr ',' '\n' < "$TMP/labels/$1" | sed '/^$/d' | sort | tr '\n' ','; }
 
 HARNESS="$TMP/harness"
 REPO="$TMP/repo"
@@ -29,11 +31,23 @@ SSH_HOST="unused"
 NAMES=(alpha)
 NAME_MAX_LEN=40
 MAX_PARALLEL_EPICS=2
+DEFECT_FIX_REPOS=()
 EOF
+
+set_defect_fix_repos() {
+  grep -v '^DEFECT_FIX_REPOS=' "$HARNESS/etc/repos.conf" > "$HARNESS/etc/repos.conf.next"
+  printf 'DEFECT_FIX_REPOS=(%s)\n' "$1" >> "$HARNESS/etc/repos.conf.next"
+  mv "$HARNESS/etc/repos.conf.next" "$HARNESS/etc/repos.conf"
+}
+unset_defect_fix_repos() {
+  grep -v '^DEFECT_FIX_REPOS=' "$HARNESS/etc/repos.conf" > "$HARNESS/etc/repos.conf.next"
+  mv "$HARNESS/etc/repos.conf.next" "$HARNESS/etc/repos.conf"
+}
 
 cat > "$HARNESS/bin/launch.sh" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$LAUNCH_LOG"
+if [[ "$*" == "--check-capacity" ]]; then exit "${CAPACITY_RC:-0}"; fi
 exit "${LAUNCH_RC:-0}"
 STUB
 chmod +x "$HARNESS/bin/launch.sh"
@@ -68,6 +82,8 @@ case "${1:-} ${2:-}" in
       [[ -z "${FIXER_QUEUE:-}" ]] || printf '%b\n' "$FIXER_QUEUE"
     elif [[ "$*" == *needs-ci-fix* ]]; then
       [[ -z "${CI_QUEUE:-}" ]] || printf '%b\n' "$CI_QUEUE"
+    elif [[ "$*" == *needs-defect-fix* ]]; then
+      [[ -z "${DEFECT_QUEUE:-}" ]] || printf '%b\n' "$DEFECT_QUEUE"
     else
       [[ -z "${READY_QUEUE:-}" ]] || printf '%b\n' "$READY_QUEUE"
     fi
@@ -132,12 +148,13 @@ run_dispatch() {
     PATH="$TMP/bin:$PATH" TMPDIR="$TMP/locks" \
     LAUNCH_LOG="$TMP/launch.log" GH_LOG="$TMP/gh.log" \
     LABEL_DIR="$TMP/labels" BLOCKER_DIR="$TMP/blockers" \
-    READY_QUEUE="${READY_QUEUE:-}" FIXER_QUEUE="${FIXER_QUEUE:-}" CI_QUEUE="${CI_QUEUE:-}" \
+    READY_QUEUE="${READY_QUEUE:-}" FIXER_QUEUE="${FIXER_QUEUE:-}" CI_QUEUE="${CI_QUEUE:-}" DEFECT_QUEUE="${DEFECT_QUEUE:-}" \
     FAIL_VIEW_ISSUE="${FAIL_VIEW_ISSUE:-}" FAIL_EDIT_ISSUE="${FAIL_EDIT_ISSUE:-}" \
     FAIL_BLOCKER_ISSUE="${FAIL_BLOCKER_ISSUE:-}" \
     FAIL_QUEUE="${FAIL_QUEUE:-}" \
     COMMA_LABEL_ISSUE="${COMMA_LABEL_ISSUE:-}" \
     FLOCK_BUSY="${FLOCK_BUSY:-}" STUB_SESSION_NAME="${STUB_SESSION_NAME:-}" \
+    CAPACITY_RC="${CAPACITY_RC:-}" LAUNCH_RC="${LAUNCH_RC:-}" \
     bash "$DISPATCH" "$@" 2>&1
   )" || RUN_RC=$?
 }
@@ -147,6 +164,7 @@ reset_state() {
   READY_QUEUE=""
   FIXER_QUEUE=""
   CI_QUEUE=""
+  DEFECT_QUEUE=""
   FAIL_VIEW_ISSUE=""
   FAIL_EDIT_ISSUE=""
   FAIL_BLOCKER_ISSUE=""
@@ -154,7 +172,21 @@ reset_state() {
   COMMA_LABEL_ISSUE=""
   FLOCK_BUSY=""
   STUB_SESSION_NAME=""
+  LAUNCH_RC=""
+  CAPACITY_RC=""
+  set_defect_fix_repos ""
 }
+
+assert_contains "the tracked config documents an empty-by-default defect allowlist" "$(cat "$ROOT/etc/repos.conf.template")" "DEFECT_FIX_REPOS=("
+
+printf '\ndispatch: an unknown defect-fixer opt-in fails before mutation or launch\n'
+reset_state
+set_defect_fix_repos "missingrepo"
+run_dispatch
+assert_rc "an unknown configured repo aborts the tick" 1 "$RUN_RC"
+assert_contains "the refusal names DEFECT_FIX_REPOS" "$RUN_OUT" "DEFECT_FIX_REPOS"
+assert_not_contains "no issue label is mutated" "$(cat "$TMP/gh.log")" "issue edit"
+assert_eq "launch.sh is never invoked, even for capacity" "" "$(cat "$TMP/launch.log")"
 
 printf '\ndispatch: unlabeled ready work defaults to Claude\n'
 reset_state
@@ -279,6 +311,65 @@ assert_contains "it launches the CI pipeline" "$(cat "$TMP/launch.log")" '--ci 2
 assert_not_contains "and never the conflict fixer" "$(cat "$TMP/launch.log")" '--fix 21'
 assert_contains "the shield swap ran before the launch" "$(cat "$TMP/labels/21")" 'in-progress'
 
+printf '\ndefect fixer: repositories are opted in explicitly\n'
+reset_state
+unset_defect_fix_repos
+DEFECT_QUEUE=30
+printf 'ready-to-review,needs-defect-fix,engine:codex' > "$TMP/labels/30"
+run_dispatch
+assert_rc "an unset allowlist ignores the marker queue" 0 "$RUN_RC"
+assert_not_contains "no autonomous defect fixer is launched" "$(cat "$TMP/launch.log")" '--defect 30'
+assert_not_contains "dispatch does not even walk an opted-out queue" "$(cat "$TMP/gh.log")" 'needs-defect-fix'
+assert_eq "the resting review labels are untouched" "ready-to-review,needs-defect-fix,engine:codex" "$(cat "$TMP/labels/30")"
+
+reset_state
+set_defect_fix_repos "testrepo"
+DEFECT_QUEUE=30
+printf 'ready-to-review,needs-defect-fix,engine:codex' > "$TMP/labels/30"
+run_dispatch
+assert_rc "an opted-in tick exits 0" 0 "$RUN_RC"
+assert_contains "it launches the dedicated defect pipeline" "$(cat "$TMP/launch.log")" '--defect 30 --repo testrepo --engine codex'
+assert_contains "the existing engine route is preserved" "$(cat "$TMP/launch.log")" '--engine codex'
+assert_contains "the terminal shield is replaced before launch" "$(cat "$TMP/labels/30")" 'in-progress'
+assert_not_contains "ready-to-review is removed while the session is live" "$(cat "$TMP/labels/30")" 'ready-to-review'
+
+printf '\ndefect fixer: an exhausted ladder is excluded and the exact terminal state is restored\n'
+reset_state
+set_defect_fix_repos "testrepo"
+DEFECT_QUEUE=31
+printf 'ready-to-review,needs-defect-fix,defect-attempted,defect-retried' > "$TMP/labels/31"
+run_dispatch
+assert_rc "tick exits 0" 0 "$RUN_RC"
+assert_contains "the queue query excludes the spent ladder" "$(cat "$TMP/gh.log")" '-label:defect-retried'
+assert_not_contains "nothing is launched on a spent ladder" "$(cat "$TMP/launch.log")" '--defect 31'
+assert_contains "the stale search hit was shielded first" "$(cat "$TMP/gh.log")" 'issue edit 31 --remove-label ready-to-review --add-label in-progress'
+assert_contains "the direct reread restores ready-to-review" "$(cat "$TMP/gh.log")" 'issue edit 31 --add-label ready-to-review --remove-label in-progress'
+assert_eq "the issue is never stranded in-progress or changed to failed" "defect-attempted,defect-retried,needs-defect-fix,ready-to-review," "$(issue_labels 31)"
+
+printf '\ndefect fixer: a launch failure restores ready-to-review, not failed\n'
+reset_state
+set_defect_fix_repos "testrepo"
+DEFECT_QUEUE=32
+printf 'ready-to-review,needs-defect-fix' > "$TMP/labels/32"
+LAUNCH_RC=4
+run_dispatch
+assert_rc "an issue-specific launch failure makes the tick non-clean" 1 "$RUN_RC"
+assert_contains "the defect launch was attempted" "$(cat "$TMP/launch.log")" '--defect 32'
+assert_eq "the exact resting terminal label is restored" "needs-defect-fix,ready-to-review," "$(issue_labels 32)"
+assert_not_contains "a defect repair failure never invents failed" "$(cat "$TMP/labels/32")" 'failed'
+
+printf '\ndefect fixer: a full host defers before touching review labels\n'
+reset_state
+set_defect_fix_repos "testrepo"
+DEFECT_QUEUE=33
+printf 'ready-to-review,needs-defect-fix' > "$TMP/labels/33"
+CAPACITY_RC=3
+run_dispatch
+assert_rc "capacity is a clean deferral" 0 "$RUN_RC"
+assert_not_contains "no defect session is attempted" "$(cat "$TMP/launch.log")" '--defect 33'
+assert_not_contains "no label write occurs" "$(cat "$TMP/gh.log")" 'issue edit 33'
+assert_eq "the issue remains ready-to-review" "needs-defect-fix,ready-to-review," "$(issue_labels 33)"
+
 printf '\nfixer: an exhausted CI ladder stays out of the queue\n'
 reset_state
 CI_QUEUE=22
@@ -295,24 +386,32 @@ printf '\nfixer: one fixer of either kind per repo per tick\n'
 reset_state
 FIXER_QUEUE=23
 CI_QUEUE=24
+DEFECT_QUEUE=28
 printf 'failed,needs-judgment' > "$TMP/labels/23"
 printf 'failed,needs-ci-fix' > "$TMP/labels/24"
+printf 'ready-to-review,needs-defect-fix' > "$TMP/labels/28"
+set_defect_fix_repos "testrepo"
 run_dispatch
 assert_rc "tick exits 0" 0 "$RUN_RC"
 assert_contains "the conflict queue is walked first" "$(cat "$TMP/launch.log")" '--fix 23'
 assert_not_contains "and the CI queue waits for the next tick" "$(cat "$TMP/launch.log")" '--ci 24'
+assert_not_contains "and the defect queue waits behind both" "$(cat "$TMP/launch.log")" '--defect 28'
 
 printf '\nfixer: a live session parks both fixer walks in that repo\n'
 reset_state
 FIXER_QUEUE=25
 CI_QUEUE=26
+DEFECT_QUEUE=29
 printf 'failed,needs-judgment' > "$TMP/labels/25"
 printf 'failed,needs-ci-fix' > "$TMP/labels/26"
+printf 'ready-to-review,needs-defect-fix' > "$TMP/labels/29"
+set_defect_fix_repos "testrepo"
 STUB_SESSION_NAME="testrepo-epic-25"
 run_dispatch
 assert_rc "tick exits 0" 0 "$RUN_RC"
 assert_not_contains "the busy conflict candidate launches nothing" "$(cat "$TMP/launch.log")" '--fix 25'
 assert_not_contains "and the CI queue is parked too" "$(cat "$TMP/launch.log")" '--ci 26'
+assert_not_contains "and the defect queue is parked too" "$(cat "$TMP/launch.log")" '--defect 29'
 
 printf '\nfixer: a CI queue that cannot be read never launches\n'
 reset_state
@@ -370,6 +469,14 @@ assert_rc "manual epic requires an explicit engine" 1 "$CONTROL_RC"
 SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/remote-control.sh" epic 10 --engine codex
 assert_contains "manual epic forwards its explicit engine" "$(cat "$TMP/ssh.log")" "--engine 'codex'"
 assert_contains "manual epic persists the engine first" "$(cat "$TMP/ssh.log")" "--route-issue '10' 'codex'"
+: > "$TMP/ssh.log"
+set +e
+SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/remote-control.sh" defect 10 --engine codex -r testrepo >/dev/null 2>&1
+CONTROL_RC=$?
+set -e
+assert_rc "manual defect repair is accepted even without repo opt-in" 0 "$CONTROL_RC"
+assert_contains "manual defect repair persists the engine before launching" "$(cat "$TMP/ssh.log")" "--route-issue '10' 'codex'"
+assert_contains "manual defect repair uses the dedicated launch mode" "$(cat "$TMP/ssh.log")" "--defect '10' --engine 'codex'"
 : > "$TMP/ssh.log"
 set +e
 SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/remote-control.sh" epic '#' --engine codex >/dev/null 2>&1
