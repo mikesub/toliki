@@ -192,8 +192,10 @@ issue back on ready-to-merge under an adversarial check. Nothing to do unless
 it comes back failed again with the fixer's own blocker comment."
   else
     next="The PR is open and NOT merged; the change itself is complete. Fix the cause
-above and merge it by hand — the worker does not retry, and re-running /epic on
-this issue will skip it while the PR is open."
+above, push, and swap \`failed\` → \`ready-to-merge\`: the worker does not retry on
+its own, and that swap is the retry — it rebases, re-runs the checks and lands
+the PR itself. Do not merge by hand. Re-running /epic on this issue will skip it
+while the PR is open."
   fi
   gh issue comment "$issue" -R "$ORIGIN" --body-file - <<EOF || say "$REPO: could not comment on #$issue"
 🤖 merge-worker blocked
@@ -543,7 +545,7 @@ fi
 # Only when something actually happened. An empty drain is the overwhelmingly
 # common case — one tick per repo per minute, ~4k lines a day of "0 merged, 0
 # failed" — and that is not merely noise: it buries the real entries so deep
-# that a `tail` of this log cannot reach them, which is exactly how /triage is
+# that a `tail` of this log cannot reach them, which is exactly how /toliki is
 # told to explain a stuck ready-to-merge. A log that is unreadable at the
 # moment it matters is worse than a short one. Cron liveness is unaffected:
 # dispatch.sh and reap.sh still log every tick to their own files.

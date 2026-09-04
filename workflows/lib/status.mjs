@@ -3,7 +3,7 @@
 // The label lifecycle already says which state an issue is in; what it cannot
 // say is whether an `in-progress` run is alive and how far it got. That gap is
 // what sends an operator to `tmux capture-pane` for a question GitHub should be
-// able to answer, and it is the one thing /triage cannot see without ssh.
+// able to answer, and it is the one thing /toliki cannot see without ssh.
 //
 // Edited rather than re-posted, which is what makes it affordable at all — the
 // three reasons per-phase comments were removed all turn on re-posting: an edit

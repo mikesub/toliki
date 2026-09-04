@@ -289,7 +289,7 @@ fixer_queue() {
 # failed → in-progress only to revert it when launch says 3 — two label
 # writes and two timeline events per minute for as long as the box stays
 # full, churn that also resets updatedAt and so hides the issue from
-# /triage's "sat unchanged" heuristic. The probe is launch.sh's own counting
+# /toliki's "sat unchanged" heuristic. The probe is launch.sh's own counting
 # (--check-capacity runs the same capacity_gate as a real launch), so the cap
 # still lives in exactly one place. Not run for --dry-run, which is
 # documented as not simulating capacity.

@@ -4,142 +4,156 @@ description: Surface everything stuck in the epic pipeline — failed and review
 ---
 
 Produce the operator's sit-down brief: everything that needs a human and
-everything stuck in the machine. Stateless and read-only: the brief is computed
-from current state only, with nothing written anywhere, so it reports the same
-truth whether it ran an hour ago or a week ago. This skill surfaces and
+everything stuck in the machine. Read-only and stateless: the brief is computed
+from current state, and nothing is written anywhere. This skill surfaces and
 suggests; it never relabels, merges, kills or launches sessions, and never runs
-`dispatch.sh`, `reap.sh` or `merge-worker.sh`. The allowed surface is exactly
-the harness AGENTS.md's safe list: `gh` reads, `./remote-control.sh ls`,
-read-only `ssh` queries (`tmux capture-pane`, log tails). Laptop-side, like
-`remote-control.sh`.
+`dispatch.sh`, `merge-worker.sh`, or `reap.sh` without `-n`. The allowed
+surface is exactly the harness AGENTS.md's safe list: `gh` reads,
+`./remote-control.sh ls`, `bin/reap.sh -n`, and read-only `ssh` queries
+(`tmux capture-pane`, log greps). Laptop-side, like `remote-control.sh`.
 
 ## 0. Setup
 
 Run laptop-side commands from the Toliki repository root (the checkout that
 contains this skill at `.agents/skills/toliki/SKILL.md`). Its machine-local
-`etc/repos.conf` is the registry: `REPO_ORIGINS` decides which repos get
-checked (every entry, always), and `SSH_HOST` is how the host is reached. No
-other repo list exists. Source `etc/lib.sh` under bash explicitly, since it
-locates itself via `BASH_SOURCE` and the interactive shell may be zsh:
+`etc/repos.conf` is the only registry. Source `etc/lib.sh` under bash
+explicitly, since it locates itself via `BASH_SOURCE` and the interactive
+shell may be zsh:
 
 ```
-bash -c 'source etc/lib.sh && printf "%s\n" "${REPO_ORIGINS[@]}"'
+bash -c 'source etc/lib.sh && printf "%s\n" "SSH_HOST=$SSH_HOST" "HOST_CONTROL_DIR=$HOST_CONTROL_DIR" "${REPO_ORIGINS[@]}"'
 ```
 
-If it fails, report the message it prints. Never
-`cp etc/repos.conf.template etc/repos.conf`: that file is gitignored and
-machine-local, and the copy destroys the real registry.
+Every `REPO_ORIGINS` entry gets checked, always. `SSH_HOST` is the ssh
+destination and `HOST_CONTROL_DIR` is where `bin/` lives on the host; carry
+both into every ssh command below. If the command fails, report the message
+it prints. Never `cp etc/repos.conf.template etc/repos.conf`: that file is
+gitignored and machine-local, and the copy destroys the real registry.
 
-## 1. Needs a decision (all open issues, however old)
+## 1. Host probes (read-only)
 
-Per repo, via `gh -R <owner/repo>`:
+Run both first; §3 and §4 read their output.
 
-- **`failed`**: first check for a fixer queue label beside it, which changes
-  who owns the issue. Two of them exist, each with its own attempt ladder:
-  `needs-judgment` (a rebase conflict; ladder `fix-attempted`/`fix-retried`)
-  and `needs-ci-fix` (checks red on the rebased head; ladder
-  `ci-attempted`/`ci-retried`).
+- `./remote-control.sh ls`, run locally and never wrapped in `ssh` (it sshes
+  to `SSH_HOST` itself). One line per session: name, repo, engine,
+  `running`/`dead`.
+- `ssh $SSH_HOST "$HOST_CONTROL_DIR/bin/reap.sh -n"`: the reaper's own sweep,
+  changing nothing. It exits non-zero when something needs a human, and each
+  such line is an item: a `<repo>-epic-<N>` session whose process died before
+  its issue went terminal, an issue or ref listing it could not read, a claim
+  it could not check, and agent processes running with no live pipeline
+  session. Lines starting `would kill`, `would delete` or `would remove` are
+  the design working: say nothing about them.
+
+## 2. Per-issue evidence
+
+One query per repo gives every issue in a lifecycle state, with its age:
+
+```
+gh issue list -R <owner/repo> --state open --limit 200 --json number,title,labels,updatedAt \
+  --jq '.[] | select([.labels[].name] | any(IN("ready","in-progress","ready-to-merge","ready-to-review","failed"))) | [.number, .updatedAt, ([.labels[].name] | join(",")), .title] | @tsv'
+```
+
+Every run edits one status comment on its issue, starting `🤖 **epic-run**`
+(`fix-run` or `ci-run` for the fixers): the current phase and an `updated`
+timestamp while it runs, and on exit a note: `**blocked** at <phase>:
+<reason>`, `**skipped**: <reason>`, `**done** …`, or `**done, held for
+review** … (<reason>)`. Every other pipeline record is a 🤖 comment too. Read
+them all in one call, oldest first:
+
+```
+gh issue view <N> -R <owner/repo> --json comments --jq '.comments[] | select(.body | startswith("🤖")) | .body'
+```
+
+## 3. Needs a decision (all open issues, however old)
+
+- **`failed`**: a fixer queue label beside it changes who owns the issue.
+  Two exist, each with its own attempt ladder: `needs-judgment` (a rebase
+  conflict; ladder `fix-attempted`/`fix-retried`) and `needs-ci-fix` (checks
+  red on the rebased head; ladder `ci-attempted`/`ci-retried`).
   - a queue label **without** its spent-ladder label: the automated fixer owns
     it and dispatch relaunches it on its own, so this is not a decision item.
-    Mention it under "stuck in the machine" only if it has sat unchanged for
-    over ~1h; then check sessions and `~/dispatch.log` for why the fixer walk
-    is not picking it up.
+    Mention it under §4 only if unchanged for over ~1h; then
+    `grep "#<N>" ~/dispatch.log | tail` says why the fixer walk passes it.
   - a queue label **with** its spent-ladder label (`fix-retried`,
-    `ci-retried`): that fixer's attempt ladder is exhausted, a real decision
-    item. Read the newest 🤖 fix-conflict or 🤖 fix-ci comment; the human
-    either finishes it by hand or strips that ladder's two labels to grant
-    another round.
-  - plain `failed`: read the newest 🤖 comment for the cause and check the
-    PR's state (`mergeable` says if a conflict is still live). Report a
-    one-line cause, the PR link, and what finishing takes: typically *fix the
-    cause, push, swap `failed` → `ready-to-merge`; the merge worker lands it
-    from there*.
-- **`ready-to-review`**: read the deferred or summary comment and extract the
-  actual decision the human is being asked to make, not the whole list.
+    `ci-retried`): that ladder is exhausted, a real decision item. The newest
+    🤖 fix-conflict or fix-ci comment names the cause; the human either
+    finishes it by hand or strips that ladder's two labels to grant another
+    round.
+  - plain `failed`: the newest `🤖 merge-worker blocked` or `🤖 epic-run
+    blocked` comment names the cause, and `gh pr view <P> --json mergeable`
+    says whether a conflict is still live. Report a one-line cause, the PR
+    link, and what finishing takes: typically *fix the cause, push, swap
+    `failed` → `ready-to-merge`; the merge worker lands it from there*.
+- **`ready-to-review`**: two sources, two different decisions.
+  - a `🤖 deferred / not done` comment (an epic's ship): extract the actual
+    decision the human is being asked to make from its items, not the whole
+    list. The status note's `held for review` reason is the gate that held it.
+  - a `🤖 fix-conflict resolved a judgment rebase conflict` comment (the
+    conflict fixer): the only decision is whether the resolution stands.
+    Accepting it is swapping `ready-to-review` → `ready-to-merge`.
+- **`in-progress` with no `running` session of its name in `ls`**: stranded,
+  and nothing automated recovers it (reap never relabels; dispatch skips an
+  issue whose session still exists, dead or not). Report the phase and
+  `updated` time from the status comment, the scrollback line from §4, and
+  what finishing takes: `./remote-control.sh stop <session>`, then swap
+  `in-progress` → `ready` (a fixer run: → `failed`, its queue label is still
+  on). A branch with checkpoints resumes on the next tick; one holding only
+  the claim commit is refused as claimed elsewhere until reap clears it
+  (`CLAIM_GRACE_HOURS`, 6h) or the human deletes it from origin.
 
-## 2. Stuck in the machine
+## 4. Stuck in the machine
 
-These catch what labels alone do not flag. The age thresholds are heuristics
-about *current* state, not reporting windows: say "looks stuck", not "is
-broken".
+Heuristics about *current* state, not reporting windows: say "looks stuck",
+not "is broken".
 
-- **`ready-to-merge` open for over ~1h**: the worker drains in minutes, so
-  check the tail of `~/merge.log` for the why (infrastructure aborts log
-  "aborting the run" and write no label). An issue the CI fixer just returned
+- **`ready-to-merge` open for over ~1h**: the worker drains in minutes.
+  `grep "#<N>" ~/merge.log | tail` for the why; infrastructure aborts log
+  "aborting the run" and write no label. An issue the CI fixer just returned
   here is normal: it goes back through the worker's rebase and check re-run.
-- **`ready` untouched for over ~18h**: list its open `blocked_by` issues.
-  Blockers explain it (report the chain); no blockers means dispatch is
-  passing it over, so flag it for investigation.
-- **`in-progress` with no live session on the host**: a stranded claim; reap
-  recycles it after `CLAIM_GRACE_HOURS` (6h). Report the age so the user can
-  wait or intervene.
-
-## 3. Host half (one ssh, read-only)
-
-- Sessions with status: `./remote-control.sh ls`, run locally from the harness
-  checkout and never wrapped in `ssh`. The script sshes to `SSH_HOST` itself;
-  sent to the host it fails with `Temporary failure in name resolution`, which
-  is not a DNS problem and no retry fixes. (`ssh $SSH_HOST 'tmux ls'` is the
-  direct equivalent, and does go over ssh.)
-
-  A dead pipeline session is not news by itself: the orchestrator exits when
-  its run ends, so every finished `<repo>-epic-<N>` sits at a shell prompt
-  until reap kills it. What separates finished from crashed is the run's last
-  line, so check that before reading anything else:
+- **`ready` untouched for over ~18h**: list its open blockers:
 
   ```
-  ssh $SSH_HOST 'tmux capture-pane -p -t <name> -S -200 | grep "^RESULT "'
+  gh api repos/<owner/repo>/issues/<N>/dependencies/blocked_by --jq '.[] | select(.state == "open") | .number'
   ```
 
-  - **A `RESULT` line exists**: the run finished and reported itself.
-    `readyToMerge`/`mergeSkipped` are already covered by the label sections
-    above, so say nothing; `skipped` or `blocked` is the item, and the JSON's
-    own `reason` is the one-line cause. Reap clears the session on its next
-    sweep either way.
-  - **No `RESULT` line**: the run died mid-phase, and the scrollback is the
-    only record of why. `capture-pane -p -t <name> -S -60`, summarize the
-    failure in a line, and flag it: nothing will relaunch that issue until the
-    session is gone, and reap deliberately leaves a non-terminal dead session
-    alive so the scrollback survives.
+  Blockers explain it (report the chain). None means dispatch is passing it
+  over: `grep "#<N>" ~/dispatch.log | tail` shows what the last tick did with
+  it (`blocked by`, `session exists`, `engine routing`, or nothing at all).
+  Report that line.
+- **Dead pipeline sessions**: the orchestrator exits when its run ends, so
+  every finished `<repo>-epic-<N>` sits at a shell prompt until reap kills
+  it; dead alone is not news. The issue's status note separates finished
+  from crashed:
+  - `**skipped**` or `**blocked**`: that is the item, and the note's reason
+    is the one-line cause. `done` and `held for review` are already covered
+    by §3's labels: say nothing.
+  - the comment never reached `finished` (it still shows a phase): the run
+    crashed, and the scrollback is the only record:
+    `ssh $SSH_HOST 'tmux capture-pane -p -t <name> -S -60'`. Summarize the
+    failure in a line and flag it; reap never kills such a session, and the
+    finish is §3's stranded recipe.
 
-  For a dead **interactive** session (a pool name), the scrollback is the
-  whole story; there is no RESULT line to look for.
-- `~/reap.log` and `~/merge.log` are diagnostics, not a sweep. Tail one
-  **only to explain an item already flagged above**, and `grep` it for the
-  repo or issue at hand rather than reading the last N lines. Nothing flagged
-  ⇒ skip them entirely; they are never a section of their own.
-
-## 4. Host hygiene (same ssh, still read-only)
-
-Two things that hold real resources while being invisible to every label.
-Report only what is actually there, and skip the section entirely when both
-are clean.
-
-- **Orphaned agent processes.** Each phase of a run is its own `claude -p`
-  process; a SIGKILL or the OOM killer leaves them running under no session,
-  invisible to the slot cap (it counts tmux panes).
+  A dead **interactive** session (a pool name) has no status comment; the
+  scrollback is the whole story.
+- **Orphaned agent processes** (`claude -p`, `codex exec` under no live
+  session; the slot cap does not count them). Reap's sweep flags them only
+  while no pipeline session is live; with runs in flight, list them yourself
+  and match each to a session by its cwd (the worktree path ends in the
+  session name):
 
   ```
-  ssh $SSH_HOST "pgrep -af '(^|/)claude -p( |\$)'"
+  ssh $SSH_HOST 'for p in $(pgrep -f "(^|/)(claude -p|codex exec)( |$)"); do echo "$p $(ps -o lstart= -p $p) $(readlink /proc/$p/cwd)"; done'
   ```
 
-  Keep that pattern anchored: a loose `claude .*-p` also matches an
-  interactive session (whose command line carries
-  `--dangerously-skip-permissions`), and reporting a healthy session as an
-  orphan is worse than not looking.
-
-  Cross-check against the live `<repo>-epic-<N>` sessions from §3: with a run
-  in flight, these are simply its current phase and there is nothing to
-  report. Agents with **no** live pipeline session are the finding. Report the
-  count, the oldest start time (`ps -o lstart= -p <pid>`), and that clearing
-  them is `kill -TERM -<pgid>`, as a suggestion the user runs, never something
-  this skill does. Reap refuses to kill them for the same reason: a long
-  verify and a hung one look identical from outside.
-
-- **Leaked worktrees.** Each run gets one under `~/.epic-worktrees/<repo>/`,
-  and reap removes one only once its issue's branch is gone from origin and
-  `$WORKTREE_GRACE_HOURS` (24h) have passed. A pile-up therefore means either
-  reap is not running or those issues still have open branches:
+  Keep the pattern anchored: a loose one also matches interactive sessions.
+  Processes whose session is `running` are that run's current phase: nothing
+  to report. The rest are the finding: report the count, the oldest start
+  time, and that clearing them is `kill -TERM -<pgid>`, as a suggestion the
+  user runs, never something this skill does.
+- **Leaked worktrees**: each run gets one under `~/.epic-worktrees/<repo>/`,
+  removed by reap only once the issue's branch is gone from origin and
+  `WORKTREE_GRACE_HOURS` (24h) have passed.
 
   ```
   ssh $SSH_HOST 'du -sh ~/.epic-worktrees/*/* 2>/dev/null | sort -h | tail -20; df -h / | tail -1'
@@ -147,8 +161,11 @@ are clean.
 
   Worth a line only when the total matters against free disk, or when a
   worktree's issue is closed and well past the grace (which points at reap,
-  not at the worktree). Otherwise silent: a worktree per in-flight and
-  recently-finished issue is the design working.
+  not at the worktree). Otherwise silent.
+
+`~/dispatch.log`, `~/reap.log` and `~/merge.log` are diagnostics, not a
+sweep: grep them for an issue only to explain an item already flagged above,
+never as a section of their own.
 
 ## The brief
 

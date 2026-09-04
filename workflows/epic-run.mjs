@@ -665,7 +665,7 @@ async function postBlocker({ issue, slug, phase, reason, prUrl }) {
   if (prUrl) {
     // A block AFTER ship: the PR is open, pushed and complete — the work needs a human, not
     // preservation, and a re-run would skip it (prepare's open-PR guard) rather than resume.
-    branchLine = `- PR: ${prUrl} — open on ${branch}, NOT merged and NOT queued for the merge worker; the change itself is complete. Fix the cause above, then merge it by hand. A re-run of /epic #${issue} will skip (an open PR already delivers this issue).`
+    branchLine = `- PR: ${prUrl} — open on ${branch}, NOT merged and NOT queued for the merge worker; the change itself is complete. Fix the cause above, push, and swap \`failed\` → \`ready-to-merge\` if the deferred record on this issue lists no defect (else \`ready-to-review\`); the merge worker rebases, re-checks and lands it. Do not merge by hand. A re-run of /epic #${issue} will skip (an open PR already delivers this issue).`
   } else if (branch) {
     // Checkpoint commits on the branch are durable; only uncommitted changes are at risk. The WIP
     // commit never carries "Closes #N" (unfinished work must not auto-close the issue on an accidental
