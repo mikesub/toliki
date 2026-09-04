@@ -17,7 +17,7 @@ Request: $ARGUMENTS
 
 2. **Discovery.** If the request is unclear, ask what problem it solves, what it should do, and the constraints. Summarize your understanding back.
 
-3. **Explore the relevant surface (read-only).** Launch `explorer` subagents in parallel, each scoped to the area you need to understand for good requirements, not the whole system. Read the key files they flag; do not open broad swaths of code you do not need.
+3. **Explore the relevant surface (read-only).** Launch `spec-explorer` subagents in parallel, each scoped to the area you need to understand for good requirements, not the whole system. Read the key files they flag; do not open broad swaths of code you do not need.
 
 4. **Clarifying questions, never skipped.** List every underspecified aspect: edge cases, error handling, integration points, scope boundaries, backward compatibility, performance, design preferences. Present them as an organized list and wait for answers; recommend and confirm when asked to pick.
 

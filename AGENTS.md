@@ -137,12 +137,18 @@ than made launchable against a main without the code it describes.
   class. Two open PRs on one issue is ambiguous and merges nothing. Gated by
   `tests/merge-autoresolve.test.sh` for the resolver and
   `tests/merge-worker.test.sh` for the state machine around it.
-- `setup.sh` (laptop) and `bin/provision.sh` (host) wire the same per-item
-  symlinks for `skills/` and `agents/`. Keep them aligned.
+- `setup.sh` (laptop) and `bin/provision.sh` (host) both source
+  `etc/wire-claude-content.sh`, which exposes only `/spec` and `spec-explorer` as
+  user-level Claude content. Laptop setup also links `/spec` into Codex's
+  user-level skill directory and the native `agents/spec-explorer.toml` charter
+  into its custom-agent directory. Pipeline entry points and charters stay
+  internal; Codex's built-in `explorer` remains unshadowed.
 - `remote-control.sh` is the one script that runs on the laptop; everything in
   `bin/` runs on the host and never sshes.
-- `.claude/skills/triage` is deliberately project-level rather than in
-  `skills/`: an operator-only skill must not surface in every project.
+- `.agents/skills/toliki` is the cross-client project-level source of the
+  operator-only pipeline triage skill; `.claude/skills/toliki` is a relative
+  symlink to it for Claude discovery. It stays project-level so it does not
+  surface in every project.
 
 ## Non-negotiable behavior
 
@@ -227,8 +233,10 @@ than made launchable against a main without the code it describes.
   installed binary, so a stale binary silently turns them into pins.
 - The Docker GC policy loads only on a full daemon restart, and unknown keys
   are dropped silently. Verify with `docker buildx inspect`.
-- Shared skills and agents are user-level symlinks per item; a project-local
-  copy silently shadows the shared one. Only `spec` is model-invocable.
+- Only `spec` and `spec-explorer` are user-level symlinks; laptop setup
+  publishes the same pair to Codex in its native paths. A project-local copy
+  silently shadows shared content. Pipeline skills and charters are not
+  published.
 - Never invent a second session-name pattern: reap, dispatch and the cap all key
   on `<repo>-epic-<N>`.
 
@@ -242,7 +250,7 @@ than made launchable against a main without the code it describes.
 4. When the contract or its rationale changes, update this file, DOCTRINE.md,
    README, the template or the script header. Never leave an invariant only in
    a commit message.
-5. Run every relevant suite; run all nine before handing off a broad change.
+5. Run every relevant suite; run all ten before handing off a broad change.
 
 Trunk-based: when asked to commit or push, commit straight to `main` and push.
 No feature branches or PRs unless explicitly requested. Never commit or push
@@ -262,7 +270,7 @@ merely because the code is ready.
 
 ## Tests
 
-All nine suites are hermetic and need no network or credentials:
+All ten suites are hermetic and need no network or credentials:
 
 ```bash
 for t in tests/*.test.sh; do bash "$t" || exit; done

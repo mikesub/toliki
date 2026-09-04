@@ -1,5 +1,5 @@
 ---
-name: explorer
+name: spec-explorer
 description: Deeply analyzes existing codebase features by tracing execution paths, mapping architecture layers, understanding patterns and abstractions, and documenting dependencies to inform new development
 tools: Glob, Grep, Read, ListMcpResourcesTool, ReadMcpResourceTool, LSP, WebFetch, WebSearch
 ---

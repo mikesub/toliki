@@ -42,8 +42,8 @@ nobody is waiting for, and do not invent a label for it.
 Use **only** flat issues, `blocked_by` dependencies, `#N` cross-references (plus
 the "relates to" relationship where a human is driving the UI), and GitHub's
 native `Bug` issue type (an org-level primitive, distinct from labels — it marks
-the standalone bug track, filed by `/bugreport`; never `Task`/`Feature` types
-for roadmap issues). No custom fields, no status taxonomies.
+the standalone bug track; never `Task`/`Feature` types for roadmap issues). No
+custom fields, no status taxonomies.
 
 **Do not create labels by hand.** The label namespace belongs to the pipeline's
 lifecycle, defined in the shared harness's `workflows/epic-run.mjs` and

@@ -84,7 +84,7 @@ On the laptop:
 
 ```
 gh repo clone mikesub/toliki && cd toliki
-./setup.sh              # wires ~/.claude, seeds etc/repos.conf — edit it, then re-run
+./setup.sh              # exposes /spec + spec-explorer to both clients; seeds local config
 ./remote-control.sh ls
 ```
 
@@ -101,8 +101,13 @@ gh repo clone mikesub/toliki && cd toliki
   `fix-run` and `ci-run`) and the small runtime they sit on: the engine
   adapter, the git/gh/npm transport, the concurrency gate, structured-output
   validation, and the per-spawn usage log `usage-report.mjs` summarizes.
-- **`skills/`, `agents/`** — the shared content: `/spec` (the human gate), the
-  agent charters each phase runs under, and the manual entry points.
+- **`skills/`, `agents/`** — `/spec` and its `spec-explorer` are exposed to local
+  Claude and Codex sessions; pipeline entry contracts and phase charters stay
+  internal. Each client gets the same read-only charter in its native format,
+  without shadowing Codex's built-in `explorer`.
+- **`.agents/skills/toliki`** — the project-local, cross-client operator skill
+  for checking stuck pipeline work; Claude discovers the same source through
+  `.claude/skills/toliki`.
 
 ## Caveats
 

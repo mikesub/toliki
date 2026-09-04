@@ -35,7 +35,7 @@ Usage: $0 [-h]
 Provisions this Ubuntu host for the coding-agent harness: system packages,
 node 24, gh, docker (+ build-cache GC), supabase CLI, Claude Code, Codex CLI,
 Bun, clones of the control repo and every repo in etc/repos.conf, and the
-~/.claude wiring (skills/agents symlinks, CLAUDE_HARNESS_DIR). Safe to re-run;
+~/.claude wiring (/spec and spec-explorer symlinks). Safe to re-run;
 reports state and exits non-zero while any manual step is outstanding.
 EOF
 }
@@ -73,6 +73,7 @@ ver() { local out; out="$("$@" 2>/dev/null | head -n1)" || out=""; printf '%s' "
 # Keeping their install logic and Codex's auth gate in a sourced helper makes
 # them hermetically testable without a test-only mode in this provisioner.
 source "$HERE/provision-agent-clis.lib.sh"
+source "$HERE/../etc/wire-claude-content.sh"
 
 # ---------------------------------------------------------------- preflight --
 
@@ -180,8 +181,8 @@ add_apt_source() {
 
 say "base packages"
 # curl/gnupg/ca-certificates are needed to register the apt sources below, so
-# they go in first; jq does the JSON surgery on ~/.claude/settings.json and the
-# workspace-trust check. Codex uses bubblewrap to enforce the read-only sandbox
+# they go in first; jq checks CLI releases and Claude's interactive gates.
+# Codex uses bubblewrap to enforce the read-only sandbox
 # that fences architect and reviewer phases on Linux. unzip is required by
 # Bun's own installer (it fails outright without it — see provision_bun).
 apt_install git tmux jq curl ca-certificates gnupg bubblewrap unzip
@@ -550,103 +551,10 @@ fi
 # ------------------------------------------------------------ ~/.claude wiring --
 
 say "~/.claude wiring"
-mkdir -p "$HOME/.claude"
-
-# skills/ and agents/ are discovered as user-level content through per-item
-# symlinks into this repo — that's what makes these copies the canonical ones.
-# Per ITEM rather than one symlink per directory, so user-level content from
-# elsewhere can coexist with the harness-supplied set; a whole-directory
-# symlink from the old scheme is converted in place (it held nothing else by
-# construction). Anything at a destination that isn't a link into this repo
-# would shadow the shared copy and is reported, never replaced. Keep these
-# semantics in sync with the laptop-side setup.sh.
-for d in skills agents; do
-  link_dir="$HOME/.claude/$d"
-  src_dir="$HOST_CONTROL_DIR/$d"
-  if [[ ! -d "$src_dir" ]]; then
-    blocked "$src_dir doesn't exist — the control clone above has to land first"
-    continue
-  fi
-  if [[ -L "$link_dir" ]]; then
-    if [[ "$(readlink "$link_dir")" == "$src_dir" || ! -e "$link_dir" ]]; then
-      # Ours, or dangling (the clone moved out from under it) — either way it
-      # holds nothing of the user's; convert it.
-      rm "$link_dir"
-      mkdir -p "$link_dir"
-      changed "converted ~/.claude/$d from a whole-directory symlink to a real directory (per-item links below)"
-    else
-      blocked "~/.claude/$d is a symlink to $(readlink "$link_dir"), which isn't the control clone — resolve by hand"
-      continue
-    fi
-  elif [[ ! -e "$link_dir" ]]; then
-    mkdir -p "$link_dir"
-    changed "created ~/.claude/$d"
-  elif [[ ! -d "$link_dir" ]]; then
-    blocked "~/.claude/$d exists and isn't a directory — resolve by hand"
-    continue
-  fi
-  linked=()
-  for item in "$src_dir"/*; do
-    name="$(basename "$item")"
-    dest="$link_dir/$name"
-    if [[ -L "$dest" && "$(readlink "$dest")" == "$item" ]]; then
-      linked+=("$name")
-    elif [[ -L "$dest" && ! -e "$dest" ]]; then
-      # A dangling link serves nothing and shadows nothing — typically left
-      # behind when this checkout was moved or renamed. Replace it.
-      old_target="$(readlink "$dest")"
-      rm "$dest"
-      ln -s "$item" "$dest"
-      changed "replaced dangling link ~/.claude/$d/$name (was $old_target) -> $item"
-      linked+=("$name")
-    elif [[ -e "$dest" || -L "$dest" ]]; then
-      blocked "~/.claude/$d/$name exists and isn't a link into the control clone — it would shadow the shared copy; resolve by hand"
-    else
-      ln -s "$item" "$dest"
-      changed "linked ~/.claude/$d/$name -> $item"
-      linked+=("$name")
-    fi
-  done
-  [[ ${#linked[@]} -eq 0 ]] || ok "$d: ${linked[*]}"
-  # Prune only what is ours: dangling links into this repo, left behind when
-  # a skill/agent is renamed or removed.
-  for dest in "$link_dir"/*; do
-    [[ -L "$dest" ]] || continue
-    if [[ "$(readlink "$dest")" == "$src_dir/"* && ! -e "$dest" ]]; then
-      rm "$dest"
-      changed "pruned stale link ~/.claude/$d/$(basename "$dest") (target gone from the repo)"
-    fi
-  done
-done
-
-# CLAUDE_HARNESS_DIR is the one value that differs between laptop and host; the
-# /epic and /fix-conflict skills resolve workflows/*-run.mjs through it. (The
-# host's own pipeline runs never read it — launch.sh passes the script path
-# directly — but a hand-run skill session on the box would.) Merged with jq
-# into whatever settings.json already holds — never rewritten wholesale.
-SETTINGS="$HOME/.claude/settings.json"
-if [[ ! -f "$SETTINGS" ]]; then
-  printf '{}\n' > "$SETTINGS"
-  changed "created empty $SETTINGS"
-fi
-if ! jq -e . "$SETTINGS" >/dev/null 2>&1; then
-  blocked "$SETTINGS is not valid JSON — fix it by hand, then re-run"
-else
-  CURRENT="$(jq -r '.env.CLAUDE_HARNESS_DIR // ""' "$SETTINGS")"
-  if [[ "$CURRENT" == "$HOST_CONTROL_DIR" ]]; then
-    ok "CLAUDE_HARNESS_DIR=$HOST_CONTROL_DIR"
-  else
-    TMP_SETTINGS="$(mktemp "$HOME/.claude/settings.json.XXXXXX")"
-    jq --arg d "$HOST_CONTROL_DIR" '.env = ((.env // {}) + {CLAUDE_HARNESS_DIR: $d})' \
-      "$SETTINGS" > "$TMP_SETTINGS"
-    mv "$TMP_SETTINGS" "$SETTINGS"
-    if [[ -n "$CURRENT" ]]; then
-      changed "CLAUDE_HARNESS_DIR: $CURRENT -> $HOST_CONTROL_DIR (other keys untouched)"
-    else
-      changed "set CLAUDE_HARNESS_DIR=$HOST_CONTROL_DIR (other keys untouched)"
-    fi
-  fi
-fi
+# Host launchers execute pipeline scripts directly, and the engine reads its
+# charters from the control clone. Only /spec and its spec-explorer are useful as
+# user-level content, matching laptop-side setup.sh exactly.
+wire_claude_content "$HOST_CONTROL_DIR"
 
 # ------------------------------------------------------- the interactive gates --
 #
@@ -697,6 +605,7 @@ say "bypass-permissions acceptance"
 # Acceptance is global, one dialog per host, recorded in settings.json.
 # Checked, never set: accepting it is a consent decision, the same class as
 # the logins and trust above, not a default a script should assume.
+SETTINGS="$HOME/.claude/settings.json"
 if jq -e '.skipDangerousModePermissionPrompt == true' "$SETTINGS" >/dev/null 2>&1; then
   ok "bypass-permissions dialog accepted"
 else
