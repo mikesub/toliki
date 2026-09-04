@@ -86,8 +86,11 @@ Lifecycle labels are owned by automation. Do not add or repurpose one.
 | issue closed | merged |
 
 `engine:<name>` is the separate routing namespace and is never cleared by a
-lifecycle change. Follow-up issues ship with no labels and link back with a
-`Follow-up to #N` line in the body.
+lifecycle change. A follow-up issue ship files is queued as it is filed —
+`ready`, and `blocked_by` the issue it came out of, so it cannot run until that
+one closes — and links back with a `Follow-up to #N` line in the body. Ordering
+is written before the label: an unordered follow-up is left unqueued rather
+than made launchable against a main without the code it describes.
 
 ## Architecture boundaries
 

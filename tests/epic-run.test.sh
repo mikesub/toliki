@@ -202,6 +202,10 @@ state="$STUB_GH_STATE"
 labels="$state/labels"
 [[ -f "$labels" ]] || printf '%s\n' "${GH_ISSUE_LABELS:-}" | tr ',' '\n' | sed '/^$/d' > "$labels"
 labels_json() { jq -R -s -c 'split("\n") | map(select(length > 0)) | map({name: .})' "$labels"; }
+# Labels are per issue: the run's own issue keeps $labels, and any other issue
+# ship touches (a follow-up it files and queues) gets its own file. One shared
+# file would let a follow-up's `ready` read back as the epic issue's own label.
+labels_for() { [[ "$1" == "${GH_RUN_ISSUE:-42}" ]] && printf '%s' "$labels" || printf '%s' "$state/labels-$1"; }
 case "${1:-} ${2:-}" in
   "issue view")
     # The deferred-record probe reads comments; they are stored as blocks
@@ -216,11 +220,13 @@ case "${1:-} ${2:-}" in
     fi
     printf '{"number":%s,"title":"Add widget","body":"Build a widget.","state":"%s","labels":%s}\n' "${3:-0}" "${GH_ISSUE_STATE:-OPEN}" "$(labels_json)" ;;
   "issue edit")
+    target="$(labels_for "${3:-}")"
+    touch "$target"
     shift 3
     while [[ $# -gt 0 ]]; do
       case "$1" in
-        --add-label) grep -qx -- "$2" "$labels" || printf '%s\n' "$2" >> "$labels"; shift 2 ;;
-        --remove-label) grep -vx -- "$2" "$labels" > "$labels.tmp" || true; mv "$labels.tmp" "$labels"; shift 2 ;;
+        --add-label) grep -qx -- "$2" "$target" || printf '%s\n' "$2" >> "$target"; shift 2 ;;
+        --remove-label) grep -vx -- "$2" "$target" > "$target.tmp" || true; mv "$target.tmp" "$target"; shift 2 ;;
         *) shift ;;
       esac
     done ;;
@@ -255,9 +261,21 @@ case "${1:-} ${2:-}" in
     printf '%s\n' "$*" >> "$state/pr-created"
     printf 'https://github.com/o/r/pull/7\n' ;;
   "api "*)
-    if [[ "$*" == *dependencies/blocked_by* ]]; then
+    if [[ "$*" == *"--method POST"* && "$*" == *dependencies/blocked_by* ]]; then
+      # Ship ordering a follow-up behind the epic's own issue. Records
+      # "<follow-up> <blocker id>" so a scenario can assert what was linked.
+      [[ "${GH_DEP_WRITE_FAIL:-}" != "1" ]] || { printf 'HTTP 422\n' >&2; exit 1; }
+      dep_n="$(printf '%s' "$*" | sed -n 's|.*/issues/\([0-9]*\)/dependencies.*|\1|p')"
+      dep_id="$(printf '%s' "$*" | sed -n 's|.*issue_id=\([0-9]*\).*|\1|p')"
+      printf '%s %s\n' "$dep_n" "$dep_id" >> "$state/deps-created"
+      printf '{"number":%s}\n' "${dep_n:-0}"
+    elif [[ "$*" == *dependencies/blocked_by* ]]; then
       [[ "${GH_DEPS_FAIL:-}" != "1" ]] || { printf 'HTTP 502\n' >&2; exit 1; }
       printf '%s\n' "${GH_BLOCKED_BY:-[]}"
+    elif [[ "$*" == *"--jq .id"* ]]; then
+      # The epic issue's database id, which the dependency API takes.
+      [[ "${GH_ISSUE_ID_FAIL:-}" != "1" ]] || { printf 'HTTP 404\n' >&2; exit 1; }
+      printf '%s\n' "${GH_ISSUE_ID:-900042}"
     else
       # The status comment's edit. Slow on demand, so a scenario can have one
       # in flight when the run finishes.
@@ -691,6 +709,34 @@ assert_contains "the legal marker reaches the PR body" "$(cat "$WT/.epics/42-add
 # by a retry, a filed issue and a posted comment cannot.
 GH_ORDER="$(grep -n -E '^(pr create|issue create|issue comment 42)' "$GH_LOG" | head -3 | cut -d: -f2- | cut -d' ' -f1-2 | tr '\n' '|')"
 assert_contains "the PR is created before any follow-up issue" "$GH_ORDER" "pr create|issue create"
+# Ship queues what it files: each follow-up is ordered behind this issue and
+# labelled ready, so the pipeline picks it up once this one closes.
+DEPS="$(cat "$STATE_DIR/gh/deps-created" 2>/dev/null || true)"
+assert_eq "every filed follow-up is ordered behind the epic issue" 3 "$(grep -c ' 900042$' <<<"$DEPS")"
+assert_eq "the follow-ups are the ones just created" "101 102 103" "$(cut -d' ' -f1 <<<"$DEPS" | sort | tr '\n' ' ' | sed 's/ $//')"
+assert_eq "each is queued ready" "ready" "$(cat "$STATE_DIR/gh/labels-101" "$STATE_DIR/gh/labels-102" "$STATE_DIR/gh/labels-103" 2>/dev/null | sort -u | tr '\n' ' ' | sed 's/ $//')"
+assert_eq "and the epic issue itself is untouched by that" "ready-to-review," "$(gh_labels)"
+# The dependency is what keeps a queued follow-up off a main without its code,
+# so it is written FIRST — a `ready` that landed without it would be launchable
+# immediately, against a tree that lacks the branch the defect lives in.
+DEP_ORDER="$(grep -n -E "^(api --method POST repos/\{owner\}/\{repo\}/issues/101|issue edit 101)" "$GH_LOG" | head -2 | cut -d: -f2- | cut -d' ' -f1-2 | tr '\n' '|')"
+assert_contains "the dependency is written before the ready label" "$DEP_ORDER" "api --method|issue edit"
+
+scenario 'epic-run: a follow-up that cannot be ordered is never queued'
+GH_DEP_WRITE_FAIL=1 run_pipeline "$EPIC_RUN" "$DEFER" --issue 42
+assert_rc "the run still finishes" 0 "$RUN_RC"
+assert_eq "the follow-ups are still filed" 3 "$(grep -c '^TITLE: ' "$STATE_DIR/gh/issues-created")"
+# Fail closed: unordered means unqueued, never queued-and-unordered.
+assert_eq "but none is labelled ready" "" "$(cat "$STATE_DIR/gh/labels-101" "$STATE_DIR/gh/labels-102" "$STATE_DIR/gh/labels-103" 2>/dev/null | tr -d '\n')"
+assert_contains "and the run says so" "$RUN_OUT" "left unqueued"
+
+scenario 'epic-run: an unreadable issue id leaves the follow-ups for a human'
+GH_ISSUE_ID_FAIL=1 run_pipeline "$EPIC_RUN" "$DEFER" --issue 42
+assert_rc "the run still finishes" 0 "$RUN_RC"
+assert_eq "the follow-ups are still filed" 3 "$(grep -c '^TITLE: ' "$STATE_DIR/gh/issues-created")"
+assert_eq "none is ordered" 0 "$(grep -c . "$STATE_DIR/gh/deps-created" 2>/dev/null || echo 0)"
+assert_eq "and none is queued" "" "$(cat "$STATE_DIR/gh/labels-101" 2>/dev/null | tr -d '\n')"
+assert_contains "the run says a human orders them" "$RUN_OUT" "for a human to order and label"
 assert_contains "and the commit body" "$(git -C "$ORIGIN" log -1 --format=%B epic/42-add-widget)" "LEGAL-REVIEW: required"
 
 scenario 'verify gate: red tests that pass are sent back once, then accepted'

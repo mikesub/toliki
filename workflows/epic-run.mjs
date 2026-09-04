@@ -45,7 +45,7 @@ import { initStatus, statusPhase, statusNote, statusFinish } from './lib/status.
 import { failureReason, must } from './lib/proc.mjs'
 import {
   ensureLabels, editLabels, issueLabels, issueView, openBlockers, comment, assignSelf,
-  openPrs, searchOpenPrs, prCreate, issueCreate, withBodyFile, hasDeferredRecord,
+  openPrs, searchOpenPrs, prCreate, issueCreate, withBodyFile, hasDeferredRecord, issueId, addBlockedBy,
 } from './lib/github.mjs'
 import {
   git, gitOut, discoverPackages, pkgList, ensureDeps, runVerify, ensureEpicsIgnored, checkpoint, intentToAdd,
@@ -596,7 +596,15 @@ async function shipTransport({ issue, slug, dir, decision }) {
   // retry to add to, so they go last, and a record already on the issue is left alone rather than
   // doubled. A follow-up issue is filed only for the kinds that can earn one, only when ship judged
   // it a coherent slice, and at most 3 — defects first. That "Follow-up to #N" line IS the relation
-  // (GitHub records it as a cross-reference); no label, no blocked_by, no sub-issue.
+  // (GitHub records it as a cross-reference); no sub-issue.
+  //
+  // A filed follow-up is also QUEUED: `ready`, and `blocked_by` this issue. Ship has already judged
+  // it a coherent mergeable slice — the same test the queue applies — so leaving it unlabelled meant
+  // work the pipeline had fully specified sat waiting on a human to type one label. The dependency is
+  // what makes that safe: the follow-up describes a defect in code that is still only on this epic's
+  // branch, so it must not run until this issue closes, and dispatch skips a blocked issue rather
+  // than burning a run on it. Both are best effort — the PR is already open by here, and a link or a
+  // label that failed to land is a queueing loss, not a reason to fail a finished run.
   let filed = 0
   if (deferred.length) {
     if (await hasDeferredRecord(issue)) {
@@ -605,10 +613,21 @@ async function shipTransport({ issue, slug, dir, decision }) {
       const rank = { defect: 0, 'missing-gate': 1, 'scope-cut': 2 }
       const eligible = deferred.filter(d => d.file === true && d.kind in rank).sort((a, b) => rank[a.kind] - rank[b.kind])
       const links = new Map()
+      const blockerId = eligible.length ? await issueId(issue) : null
+      if (eligible.length && !blockerId) log(`Ship: #${issue}'s id could not be read — follow-ups are filed unqueued, for a human to order and label`)
+      if (blockerId) await ensureLabels(['ready'])
       for (const d of eligible.slice(0, 3)) {
         const url = await issueCreate({ title: d.issueTitle || d.title, body: `${String(d.issueBody || d.why).trim()}\n\nFollow-up to #${issue}` })
         links.set(d, url)
         filed++
+        // Order first, queue second: a follow-up that got `ready` without its dependency would be
+        // launchable immediately, against a main that does not yet carry the code it describes.
+        const number = Number(String(url).trim().split('/').pop())
+        if (!Number.isInteger(number) || !blockerId) continue
+        const dep = await addBlockedBy(number, blockerId)
+        if (!dep.ok) { log(`Ship: could not mark ${url} blocked_by #${issue} (${failureReason(dep)}) — left unqueued`); continue }
+        const queued = await editLabels(number, { add: ['ready'] })
+        if (!queued.ok) log(`Ship: could not queue ${url} (${failureReason(queued)}) — it is ordered but a human labels it`)
       }
       const lines = ['🤖 deferred / not done', '']
       for (const d of deferred) lines.push(`- ${d.title} (${d.kind}): ${d.why}${d.checkNote ? ` — ${d.checkNote}` : ''}${links.has(d) ? ` — filed as ${links.get(d)}` : ''}`)

@@ -27,8 +27,12 @@ export async function ghJson(args, what) {
 }
 
 // The lifecycle labels the pipelines write, in one place so every run creates
-// the same label with the same colour and description. `ready` is /spec's.
+// the same label with the same colour and description. `ready` is /spec's to
+// apply, and here too because ship queues the follow-ups it files: a repo whose
+// first epic files one may never have been touched by /spec, so the label has
+// to be creatable from this side as well.
 export const LABELS = {
+  ready:             { color: '1D76DB', description: 'Spec complete; queued for the epic-run pipeline' },
   'in-progress':     { color: 'FBCA04', description: 'Actively being worked by epic-run' },
   'ready-to-merge':  { color: '0E8A16', description: 'epic-run finished; PR open and gates cleared — queued for bin/merge-worker.sh' },
   'ready-to-review': { color: '0E8A16', description: 'epic-run finished; PR is open and awaiting review' },
@@ -143,4 +147,22 @@ export async function prCreate({ head, title, bodyFile }) {
 export async function issueCreate({ title, body }) {
   return withBodyFile(body, async (file) =>
     urlIn(must(await gh(['issue', 'create', '--title', title, '--body-file', file]), 'gh issue create'), 'gh issue create'))
+}
+
+// The issue's database id, which the dependency API takes instead of its
+// number. Null when it cannot be read, so a caller degrades rather than throws.
+export async function issueId(issue) {
+  const r = await gh(['api', `repos/{owner}/{repo}/issues/${issue}`, '--jq', '.id'])
+  if (!r.ok) return null
+  const id = Number(String(r.out).trim())
+  return Number.isInteger(id) && id > 0 ? id : null
+}
+
+// Record that `issue` is blocked by `blockerId` (a database id from issueId).
+// Best effort and never throws: the dependency is ordering, and a run that
+// already opened its PR must not fail on a link it could not draw. `-F` sends
+// a typed integer — `-f` would send a string and the API rejects it 422.
+export async function addBlockedBy(issue, blockerId) {
+  if (!blockerId) return { ok: false, err: 'no blocker id' }
+  return gh(['api', '--method', 'POST', `repos/{owner}/{repo}/issues/${issue}/dependencies/blocked_by`, '-F', `issue_id=${blockerId}`])
 }
