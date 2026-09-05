@@ -287,12 +287,15 @@ export function renderReview(dir, confirmed, unconfirmed, postFix = null) {
     text += `\n## Unconfirmed — not fixed\n\nFixes-after-review and ship MUST NOT act on these. Adversarial verification refuted them or could not confirm them; they are recorded only so a human can double-check the discard.\n\n`
     text += unconfirmed.map(f => `- ${f.title} (${f.location}; ${f.severity}): ${f.verdict?.reasoning || 'no reasoning recorded'}`).join('\n') + '\n'
   }
-  // The skeptic's one pass over the fixes-after-review delta. An unconfirmed fix
-  // and a regression are deferred work a human decides on; ship records each on
-  // the issue, and a regression is a defect.
+  // The skeptic's pass — or both passes — over the fixes-after-review delta,
+  // rendered as the END state: what the rounds together confirmed, and what is
+  // still open after the last check. Ship records each open item on the issue.
+  // A regression is a defect; a fix nobody could confirm is a human's call
+  // rather than a named bug.
   if (postFix) {
     const total = postFix.confirmed.length + postFix.unresolved.length
     text += `\n## Post-fix check\n\n`
+    if (postFix.rounds > 1) text += 'A second and final fix round ran over what the first check left open; this is the state after it.\n\n'
     if (postFix.note) text += `${postFix.note}.\n\n`
     text += `Fixes confirmed: ${postFix.confirmed.length} of ${total}.\n`
     for (const c of postFix.confirmed) text += `- ${c.finding.title}: confirmed (confidence ${c.verdict.confidence}) — ${c.verdict.reasoning}\n`

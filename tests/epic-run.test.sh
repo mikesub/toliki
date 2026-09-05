@@ -138,8 +138,10 @@ case "${EPIC_STEP_LABEL:-}" in
   review:focus)                                key=review-focus ;;
   verify:*)                                    key=verify ;;
   fix-check)                                   key=fixcheck ;;
+  fix-check:round2)                            key=fixcheck2 ;;
   deferral-check)                              key=defercheck ;;
   fixes-after-review|fixes-after-review:retry) key=triage ;;
+  fixes-after-review:round2|fixes-after-review:round2:retry) key=triage2 ;;
   ship:pr)                                     key=ship ;;
   summary:write)                               key=summary ;;
   resolve)                                     key=fix-resolve ;;
@@ -785,6 +787,8 @@ assert_contains "RESULT carries the PR url" "$RUN_OUT" '"prUrl":"https://github.
 assert_contains "review tally reported" "$RUN_OUT" '1 confirmed by adversarial verification, 0 refuted'
 assert_eq "exactly the eight model steps ran" 8 "$(wc -l < "$RUN_LOG" | tr -d ' ')"
 assert_eq "the fixes were checked once" 1 "$(calls fixcheck)"
+assert_eq "a clean check starts no second fix round" 0 "$(calls triage2)"
+assert_eq "and no second check" 0 "$(calls fixcheck2)"
 assert_eq "no deferrals, no deferral check" 0 "$(calls defercheck)"
 assert_contains "the tally records the fix check" "$RUN_OUT" "fix check: 1/1 fixes confirmed, 0 regression(s)"
 assert_contains "the fix check was handed the exact delta" "$(cat "$STATE_DIR/fixcheck.0.prompt")" "git diff "
@@ -1606,28 +1610,98 @@ assert_eq "one attempt only" 1 "$(calls design)"
 assert_contains "the reason says it timed out" "$RUN_OUT" "timed out"
 assert_not_contains "no respawn on a timeout" "$RUN_OUT" "respawning once (transient)"
 
-scenario 'post-fix check: an unconfirmed fix holds the PR'
-UNFIXED="$TMP/fixtures-unfixed"; cp -R "$BASE" "$UNFIXED"
-fixture "$UNFIXED" fixcheck '{"verdicts":[{"index":1,"resolved":false,"confidence":90,"reasoning":"The guard checks null, not empty."}],"regressions":[]}'
-run_pipeline "$EPIC_RUN" "$UNFIXED" --issue 42
-assert_rc "exits 0 (the PR is real, just held)" 0 "$RUN_RC"
-assert_contains "the gate names the unconfirmed fix" "$RUN_OUT" 'fix(es) not confirmed by the post-fix check (Null deref on empty list)'
-assert_not_contains "it is not queued for merge" "$RUN_OUT" '"readyToMerge":true'
-assert_contains "RESULT marks the concrete unresolved fix repairable" "$RUN_OUT" '"needsDefectFix":true'
-assert_eq "the issue stays reviewable and enters the defect-fixer queue" "needs-defect-fix,ready-to-review," "$(gh_labels)"
-assert_contains "review.md records the verdict" "$(cat "$WT/.epics/42-add-widget/review.md")" "NOT confirmed"
-assert_eq "no second fix round" 1 "$(calls triage)"
+# ───────────────────────── the second and final fix round ─────────────────────────
+# What the first check leaves open — a fix it could not confirm, a regression it
+# found — gets exactly ONE more fix round over those items and one more pass of
+# the same check. Two rounds is the whole budget; the fail-closed outcomes (a
+# dead check, a claimed fix with no diff) start no round at all.
+scenario 'post-fix check: an unconfirmed fix gets one more round, and a confirmed round 2 ships'
+ROUND2="$TMP/fixtures-round2"; cp -R "$BASE" "$ROUND2"
+fixture "$ROUND2" fixcheck '{"verdicts":[{"index":1,"resolved":false,"confidence":90,"reasoning":"The guard checks null, not empty."}],"regressions":[]}'
+fixture "$ROUND2" triage2 '{"status":"Made the empty-list guard explicit and covered it with a regression test.","deferred":[]}'
+fixture_sh "$ROUND2" triage2 'printf "export const createWidget = (items = []) => ({ items })\n" > frontend/src/widget.ts'
+fixture "$ROUND2" fixcheck2 '{"verdicts":[{"index":1,"resolved":true,"confidence":95,"reasoning":"A test now fails without the guard."}],"regressions":[]}'
+run_pipeline "$EPIC_RUN" "$ROUND2" --issue 42
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_eq "exactly one second fix round ran" 1 "$(calls triage2)"
+assert_contains "the round-2 prompt names the unconfirmed finding" "$(cat "$STATE_DIR/triage2.0.prompt")" "Title: Null deref on empty list"
+assert_contains "and carries why the check could not confirm it" "$(cat "$STATE_DIR/triage2.0.prompt")" "Why the check could not confirm it: The guard checks null, not empty."
+assert_contains "and says it is the last round" "$(cat "$STATE_DIR/triage2.0.prompt")" "SECOND and final round"
+assert_contains "it asks for the smallest correct change" "$(cat "$STATE_DIR/triage2.0.prompt")" "smallest correct change"
+assert_contains "and for evidence a reader who cannot run code can follow" "$(cat "$STATE_DIR/triage2.0.prompt")" "fails without the fix and passes with it"
+assert_eq "the second round was checked once" 1 "$(calls fixcheck2)"
+assert_contains "the second check was handed the round-2 delta" "$(cat "$STATE_DIR/fixcheck2.0.prompt")" "git diff "
+assert_contains "and the pinned requirement" "$(cat "$STATE_DIR/fixcheck2.0.prompt")" "Build a widget."
+assert_contains "the tally records both checks" "$RUN_OUT" "fix check: 0/1 fixes confirmed, 0 regression(s); fix check 2: 1/1 confirmed, 0 regression(s)"
+assert_contains "review.md reports the state after round 2" "$(cat "$WT/.epics/42-add-widget/review.md")" "A second and final fix round ran"
+assert_contains "the run ships" "$RUN_OUT" '"readyToMerge":true'
+assert_eq "the issue ends ready-to-merge" "ready-to-merge," "$(gh_labels)"
 
-scenario 'post-fix check: a regression holds the PR'
-REGRESS="$TMP/fixtures-regress"; cp -R "$BASE" "$REGRESS"
-fixture "$REGRESS" fixcheck '{"verdicts":[{"index":1,"resolved":true,"confidence":90,"reasoning":"Fixed."}],"regressions":[{"title":"Guard breaks the non-empty path","severity":"Important","confidence":85,"location":"src/widget.ts:14","problem":"Returns early for every list.","fix":"Check length, not truthiness.","gate":"unit test for a non-empty list"}]}'
-run_pipeline "$EPIC_RUN" "$REGRESS" --issue 42
+scenario 'post-fix check: a fix the second check still cannot confirm holds the PR for a human'
+UNCONF2="$TMP/fixtures-unconfirmed2"; cp -R "$ROUND2" "$UNCONF2"
+fixture "$UNCONF2" fixcheck2 '{"verdicts":[{"index":1,"resolved":false,"confidence":85,"reasoning":"Still cannot tell the empty case is covered."}],"regressions":[]}'
+run_pipeline "$EPIC_RUN" "$UNCONF2" --issue 42
+assert_rc "exits 0 (the PR is real, just held)" 0 "$RUN_RC"
+assert_contains "the held reason says a human decides" "$RUN_OUT" '1 fix(es) not confirmed by the post-fix check — a human decides (Null deref on empty list)'
+assert_not_contains "it is not queued for merge" "$RUN_OUT" '"readyToMerge":true'
+assert_not_contains "uncertainty is never a defect the fixer may repair" "$RUN_OUT" '"needsDefectFix":true'
+assert_eq "the issue rests at ready-to-review for a human" "ready-to-review," "$(gh_labels)"
+assert_not_contains "and no repair envelope is posted" "$(gh_comments)" "🤖 defect-fix evidence"
+assert_contains "review.md records the verdict" "$(cat "$WT/.epics/42-add-widget/review.md")" "NOT confirmed"
+assert_eq "exactly two fix rounds, never a third" "1 1" "$(calls triage) $(calls triage2)"
+assert_eq "and exactly two post-fix checks" "1 1" "$(calls fixcheck) $(calls fixcheck2)"
+
+scenario 'post-fix check: a regression the second check finds is a defect the fixer may repair'
+REGRESS2="$TMP/fixtures-regress2"; cp -R "$ROUND2" "$REGRESS2"
+fixture "$REGRESS2" fixcheck2 '{"verdicts":[{"index":1,"resolved":true,"confidence":95,"reasoning":"Confirmed against the code."}],"regressions":[{"title":"Guard breaks the non-empty path","severity":"Important","confidence":85,"location":"src/widget.ts:14","problem":"Returns early for every list.","fix":"Check length, not truthiness.","gate":"unit test for a non-empty list"}]}'
+run_pipeline "$EPIC_RUN" "$REGRESS2" --issue 42
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_contains "the gate names the regression" "$RUN_OUT" 'regression(s) introduced by the fixes (Important: Guard breaks the non-empty path)'
+assert_not_contains "it is not queued for merge" "$RUN_OUT" '"readyToMerge":true'
 assert_contains "RESULT marks the concrete regression repairable" "$RUN_OUT" '"needsDefectFix":true'
 assert_eq "the issue stays reviewable and enters the defect-fixer queue" "needs-defect-fix,ready-to-review," "$(gh_labels)"
+assert_contains "the repair envelope names the regression" "$(gh_comments)" "Guard breaks the non-empty path"
 assert_contains "review.md lists it as a deferred defect" "$(cat "$WT/.epics/42-add-widget/review.md")" "Regressions introduced by the fixes"
-assert_eq "no second fix round" 1 "$(calls triage)"
+
+scenario 'post-fix check: a regression the first check found is the second round job'
+REGRESS1="$TMP/fixtures-regress1"; cp -R "$BASE" "$REGRESS1"
+fixture "$REGRESS1" fixcheck '{"verdicts":[{"index":1,"resolved":true,"confidence":90,"reasoning":"Fixed."}],"regressions":[{"title":"Guard breaks the non-empty path","severity":"Important","confidence":85,"location":"src/widget.ts:14","problem":"Returns early for every list.","fix":"Check length, not truthiness.","gate":"unit test for a non-empty list"}]}'
+fixture "$REGRESS1" triage2 '{"status":"Checked length instead of truthiness.","deferred":[]}'
+fixture_sh "$REGRESS1" triage2 'printf "export const createWidget = (items = []) => ({ items, empty: items.length === 0 })\n" > frontend/src/widget.ts'
+fixture "$REGRESS1" fixcheck2 '{"verdicts":[{"index":1,"resolved":true,"confidence":92,"reasoning":"The non-empty path is back."}],"regressions":[]}'
+run_pipeline "$EPIC_RUN" "$REGRESS1" --issue 42
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_contains "the regression is put to the second round as a finding" "$(cat "$STATE_DIR/triage2.0.prompt")" "Regression the fixes introduced 1"
+assert_contains "with the regression evidence the check suggested" "$(cat "$STATE_DIR/triage2.0.prompt")" "unit test for a non-empty list"
+assert_not_contains "a fix the check confirmed is never re-opened" "$(cat "$STATE_DIR/triage2.0.prompt")" "Null deref on empty list"
+assert_contains "the second check judged the repaired regression" "$(cat "$STATE_DIR/fixcheck2.0.prompt")" "Guard breaks the non-empty path"
+assert_contains "the run ships once it is confirmed" "$RUN_OUT" '"readyToMerge":true'
+assert_eq "the issue ends ready-to-merge" "ready-to-merge," "$(gh_labels)"
+
+scenario 'post-fix check: what round 2 leaves unfixed is classed by where it came from'
+HELD2="$TMP/fixtures-held2"; cp -R "$REGRESS1" "$HELD2"
+fixture "$HELD2" fixcheck '{"verdicts":[{"index":1,"resolved":false,"confidence":90,"reasoning":"The guard checks null, not empty."}],"regressions":[{"title":"Guard breaks the non-empty path","severity":"Important","confidence":85,"location":"src/widget.ts:14","problem":"Returns early for every list.","fix":"Check length, not truthiness.","gate":"unit test for a non-empty list"}]}'
+fixture "$HELD2" triage2 '{"status":"Made the guard evident; left the regression for a human.","deferred":[{"title":"Guard breaks the non-empty path","severity":"Important","why":"The behavior wanted for a non-empty list needs a product decision."}]}'
+fixture "$HELD2" fixcheck2 '{"verdicts":[{"index":1,"resolved":true,"confidence":95,"reasoning":"A test now fails without the guard."}],"regressions":[]}'
+run_pipeline "$EPIC_RUN" "$HELD2" --issue 42
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_contains "only what round 2 repaired went to the second check" "$(cat "$STATE_DIR/fixcheck2.0.prompt")" "Null deref on empty list"
+assert_not_contains "what it deferred did not" "$(cat "$STATE_DIR/fixcheck2.0.prompt")" "Guard breaks the non-empty path"
+assert_contains "the gate names the regression round 2 left" "$RUN_OUT" 'regression(s) the second fix round left unfixed (Important: Guard breaks the non-empty path)'
+assert_contains "a named regression stays repairable" "$RUN_OUT" '"needsDefectFix":true'
+assert_eq "the issue stays reviewable and enters the defect-fixer queue" "needs-defect-fix,ready-to-review," "$(gh_labels)"
+
+scenario 'verify gate: a second fix round that leaves verify red twice blocks the run'
+BROKEN2="$TMP/fixtures-broken2"; cp -R "$ROUND2" "$BROKEN2"
+fixture_sh "$BROKEN2" triage2 'rm -f frontend/src/widget.ts'   # the second round deletes the implementation
+run_pipeline "$EPIC_RUN" "$BROKEN2" --issue 42
+assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
+assert_contains "it blocks in the fixes phase" "$RUN_OUT" '"phase":"triage"'
+assert_contains "the reason names the red verify" "$RUN_OUT" 'red after the second fix round and its retry'
+assert_eq "the second round was spawned twice, never a third time" 2 "$(calls triage2)"
+assert_contains "the retry carried the verify output" "$(cat "$STATE_DIR/triage2.1.prompt")" "missing export createWidget"
+assert_eq "no second check ran on an unverified tree" 0 "$(calls fixcheck2)"
+assert_eq "nothing shipped a PR" "" "$(gh_pr_created)"
 
 scenario 'post-fix check: a claimed fix with no diff holds the PR without a model'
 NODIFF="$TMP/fixtures-nodiff"; cp -R "$BASE" "$NODIFF"
@@ -1636,6 +1710,7 @@ run_pipeline "$EPIC_RUN" "$NODIFF" --issue 42
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_contains "the gate says so" "$RUN_OUT" 'reported fixed but the fixes step changed nothing'
 assert_eq "no skeptic was spawned for an empty delta" 0 "$(calls fixcheck)"
+assert_eq "and an empty delta starts no second round" 0 "$(calls triage2)"
 assert_contains "RESULT marks a claimed no-delta fix repairable" "$RUN_OUT" '"needsDefectFix":true'
 assert_eq "the issue stays reviewable and enters the defect-fixer queue" "needs-defect-fix,ready-to-review," "$(gh_labels)"
 
@@ -1648,6 +1723,7 @@ assert_contains "the gate says the fixes are unreviewed" "$RUN_OUT" 'the post-fi
 assert_contains "the PR was still opened" "$RUN_OUT" '"prUrl":"https://github.com/o/r/pull/7"'
 assert_not_contains "missing post-fix evidence is not autonomously repairable" "$RUN_OUT" '"needsDefectFix":true'
 assert_eq "the issue stays ready-to-review" "ready-to-review," "$(gh_labels)"
+assert_eq "a dead check has no list to fix from, so no second round" 0 "$(calls triage2)"
 
 scenario 'provider quota: a normally-soft post-fix check holds the run instead'
 QUOTA_FIXCHECK="$TMP/fixtures-quota-fixcheck"; cp -R "$BASE" "$QUOTA_FIXCHECK"
@@ -2735,9 +2811,11 @@ assert_defect_handoff() { # name epic-fixtures expected blocker text
   assert_rc "$name evidence is accepted without synthetic comments" 0 "$RUN_RC"
   assert_contains "$name blocker reaches the fixer" "$(cat "$STATE_DIR/defect-fix.0.prompt")" "$expected"
 }
+# An unconfirmed fix is deliberately absent: it is uncertainty, not a named
+# defect, so it holds the PR for a human and never reaches this handoff.
 assert_defect_handoff "triage deferral" "$HELD" "Null deref on empty list"
-assert_defect_handoff "unconfirmed fix" "$UNFIXED" "Null deref on empty list"
-assert_defect_handoff "fix regression" "$REGRESS" "Guard breaks the non-empty path"
+assert_defect_handoff "fix regression" "$REGRESS2" "Guard breaks the non-empty path"
+assert_defect_handoff "regression round 2 left unfixed" "$HELD2" "Guard breaks the non-empty path"
 assert_defect_handoff "claimed no-delta fix" "$NODIFF" "fixes step changed nothing"
 assert_defect_handoff "ship deferral" "$DEFER" "Second defect"
 
@@ -2756,6 +2834,11 @@ fixture "$GROUP" verify '{"verdicts":[
   {"index":1,"real":true,"confidence":90,"reasoning":"Confirmed."},
   {"index":2,"real":true,"confidence":88,"reasoning":"Same fault as 1.","sameDefectAs":1},
   {"index":3,"real":true,"confidence":85,"reasoning":"Same fault as 1.","sameDefectAs":1}]}'
+# All three fixes confirmed: this scenario is about the grouping, not the rounds.
+fixture "$GROUP" fixcheck '{"verdicts":[
+  {"index":1,"resolved":true,"confidence":92,"reasoning":"Fixed."},
+  {"index":2,"resolved":true,"confidence":92,"reasoning":"Fixed."},
+  {"index":3,"resolved":true,"confidence":92,"reasoning":"Fixed."}],"regressions":[]}'
 run_pipeline "$EPIC_RUN" "$GROUP" --issue 42
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_contains "one batch, not one per file" "$RUN_OUT" "in 1 batch(es)"

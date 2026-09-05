@@ -219,12 +219,17 @@ than made launchable against a main without the code it describes.
   not mandated for every finding. Follow-up issues are still filed and queued
   for concrete material work with a standalone definition of done; the cap is
   a ceiling, not a target, and filing never clears the current PR's blockers.
-- The fixes-after-review delta gets one skeptic pass (fix-check). An
-  unconfirmed fix, a regression, a dead check or a claimed fix with no diff
-  holds the PR at `ready-to-review`; nothing starts a second fix round inside
-  that epic. If and only if every blocker is defect-class, the completed run
-  may mark it for the separate bounded defect-fixer queue. Gated by
-  `tests/epic-run.test.sh`.
+- The fixes-after-review delta gets a skeptic pass (fix-check), and an epic runs
+  at most two fix rounds. What the first check leaves open — a fix it could not
+  confirm, a regression it found — gets one more fix round over exactly those
+  items and one more pass of the same check. There is never a third, and a dead
+  check or a claimed fix with no diff holds the PR at `ready-to-review` with no
+  second round at all. After the last check, a fix nobody could confirm holds
+  the PR for a human and never enters the defect-fixer queue: it is uncertainty,
+  not a named bug. A regression, or a confirmed finding left unfixed, is
+  defect-class and may enter it. If and only if every blocker is defect-class, the
+  completed run may mark it for the separate bounded defect-fixer queue. Gated
+  by `tests/epic-run.test.sh`.
 - Ship's deferral kinds feed the merge gate only after the skeptic re-judges
   every item ship did not call a defect; the skeptic can only escalate, and a
   dead check holds the PR. Gated by `tests/epic-run.test.sh`.

@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 // defect-run — bounded repair for a finished epic PR whose deterministic ship
 // gate held only on concrete defects (`needs-defect-fix`). This is a separate
-// session, never a second round inside epic-run: it reads the authenticated,
-// PR/head-bound gate envelope epic-run persisted on GitHub, edits exactly those
-// defects, runs the project's real verify contract, and intent-adds new files
-// before giving the exact delta to a blind adversarial checker.
+// session, never a continuation of epic-run's own two fix rounds, which end at
+// that gate: it reads the authenticated, PR/head-bound gate envelope epic-run
+// persisted on GitHub, edits exactly those defects, runs the project's real
+// verify contract, and intent-adds new files before giving the exact delta to a
+// blind adversarial checker.
 // Only a verified fix is amended and force-pushed under a lease, after which
 // the issue returns to ready-to-merge for the merge worker's rebase and check
 // re-run. Everything else rests at ready-to-review for a human.

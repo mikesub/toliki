@@ -31,11 +31,15 @@
 // After fixes it must be green too. An agent's word that it ran a gate is
 // never the gate; a wrong answer is handed back once, then blocks the run.
 //
-// The fixes themselves get one skeptic pass (fix-check) over exactly the
-// delta they produced. A fix the skeptic cannot confirm, a regression, a dead
-// check or a claimed fix with no diff holds the PR at ready-to-review; none
-// starts a second round inside this epic. Concrete defect-only holds may be
-// repaired later by defect-run under its independent label-bounded ladder.
+// The fixes themselves get a skeptic pass (fix-check) over exactly the delta
+// they produced. What that check leaves open — a fix it could not confirm, a
+// regression it found — gets exactly ONE more fix round over those items and
+// one more pass of the same check. There is never a third, and a dead check or
+// a claimed fix with no diff holds the PR at ready-to-review with no second
+// round at all. After the last check, a fix nobody could confirm holds the PR
+// for a human and never enters the defect queue; a regression, or a confirmed
+// finding still sitting in the tree, is a concrete defect, and a hold made only
+// of those may be repaired later by defect-run under its own label-bounded ladder.
 //
 // Ship's deferrals go through the same skeptic before the merge gate counts
 // them: every item ship did not call a defect is re-judged, and the skeptic
@@ -160,6 +164,38 @@ Leave everything in the working tree: do NOT commit or push; the pipeline checkp
 - status: a short summary — which findings were fixed, which were deferred and why, and the final verify result.
 - deferred: one entry per CONFIRMED finding you did NOT fix; empty array when you fixed them all. This list is a MERGE GATE: an empty list queues the PR to be merged to main unattended, so omitting something you left unfixed ships it. Report every one.`,
 
+  // Round two, and there is no round three. It lists exactly what the first post-fix check left open —
+  // each fix it could not confirm, with the reason it gave, and each regression it found — and nothing
+  // it confirmed, because re-opening settled work is how a bounded round turns into a loop.
+  triageRound2: (dir, pkgs, unconfirmed, regressions) =>
+`Fixes-after-review phase, SECOND and final round, autonomous (NO user sign-off). An earlier fixes step edited this change after review, and an independent check then read exactly those edits. The items below are what that check left open, and they are the whole job: do not revisit anything it confirmed, and NEVER act on anything under "## Unconfirmed — not fixed" in ${dir}/review.md — those were refuted and are recorded for human eyes only. Read ${dir}/requirements.md and the diff for the context you need.
+
+${unconfirmed.map((u, i) => `--- Fix the check could not confirm ${i + 1} ---
+Title: ${u.finding.title}
+Severity: ${u.finding.severity}
+Location: ${u.finding.location}
+Problem: ${u.finding.problem}
+Recommended fix: ${u.finding.fix}
+Why the check could not confirm it: ${u.verdict?.reasoning || 'no reasoning recorded'}`).join('\n\n')}${unconfirmed.length && regressions.length ? '\n\n' : ''}${regressions.map((r, i) => `--- Regression the fixes introduced ${i + 1} ---
+Title: ${r.title}
+Severity: ${r.severity}
+Location: ${r.location}
+Problem: ${r.problem}
+Recommended fix: ${r.fix}
+Regression evidence the check suggested: ${r.gate}`).join('\n\n')}
+
+Repair every item above with the smallest correct change, and add or update a regression check where it meaningfully protects the affected behavior.
+- For a fix the check could not confirm: make its correctness evident to a reader who cannot run the code — a regression test that fails without the fix and passes with it, or a code change that removes the exact ambiguity the check named. Answer what the check actually said, not the finding in general.
+- For a regression: remove it without giving back the fix that introduced it.
+- NEVER weaken, skip or delete a test to make something pass.
+Keep the repair proportional to the item. Nothing here requires a new abstraction, shared helper, lint rule or project instruction: introduce one only when this repair needs it. If a necessary repair changes a documented contract, update the relevant project instructions or documentation in their existing voice. Shared harness skills, agents and pipeline files outside this project remain out of scope; never edit or recreate them. Follow the project's own explicit verification rules.
+If an item is genuinely too risky or expensive to fix safely without a human decision, DO NOT guess — leave it and report it as deferred. Record material decisions and anything left undone in ${dir}/epic.md's phase log.
+
+After the fixes, re-run \`npm run verify\` in each touched package (this repo's packages: ${pkgs}) until green.
+Leave everything in the working tree: do NOT commit or push; the pipeline checkpoints your work itself, and re-runs \`npm run verify\` after you return — a red run comes back to you once, then blocks the run. This is the last fix round in this run: whatever is still open after it is checked once more and then waits for a human. Return:
+- status: a short summary — which items you repaired, which you left and why, and the final verify result.
+- deferred: one entry per item above you did NOT fix, under its EXACT title as written above; empty array when you fixed them all. This list is a MERGE GATE: an empty list is what lets the PR be queued for unattended merge, so omitting something you left unfixed ships it. Report every one.`,
+
   // Appended to a step's own prompt when the orchestrator's verify run disagreed with it.
   redRetry: (gate) =>
 `
@@ -229,7 +265,7 @@ Your output is schema-enforced JSON:
    **Never write a bare \`#<number>\` for anything except issue #${issue} itself.** GitHub turns every \`#N\` into a live cross-reference and renders it as that issue or PR's TITLE, so numbering findings \`#1\`, \`#2\`, \`#3\` splices the titles of three unrelated PRs into your sentences and notifies them. Refer to a finding as \`Finding 3\`, or just lead with what it was; the same goes for hunks, steps, requirements and packages, in every field you return. Fixes-after-review status: ${triageStatus}
 3. commitBody: a short commit body (the why and notable details), or an empty string.
 4. legalMarker: apply THIS project's own legal/compliance review trigger, if it has one: look in its AGENTS.md for a section defining when a change needs legal or policy review. If one exists, judge this diff against the criteria written there — not against any you remember from elsewhere — and when they are met, return the exact marker string that section specifies; the pipeline adds it to the commit body and the PR body. If the project defines no such trigger, or the criteria are not met, omit the field: do NOT invent criteria and do NOT import another project's.
-5. deferred: everything deferred or out of scope, one entry each; empty array when nothing was. Read ${dir}/epic.md's phase log and ${dir}/review.md (confirmed sections only — refuted "Unconfirmed" findings are NOT deferred work; a "Post-fix check" section, when present, lists fixes the check could not confirm and regressions it found, and every one of those IS deferred work — a regression is a defect) and collect: deferred review findings (with why), scope cut, edge cases intentionally skipped, clarifying answers that narrowed scope, uncovered test surfaces. For each entry:
+5. deferred: everything deferred or out of scope, one entry each; empty array when nothing was. Read ${dir}/epic.md's phase log and ${dir}/review.md (confirmed sections only — refuted "Unconfirmed" findings are NOT deferred work; a "Post-fix check" section, when present, reports the state after the fix rounds, and every fix still unconfirmed and every regression still listed there IS deferred work. A regression is a defect. A fix the check could not confirm is kind "other" — nobody established that a bug is there, only that the fix could not be confirmed against the code — UNLESS the check named a concrete bug still in the code, and then it is a defect) and collect: deferred review findings (with why), scope cut, edge cases intentionally skipped, clarifying answers that narrowed scope, uncovered test surfaces. For each entry:
    - title and why: one line each.
    - kind, judged honestly, because it drives a MERGE GATE:
      defect — a correctness, security, data-loss, or user-visible breakage bug that still exists on main AFTER this merges, whether this diff introduced it or merely exposed it. One defect holds the PR open for a human; none lets it merge unattended. A missing gate, a scope cut, a nice-to-have or a refactor idea is NOT a defect and must not inflate the count, and a real defect must not be relabelled to keep the merge: an independent check re-judges every item you do not call a defect, and its verdict wins.
@@ -1267,26 +1303,66 @@ try {
   log(`Fixes after review: ${triageStatus}`)
 
   // ───────────────────────── Post-fix check ─────────────────────────
-  // The fixes changed code no reviewer has seen. One skeptic pass over exactly that delta: does each fix
+  // The fixes changed code no reviewer has seen. A skeptic pass over exactly that delta: does each fix
   // resolve its finding, and does the delta introduce a defect of its own? Every bad answer changes the
-  // label — the merge gate below holds the PR — never the tree. There is no second fix round, which is
-  // what keeps it bounded. Git mode only: manual mode has no checkpoints and no gate.
+  // label — the merge gate below holds the PR — never the tree.
+  //
+  // What the check leaves open — a fix it could not confirm, a regression it found — gets exactly ONE
+  // more fix round over those items and nothing else, then one more pass of the same check. Two rounds
+  // is the whole budget: there is never a third, and the fail-closed outcomes (a dead check, a claimed
+  // fix with no diff) hold the PR with no second round at all, because there is nothing trustworthy to
+  // fix from. One interactive engineer would fix, check and fix once more; past that a round is not
+  // converging, and the PR is better in front of a human than in another loop.
+  //
+  // How the last check's answers are classed matters as much as the count. A fix it could not confirm
+  // is UNCERTAINTY, not a named bug: it holds the PR for a human and never queues the issue for the
+  // defect fixer, which repairs only concrete defects. A regression it names, and a confirmed finding
+  // still sitting in the tree, are those concrete defects. Git mode only: manual mode has no
+  // checkpoints and no gate.
   const fixBlockers = []
   if (gitMode && verified.length) {
     const fixSha = await gitOut(['rev-parse', 'HEAD'], 'git rev-parse HEAD')
     const deferredTitles = new Set(triageDeferred.map(d => d.title))
     const fixed = verified.filter(f => !deferredTitles.has(f.title))
     const changed = (await git(['diff', '--quiet', codeSha, fixSha])).code !== 0
+    // One reader for both checks: a missing, low-confidence or malformed verdict is unresolved, never
+    // assumed fixed, and a low-confidence regression is not counted.
+    const readCheck = (c, items) => {
+      const verdicts = Array.isArray(c.verdicts) ? c.verdicts : []
+      const confirmed = []
+      const unresolved = []
+      items.forEach((f, i) => {
+        const v = verdicts.find(x => Number(x.index) === i + 1)
+        if (v && v.resolved === true && Number(v.confidence) >= 75) confirmed.push({ finding: f, verdict: v })
+        else unresolved.push({ finding: f, verdict: v || { resolved: false, confidence: 0, reasoning: 'no verdict returned — recorded as unresolved rather than assumed fixed' } })
+      })
+      const regressions = (Array.isArray(c.regressions) ? c.regressions : []).filter(r => Number(r.confidence) >= 75)
+      return { confirmed, unresolved, regressions }
+    }
+    const unconfirmedBlocker = (entries, what) => ({
+      source: 'unconfirmed-post-review-fix',
+      reason: `${entries.length} fix(es) ${what} — a human decides (${entries.map(u => u.finding.title).join('; ')})`,
+      defectClass: false,
+      items: entries,
+    })
+    const regressionBlocker = (items, what) => ({
+      source: 'post-review-fix-regression',
+      reason: `${items.length} regression(s) ${what} (${items.map(r => `${r.severity}: ${r.title}`).join('; ')})`,
+      defectClass: true,
+      items,
+    })
     let postFix = null
+    let summary1 = null
+    let summary2 = null
     if (!changed && fixed.length) {
-      // A claimed fix with no diff is not a fix. No model needed to say so.
+      // A claimed fix with no diff is not a fix. No model needed to say so, and nothing to fix from.
       fixBlockers.push({
         source: 'claimed-fix-without-delta',
         reason: `${fixed.length} finding(s) reported fixed but the fixes step changed nothing`,
         defectClass: true,
         items: fixed,
       })
-      postFix = { confirmed: [], unresolved: fixed.map(f => ({ finding: f, verdict: { resolved: false, confidence: 0, reasoning: 'the fixes step produced no diff' } })), regressions: [], note: 'The fixes step reported fixes but produced no diff' }
+      postFix = { confirmed: [], unresolved: fixed.map(f => ({ finding: f, verdict: { resolved: false, confidence: 0, reasoning: 'the fixes step produced no diff' } })), regressions: [], note: 'The fixes step reported fixes but produced no diff', rounds: 1 }
     } else if (changed) {
       const c = await agent(PROMPTS.fixCheck(fixed, requirement, `git diff ${codeSha} ${fixSha}`, DIFF),
         { label: 'fix-check', phase: 'Fixes after review', step: 'confirm-review', schema: FIXCHECK_SCHEMA },
@@ -1297,37 +1373,98 @@ try {
           return await fail('triage', 'The post-fix check hit provider quota — refusing to turn missing review evidence into a soft PR hold.', failure)
         }
         // A dead check leaves the fixes unreviewed; the PR is complete and verified, so it waits for a
-        // human rather than failing the run.
-        fixBlockers.push({ source: 'missing-post-fix-verdict', reason: 'the post-fix check produced no result — the fixes are unreviewed', defectClass: false, items: fixed })
-        postFix = { confirmed: [], unresolved: fixed.map(f => ({ finding: f, verdict: { resolved: false, confidence: 0, reasoning: 'the post-fix check produced no result' } })), regressions: [], note: 'The post-fix check produced no result' }
+        // human rather than failing the run. No second round: a round needs a list of what to repair.
+        fixBlockers.push({ source: 'missing-post-fix-verdict', reason: 'the post-fix check produced no result — the fixes are unreviewed and a human decides', defectClass: false, items: fixed })
+        postFix = { confirmed: [], unresolved: fixed.map(f => ({ finding: f, verdict: { resolved: false, confidence: 0, reasoning: 'the post-fix check produced no result' } })), regressions: [], note: 'The post-fix check produced no result', rounds: 1 }
       } else {
-        const verdicts = Array.isArray(c.verdicts) ? c.verdicts : []
-        const confirmed = []
-        const unresolved = []
-        fixed.forEach((f, i) => {
-          const v = verdicts.find(x => Number(x.index) === i + 1)
-          if (v && v.resolved === true && Number(v.confidence) >= 75) confirmed.push({ finding: f, verdict: v })
-          else unresolved.push({ finding: f, verdict: v || { resolved: false, confidence: 0, reasoning: 'no verdict returned — recorded as unresolved rather than assumed fixed' } })
-        })
-        const regressions = (Array.isArray(c.regressions) ? c.regressions : []).filter(r => Number(r.confidence) >= 75)
-        if (unresolved.length) fixBlockers.push({
-          source: 'unconfirmed-post-review-fix',
-          reason: `${unresolved.length} fix(es) not confirmed by the post-fix check (${unresolved.map(u => u.finding.title).join('; ')})`,
-          defectClass: true,
-          items: unresolved,
-        })
-        if (regressions.length) fixBlockers.push({
-          source: 'post-review-fix-regression',
-          reason: `${regressions.length} regression(s) introduced by the fixes (${regressions.map(r => `${r.severity}: ${r.title}`).join('; ')})`,
-          defectClass: true,
-          items: regressions,
-        })
-        postFix = { confirmed, unresolved, regressions, note: null }
+        const r1 = readCheck(c, fixed)
+        postFix = { ...r1, note: null, rounds: 1 }
+        summary1 = `fix check: ${r1.confirmed.length}/${fixed.length} fixes confirmed, ${r1.regressions.length} regression(s)`
+        if (!r1.unresolved.length && !r1.regressions.length) {
+          // Clean: one fixes spawn, one check spawn, exactly as before the second round existed.
+        } else {
+          // ─────────────────── Fixes after review, round 2 (the last one) ───────────────────
+          const round2Prompt = PROMPTS.triageRound2(dir, pkgList(packages), r1.unresolved, r1.regressions)
+          const openCount = r1.unresolved.length + r1.regressions.length
+          log(`Fixes after review: the check left ${openCount} item(s) open — running the second and final fix round.`)
+          let triaged2 = await agent(round2Prompt,
+            { label: 'fixes-after-review:round2', phase: 'Fixes after review', step: 'fixes-after-review', schema: TRIAGE_SCHEMA },
+          )
+          // Fail closed exactly as round 1 does: a dead round leaves partially applied edits in the tree
+          // with nothing saying what they are, and that tree is what the PR would carry.
+          if (!triaged2) return await fail('triage', `the second fixes-after-review round produced no result for ${openCount} open item(s) — their state is unknown (partially applied fixes may sit in the tree) and the merge gate has nothing to read.`)
+          let fix2Gate = await verifyGate('Fixes after review (round 2): verify gate')
+          if (!fix2Gate.green) {
+            log('Fixes after review (round 2): verify is red after the fixes — respawning once with the failure.')
+            triaged2 = await agent(round2Prompt + PROMPTS.verifyRetry(fix2Gate),
+              { label: 'fixes-after-review:round2:retry', phase: 'Fixes after review', step: 'fixes-after-review', schema: TRIAGE_SCHEMA },
+            )
+            if (!triaged2) return await fail('triage', `the second fixes-after-review round produced no result on its retry for ${openCount} open item(s) — their state is unknown and the merge gate has nothing to read.`)
+            fix2Gate = await verifyGate('Fixes after review (round 2): verify gate (retry)')
+            if (!fix2Gate.green) return await fail('triage', `npm run verify is red after the second fix round and its retry (${fix2Gate.detail}) — refusing to ship an unverified change.`)
+          }
+          const round2Checkpoint = await checkpointWork('triage')
+          updateEpicMd(dir, { log: `fixes-after-review round 2: ${triaged2.status} (${round2Checkpoint})` })
+          log(`Fixes after review (round 2): ${triaged2.status}`)
+
+          // What round 2 left behind, split by where the item came from: a regression it declined to fix
+          // is still a named bug, so it stays defect-class; a fix it declined to make evident is still
+          // only "nobody could confirm it", so it stays a human's call.
+          const deferred2 = Array.isArray(triaged2.deferred) ? triaged2.deferred : []
+          const why2 = new Map(deferred2.map(d => [d.title, d.why]))
+          const heldFixes = r1.unresolved.filter(u => why2.has(u.finding.title))
+            .map(u => ({ finding: u.finding, verdict: { resolved: false, confidence: 0, reasoning: `the second fix round left it unfixed: ${why2.get(u.finding.title)}` } }))
+          const heldRegressions = r1.regressions.filter(r => why2.has(r.title))
+          // A regression is a finding for the second check: same fields, same question.
+          const items2 = [...r1.unresolved.map(u => u.finding), ...r1.regressions].filter(f => !why2.has(f.title))
+          const fix2Sha = await gitOut(['rev-parse', 'HEAD'], 'git rev-parse HEAD')
+          const changed2 = (await git(['diff', '--quiet', fixSha, fix2Sha])).code !== 0
+          let r2 = { confirmed: [], unresolved: [], regressions: [] }
+          let note2 = null
+          if (!changed2 && items2.length) {
+            fixBlockers.push({
+              source: 'claimed-fix-without-delta',
+              reason: `${items2.length} item(s) reported repaired by the second fix round, which changed nothing`,
+              defectClass: true,
+              items: items2,
+            })
+            r2 = { confirmed: [], unresolved: items2.map(f => ({ finding: f, verdict: { resolved: false, confidence: 0, reasoning: 'the second fix round produced no diff' } })), regressions: [] }
+            note2 = 'The second fix round reported repairs but produced no diff'
+          } else if (changed2) {
+            const c2 = await agent(PROMPTS.fixCheck(items2, requirement, `git diff ${fixSha} ${fix2Sha}`, DIFF),
+              { label: 'fix-check:round2', phase: 'Fixes after review', step: 'confirm-review', schema: FIXCHECK_SCHEMA },
+            )
+            if (!c2) {
+              const failure2 = takeAgentFailure()
+              if (failure2?.kind === 'quota-exhausted') {
+                return await fail('triage', 'The second post-fix check hit provider quota — refusing to turn missing review evidence into a soft PR hold.', failure2)
+              }
+              fixBlockers.push({ source: 'missing-post-fix-verdict', reason: 'the second post-fix check produced no result — the second round of fixes is unreviewed and a human decides', defectClass: false, items: items2 })
+              r2 = { confirmed: [], unresolved: items2.map(f => ({ finding: f, verdict: { resolved: false, confidence: 0, reasoning: 'the second post-fix check produced no result' } })), regressions: [] }
+              note2 = 'The second post-fix check produced no result'
+            } else {
+              r2 = readCheck(c2, items2)
+              if (r2.unresolved.length) fixBlockers.push(unconfirmedBlocker(r2.unresolved, 'not confirmed by the post-fix check'))
+              if (r2.regressions.length) fixBlockers.push(regressionBlocker(r2.regressions, 'introduced by the fixes'))
+            }
+          }
+          if (heldRegressions.length) fixBlockers.push(regressionBlocker(heldRegressions, 'the second fix round left unfixed'))
+          if (heldFixes.length) fixBlockers.push(unconfirmedBlocker(heldFixes, 'the second fix round left unfixed'))
+          // The end state across both rounds, which is what ship reads out of review.md.
+          postFix = {
+            confirmed: [...r1.confirmed, ...r2.confirmed],
+            unresolved: [...r2.unresolved, ...heldFixes],
+            regressions: [...r2.regressions, ...heldRegressions],
+            note: note2,
+            rounds: 2,
+          }
+          summary2 = `fix check 2: ${r2.confirmed.length}/${items2.length} confirmed, ${r2.regressions.length} regression(s)${note2 ? ` (${note2.toLowerCase()})` : ''}`
+        }
       }
     }
     if (postFix) {
       renderReview(dir, verified, unconfirmed, postFix)
-      const summary = `fix check: ${postFix.confirmed.length}/${fixed.length} fixes confirmed, ${postFix.regressions.length} regression(s)${postFix.note ? ` (${postFix.note.toLowerCase()})` : ''}`
+      const summary = [summary1 || `fix check: ${postFix.confirmed.length}/${fixed.length} fixes confirmed, ${postFix.regressions.length} regression(s)${postFix.note ? ` (${postFix.note.toLowerCase()})` : ''}`, summary2].filter(Boolean).join('; ')
       reviewTally += `; ${summary}`
       updateEpicMd(dir, { log: summary })
       log(`Fix check: ${summary}.`)

@@ -42,13 +42,17 @@ don't get re-litigated from memory.
   skeptic instructed to refute it; survivors are auto-fixed, refuted ones
   recorded as unconfirmed rather than deleted; missing verdicts block rather
   than count as refutations. The skeptic and fix checker also receive the
-  original requirement. The fixes get one pass from
-  the same skeptic — a fix it cannot confirm holds the PR instead of starting
-  another round inside the same epic. A hold made entirely of concrete defects
-  may enter a separate, label-bounded defect-fixer session in repositories that
-  explicitly opt in; uncertainty still goes directly to a human. The strong
-  model goes to design and adjudication, where being wrong is expensive;
-  implementation runs on a cheaper model under the test gate.
+  original requirement. The fixes get a pass from the same skeptic, and what it
+  leaves open gets one more fix round and one more pass — two rounds inside an
+  epic, never a third, because a third round is a round that is not converging.
+  A fix still unconfirmed after the last pass holds the PR for a human: nobody
+  established a bug, only that the fix could not be confirmed, so it never
+  enters a repair queue. A hold made entirely of concrete defects — a named
+  regression, a confirmed finding left in the tree — may enter a separate,
+  label-bounded defect-fixer session in repositories that explicitly opt in;
+  uncertainty still goes directly to a human. The strong model goes to design
+  and adjudication, where being wrong is expensive; implementation runs on a
+  cheaper model under the test gate.
 - **Repairs stay proportional.** Fix the named defect and add meaningful
   regression coverage. A review finding does not automatically require a new
   abstraction, lint rule or instruction to prevent an entire class of problems.
@@ -67,16 +71,17 @@ don't get re-litigated from memory.
   own — a judgment-class conflict and a red check — go to fixer runs rather
   than to a human, each under an adversarial check and each bounded by one
   retry.
-- **Repair is a new bounded session, never an in-run loop.** Conflict, CI and
-  ship-gate defect repair each have an independent two-attempt ladder in
-  GitHub labels. The defect rung is additionally per-repo opt-in because it
-  changes an already reviewed PR and returns it to unattended eligibility. It
-  may do that only from a durable named-defect envelope authored by the
-  automation identity and bound to the selected PR head. Epic-run verifies the
-  envelope before queueing; the fixer rejects mutable issue prose, stale heads
-  and fork PRs before spending an attempt. After the project verify gate and a
-  blind adversarial check over the complete delta, the merge worker still
-  rebases and re-runs the real checks before landing it.
+- **Repair is bounded: two fix rounds inside the epic, then a new bounded
+  session, never an unbounded loop.** Conflict, CI and ship-gate defect repair
+  each have an independent two-attempt ladder in GitHub labels. The defect rung
+  is additionally per-repo opt-in because it changes an already reviewed PR and
+  returns it to unattended eligibility. It may do that only from a durable
+  named-defect envelope authored by the automation identity and bound to the
+  selected PR head. Epic-run verifies the envelope before queueing; the fixer
+  rejects mutable issue prose, stale heads and fork PRs before spending an
+  attempt. After the project verify gate and a blind adversarial check over the
+  complete delta, the merge worker still rebases and re-runs the real checks
+  before landing it.
 - **Crons watch, models act.** Dispatch, reap and merge ticks are plain shell
   reading labels; the first model to run is the epic that got launched.
 - **Exhausted allowance pauses admission, not work.** A provider's hard quota
