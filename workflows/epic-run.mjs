@@ -568,7 +568,9 @@ async function prepare(issue) {
 // window reap will honour, so the sweep can kill a live session between the label and the record of
 // what the gate decided. terminalBudget() opens the window at the first such write and hands the same
 // one back to every caller after it; before the write there is no clock running, so `spend()` is empty
-// and the default timeout stands.
+// and the default timeout stands. The same window is why no model step may run after that first write:
+// runtime's agent() refuses a spawn once it is open, since a ninety-minute ceiling is the one thing this
+// budget cannot cap.
 const spend = terminalSpend
 
 // Squash, push, open the PR, record deferrals, label — from ship's JSON.
@@ -668,16 +670,49 @@ async function shipTransport({ issue, slug, dir, decision }) {
 }
 
 // Transport, not judgment: the merge gate has already been computed from structured counts, and this
-// only writes its verdict where bin/merge-worker.sh will read it. Verified by reading the labels
-// back: labelled=true only when ready-to-merge is on and ready-to-review is off.
+// only writes its verdict where bin/merge-worker.sh will read it. The LABEL is that verdict, never this
+// write's exit code: the merge worker selects on `ready-to-merge` alone, and GitHub can apply the swap
+// while the client is still waiting — so a write that timed out is not a write that did not happen, and
+// the readback runs whatever the write returned. Two outcomes, and each of them has to agree with what
+// RESULT will claim, or the run reports a held PR that the merge worker lands anyway:
+//   - ready-to-merge on and ready-to-review off: the promotion is real and is claimed, confirmed write or not;
+//   - anything else — half-landed beside ready-to-review, unreadable, or a clean ready-to-review: the
+//     promotion is taken back OFF and the demotion is proved, inside the window ship's write opened.
+//     A read is a snapshot and not a promise, so a clean ready-to-review is not proof that the promotion
+//     will not land: an unconfirmed write GitHub has not applied YET can apply straight after that read,
+//     recreating the label the merge worker selects on under a RESULT that says the PR is held. So the
+//     compensating transition is issued for every promotion this write did not confirm, and the readback
+//     after it — not the one before — is what lets the PR be reported as held. `unresolved` is the state
+//     that is neither, and the caller blocks on it rather than resting on a label it cannot account for.
 async function handoff(issue, dir) {
+  const readLabels = async () => {
+    try {
+      return await issueLabels(issue, spend())
+    } catch (e) {
+      log(`handoff: the issue's labels could not be read back (${e && e.message || e})`)
+      return null
+    }
+  }
+  const observedIn = (labels) => labels ? `observed labels: ${labels.join(', ') || 'none'}` : 'the labels could not be read back'
   await ensureLabels(['ready-to-merge'], spend())
   const r = await editLabels(issue, { add: ['ready-to-merge'], remove: ['ready-to-review'] }, spend())
-  if (!r.ok) return { labelled: false, summary: failureReason(r) }
-  const labels = await issueLabels(issue, spend())
-  const labelled = labels.includes('ready-to-merge') && !labels.includes('ready-to-review')
-  if (labelled) updateEpicMd(dir, { log: 'handoff: queued for merge-worker' })
-  return { labelled, summary: labelled ? 'ready-to-merge observed' : `observed labels: ${labels.join(', ')}` }
+  const labels = await readLabels()
+  const why = r.ok ? observedIn(labels) : `${failureReason(r)}; ${observedIn(labels)}`
+  if (labels && labels.includes('ready-to-merge') && !labels.includes('ready-to-review')) {
+    // Local bookkeeping, and it cannot unseat an observed verdict: .epics/ dies with the worktree,
+    // while the label is already on the issue and RESULT has to say so.
+    try { updateEpicMd(dir, { log: 'handoff: queued for merge-worker' }) } catch { /* the pane log is the record */ }
+    return { labelled: true, summary: r.ok ? 'ready-to-merge observed' : `the write itself was not confirmed (${failureReason(r)}) but ready-to-merge is observed on the issue` }
+  }
+  const rest = terminalTransition({ rest: 'ready-to-review' })
+  await ensureLabels(rest.add, spend())
+  const undo = await editLabels(issue, rest, spend())
+  const after = await readLabels()
+  if (after && after.includes('ready-to-review') && !after.includes('ready-to-merge')) {
+    return { labelled: false, summary: `${why} — the promotion was taken back off and ready-to-review confirmed` }
+  }
+  const undoneWhy = undo.ok ? observedIn(after) : `${failureReason(undo)}; ${observedIn(after)}`
+  return { labelled: false, summary: why, unresolved: `${why} — and the demotion back to ready-to-review could not be verified (${undoneWhy})` }
 }
 
 // The blocker report: preserve the work, say where it is, flip the label to failed.
@@ -1167,6 +1202,9 @@ try {
   // Ship's `kind` per deferral feeds the merge gate, and ship is the builder side. Every item it did
   // not call a defect goes to the skeptic, whose verdict can only escalate: a builder's "defect" stands,
   // a builder's "other" that the skeptic calls a defect becomes one. A dead check holds the PR.
+  // This MUST stay ahead of shipTransport: that call writes `ready-to-review`, the run's first terminal
+  // label, which opens the reporting window — and runtime's agent() refuses any spawn once it is open,
+  // so a check moved below the write would be refused and would hold a PR that had nothing wrong with it.
   const deferralBlockers = []
   const deferred = Array.isArray(decision.deferred) ? decision.deferred : []
   const toCheck = deferred.filter(d => d.kind !== 'defect')
@@ -1280,14 +1318,23 @@ try {
   try {
     handed = await handoff(issue, dir)
   } catch (e) {
-    handed = { labelled: false, summary: e && e.message || String(e) }
+    // A throw leaves the labels unaccounted for, and an unaccounted-for state is never a resting one:
+    // it takes the same blocker path below as a demotion that could not be proved.
+    const summary = e && e.message || String(e)
+    handed = { labelled: false, summary, unresolved: summary }
+  }
+  // Neither confirmed nor undone: the issue may be wearing the label the merge worker selects on while
+  // this run is about to report the PR as held. That is not a resting state, so it blocks — and the
+  // blocker's own transition derives its removals from `failed`, taking `ready-to-merge` off once more.
+  if (handed.unresolved) {
+    return await fail('merge gate', `the merge gate was clear, but the promotion to ready-to-merge could not be verified and the fallback to ready-to-review could not be verified either: ${handed.unresolved}. Read this issue's labels by hand before anything else: bin/merge-worker.sh selects on ready-to-merge alone.`)
   }
   if (!handed.labelled) {
     const why = `merge gate was clear but ready-to-merge could not be applied${handed.summary ? ` (${handed.summary})` : ''} — the PR is complete and stays ready-to-review`
     log(`Merge gate: clear, handoff FAILED — ${why}.`)
     return { ...result, mergeSkipped: why }
   }
-  log(`Merge gate: clear — #${issue} is ready-to-merge; bin/merge-worker.sh owns it from here.`)
+  log(`Merge gate: clear — #${issue} is ready-to-merge (${handed.summary}); bin/merge-worker.sh owns it from here.`)
 
   return { ...result, readyToMerge: true }
 } catch (e) {

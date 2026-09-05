@@ -24,9 +24,21 @@
 // decays safely — a claim ref with no session is what reap's second pass
 // exists for, and a shipped-but-unpromoted run stays `ready-to-review`, which
 // is the direction the merge gate is designed to fail in.
+//
+// One ordering invariant is enforced here rather than trusted: NO model step
+// runs after the run's terminal label. Everything past that write shares the
+// one reporting budget github.mjs hands out (terminalBudget), because reap's
+// settle clock started at the label — and a spawn is the one thing that budget
+// cannot cap, since agent() runs on a ninety-minute ceiling. So a spawn
+// requested once the window is open is refused: it resolves null like any dead
+// step, the callers' fail-closed branches take over, and withAgentFailure()
+// names it a pipeline ordering fault. A step moved after a terminal write
+// therefore yields a held or failed run with a legible reason instead of a
+// session reaped mid-sentence.
 
 import os from 'node:os'
 import { resolveEngine, resolveVendor, STEPS, terminateAll, isTransient } from './engine.mjs'
+import { terminalSpend } from './github.mjs'
 import { validate } from './schema.mjs'
 import { recordUsage } from './usage.mjs'
 
@@ -81,7 +93,9 @@ export function withAgentFailure(reason) {
   const f = lastAgentFailure
   lastAgentFailure = null
   if (!f) return reason
-  const category = f.kind === 'quota-exhausted' ? 'Provider usage quota exhausted' : 'Agent failure'
+  const category = f.kind === 'quota-exhausted' ? 'Provider usage quota exhausted'
+    : f.kind === 'post-terminal' ? 'Pipeline ordering fault'
+    : 'Agent failure'
   const tries = `${f.attempts} attempt${f.attempts === 1 ? '' : 's'}`
   return `${reason} ${category}: ${f.label} failed after ${tries} [${f.vendor} ${f.model}/${f.effort}] — ${f.reason}`
 }
@@ -173,6 +187,20 @@ export async function agent(prompt, opts = {}) {
     vendor = resolveVendor(vendorName)
   } catch (e) {
     log(`${label}: ${e.message}`)
+    return null
+  }
+
+  // The ordering gate. terminalSpend() is empty until the run's first terminal
+  // label write opens the window, so this costs nothing on every normal step;
+  // once it is open, reap is already timing the issue and a spawn would outlast
+  // the budget the rest of the run is being held to. Refuse before acquire():
+  // nothing is spawned, so there is no usage record to write either.
+  if (terminalSpend()) {
+    lastAgentFailure = {
+      label, vendor: vendorName, model, effort, attempts: 0, kind: 'post-terminal',
+      reason: "refused: requested after the run's terminal label",
+    }
+    log(`${label}: refused — the run's terminal label is already resting and bin/reap.sh's settle clock is running; a model step here would outlast the window (see terminalBudget in github.mjs)`)
     return null
   }
 

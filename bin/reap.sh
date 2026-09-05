@@ -71,7 +71,10 @@ TERMINAL_SETTLE_MINUTES="${TERMINAL_SETTLE_MINUTES:-5}"
 # pass reads the moment it applies that label, even if the client is still
 # waiting on the response, so the write and everything after it share ONE budget
 # for the whole run (TERMINAL_REPORT_BUDGET_MS, plus status.mjs's own 20s) that
-# stays well under a minute and a half. A window configured below this floor
+# stays well under a minute and a half. A model spawn after the terminal write is
+# refused outright rather than budgeted — nothing caps a ninety-minute agent
+# ceiling — so that budget plus status.mjs's 20s really is the whole
+# post-terminal stretch. A window configured below this floor
 # could kill a run in the middle of it — no guidance on the issue, no RESULT line
 # in the pane — so a smaller value is raised rather than honoured: settling late
 # only delays cleanup, settling early destroys the only report of why a run
