@@ -207,15 +207,22 @@ than made launchable against a main without the code it describes.
   required.
 - Mechanical conflict resolution stays containment-gated. If both sides' intent
   cannot be proven to survive, escalate instead of guessing.
-- The conflict fixer never merges and never restores unattended eligibility:
-  it lands `ready-to-review`, and its push is the last step after verify and
-  the adversarial check.
-- The CI fixer does restore it — it lands `ready-to-merge` — and that is only
-  safe because the merge worker rebases and RE-RUNS the real checks before
-  anything merges, so a fix that is still red cannot land. What that cannot
-  catch is a fix that is green and wrong, which is why the fixer is forbidden
-  to weaken a test and its diff goes to an adversarial check that refutes by
-  default. Gated by `tests/epic-run.test.sh`.
+- The conflict fixer never merges, but it does restore unattended eligibility:
+  it lands `ready-to-merge`, and its push is the last step after verify and the
+  adversarial check. That landing is safe for the same reason the CI fixer's is
+  — the merge worker rebases and RE-RUNS the real checks before anything
+  merges, so a resolution that broke something cannot land on a red check. What
+  that cannot catch is a resolution that is green and wrong, which is what the
+  adversarial check refuting by default is for; it judges every edit made
+  outside a marker block too, since the resolver may make one only where that
+  is what carries a side's intent to lines the other side moved. Gated by
+  `tests/epic-run.test.sh`.
+- The CI fixer lands `ready-to-merge` too, and that is only safe because the
+  merge worker rebases and RE-RUNS the real checks before anything merges, so a
+  fix that is still red cannot land. What that cannot catch is a fix that is
+  green and wrong, which is why the fixer is forbidden to weaken a test and its
+  diff goes to an adversarial check that refutes by default. Gated by
+  `tests/epic-run.test.sh`.
 - The defect fixer has the same verified-push safety argument as the CI fixer,
   but repairs only defects already named by the durable ship-gate evidence. It
   is a separate two-attempt session, and epic-run queues it only when no mixed

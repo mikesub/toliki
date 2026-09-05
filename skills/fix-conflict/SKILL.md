@@ -1,10 +1,10 @@
 ---
 name: fix-conflict
-description: "Autonomous judgment-conflict fixer: `/fix-conflict #N` takes a `needs-judgment` issue (a finished epic whose PR the merge worker declined on a judgment-class rebase conflict), rebases the PR onto current main, resolves the judgment hunks under an adversarial check, re-verifies, force-pushes, and lands the issue ready-to-review. An issue number is required; on the host, dispatch launches it."
+description: "Autonomous judgment-conflict fixer: `/fix-conflict #N` takes a `needs-judgment` issue (a finished epic whose PR the merge worker declined on a judgment-class rebase conflict), rebases the PR onto current main, resolves the judgment hunks under an adversarial check, re-verifies, force-pushes, and lands the issue ready-to-merge. An issue number is required; on the host, dispatch launches it."
 disable-model-invocation: true
 ---
 
-Launch the autonomous `fix-run` pipeline for a `needs-judgment` issue and report what it returned. It exits at `ready-to-review` or at a blocker comment. It never merges and never lands `ready-to-merge`: promoting is a human's call, and the merge worker re-runs CI before anything lands. It escalates instead of guessing and never fixes code: a resolution that cannot show both sides' intent surviving, a red `npm run verify`, or a refuted check leaves the issue `failed` with the reason.
+Launch the autonomous `fix-run` pipeline for a `needs-judgment` issue and report what it returned. It exits at `ready-to-merge` or at a blocker comment. It never merges: it puts the issue back in the merge worker's queue, and the merge worker rebases the PR and re-runs the real checks before anything lands. It escalates instead of guessing and never fixes code: a resolution that cannot show both sides' intent surviving, a red `npm run verify`, or a refuted check leaves the issue `failed` with the reason.
 
 Request: $ARGUMENTS
 
@@ -19,7 +19,7 @@ Request: $ARGUMENTS
 
    Its last line is `RESULT <json>`. Exit codes: `0` fixed, `2` skipped, `3` blocked, `1` usage error or crash.
 3. **Report the outcome and exit.** From the `RESULT` JSON:
-   - **Fixed** (`readyToReview: true`): report the PR URL, `resolvedHunks` (0 means the conflict had turned mechanical or evaporated, so no judgment was exercised), `checkConfidence`, and that the issue now sits `ready-to-review`. Do not merge or promote anything.
+   - **Fixed** (`readyToMerge: true`): report the PR URL, `resolvedHunks` (0 means the conflict had turned mechanical or evaporated, so no judgment was exercised), `checkConfidence`, and that the issue is back on `ready-to-merge`, where the merge worker lands it. Do not merge anything by hand.
    - **Skipped** (`skipped: true`): nothing ran. Relay the reason. `refusalFinal: true` means the refusal is already commented on the issue, which stays `failed` for a human.
    - **Blocked** (`blocked: true`): report the phase and reason, already commented on the issue. `attempt: 1` means dispatch retries once on its own after the session is reaped; `attempt: 2` means the ladder is exhausted and a human decides. Do not retry from here.
 

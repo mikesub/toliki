@@ -1130,6 +1130,16 @@ seed_clean() {
   seed_branch epic/42-add-widget main 'printf "export const items = [] // pr-guard\n" > frontend/src/index.ts && git commit -qam "feat: add guard" -m "Closes #42"'
   seed_branch main main 'printf "# app\n\nmoved on\n" > README.md && git commit -qam "docs: main moved" -m "Closes #41"'
 }
+# The shape toliki#17 declined twice: main bounded a call that sits INSIDE the
+# conflicting block, while the PR moved that same call OUT of the block into a
+# new function below. Keeping both intents takes the marker block plus one line
+# outside it, on lines only the PR wrote — the edit the old marker-only boundary
+# forbade, for no safety the adversarial check does not already give.
+seed_conflict_moved() {
+  seed_branch main main 'printf "export const items = []\n\nexport function land() {\n  return abort()\n}\n\nexport const noop = () => {}\n\nexport const other = () => {}\n" > frontend/src/index.ts && git commit -qam "base: land helper" -m "Closes #40"'
+  seed_branch epic/42-add-widget main 'printf "export const items = []\n\nexport function land() {\n  return finish()\n}\n\nexport const noop = () => {}\n\nexport const other = () => {}\n\nexport function postBlocker() {\n  return abort()\n}\n" > frontend/src/index.ts && git commit -qam "feat: move the abort out of land()" -m "Closes #42"'
+  seed_branch main main 'printf "export const items = []\n\nexport function land() {\n  return abort(bounded())\n}\n\nexport const noop = () => {}\n\nexport const other = () => {}\n" > frontend/src/index.ts && git commit -qam "main: bound the abort" -m "Closes #41"'
+}
 FIXBASE="$TMP/fixtures-fix"
 mkdir -p "$FIXBASE"
 fixture "$FIXBASE" fix-resolve '{"completed":true,"resolutions":[{"file":"frontend/src/index.ts","hunk":1,"mainIntent":"main renamed the helper","prIntent":"the PR added a guard","resolution":"Keeps the rename and the guard."}]}'
@@ -1138,15 +1148,17 @@ fixture_sh "$FIXBASE" fix-resolve 'printf "export const items = [] // main-renam
 fixture "$FIXBASE" fix-check '{"survives":true,"confidence":88,"reasoning":"Both changes are present at HEAD."}'
 run_fix() { GH_ISSUE_LABELS="${FIX_LABELS:-failed,needs-judgment}" GH_OPEN_PR_BRANCH=epic/42-add-widget run_pipeline "$FIX_RUN" "$@"; }
 
-scenario 'fix-run: judgment hunk resolved, verified, checked, shipped ready-to-review'
+scenario 'fix-run: judgment hunk resolved, verified, checked, shipped ready-to-merge'
 seed_conflict
 BEFORE="$(origin_ref epic/42-add-widget)"
 run_fix "$FIXBASE" --issue 42 --session myapp-epic-42
 assert_rc "exits 0" 0 "$RUN_RC"
-assert_contains "RESULT lands ready-to-review" "$RUN_OUT" '"readyToReview":true'
+assert_contains "RESULT lands ready-to-merge" "$RUN_OUT" '"readyToMerge":true'
 assert_contains "it records one judgment hunk" "$RUN_OUT" '"resolvedHunks":1'
-assert_not_contains "no merge queue promotion" "$RUN_OUT" 'readyToMerge'
+assert_not_contains "and never rests for a human instead" "$RUN_OUT" 'readyToReview'
 assert_contains "the resolver was handed the rung's classification" "$(cat "$STATE_DIR/fix-resolve.0.prompt")" 'needs judgment'
+assert_contains "the resolver may carry an intent outside a marker block" "$(cat "$STATE_DIR/fix-resolve.0.prompt")" "carries one side's intent to lines the other side moved"
+assert_contains "the skeptic is told to trace every out-of-block change" "$(cat "$STATE_DIR/fix-check.0.prompt")" 'sits outside a resolved block'
 assert_eq "the branch on origin was rewritten" "$(git -C "$WT" rev-parse HEAD)" "$(origin_ref epic/42-add-widget)"
 assert_not_contains "and is not what it was" "$(origin_ref epic/42-add-widget)" "$BEFORE"
 assert_eq "it is exactly one commit above the new main" 1 "$(origin_count epic/42-add-widget)"
@@ -1155,7 +1167,22 @@ assert_contains "verify ran in the discovered package" "$(cat "$NPM_LOG")" "run 
 assert_contains "the audit comment states main's intent" "$(gh_comments)" "origin/main intended: main renamed the helper"
 assert_contains "the audit comment states the PR's intent" "$(gh_comments)" "the PR intended: the PR added a guard"
 assert_contains "the audit comment records the adversarial check" "$(gh_comments)" "confidence 88/100"
-assert_eq "the labels: ready-to-review, ladder kept, needs-judgment cleared" "fix-attempted,ready-to-review," "$(gh_labels)"
+assert_contains "and says the merge worker re-runs the checks before anything lands" "$(gh_comments)" "re-runs the real checks before anything lands"
+assert_eq "the labels: ready-to-merge, ladder kept, needs-judgment cleared" "fix-attempted,ready-to-merge," "$(gh_labels)"
+
+scenario 'fix-run: an intent carried outside the marker block ships, and is recorded'
+seed_conflict_moved
+OUTSIDE="$TMP/fixtures-outside"; cp -R "$FIXBASE" "$OUTSIDE"
+fixture "$OUTSIDE" fix-resolve '{"completed":true,"resolutions":[{"file":"frontend/src/index.ts","hunk":1,"mainIntent":"main bounded the abort call","prIntent":"the PR moved the abort out of land() into postBlocker()","resolution":"Keeps the PR restructure and carries the bounded abort to where the call now lives.","outsideEdits":[{"where":"frontend/src/index.ts postBlocker()","intent":"the bounded abort main added, on the line the PR moved it to"}]}]}'
+fixture_sh "$OUTSIDE" fix-resolve 'printf "export const items = []\n\nexport function land() {\n  return finish()\n}\n\nexport const noop = () => {}\n\nexport const other = () => {}\n\nexport function postBlocker() {\n  return abort(bounded())\n}\n" > frontend/src/index.ts && git add frontend/src/index.ts && GIT_EDITOR=true git rebase --continue >/dev/null'
+run_fix "$OUTSIDE" --issue 42 --session myapp-epic-42
+assert_rc "exits 0" 0 "$RUN_RC"
+SHIPPED="$(git -C "$ORIGIN" show epic/42-add-widget:frontend/src/index.ts)"
+assert_contains "the PR's restructure is in the shipped file" "$SHIPPED" "return finish()"
+assert_contains "and main's intent reached the line the PR moved it to" "$SHIPPED" "return abort(bounded())"
+assert_not_contains "so no unbounded abort survives" "$SHIPPED" "return abort()"
+assert_contains "the audit comment records the out-of-block edit" "$(gh_comments)" "- edit outside the marker block: frontend/src/index.ts postBlocker() — the bounded abort main added"
+assert_eq "and it lands in the merge queue like any other resolution" "fix-attempted,ready-to-merge," "$(gh_labels)"
 
 scenario 'fix-run: the resolver escalates instead of guessing'
 seed_conflict
@@ -1239,38 +1266,40 @@ assert_eq "the branch was rebased onto the new main and pushed" 1 "$(origin_coun
 if git -C "$ORIGIN" merge-base --is-ancestor main epic/42-add-widget; then ok "and sits on top of main"; else nok "and sits on top of main"; fi
 assert_contains "the audit comment says the conflict evaporated" "$(gh_comments)" "the conflict had evaporated"
 
-# The fixer's landing swap is a terminal write too: `ready-to-review` rests the
+# The fixer's landing swap is a terminal write too: `ready-to-merge` rests the
 # issue and starts reap's settle clock as soon as GitHub applies it, while the
 # client can still be waiting on the response. The readback the label verdict is
 # composed from and the RESULT line both come after it, so the write opens the
 # window and spends it rather than running on the five-minute gh default.
-scenario 'fix-run: the ready-to-review landing write is bounded, not left to the gh timeout'
+scenario 'fix-run: the ready-to-merge landing write is bounded, not left to the gh timeout'
 seed_conflict
 LAND_START="$(date +%s)"
-EPIC_TERMINAL_REPORT_MS=3000 GH_SLOW_LABEL=ready-to-review:20 run_fix "$FIXBASE" --issue 42 --session myapp-epic-42
+EPIC_TERMINAL_REPORT_MS=3000 GH_SLOW_LABEL=ready-to-merge:20 run_fix "$FIXBASE" --issue 42 --session myapp-epic-42
 LAND_ELAPSED=$(( $(date +%s) - LAND_START ))
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_eq "the run gave up on the stalled landing write" "bounded" "$( (( LAND_ELAPSED < 15 )) && echo bounded || echo "waited ${LAND_ELAPSED}s for a 20s stall" )"
-assert_eq "the label GitHub applied before the stall is on the issue, ladder kept" "fix-attempted,ready-to-review," "$(gh_labels)"
-assert_contains "the readback inside the window still confirmed the landing" "$RUN_OUT" '"readyToReview":true'
+assert_eq "the label GitHub applied before the stall is on the issue, ladder kept" "fix-attempted,ready-to-merge," "$(gh_labels)"
+assert_contains "the readback inside the window still confirmed the landing" "$RUN_OUT" '"readyToMerge":true'
 assert_contains "and the audit comment written before it is on the issue" "$(gh_comments)" "origin/main intended: main renamed the helper"
 
-# Same stall, unverified: `ready-to-review` was applied and the readback never
-# came back. A run that blocks with the landing label it never confirmed still on
-# the issue reports one state and presents another — and it has silently left its
-# own retry queue, so nothing picks the conflict up again. The demotion restores
-# both halves inside the window the landing opened.
+# Same stall, one step worse: GitHub applied `ready-to-merge` and the readback
+# that would confirm it never came back. A run that blocks with the landing label
+# it never confirmed still on the issue reports one state and presents another —
+# and that label is the one bin/merge-worker.sh selects on, so a blocked run's PR
+# would be landed unattended. It has also silently left its own retry queue, so
+# nothing picks the conflict up again. The demotion restores both halves inside
+# the window the landing opened.
 scenario 'fix-run: a landing it could not verify is demoted and put back in its queue'
 seed_conflict
 UNVERIFIED_START="$(date +%s)"
-EPIC_TERMINAL_REPORT_MS=3000 GH_SLOW_LABEL=ready-to-review:20 GH_LABEL_READ_FAIL_AT=2 \
+EPIC_TERMINAL_REPORT_MS=3000 GH_SLOW_LABEL=ready-to-merge:20 GH_LABEL_READ_FAIL_AT=2 \
   run_fix "$FIXBASE" --issue 42 --session myapp-epic-42
 UNVERIFIED_ELAPSED=$(( $(date +%s) - UNVERIFIED_START ))
 assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
 assert_contains "the blocker names the unverified swap" "$RUN_OUT" "label swap could not be verified"
 assert_eq "the whole fallback fits the window the landing opened" "bounded" "$( (( UNVERIFIED_ELAPSED < 15 )) && echo bounded || echo "waited ${UNVERIFIED_ELAPSED}s for a 20s stall" )"
 assert_eq "it rests at failed, back in the conflict fixer queue, ladder kept" "failed,fix-attempted,needs-judgment," "$(gh_labels)"
-assert_not_contains "no unconfirmed landing label survives the block" "$(gh_labels)" "ready-to-review"
+assert_not_contains "the merge worker has nothing to select" "$(gh_labels)" "ready-to-merge"
 assert_contains "the blocker comment still reached the issue" "$(gh_comments)" "🤖 fix-conflict blocked"
 assert_contains "and the pane still gets its RESULT line" "$RUN_OUT" "RESULT "
 assert_contains "which records the blocked run" "$RUN_OUT" '"blocked":true'

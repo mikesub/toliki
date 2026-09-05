@@ -4,10 +4,16 @@
 //
 // Rebases the PR onto current origin/main, lets the deterministic rung settle
 // every mechanical hunk (merge-autoresolve.sh --partial, containment-gated),
-// has a model resolve ONLY the hunks left marked — stating what each side
-// intended and how both survive, escalating instead of guessing — re-runs
-// npm run verify, has a blind adversarial agent try to refute the resolution,
-// force-pushes, and lands the issue ready-to-review, never ready-to-merge.
+// has a model resolve the hunks left marked — stating what each side intended
+// and how both survive, editing outside a marker block only where that is what
+// carries a side's intent to lines the other side moved, escalating instead of
+// guessing — re-runs npm run verify, has a blind adversarial agent try to
+// refute the resolution, force-pushes, and lands the issue ready-to-merge:
+// back in the unattended queue, where the merge worker rebases it again and
+// RE-RUNS THE REAL CHECKS before anything lands. That re-run is what makes the
+// landing safe: a resolution that breaks a check cannot merge. What it cannot
+// catch is a resolution that is green and wrong, which is what the adversarial
+// check is for.
 // Attempt ladder in labels: fix-attempted, then fix-retried (one retry);
 // exhausted → refuses and stays failed.
 //
@@ -44,8 +50,11 @@ The final line is RESULT <json>.`
 // decided there is something worth judging. This run is that model, fenced on
 // every side: the mechanical share is re-settled by the same containment-gated
 // code (never re-litigated by the model), the judgment share must come with
-// stated intents and survive an adversarial check, verify must be green, and
-// the landing is ready-to-review — a human glances, but the work is done.
+// stated intents — including every edit made outside a marker block to carry a
+// side's intent to lines the other side moved — and must survive an adversarial
+// check, and verify must be green. The landing is ready-to-merge because the
+// merge worker still rebases and RE-RUNS the real checks before anything
+// merges, so a resolution that breaks one cannot land.
 
 // The deterministic rung, by absolute path. Resolved from this file's own
 // location: the orchestrator knows where the harness is.
@@ -55,8 +64,9 @@ const AUTORESOLVE = `${HARNESS_DIR}/bin/merge-autoresolve.sh`
 const PROMPTS = {
   // The judgment core — the one stage that exists because a model is needed.
   // It gets the same evidence a human would open: both sides' diffs and both
-  // sides' issue bodies. Its charter is narrow: only the marked hunks, both
-  // intents stated and preserved, escalate instead of guessing.
+  // sides' issue bodies. Its scope is narrow: the marked hunks, both intents
+  // stated and preserved, an edit outside a block only where that is what
+  // carries a side's intent, escalate instead of guessing.
   resolve: (issue, prep) =>
 `Resolve the JUDGMENT hunks of a rebase conflict. You are mid-rebase: the PR branch ${prep.branch} (issue #${issue}) is being rebased onto origin/main, and the stop is partially settled — every mechanical hunk was already resolved by a containment-gated script and is NOT yours to touch. Yours are exactly the diff3 marker blocks still sitting in: ${prep.markedFiles.join(', ')}.
 
@@ -75,11 +85,11 @@ For EACH marker block (<<<<<<< ours is origin/main's side, >>>>>>> theirs is the
 
 **Escalate instead of guessing.** If for ANY hunk you cannot honestly state both intents and show both surviving — the two sides genuinely contradict, or the evidence does not say what a side meant — resolve NOTHING further, return escalate="<file> hunk <n>: <why both intents cannot both survive>". A \`failed\` label is recoverable; a silently dropped intent is not.
 
-Boundaries: edit ONLY between and including marker lines, ONLY in the files listed above; never revisit the mechanical resolutions or any other file; never commit anything new; never push.
+Boundaries: the marker blocks are the target — that text is what you are here to rewrite. An edit OUTSIDE a marker block is allowed only in the files listed above, and only where it is what carries one side's intent to lines the other side moved or restructured: say main changed a call inside the block to use a bounded timeout while the PR moved that call outside the block, so keeping main's intent takes a one-line edit outside the markers. List every such edit in that hunk's resolution entry, under outsideEdits: where it is (file, and the symbol or line range) and which side's intent required it. Never revisit the mechanical resolutions; never touch a file that is not listed above; never commit anything new; never push. Where keeping both intents would take more than this, escalate instead of guessing.
 
 When every block is resolved: confirm no markers remain (\`git diff --check\` and \`grep -n '^<<<<<<<\\|^>>>>>>>' <files>\` must be clean), \`git add\` exactly those files, \`GIT_EDITOR=true git rebase --continue\`. Then confirm the rebase fully finished (\`git status\` shows no rebase in progress; \`git rev-list --count origin/main..HEAD\` is exactly 1 — if a second stop appears, escalate="rebase stopped again — an epic branch holds exactly one commit" instead of resolving further). The pipeline checks all of that again before anything ships.
 
-Return: completed (true only when the rebase finished clean), escalate (INSTEAD of completing, when set), and resolutions — one entry per marker block you resolved: file, hunk number (as the classification above numbers them), mainIntent, prIntent, resolution (one sentence: what the merged text does and how it keeps both).`,
+Return: completed (true only when the rebase finished clean), escalate (INSTEAD of completing, when set), and resolutions — one entry per marker block you resolved: file, hunk number (as the classification above numbers them), mainIntent, prIntent, resolution (one sentence: what the merged text does and how it keeps both), and outsideEdits (one entry per edit you made outside that block: where, intent) when there were any.`,
 
   // Blind on purpose, and refute-by-default on purpose: this is the same
   // adversarial shape as epic-run's review verify — the resolver's stated
@@ -97,9 +107,11 @@ Gather the evidence yourself:
 - What actually shipped: \`git diff origin/main HEAD -- <the files>\` and the files at HEAD.
 Do NOT open anything under \`.epics/\` — it carries a builder's framing and would anchor you.
 
+Edits outside the marker blocks are permitted in those files, but only where they carry a side's intent to lines the other side moved or restructured. So read the WHOLE delta, not only the blocks: find every change in \`git diff origin/main HEAD -- <the files>\` that sits outside a resolved block, and trace each one back to what one side's own diff intended. An out-of-block change you cannot trace to either side's intent refutes the resolution — say survives=false.
+
 Hunt specifically for: a side's change silently dropped (picking a side is the classic failure, and often no test covers the loss); duplicate object keys, doubled imports or re-declared symbols from a lazy keep-both; an edit placed at the wrong spot so the code runs in a changed order; one side's rename or retype applied in the hunk but not to the lines the other side contributed.
 
-Default to refuted: if you cannot positively confirm, from the code in front of you, that both sides' intents survive, say survives=false. An over-cautious refute costs one human review; a wrong pass ships a silently mangled merge.
+Default to refuted: if you cannot positively confirm, from the code in front of you, that both sides' intents survive, say survives=false. This issue goes back into the unattended merge queue on your word, so an over-cautious refute costs one human look, while a wrong pass merges a silently mangled resolution.
 
 Return: survives, confidence (0-100), reasoning (name the hunk and the evidence, whichever way you rule).`,
 }
@@ -130,6 +142,18 @@ const RESOLVE_SCHEMA = {
           mainIntent: { type: 'string', description: 'what origin/main intended with these lines' },
           prIntent: { type: 'string', description: 'what the PR intended with these lines' },
           resolution: { type: 'string', description: 'one sentence: what the merged text does and how it keeps both' },
+          outsideEdits: {
+            type: 'array',
+            description: 'every edit this hunk needed outside its marker block, when there were any',
+            items: {
+              type: 'object', additionalProperties: false,
+              required: ['where', 'intent'],
+              properties: {
+                where: { type: 'string', description: 'file, and the symbol or line range the edit landed on' },
+                intent: { type: 'string', description: 'which side\'s intent required the edit' },
+              },
+            },
+          },
         },
       },
     },
@@ -273,23 +297,25 @@ async function ship(issue, prep, body) {
   if (!push.ok) return { pushed: false, labelled: false, note: pushRejected(push) ? `rejected — ${prep.branch} moved on origin under this run` : failureReason(push) }
   // The resolution rewrote lines nobody reviewed, so the audit trail lives where a human will look.
   await comment(issue, body)
-  // ready-to-review, NEVER ready-to-merge: a rewritten resolution needs a human glance before it may
-  // merge unattended. The ladder labels stay: the ladder deliberately does not reset.
+  // ready-to-merge: the PR was in the unattended queue before the conflict declined it, and it goes
+  // back there — where the merge worker rebases it and RE-RUNS the real checks before anything
+  // lands, so a resolution that breaks one cannot merge. The ladder labels stay: they do not reset.
   // From here the run is inside reap's settle window: the swap starts the clock
   // the moment GitHub processes it, so the write and the readback after it share
   // one budget (see terminalBudget) and the run still has a RESULT line to write.
   // A readback that cannot confirm the landing drops into the blocker path, which
   // transitions the labels again — inside THIS window, not a second one.
   const budget = terminalBudget()
-  await ensureLabels(['ready-to-review'], { budget })
-  const flip = await editLabels(issue, { add: ['ready-to-review'], remove: ['in-progress', 'needs-judgment'] }, { budget })
+  await ensureLabels(['ready-to-merge'], { budget })
+  const absent = ['in-progress', 'needs-judgment', 'ready-to-review', 'failed']
+  const flip = await editLabels(issue, { add: ['ready-to-merge'], remove: absent }, { budget })
   let labels
   try {
     labels = await issueLabels(issue, { budget })
   } catch (e) {
     return { pushed: true, labelled: false, note: e && e.message || String(e) }
   }
-  const labelled = labels.includes('ready-to-review') && !labels.includes('in-progress') && !labels.includes('needs-judgment')
+  const labelled = labels.includes('ready-to-merge') && absent.every(l => !labels.includes(l))
   return { pushed: true, labelled, note: labelled ? '' : (flip.ok ? `observed labels: ${labels.join(', ')}` : failureReason(flip)) }
 }
 
@@ -312,7 +338,8 @@ async function postBlocker({ issue, phase, reason, prUrl, attempt }) {
     : 'The attempt ladder was not reached, so dispatch will relaunch the fixer on its next tick.'
   // needs-judgment keeps the issue in the fixer queue and the ladder labels bound the retries; both
   // stay — and needs-judgment is RESTORED rather than assumed, because a landing swap that GitHub
-  // applied but this run could not verify has already stripped it and put `ready-to-review` on. A run
+  // applied but this run could not verify has already stripped it and put `ready-to-merge` on — the
+  // one label bin/merge-worker.sh selects on, so a blocked run's PR would be landed unattended. A run
   // resting at `failed` beside a landing label it never verified reports one state and presents
   // another, so the transition names the one label it rests at and derives every removal from it.
   const settled = await finalizeFixerIssue({
@@ -372,6 +399,11 @@ const buildComment = (prep, resolutions, verifyDetail, check) => {
       lines.push(`  - origin/main intended: ${r.mainIntent}`)
       lines.push(`  - the PR intended: ${r.prIntent}`)
       lines.push(`  - resolution: ${r.resolution}`)
+      // An edit outside the marker block is the one thing a reader cannot find by looking at the
+      // block, so the record names each: where it landed and whose intent put it there.
+      for (const e of (Array.isArray(r.outsideEdits) ? r.outsideEdits : [])) {
+        lines.push(`  - edit outside the marker block: ${e.where} — ${e.intent}`)
+      }
     }
     lines.push('')
     lines.push(`An adversarial check, blind to this session's reasoning, tried to refute "both intents survived" and failed to (confidence ${check.confidence}/100).`)
@@ -379,7 +411,7 @@ const buildComment = (prep, resolutions, verifyDetail, check) => {
   lines.push('')
   lines.push(`verify: ${verifyDetail}`)
   lines.push('')
-  lines.push('The branch is rebased and force-pushed; the issue is ready-to-review. Promoting to ready-to-merge is a human\'s call — the merge worker re-runs CI on the true base before anything lands.')
+  lines.push('The branch is rebased and force-pushed; the issue is back to ready-to-merge. The merge worker rebases it onto current main and re-runs the real checks before anything lands, so a resolution that breaks one cannot merge.')
   return lines.join('\n')
 }
 
@@ -466,9 +498,9 @@ try {
     // Fail closed on the label half too: pushed-but-unlabelled would leave a
     // fixed PR on an issue reap reads as "still working" — a leaked slot and
     // an invisible success. failed + the blocker comment puts a human on it.
-    return await fail('ship', `pushed, but the ready-to-review label swap could not be verified${shipped.note ? ` (${shipped.note})` : ''} — a human finishes the labels; the PR itself is fixed and rebased.`)
+    return await fail('ship', `pushed, but the ready-to-merge label swap could not be verified${shipped.note ? ` (${shipped.note})` : ''} — a human finishes the labels; the PR itself is fixed and rebased.`)
   }
-  log(`Ship: pushed and labelled ready-to-review — ${prep.prUrl}`)
+  log(`Ship: pushed and labelled ready-to-merge — ${prep.prUrl}`)
 
   return {
     issue,
@@ -479,7 +511,7 @@ try {
     resolvedHunks: resolutions.length,
     checkConfidence: check ? check.confidence : null,
     verify: v.detail,
-    readyToReview: true,
+    readyToMerge: true,
   }
 } catch (e) {
   return await fail(currentPhase, (e && e.message) || String(e))
@@ -489,5 +521,5 @@ try {
 const RESULT = await main()
 // Best effort, and awaited so the edit lands before the process goes: this is the
 // last thing the issue page will show until a human or the merge worker acts.
-await statusFinish(RESULT?.blocked ? `**blocked** at ${RESULT.phase}: ${RESULT.reason}` : RESULT?.skipped ? `**skipped**: ${RESULT.reason}` : RESULT?.readyToReview ? `**done** — ${RESULT.prUrl} is ready-to-review` : '**finished**')
+await statusFinish(RESULT?.blocked ? `**blocked** at ${RESULT.phase}: ${RESULT.reason}` : RESULT?.skipped ? `**skipped**: ${RESULT.reason}` : RESULT?.readyToMerge ? `**done** — ${RESULT.prUrl} is back to ready-to-merge` : '**finished**')
 process.exit(finish(RESULT))

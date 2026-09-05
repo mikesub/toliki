@@ -32,8 +32,8 @@ only where a judgment is needed. Claude Code and Codex are both supported.
    is accepted for repos with no CI.
    Mechanical rebase conflicts it resolves itself under a line-containment
    gate; a conflict that needs judgment is labeled for **`fix-run.mjs`**, a
-   dispatched fixer run that resolves it under an adversarial check and
-   returns the PR for human review. A red check on the rebased head is labeled
+   dispatched fixer run that resolves it under an adversarial check and puts
+   the PR back in the merge queue. A red check on the rebased head is labeled
    for **`ci-run.mjs`**, which reads the failing job logs, repairs the cause
    under its own adversarial check, and puts the PR back in the merge queue —
    where its checks are re-run before anything lands.

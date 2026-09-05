@@ -34,13 +34,14 @@ set -euo pipefail
 # is WHO resolves it. Two decline classes are automated rather than human:
 # a judgment-class conflict (exit 4 from merge-autoresolve) also gets
 # `needs-judgment`, whose fixer resolves the hunks under an adversarial gate
-# and lands the issue ready-to-review; a RED check on the rebased head also
-# gets `needs-ci-fix`, whose fixer repairs the cause under an adversarial
-# check and lands it back on ready-to-merge — where this worker rebases and
-# re-runs those same checks before anything merges. A registered check that
-# times out is infrastructure, not a red check, and waits for a human like every
-# other failure. No registered checks after the grace is the supported no-CI
-# case and clears the check gate without inventing a green result.
+# and lands the issue back on ready-to-merge; a RED check on the rebased head
+# also gets `needs-ci-fix`, whose fixer repairs the cause under an adversarial
+# check and lands it back on ready-to-merge too — where this worker rebases and
+# re-runs those same checks before anything merges, so neither repair can land
+# on a check it broke. A registered check that times out is infrastructure, not
+# a red check, and waits for a human like every other failure. No registered
+# checks after the grace is the supported no-CI case and clears the check gate
+# without inventing a green result.
 #
 # Infrastructure failures (fetch, gh API) abort the run instead of labelling
 # anything: cron retries on the next tick, and a network hiccup must never
@@ -178,8 +179,9 @@ mark_failed() {
     next="The PR is open and NOT merged; the change itself is complete. The conflict
 needs judgment, so this issue is queued for an automated fixer session:
 dispatch launches one that resolves the judgment hunks under an adversarial
-gate, re-verifies, and lands the issue ready-to-review. Nothing to do unless
-it comes back failed again with the fixer's own blocker comment."
+gate, re-verifies, and puts the issue back on ready-to-merge — where this
+worker rebases it and re-runs the checks before anything lands. Nothing to do
+unless it comes back failed again with the fixer's own blocker comment."
   elif (( NEEDS_CI_FIX )); then
     # Also automated: `needs-ci-fix` is the CI fixer's queue. It lands the
     # issue back on ready-to-merge, and this worker then rebases and re-runs
