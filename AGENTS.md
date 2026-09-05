@@ -122,6 +122,11 @@ than made launchable against a main without the code it describes.
   `etc/engines.json`, host-local, never written to GitHub.
   `node workflows/usage-report.mjs` summarizes it per step;
   `./remote-control.sh usage` runs that on the host.
+- `workflows/quota-hold.mjs` owns the one host-wide provider-quota hold:
+  reset-time parsing, schema validation, atomic monotonic writes under
+  dispatch's lock, and the read-only operator peek. A hard quota is recorded
+  before a run restores its queue labels; ordinary dispatch observes it before
+  capacity or GitHub. Routing-only and explicit manual launches bypass it.
 - `workflows/lib/prices.mjs` holds the published per-model prices for vendors
   whose CLI reports no cost. Claude bills itself and is not in the table; a
   Codex spawn is priced from it and stamped `costSource:"table"`, so a computed
@@ -163,6 +168,12 @@ than made launchable against a main without the code it describes.
   CI conclusion, ref listing, routing label or conflict classification is never
   a green gate. Gated by `tests/dispatch-engine.test.sh` and
   `tests/epic-run.test.sh`.
+- A provider `quota-exhausted` result is never transient-respawned. The run
+  preserves its resumable state, records the host hold, refunds a fixer's
+  current attempt rung, and only then restores the appropriate queue labels;
+  failure to persist the hold or verify those labels uses the ordinary blocker
+  path. Dispatch checks that record under its tick lock before capacity or any
+  GitHub access. Expired state is cleared; malformed state fails closed.
 - Merge eligibility is computed from structured counts in `epic-run.mjs`.
   Never replace it with a model's sign-off.
 - The merge is pinned to the sha whose check gate was evaluated
@@ -194,8 +205,10 @@ than made launchable against a main without the code it describes.
 - Ship's deferral kinds feed the merge gate only after the skeptic re-judges
   every item ship did not call a defect; the skeptic can only escalate, and a
   dead check holds the PR. Gated by `tests/epic-run.test.sh`.
-- GitHub is the state store: issues, labels, `blocked_by`, claim refs, PRs. No
-  second database, and no per-project facts in harness configuration.
+- GitHub is the durable work state store: issues, labels, `blocked_by`, claim
+  refs, PRs. The provider hold is the narrow host-fact exception, alongside
+  locks and usage telemetry: it expires, orders no work, and is never a second
+  project database. No per-project facts live in harness configuration.
 - Flat issue model: one issue is one autonomous, mergeable, independently
   verifiable change. No milestones, boards, parent issues or sub-issues.
 - Verification owns only its worktree and runs concurrently with other
@@ -245,6 +258,10 @@ than made launchable against a main without the code it describes.
   (`MIN_TERMINAL_SETTLE_MINUTES`) so the two cannot be configured into a race.
   Never add a GitHub call on the default timeout from a terminal label write
   onward.
+- A dead pipeline pane whose issue rests at `ready` is a completed quota hold,
+  so reap applies the normal settle window and removes its session. A live
+  `ready` pane is still working and a dead `in-progress` pane remains a crash
+  that requires a human.
 - Dispatch launches but never claims. Two ticks racing on one issue is safe
   because the ref push decides.
 - The CLI binary moves only on an idle host, under dispatch's lock. Gated by

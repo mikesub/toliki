@@ -21,6 +21,9 @@
 // checkpoint or an open PR is a fact the script established, never a claim a
 // model reported. A model runs only where a judgment is needed: design, code,
 // the review lenses and their skeptic, the fixes, and what the PR says.
+// A hard provider-quota death is not a project blocker: the branch is
+// checkpointed and pushed, the host-wide hold is recorded under dispatch's
+// lock, then the issue returns to ready so the next run resumes it.
 //
 // `npm run verify` is likewise the orchestrator's to run: after the red step
 // it must be red (tests that pass against no implementation test nothing),
@@ -41,7 +44,7 @@
 
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
-import { agent, parallel, phase, log, initRuntime, onPhase, onLog, withAgentFailure } from './lib/runtime.mjs'
+import { agent, parallel, phase, log, initRuntime, onPhase, onLog, takeAgentFailure, withAgentFailure } from './lib/runtime.mjs'
 import { parseArgs, finish, UsageError, EXIT } from './lib/cli.mjs'
 import { initStatus, statusPhase, statusNote, statusFinish } from './lib/status.mjs'
 import { failureReason, must } from './lib/proc.mjs'
@@ -56,6 +59,7 @@ import {
   pushRejected, slugify, epicDir, writeRequirements, readRequirements, initEpicMd, updateEpicMd,
   renderArchitecture, renderReview,
 } from './lib/repo.mjs'
+import { recordQuotaHold } from './quota-hold.mjs'
 
 const USAGE = `Usage: epic-run.mjs (--issue <N> | --slug <slug>) [--session <name>] [--engine <name>]
 
@@ -65,7 +69,7 @@ const USAGE = `Usage: epic-run.mjs (--issue <N> | --slug <slug>) [--session <nam
   --session      name for log lines (the tmux session bin/launch.sh created)
   --engine       registered coding-agent engine for every phase
 
-Exit: 0 shipped or held for review, 1 usage/crash, 2 skipped, 3 blocked.
+Exit: 0 shipped, provider-held, or held for review; 1 usage/crash, 2 skipped, 3 blocked.
 The final line is RESULT <json>.`
 
 // ───────────────────────── Prompts ─────────────────────────
@@ -679,6 +683,24 @@ async function handoff(issue, dir) {
   return { labelled, summary: labelled ? 'ready-to-merge observed' : `observed labels: ${labels.join(', ')}` }
 }
 
+// Preserve unfinished work for either terminal path. A quota hold needs this
+// operation to succeed before it can advertise a resumable ready issue; the
+// ordinary blocker keeps its historical best-effort behavior around it.
+async function preserveWork({ slug, phase }) {
+  if (!slug) return
+  const branch = `epic/${slug}`
+  if (await gitOut(['status', '--porcelain'], 'git status')) {
+    await gitOut(['add', '-A'], 'git add -A')
+    if ((await git(['diff', '--cached', '--quiet'])).code !== 0) await gitOut(['commit', '-q', '-m', `wip: epic blocked at ${phase}`], 'git commit (wip)')
+  }
+  const tracked = (await git(['rev-parse', '--verify', '-q', `refs/remotes/origin/${branch}`])).ok ? `origin/${branch}` : 'origin/main'
+  const ahead = Number((await git(['rev-list', '--count', `${tracked}..HEAD`])).out) || 0
+  if (ahead > 0) {
+    const pushed = await git(['push', '--force-with-lease', '-u', 'origin', branch])
+    if (!pushed.ok) throw new Error(`git push failed (${failureReason(pushed)})`)
+  }
+}
+
 // The blocker report: preserve the work, say where it is, flip the label to failed.
 async function postBlocker({ issue, slug, phase, reason, prUrl }) {
   const branch = slug ? `epic/${slug}` : null
@@ -692,13 +714,7 @@ async function postBlocker({ issue, slug, phase, reason, prUrl }) {
     // commit never carries "Closes #N" (unfinished work must not auto-close the issue on an accidental
     // merge) and `git add -A` respects .gitignore, so .epics/ stays out.
     try {
-      if (await gitOut(['status', '--porcelain'], 'git status')) {
-        await gitOut(['add', '-A'], 'git add -A')
-        if ((await git(['diff', '--cached', '--quiet'])).code !== 0) await gitOut(['commit', '-q', '-m', `wip: epic blocked at ${phase}`], 'git commit (wip)')
-      }
-      const tracked = (await git(['rev-parse', '--verify', '-q', `refs/remotes/origin/${branch}`])).ok ? `origin/${branch}` : 'origin/main'
-      const ahead = Number((await git(['rev-list', '--count', `${tracked}..HEAD`])).out) || 0
-      if (ahead > 0) await git(['push', '--force-with-lease', '-u', 'origin', branch])
+      await preserveWork({ slug, phase })
     } catch (e) {
       log(`blocked: could not preserve the work (${e && e.message || e})`)
     }
@@ -716,7 +732,7 @@ async function postBlocker({ issue, slug, phase, reason, prUrl }) {
   // Every terminal label comes off — ready-to-merge above all, since leaving it would hand a failed
   // run's PR to the merge worker. The assignee stays.
   await ensureLabels(['failed'], spend())
-  const flip = await editLabels(issue, { add: ['failed'], remove: ['in-progress', 'ready-to-merge', 'ready-to-review'] }, spend())
+  const flip = await editLabels(issue, { add: ['failed'], remove: ['ready', 'in-progress', 'ready-to-merge', 'ready-to-review', 'needs-defect-fix'] }, spend())
   if (!flip.ok) log(`blocked: label flip to failed failed (${failureReason(flip)})`)
 }
 
@@ -727,8 +743,33 @@ async function postBlocker({ issue, slug, phase, reason, prUrl }) {
 let currentPhase = 'prepare'
 let blockerPosted = false
 let openPr = null
-async function fail(phase, reason) {
-  reason = withAgentFailure(reason)
+async function holdForQuota(phase, failure) {
+  if (!gitMode) return { error: 'quota holds require issue mode' }
+  try {
+    await preserveWork({ slug, phase })
+    const { hostHold, trigger } = await recordQuotaHold({ vendor: failure.vendor, reason: failure.reason })
+    terminalWindow = terminalBudget()
+    await ensureLabels(['ready'], spend())
+    const remove = ['in-progress', 'failed', 'ready-to-merge', 'ready-to-review', 'needs-defect-fix']
+    const flip = await editLabels(issue, { add: ['ready'], remove }, spend())
+    const labels = await issueLabels(issue, spend())
+    if (!flip.ok || !labels.includes('ready') || remove.some(label => labels.includes(label))) {
+      throw new Error(flip.ok ? `observed labels: ${labels.join(', ') || 'none'}` : failureReason(flip))
+    }
+    return { held: true, issue, slug, phase, ...hostHold, ...trigger }
+  } catch (error) {
+    return { error: error?.message || String(error) }
+  }
+}
+
+async function fail(phase, reason, suppliedFailure = undefined) {
+  const failure = suppliedFailure === undefined ? takeAgentFailure() : suppliedFailure
+  if (failure?.kind === 'quota-exhausted') {
+    const held = await holdForQuota(phase, failure)
+    if (!held.error) return held
+    reason = `${reason} Provider quota hold failed: ${held.error}.`
+  }
+  reason = withAgentFailure(reason, failure)
   if (gitMode) {
     if (!blockerPosted) {
       blockerPosted = true
@@ -988,6 +1029,10 @@ try {
       return { finding: f, verdict: got, twin: twin && twin !== f ? twin : null }
     })).catch(() => group.map(noVerdict)),
   ))).flat().filter(Boolean)
+  const verifierFailure = takeAgentFailure()
+  if (verifierFailure?.kind === 'quota-exhausted') {
+    return await fail('review', 'An adversarial review verifier hit provider quota — refusing to continue with incomplete review evidence.', verifierFailure)
+  }
 
   const confirmedRecs = verdicts.filter(r => r.verdict.real && r.verdict.confidence >= 75)
   const verified = confirmedRecs.map(r => r.finding)
@@ -1096,6 +1141,10 @@ try {
         { label: 'fix-check', phase: 'Fixes after review', step: 'confirm-review', schema: FIXCHECK_SCHEMA },
       )
       if (!c) {
+        const failure = takeAgentFailure()
+        if (failure?.kind === 'quota-exhausted') {
+          return await fail('triage', 'The post-fix check hit provider quota — refusing to turn missing review evidence into a soft PR hold.', failure)
+        }
         // A dead check leaves the fixes unreviewed; the PR is complete and verified, so it waits for a
         // human rather than failing the run.
         fixBlockers.push({ source: 'missing-post-fix-verdict', reason: 'the post-fix check produced no result — the fixes are unreviewed', defectClass: false, items: fixed })
@@ -1169,6 +1218,10 @@ try {
       { label: 'deferral-check', phase: 'Ship', step: 'confirm-review', schema: DEFERRAL_CHECK_SCHEMA },
     )
     if (!c) {
+      const failure = takeAgentFailure()
+      if (failure?.kind === 'quota-exhausted') {
+        return await fail('ship', 'The deferral check hit provider quota — refusing to create a PR before every deferral is classified.', failure)
+      }
       deferralBlockers.push({ source: 'missing-deferral-verdict', reason: `the deferral check produced no result — ${toCheck.length} deferred item(s) are unclassified`, defectClass: false, items: toCheck })
       log('Deferral check: produced no result — the PR will be held.')
     } else {
@@ -1292,5 +1345,5 @@ try {
 const RESULT = await main()
 // Best effort, and awaited so the edit lands before the process goes: this is the
 // last thing the issue page will show until a human or the merge worker acts.
-await statusFinish(RESULT?.blocked ? `**blocked** at ${RESULT.phase}: ${RESULT.reason}` : RESULT?.skipped ? `**skipped**: ${RESULT.reason}` : RESULT?.readyToMerge ? `**done** — ${RESULT.prUrl} queued for the merge worker` : RESULT?.prUrl ? `**done, held for review** — ${RESULT.prUrl} (${RESULT.mergeSkipped})` : '**finished**')
+await statusFinish(RESULT?.held ? `**held**: provider quota exhausted, resumes after ${RESULT.holdUntil} — vendor: ${RESULT.vendor}; provider reason: "${RESULT.reason}"` : RESULT?.blocked ? `**blocked** at ${RESULT.phase}: ${RESULT.reason}` : RESULT?.skipped ? `**skipped**: ${RESULT.reason}` : RESULT?.readyToMerge ? `**done** — ${RESULT.prUrl} queued for the merge worker` : RESULT?.prUrl ? `**done, held for review** — ${RESULT.prUrl} (${RESULT.mergeSkipped})` : '**finished**', { budget: terminalWindow || undefined })
 process.exit(finish(RESULT))

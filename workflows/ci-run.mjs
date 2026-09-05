@@ -20,14 +20,19 @@
 // Two model steps: the fixer and its skeptic. Everything else — the gates, the
 // ladder write, the log gathering, verify, the amend, the push, the audit
 // comment, the labels — is the orchestrator's own work.
+// A hard provider-quota death cleans the unpushed edit and records the
+// host-wide hold before labels move. A verified hold refunds this invocation's
+// rung; an unverified transition restores it and blocks inside the same
+// terminal-report window.
 
-import { agent, phase, log, initRuntime, onPhase, onLog, withAgentFailure } from './lib/runtime.mjs'
+import { agent, phase, log, initRuntime, onPhase, onLog, takeAgentFailure, withAgentFailure } from './lib/runtime.mjs'
 import { parseArgs, finish, UsageError, EXIT } from './lib/cli.mjs'
 import { initStatus, statusPhase, statusNote, statusFinish } from './lib/status.mjs'
 import { failureReason } from './lib/proc.mjs'
 import { gh, ensureLabels, editLabels, issueLabels, issueView, comment, openPrs, withBodyFile } from './lib/github.mjs'
 import { git, gitOut, discoverPackages, pkgList, ensureDeps, runVerify, pushRejected } from './lib/repo.mjs'
-import { finalizeFixerIssue } from './lib/fixer-finalize.mjs'
+import { finalizeFixerIssue, finalizeFixerQuotaHold } from './lib/fixer-finalize.mjs'
+import { recordQuotaHold } from './quota-hold.mjs'
 
 const USAGE = `Usage: ci-run.mjs --issue <N> [--session <name>] [--engine <name>]
 
@@ -35,7 +40,7 @@ const USAGE = `Usage: ci-run.mjs --issue <N> [--session <name>] [--engine <name>
   --session    name for log lines (the tmux session bin/launch.sh created)
   --engine     registered coding-agent engine for every phase
 
-Exit: 0 fixed, 1 usage/crash, 2 skipped, 3 blocked.
+Exit: 0 fixed or provider-held, 1 usage/crash, 2 skipped, 3 blocked.
 The final line is RESULT <json>.`
 
 // How much of a failing job's log the fixer gets. Enough to hold a stack trace
@@ -273,19 +278,34 @@ async function ship(issue, prep, body) {
   return { pushed: true, labelled, note: labelled ? '' : (flip.ok ? `observed labels: ${labels.join(', ')}` : failureReason(flip)) }
 }
 
-async function postBlocker({ issue, phase, reason, prUrl, attempt }) {
-  const ladder = attempt >= 2
+const attemptRung = attempt => attempt === 2 ? 'ci-retried' : 'ci-attempted'
+
+function attemptGuidance(attempt, state) {
+  const normal = attempt >= 2
     ? 'This was the RETRY (ci-attempted and ci-retried are both on the issue), so the CI fixer is done with it: fix the checks by hand, or strip the two ci-* labels to grant another round.'
     : attempt === 1
     ? 'This was the first attempt (ci-attempted is on the issue), so dispatch relaunches the CI fixer once, automatically, a few minutes after this session is reaped. Nothing to do unless the retry also fails.'
     : 'The attempt ladder was not reached, so dispatch will relaunch the CI fixer on its next tick.'
+  if (!state || attempt < 1) return normal
+  const rung = attemptRung(attempt)
+  if (!state.readable) return `GitHub did not return a label readback; check that ${rung} is present before relaunching so this spent attempt is not refunded.`
+  if (!state.labels.includes(rung)) return `${rung} could NOT be restored; set it by hand before relaunching so this spent attempt is not refunded.`
+  return normal
+}
+
+const blockerBody = ({ phase, reason, prUrl, attempt }, state) =>
+  `🤖 fix-ci blocked\n- phase: ${phase}\n- reason: ${reason}\n- pr: ${prUrl || 'not resolved'}\n- next: ${attemptGuidance(attempt, state)}\n`
+
+async function postBlocker({ issue, phase, reason, prUrl, attempt }, budget) {
   // needs-ci-fix keeps the issue in the queue and the ladder labels bound the retries; both stay.
   const settled = await finalizeFixerIssue({
     issue,
-    body: `🤖 fix-ci blocked\n- phase: ${phase}\n- reason: ${reason}\n- pr: ${prUrl || 'not resolved'}\n- next: ${ladder}\n`,
+    body: state => blockerBody({ phase, reason, prUrl, attempt }, state),
     add: ['failed'],
     remove: ['in-progress'],
+    budget,
   })
+  terminalWindow = settled.budget
   if (!settled.reported) log(`blocked: GitHub report failed (${settled.reportError})`)
   if (!settled.settled) log(`blocked: terminal label restoration failed (${settled.stateError})`)
 }
@@ -295,8 +315,50 @@ let currentPhase = 'prepare'
 let blockerPosted = false
 let prUrl = null
 let attempt = 0
+let terminalWindow = null
+async function holdForQuota(phase, failure, reason) {
+  try {
+    await git(['checkout', '-f', '--', '.'])
+    const { hostHold, trigger } = await recordQuotaHold({ vendor: failure.vendor, reason: failure.reason })
+    const rung = attemptRung(attempt)
+    const finalized = await finalizeFixerQuotaHold({
+      issue,
+      rung,
+      hold: { add: ['failed', 'needs-ci-fix'], remove: ['in-progress', rung] },
+      blocked: { add: ['failed', 'needs-ci-fix'], remove: ['in-progress'] },
+      body: (state, holdState) => blockerBody({
+        phase,
+        reason: withAgentFailure(`${reason} Provider quota hold failed: ${holdState.stateError}.`, failure),
+        prUrl,
+        attempt,
+      }, state),
+    })
+    terminalWindow = finalized.budget
+    if (!finalized.held) {
+      blockerPosted = true
+      if (!finalized.blockState.reported) log(`blocked: GitHub report failed (${finalized.blockState.reportError})`)
+      if (!finalized.blockState.settled) log(`blocked: terminal label restoration failed (${finalized.blockState.stateError})`)
+      return {
+        blocked: true, issue, phase,
+        reason: withAgentFailure(`${reason} Provider quota hold failed: ${finalized.holdState.stateError}.`, failure),
+        prUrl: prUrl || undefined,
+        attempt,
+      }
+    }
+    return { held: true, issue, phase, ...hostHold, ...trigger, attempt }
+  } catch (error) {
+    return { error: error?.message || String(error) }
+  }
+}
+
 async function fail(phase, reason) {
-  reason = withAgentFailure(reason)
+  const failure = takeAgentFailure()
+  if (failure?.kind === 'quota-exhausted') {
+    const held = await holdForQuota(phase, failure, reason)
+    if (!held.error) return held
+    reason = `${reason} Provider quota hold failed: ${held.error}.`
+  }
+  reason = withAgentFailure(reason, failure)
   if (!blockerPosted) {
     blockerPosted = true
     try {
@@ -412,5 +474,5 @@ try {
 }
 
 const RESULT = await main()
-await statusFinish(RESULT?.blocked ? `**blocked** at ${RESULT.phase}: ${RESULT.reason}` : RESULT?.skipped ? `**skipped**: ${RESULT.reason}` : RESULT?.readyToMerge ? `**done** — ${RESULT.prUrl} is back to ready-to-merge` : '**finished**')
+await statusFinish(RESULT?.held ? `**held**: provider quota exhausted, resumes after ${RESULT.holdUntil} — vendor: ${RESULT.vendor}; provider reason: "${RESULT.reason}"` : RESULT?.blocked ? `**blocked** at ${RESULT.phase}: ${RESULT.reason}` : RESULT?.skipped ? `**skipped**: ${RESULT.reason}` : RESULT?.readyToMerge ? `**done** — ${RESULT.prUrl} is back to ready-to-merge` : '**finished**', { budget: terminalWindow || undefined })
 process.exit(finish(RESULT))

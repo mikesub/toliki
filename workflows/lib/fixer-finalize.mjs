@@ -27,12 +27,16 @@
 // start reap's settle clock — while the client is still waiting for the
 // response, so a swap on the default gh timeout can be killed by a sweep that
 // already considers the label settled, before the reporting has even begun.
+// A caller may pass an existing budget when a prior terminal write already
+// started that clock. A null body intentionally performs only the verified
+// transition; successful quota holds use that form because their live status
+// comment is the complete report and a blocker/audit comment would misclassify
+// the run.
 
 import { comment, editLabels, ensureLabels, issueLabels, terminalBudget } from './github.mjs'
 import { failureReason } from './proc.mjs'
 
-export async function finalizeFixerIssue({ issue, body, add, remove, required = add, absent = remove }) {
-  const budget = terminalBudget()
+export async function finalizeFixerIssue({ issue, body, add, remove, required = add, absent = remove, budget = terminalBudget() }) {
   let stateError = ''
   let labels = []
   let readable = false
@@ -55,11 +59,40 @@ export async function finalizeFixerIssue({ issue, body, add, remove, required = 
   const state = { settled: !stateError, stateError, labels, readable, missing, stuck }
 
   let reportError = ''
-  try {
-    await comment(issue, typeof body === 'function' ? body(state) : body, { budget })
-  } catch (e) {
-    reportError = e?.message || String(e)
+  if (body != null) {
+    try {
+      await comment(issue, typeof body === 'function' ? body(state) : body, { budget })
+    } catch (e) {
+      reportError = e?.message || String(e)
+    }
   }
 
-  return { reported: !reportError, reportError, ...state }
+  return { reported: !reportError, reportError, budget, ...state }
+}
+
+// A quota hold tentatively refunds the rung this invocation just consumed.
+// If that resting state cannot be verified, the run is an ordinary blocker
+// and the rung must be restored. Keep both transitions here so every fixer
+// shares the same rung invariant and, critically, the same absolute terminal
+// deadline after the first label write may have started reap's clock.
+export async function finalizeFixerQuotaHold({ issue, rung, hold, blocked, body, budget = terminalBudget() }) {
+  if (typeof rung !== 'string' || !rung) throw new Error('fixer quota finalization requires the current attempt rung')
+  const holdState = await finalizeFixerIssue({ issue, body: null, ...hold, budget })
+  if (holdState.settled) return { held: true, budget, holdState }
+
+  const add = [...new Set([...(blocked.add || []), rung])]
+  const remove = (blocked.remove || []).filter(label => label !== rung)
+  const required = [...new Set([...(blocked.required || blocked.add || []), rung])]
+  const absent = (blocked.absent || blocked.remove || []).filter(label => label !== rung)
+  const blockState = await finalizeFixerIssue({
+    issue,
+    body: state => typeof body === 'function' ? body(state, holdState) : body,
+    ...blocked,
+    add,
+    remove,
+    required,
+    absent,
+    budget,
+  })
+  return { held: false, budget, holdState, blockState }
 }

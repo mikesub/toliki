@@ -28,7 +28,8 @@ set -euo pipefail
 # never over-dispatch.
 #
 # Capacity is not decided here either — bin/launch.sh owns it (see the comment
-# at its capacity check). This script just stops when launch.sh says 3.
+# at its capacity check). Before asking, an automatic tick observes the shared
+# provider hold under this script's lock; routing-only modes bypass admission.
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/../etc/lib.sh"
@@ -72,6 +73,10 @@ until the host hits MAX_PARALLEL_EPICS ($MAX_PARALLEL_EPICS).
   --route-issue <N> <name>
                       Persist an explicit manual epic/fix engine choice on one
                       issue. Requires -r; labels only and launches nothing.
+
+An active host provider-quota hold stops an ordinary or dry-run tick before
+capacity and GitHub. Routing-only modes and explicit remote-control launches
+remain available as operator overrides.
 EOF
 }
 
@@ -281,6 +286,30 @@ if (( HAVE_ROUTE_ISSUE )); then
   fi
   say "#$ROUTE_ISSUE ($ONLY_REPO): routed manual run to $ROUTE_ISSUE_ENGINE"
   exit 0
+fi
+
+# Admission comes after routing-only exits and before even the capacity probe.
+# `status` is allowed to clear an expired record because fd 9 already owns the
+# same lock every writer uses. Malformed or unreadable host state fails closed:
+# absence is launchable, uncertainty is not.
+if (( ! HAVE_ROUTE_NEXT )); then
+  set +e
+  HOLD_STATE="$(node "$HERE/../workflows/quota-hold.mjs" status 2>&1)"
+  hold_rc=$?
+  set -e
+  case "$hold_rc" in
+    0)
+      read -r HOLD_UNTIL HOLD_FALLBACK < <(node -e '
+        const value = JSON.parse(process.argv[1])
+        process.stdout.write(`${value.holdUntil} ${value.fallback ? "true" : "false"}\n`)
+      ' "$HOLD_STATE")
+      say "provider quota exhausted — holding launches until $HOLD_UNTIL$([[ "$HOLD_FALLBACK" == true ]] && printf ' (fallback)')"
+      exit 0 ;;
+    1) ;;
+    *)
+      warn "provider quota hold state is unreadable — refusing to launch: ${HOLD_STATE:-unknown error}"
+      exit 1 ;;
+  esac
 fi
 
 # ───────────────────────── Fixer walks ─────────────────────────

@@ -182,6 +182,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 prompt="$(cat)"
+if [[ "${CODEX_QUOTA_STDERR_ONLY:-}" == "1" ]]; then
+  printf '%s\n' 'You have hit your usage limit; resets 7:50pm (UTC)' >&2
+  printf '%s\n' 'request failed before a final response was written' >&2
+  exit 7
+fi
 set +e
 payload="$(printf '%s' "$prompt" | STUB_LOG=/dev/null "$STUB_CLAUDE")"
 rc=$?
@@ -207,6 +212,11 @@ printf '%s\n' "$*" >> "${STUB_GH_LOG:-/dev/null}"
 state="$STUB_GH_STATE"
 labels="$state/labels"
 [[ -f "$labels" ]] || printf '%s\n' "${GH_ISSUE_LABELS:-}" | tr ',' '\n' | sed '/^$/d' > "$labels"
+if [[ -f "$state/terminal-stall-active" && -n "${GH_TERMINAL_STALL_SECONDS:-}" ]]; then
+  case "${1:-} ${2:-}" in
+    "label create"|"issue edit"|"issue view"|"issue comment"|"api --method") sleep "$GH_TERMINAL_STALL_SECONDS" ;;
+  esac
+fi
 labels_json() { jq -R -s -c 'split("\n") | map(select(length > 0)) | map({name: .})' "$labels"; }
 # Labels are per issue: the run's own issue keeps $labels, and any other issue
 # ship touches (a follow-up it files and queues) gets its own file. One shared
@@ -233,22 +243,37 @@ case "${1:-} ${2:-}" in
     if [[ "$*" == *"--json labels"* ]]; then
       n="$(cat "$state/label-reads" 2>/dev/null || echo 0)"; n=$((n + 1)); printf '%s' "$n" > "$state/label-reads"
       if [[ "$n" == "${GH_LABEL_READ_FAIL_AT:-}" ]]; then printf 'HTTP 502\n' >&2; exit 1; fi
+      if [[ -f "$state/fail-next-label-read" ]]; then
+        rm -f "$state/fail-next-label-read"
+        printf 'HTTP 502 after applied hold transition\n' >&2
+        exit 1
+      fi
     fi
     printf '{"number":%s,"title":"Add widget","body":%s,"state":"%s","labels":%s}\n' "${3:-0}" "$(printf '%s' "${GH_ISSUE_BODY:-Build a widget.}" | jq -Rs .)" "${GH_ISSUE_STATE:-OPEN}" "$(labels_json)" ;;
   "issue edit")
     target="$(labels_for "${3:-}")"
     touch "$target"
     shift 3
-    added=""
+    added=""; removed=""
     while [[ $# -gt 0 ]]; do
       case "$1" in
         --add-label)
           added+="$2,"
-          if [[ "$2" != "${GH_DROP_LABEL:-}" ]]; then
+          if [[ "${EXPECT_HOLD_BEFORE_LABEL:-}" == "$2" && ! -s "${EPIC_PROVIDER_HOLD_FILE:-}" ]]; then
+            printf '%s\n' "$2 exposed before the provider hold was durable" > "$state/hold-order-error"
+            exit 12
+          fi
+          drop_once=0
+          if [[ "$2" == "${GH_DROP_LABEL_ONCE:-}" && ! -f "$state/dropped-label-once" ]]; then
+            touch "$state/dropped-label-once"
+            drop_once=1
+          fi
+          if [[ "$2" != "${GH_DROP_LABEL:-}" && "$drop_once" != "1" ]]; then
             grep -qx -- "$2" "$target" || printf '%s\n' "$2" >> "$target"
           fi
           shift 2 ;;
         --remove-label)
+          removed+="$2,"
           # GH_KEEP_LABEL is the mirror of GH_DROP_LABEL: the strip half of a
           # swap silently not landing, which is what a partial transition is.
           if [[ "$2" != "${GH_KEEP_LABEL:-}" ]]; then
@@ -258,6 +283,13 @@ case "${1:-} ${2:-}" in
         *) shift ;;
       esac
     done
+    if [[ -n "${GH_FAIL_READ_AFTER_REMOVE:-}" && ",$removed" == *",${GH_FAIL_READ_AFTER_REMOVE},"* ]]; then
+      touch "$state/fail-next-label-read"
+      if [[ -n "${GH_TERMINAL_STALL_SECONDS:-}" ]]; then
+        touch "$state/terminal-stall-active"
+        sleep "$GH_TERMINAL_STALL_SECONDS"
+      fi
+    fi
     # A write that hangs AFTER GitHub has applied it: the label is already
     # resting — and reap's settle clock already running — while the client waits
     # on the response. "<label>:<seconds>", so a scenario stalls exactly the
@@ -421,6 +453,151 @@ fixture_sh() { # dir key script
   printf '%s\n' "$3" > "$1/$2.sh"
 }
 
+# ───────────────────────── provider quota hold: pure/shared contracts ─────────────────────────
+# Keep the clock injected through the public functions: none of these waits for
+# a wall-clock boundary, and the IANA case proves this is not a UTC-only parser.
+cat > "$TMP/quota-hold-probe.mjs" <<'NODE'
+let quota
+try {
+  quota = await import(process.env.QUOTA_HOLD_MODULE)
+} catch (error) {
+  console.log(JSON.stringify({ error: error.message }))
+  process.exit(0)
+}
+
+const [op, ...args] = process.argv.slice(2)
+if (op === 'derive') {
+  console.log(JSON.stringify(quota.deriveQuotaHold(args[0], Number(args[1]))))
+} else if (op === 'record') {
+  await quota.recordQuotaHold({ vendor: args[0], reason: args[1] }, { nowMs: Number(args[2]) })
+} else if (op === 'record-result') {
+  console.log(JSON.stringify(await quota.recordQuotaHold({ vendor: args[0], reason: args[1] }, { nowMs: Number(args[2]) })))
+} else if (op === 'constant') {
+  console.log(quota.QUOTA_HOLD_FILE)
+}
+NODE
+
+quota_probe() {
+  QUOTA_HOLD_MODULE="$ROOT/workflows/quota-hold.mjs" node "$TMP/quota-hold-probe.mjs" "$@"
+}
+
+printf '\nquota hold parser: UTC and IANA reset times use the next future occurrence\n'
+DERIVED="$(quota_probe derive 'You have hit your usage limit; resets 7:50pm (UTC)' 1788631200000)"
+assert_eq "UTC wall time becomes the same day's absolute instant" "2026-09-05T19:50:00.000Z" "$(printf '%s' "$DERIVED" | jq -r '.holdUntil // empty' 2>/dev/null)"
+assert_eq "a parsed UTC reset is not a fallback" "false" "$(printf '%s' "$DERIVED" | jq -r '.fallback' 2>/dev/null)"
+DERIVED="$(quota_probe derive 'You have hit your usage limit; resets 3:50pm (Europe/Amsterdam)' 1788609600000)"
+assert_eq "an IANA wall time honours the zone offset" "2026-09-05T13:50:00.000Z" "$(printf '%s' "$DERIVED" | jq -r '.holdUntil // empty' 2>/dev/null)"
+assert_eq "a parsed IANA reset is not a fallback" "false" "$(printf '%s' "$DERIVED" | jq -r '.fallback' 2>/dev/null)"
+DERIVED="$(quota_probe derive 'You have hit your usage limit; resets 7:50pm (UTC)' 1788638400000)"
+assert_eq "a reset minute already past rolls to its next occurrence" "2026-09-06T19:50:00.000Z" "$(printf '%s' "$DERIVED" | jq -r '.holdUntil // empty' 2>/dev/null)"
+
+printf '\nquota hold parser: missing or invalid reset data gets exactly thirty minutes\n'
+DERIVED="$(quota_probe derive 'You have hit your usage limit; try again later' 1788609600000)"
+assert_eq "missing reset text falls back by thirty minutes" "2026-09-05T12:30:00.000Z" "$(printf '%s' "$DERIVED" | jq -r '.holdUntil // empty' 2>/dev/null)"
+assert_eq "the missing-time fallback is recorded" "true" "$(printf '%s' "$DERIVED" | jq -r '.fallback // empty' 2>/dev/null)"
+DERIVED="$(quota_probe derive 'You have hit your usage limit; resets 3:50pm (Not/AZone)' 1788609600000)"
+assert_eq "an invalid provider zone also falls back by thirty minutes" "2026-09-05T12:30:00.000Z" "$(printf '%s' "$DERIVED" | jq -r '.holdUntil // empty' 2>/dev/null)"
+assert_eq "the invalid-zone fallback is recorded" "true" "$(printf '%s' "$DERIVED" | jq -r '.fallback // empty' 2>/dev/null)"
+
+printf '\nquota hold record: concurrent writers are atomic and never shorten a hold\n'
+QUOTA_LOCK_DIR="$TMP/quota-lock"
+QUOTA_RECORD="$TMP/provider-hold-race.json"
+mkdir -p "$QUOTA_LOCK_DIR"
+rm -f "$QUOTA_RECORD"
+assert_eq "EPIC_PROVIDER_HOLD_FILE overrides the host-local path" "$QUOTA_RECORD" "$(EPIC_PROVIDER_HOLD_FILE="$QUOTA_RECORD" quota_probe constant)"
+EPIC_PROVIDER_HOLD_FILE="$QUOTA_RECORD" TMPDIR="$QUOTA_LOCK_DIR" quota_probe record claude 'resets 8:00pm (UTC)' 1788631200000 &
+LOW_WRITER=$!
+EPIC_PROVIDER_HOLD_FILE="$QUOTA_RECORD" TMPDIR="$QUOTA_LOCK_DIR" quota_probe record codex 'resets 11:00pm (UTC)' 1788631200000 &
+HIGH_WRITER=$!
+wait "$LOW_WRITER" "$HIGH_WRITER"
+# A later, lower candidate makes the max(existing,candidate) assertion
+# deterministic regardless of which concurrent writer acquired the lock first.
+EPIC_PROVIDER_HOLD_FILE="$QUOTA_RECORD" TMPDIR="$QUOTA_LOCK_DIR" quota_probe record claude 'resets 8:30pm (UTC)' 1788631200000
+RACE_RECORD="$(jq -c . "$QUOTA_RECORD" 2>/dev/null || true)"
+assert_eq "the later timestamp wins across concurrent writers" "2026-09-05T23:00:00.000Z" "$(printf '%s' "$RACE_RECORD" | jq -r '.holdUntil // empty' 2>/dev/null)"
+assert_eq "the winning record remains complete, not field-merged" "codex|resets 11:00pm (UTC)|false" "$(printf '%s' "$RACE_RECORD" | jq -r '[.vendor,.reason,.fallback] | join("|")' 2>/dev/null)"
+assert_eq "the durable schema has exactly four fields" "fallback,holdUntil,reason,vendor" "$(printf '%s' "$RACE_RECORD" | jq -r 'keys | sort | join(",")' 2>/dev/null)"
+
+printf '\nquota hold record: a losing writer gets the host deadline but keeps its own trigger\n'
+printf '%s\n' '{"holdUntil":"2099-01-01T00:00:00.000Z","vendor":"codex","reason":"PRIVATE_REPO_A_SENTINEL","fallback":false}' > "$QUOTA_RECORD"
+LOSING_RESULT="$(EPIC_PROVIDER_HOLD_FILE="$QUOTA_RECORD" TMPDIR="$QUOTA_LOCK_DIR" quota_probe record-result claude 'resets 8:30pm (UTC)' 1788631200000)"
+assert_eq "the later host record remains complete" "codex|PRIVATE_REPO_A_SENTINEL|2099-01-01T00:00:00.000Z" "$(jq -r '[.vendor,.reason,.holdUntil] | join("|")' "$QUOTA_RECORD" 2>/dev/null || true)"
+assert_eq "the return shape separates shared admission state from this trigger" "hostHold,trigger" "$(printf '%s' "$LOSING_RESULT" | jq -r 'keys | sort | join(",")' 2>/dev/null)"
+assert_eq "the losing call receives only the winner's shared timing" "2099-01-01T00:00:00.000Z|false" "$(printf '%s' "$LOSING_RESULT" | jq -r '[.hostHold.holdUntil,.hostHold.fallback] | join("|")' 2>/dev/null)"
+assert_eq "the losing call retains its own provider diagnosis" "claude|resets 8:30pm (UTC)" "$(printf '%s' "$LOSING_RESULT" | jq -r '[.trigger.vendor,.trigger.reason] | join("|")' 2>/dev/null)"
+assert_not_contains "the cross-repository sentinel is absent from the losing result" "$LOSING_RESULT" "PRIVATE_REPO_A_SENTINEL"
+printf '%s\n' '{broken' > "$QUOTA_RECORD"
+BAD_RECORD_RC=0
+EPIC_PROVIDER_HOLD_FILE="$QUOTA_RECORD" TMPDIR="$QUOTA_LOCK_DIR" quota_probe record claude 'resets 8:30pm (UTC)' 1788631200000 >/dev/null 2>&1 || BAD_RECORD_RC=$?
+if (( BAD_RECORD_RC != 0 )); then ok "recording refuses malformed existing state"; else nok "recording refuses malformed existing state"; fi
+assert_eq "a refused write does not erase the malformed evidence" "{broken" "$(cat "$QUOTA_RECORD")"
+
+printf '\nquota hold CLI: status may clear expiry while peek is strictly read-only\n'
+CLI_HOLD="$TMP/provider-hold-cli.json"
+printf '%s\n' '{"holdUntil":"2099-01-01T00:00:00.000Z","vendor":"claude","reason":"session limit","fallback":false}' > "$CLI_HOLD"
+PEEK_RC=0
+PEEK_OUT="$(EPIC_PROVIDER_HOLD_FILE="$CLI_HOLD" node "$ROOT/workflows/quota-hold.mjs" peek 2>/dev/null)" || PEEK_RC=$?
+assert_rc "peek reports an active hold" 0 "$PEEK_RC"
+assert_contains "peek prints the active record" "$PEEK_OUT" '"holdUntil":"2099-01-01T00:00:00.000Z"'
+assert_eq "peek leaves an active record untouched" "2099-01-01T00:00:00.000Z" "$(jq -r '.holdUntil' "$CLI_HOLD" 2>/dev/null || true)"
+printf '%s\n' '{"holdUntil":"2000-01-01T00:00:00.000Z","vendor":"claude","reason":"session limit","fallback":false}' > "$CLI_HOLD"
+PEEK_RC=0
+EPIC_PROVIDER_HOLD_FILE="$CLI_HOLD" node "$ROOT/workflows/quota-hold.mjs" peek >/dev/null 2>&1 || PEEK_RC=$?
+assert_rc "peek treats an expired hold as inactive" 1 "$PEEK_RC"
+if [[ -f "$CLI_HOLD" ]]; then ok "peek does not clear an expired record"; else nok "peek does not clear an expired record"; fi
+STATUS_RC=0
+EPIC_PROVIDER_HOLD_FILE="$CLI_HOLD" node "$ROOT/workflows/quota-hold.mjs" status >/dev/null 2>&1 || STATUS_RC=$?
+assert_rc "status treats an expired hold as inactive" 1 "$STATUS_RC"
+if [[ ! -e "$CLI_HOLD" ]]; then ok "status clears an expired record"; else nok "status clears an expired record"; fi
+STATUS_RC=0
+EPIC_PROVIDER_HOLD_FILE="$CLI_HOLD" node "$ROOT/workflows/quota-hold.mjs" status >/dev/null 2>&1 || STATUS_RC=$?
+assert_rc "status reports an absent hold without error" 1 "$STATUS_RC"
+printf '%s\n' '{broken' > "$CLI_HOLD"
+STATUS_RC=0
+EPIC_PROVIDER_HOLD_FILE="$CLI_HOLD" node "$ROOT/workflows/quota-hold.mjs" status >/dev/null 2>&1 || STATUS_RC=$?
+assert_rc "malformed state is distinguished from absence" 2 "$STATUS_RC"
+if [[ -f "$CLI_HOLD" ]]; then ok "malformed state is never silently deleted"; else nok "malformed state is never silently deleted"; fi
+
+# The runtime diagnostic is consumable data, not prose hidden inside fail().
+# This direct probe fixes the clearing and formatting API independently of any
+# one orchestrator's hold path.
+QUOTA_RUNTIME="$TMP/fixtures-quota-runtime"
+QUOTA_RUNTIME_STATE="$TMP/state-quota-runtime"
+mkdir -p "$QUOTA_RUNTIME" "$QUOTA_RUNTIME_STATE"
+fixture_error "$QUOTA_RUNTIME" red '{"type":"result","subtype":"success","is_error":true,"terminal_reason":"api_error","api_error_status":429,"result":"You have hit your session limit; resets 7:50pm (UTC)","duration_ms":386,"num_turns":1,"total_cost_usd":0,"usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
+cat > "$TMP/runtime-failure-probe.mjs" <<'NODE'
+const runtime = await import(process.env.RUNTIME_MODULE)
+runtime.initRuntime({ scriptName: 'runtime-test', defaultEngine: 'claude', issue: 42 })
+await runtime.agent('probe', { label: 'code:red', step: 'code' })
+const first = typeof runtime.takeAgentFailure === 'function'
+  ? runtime.takeAgentFailure()
+  : { missing: 'takeAgentFailure' }
+const second = typeof runtime.takeAgentFailure === 'function'
+  ? runtime.takeAgentFailure()
+  : { missing: 'takeAgentFailure' }
+console.log(`PROBE ${JSON.stringify({ first, second })}`)
+NODE
+RUNTIME_OUT="$(
+  RUNTIME_MODULE="$ROOT/workflows/lib/runtime.mjs" \
+  CLAUDE_BIN="$TMP/bin/claude" STUB_LOG="$TMP/quota-runtime-argv.log" \
+  STUB_FIXTURES="$QUOTA_RUNTIME" STUB_STATE="$QUOTA_RUNTIME_STATE" \
+  EPIC_USAGE_LOG="$TMP/quota-runtime-usage.jsonl" \
+  node "$TMP/runtime-failure-probe.mjs" 2>&1
+)"
+RUNTIME_PROBE="$(printf '%s\n' "$RUNTIME_OUT" | sed -n 's/^PROBE //p')"
+assert_eq "quota failure metadata names kind, label, vendor, and one attempt" "quota-exhausted|code:red|claude|1" "$(printf '%s' "$RUNTIME_PROBE" | jq -r '[.first.kind,.first.label,.first.vendor,.first.attempts] | join("|")' 2>/dev/null)"
+assert_contains "quota failure metadata retains the provider reset reason" "$(printf '%s' "$RUNTIME_PROBE" | jq -r '.first.reason // empty' 2>/dev/null)" "resets 7:50pm (UTC)"
+assert_eq "taking the failure clears it" "null" "$(printf '%s' "$RUNTIME_PROBE" | jq -c '.second' 2>/dev/null)"
+assert_eq "the hard quota was not respawned" "1" "$(cat "$QUOTA_RUNTIME_STATE/red.n" 2>/dev/null || echo 0)"
+cat > "$TMP/runtime-format-probe.mjs" <<'NODE'
+const runtime = await import(process.env.RUNTIME_MODULE)
+console.log(runtime.withAgentFailure('ordinary blocker', {
+  kind: 'agent-failure', label: 'review:2', vendor: 'codex', model: 'gpt-5', effort: 'high', attempts: 2, reason: 'network error',
+}))
+NODE
+FORMAT_OUT="$(RUNTIME_MODULE="$ROOT/workflows/lib/runtime.mjs" node "$TMP/runtime-format-probe.mjs")"
+assert_contains "an already-consumed ordinary failure can still format a blocker" "$FORMAT_OUT" "review:2 failed after 2 attempts"
+
 # ───────────────────────── the happy-path fixture set ─────────────────────────
 BASE="$TMP/fixtures-base"
 mkdir -p "$BASE"
@@ -451,7 +628,11 @@ run_pipeline() { # script fixtures-dir args...   (scenario knobs via GH_* env)
   CODEX_LOG="$TMP/codex-argv.$RANDOM$RANDOM"
   GH_LOG="$TMP/gh.$RANDOM$RANDOM"
   NPM_LOG="$TMP/npm.$RANDOM$RANDOM"
-  mkdir -p "$state/gh"
+  mkdir -p "$state/gh" "$state/tmp"
+  [[ "${HOLD_FILE_AS_DIRECTORY:-}" != "1" ]] || mkdir "$state/provider-hold.json"
+  if [[ -n "${SEED_HOLD_RECORD:-}" && "${HOLD_FILE_AS_DIRECTORY:-}" != "1" ]]; then
+    printf '%s\n' "$SEED_HOLD_RECORD" > "$state/provider-hold.json"
+  fi
   # A scenario can put comments on the issue before the run, the way a previous
   # attempt would have left them.
   [[ -z "${SEED_COMMENTS:-}" ]] || printf '%s\n---\n' "$SEED_COMMENTS" > "$state/gh/comments"
@@ -482,6 +663,7 @@ run_pipeline() { # script fixtures-dir args...   (scenario knobs via GH_* env)
     GH_FORK_PR="${GH_FORK_PR:-}" \
     GH_ONLY_FORK_PR="${GH_ONLY_FORK_PR:-}" \
     GH_DROP_LABEL="${GH_DROP_LABEL:-}" \
+    GH_DROP_LABEL_ONCE="${GH_DROP_LABEL_ONCE:-}" \
     GH_KEEP_LABEL="${GH_KEEP_LABEL:-}" \
     GH_SLOW_COMMENT="${GH_SLOW_COMMENT:-}" \
     GH_SLOW_LABEL="${GH_SLOW_LABEL:-}" \
@@ -497,10 +679,17 @@ run_pipeline() { # script fixtures-dir args...   (scenario knobs via GH_* env)
     GH_DEPS_FAIL="${GH_DEPS_FAIL:-}" \
     GH_SLOW_PATCH="${GH_SLOW_PATCH:-}" \
     GH_JOB_LOG="${GH_JOB_LOG:-}" \
+    GH_FAIL_READ_AFTER_REMOVE="${GH_FAIL_READ_AFTER_REMOVE:-}" \
+    GH_TERMINAL_STALL_SECONDS="${GH_TERMINAL_STALL_SECONDS:-}" \
+    EXPECT_HOLD_BEFORE_LABEL="${EXPECT_HOLD_BEFORE_LABEL:-}" \
+    CODEX_QUOTA_STDERR_ONLY="${CODEX_QUOTA_STDERR_ONLY:-}" \
+    TMPDIR="$state/tmp" \
+    EPIC_PROVIDER_HOLD_FILE="$state/provider-hold.json" \
     EPIC_USAGE_LOG="$state/usage.jsonl" \
     node "$script" "$@" 2>&1
   )" || RUN_RC=$?
   STATE_DIR="$state"
+  HOLD_FILE="$state/provider-hold.json"
 }
 calls() { cat "$STATE_DIR/$1.n" 2>/dev/null || echo 0; }
 usage_log() { cat "$STATE_DIR/usage.jsonl" 2>/dev/null || true; }
@@ -516,6 +705,20 @@ gh_last_comment() {
 }
 gh_issues_created() { cat "$STATE_DIR/gh/issues-created" 2>/dev/null || true; }
 gh_pr_created() { cat "$STATE_DIR/gh/pr-created" 2>/dev/null || true; }
+hold_order_error() { cat "$STATE_DIR/hold-order-error" 2>/dev/null || true; }
+result_json() { printf '%s\n' "$RUN_OUT" | sed -n 's/^RESULT //p' | tail -n1; }
+assert_held_contract() { # scenario-name
+  local name="$1" result file_until
+  result="$(result_json)"
+  file_until="$(jq -r '.holdUntil // empty' "$HOLD_FILE" 2>/dev/null || true)"
+  assert_eq "$name RESULT has held=true" "true" "$(printf '%s' "$result" | jq -r '.held // false' 2>/dev/null)"
+  assert_eq "$name RESULT names issue 42" "42" "$(printf '%s' "$result" | jq -r '.issue // empty' 2>/dev/null)"
+  assert_eq "$name RESULT names Claude" "claude" "$(printf '%s' "$result" | jq -r '.vendor // empty' 2>/dev/null)"
+  assert_eq "$name writes a canonical holdUntil" "valid" "$(printf '%s' "$file_until" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:00\.000Z$' && echo valid || echo invalid)"
+  assert_eq "$name RESULT carries the durable holdUntil" "$file_until" "$(printf '%s' "$result" | jq -r '.holdUntil // empty' 2>/dev/null)"
+  assert_eq "$name RESULT marks a parsed reset" "false" "$(printf '%s' "$result" | jq -r '.fallback' 2>/dev/null)"
+  assert_contains "$name RESULT retains the provider reason" "$(printf '%s' "$result" | jq -r '.reason // empty' 2>/dev/null)" "resets 7:50pm (UTC)"
+}
 
 # ───────────────────────── epic-run ─────────────────────────
 scenario 'epic-run: happy path ships and queues for merge'
@@ -939,21 +1142,136 @@ assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
 assert_eq "exactly two attempts, never a third" 2 "$(calls design)"
 assert_contains "it blocks in the architect phase" "$RUN_OUT" '"phase":"architect"'
 
-scenario 'provider quota: exact reset time reaches the durable blocker'
+scenario 'provider quota: a hard limit holds the epic without a respawn or blocker'
 QUOTA="$TMP/fixtures-quota"; cp -R "$BASE" "$QUOTA"
 rm -f "$QUOTA/red.sh"
 fixture_error "$QUOTA" red '{"type":"result","subtype":"success","is_error":true,"terminal_reason":"api_error","api_error_status":429,"result":"You\u0027ve hit your session limit · resets 3:50pm (Europe/Amsterdam)","duration_ms":386,"num_turns":1,"total_cost_usd":0,"usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
-run_pipeline "$EPIC_RUN" "$QUOTA" --issue 42
-assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
-assert_eq "the rejected step is tried exactly twice" 2 "$(calls red)"
+EXPECT_HOLD_BEFORE_LABEL=ready run_pipeline "$EPIC_RUN" "$QUOTA" --issue 42
+assert_rc "a hold is a successful run outcome" 0 "$RUN_RC"
+assert_eq "the rejected step is tried exactly once" 1 "$(calls red)"
 assert_eq "implementation never starts" 0 "$(calls green)"
-assert_contains "the result names quota exhaustion" "$RUN_OUT" "Provider usage quota exhausted"
-assert_contains "Claude's exact message survives" "$RUN_OUT" "You've hit your session limit"
-assert_contains "the provider's reset time survives" "$RUN_OUT" "resets 3:50pm (Europe/Amsterdam)"
-assert_contains "the blocker carries the exact reset time" "$(gh_comments)" "resets 3:50pm (Europe/Amsterdam)"
-assert_contains "the misleading success subtype is ignored" "$(gh_comments)" "API error 429"
-assert_eq "failed usage records are classified durably" "quota-exhausted quota-exhausted" "$(usage_log | jq -r 'select(.label=="code:red") | .failureKind' | tr '\n' ' ' | sed 's/ $//')"
+assert_contains "RESULT names the hold" "$RUN_OUT" '"held":true'
+assert_contains "RESULT names the issue and failed phase" "$RUN_OUT" '"issue":42'
+assert_contains "RESULT names the failed phase" "$RUN_OUT" '"phase":"code"'
+assert_contains "RESULT names the provider vendor" "$RUN_OUT" '"vendor":"claude"'
+assert_eq "RESULT names the resumable slug" "42-add-widget" "$(result_json | jq -r '.slug // empty' 2>/dev/null)"
+assert_eq "RESULT carries the durable holdUntil" "$(jq -r '.holdUntil' "$HOLD_FILE" 2>/dev/null || true)" "$(result_json | jq -r '.holdUntil // empty' 2>/dev/null)"
+  assert_eq "RESULT records that parsing succeeded" "false" "$(result_json | jq -r '.fallback' 2>/dev/null)"
+assert_contains "Claude's exact message survives in RESULT" "$RUN_OUT" "You've hit your session limit"
+assert_contains "the provider's reset time survives in RESULT" "$RUN_OUT" "resets 3:50pm (Europe/Amsterdam)"
+assert_contains "the status comment ends in the held outcome" "$(cat "$GH_LOG")" "**held**: provider quota exhausted, resumes after"
+assert_contains "the status names the vendor and quoted provider field" "$(cat "$GH_LOG")" "vendor: claude; provider reason: \""
+assert_contains "the status quotes the provider reset reason" "$(cat "$GH_LOG")" "resets 3:50pm (Europe/Amsterdam)"
+assert_not_contains "no blocker comment is posted" "$(gh_comments)" "🤖 epic-run blocked"
+assert_eq "the issue returns to ready with no failed state" "ready," "$(gh_labels)"
+assert_eq "the hold is durable before ready is exposed" "" "$(hold_order_error)"
+assert_eq "the hold file has the exact durable schema" "fallback,holdUntil,reason,vendor" "$(jq -r 'keys | sort | join(",")' "$HOLD_FILE" 2>/dev/null || true)"
+assert_eq "the provider reset was parsed without fallback" "false" "$(jq -r '.fallback' "$HOLD_FILE" 2>/dev/null || true)"
+assert_eq "the host record names the vendor" "claude" "$(jq -r '.vendor' "$HOLD_FILE" 2>/dev/null || true)"
+assert_contains "the host record retains the provider reason" "$(jq -r '.reason' "$HOLD_FILE" 2>/dev/null || true)" "resets 3:50pm (Europe/Amsterdam)"
+assert_eq "the hold timestamp is canonical UTC" "valid" "$(jq -r '.holdUntil' "$HOLD_FILE" 2>/dev/null | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:00\.000Z$' && echo valid || echo invalid)"
+assert_eq "one failed usage record is classified durably" "quota-exhausted" "$(usage_log | jq -r 'select(.label=="code:red") | .failureKind')"
 assert_contains "usage retains the provider reason" "$(usage_log)" "resets 3:50pm (Europe/Amsterdam)"
+
+scenario 'provider quota: a reason with no reset time records the thirty-minute fallback'
+QUOTA_FALLBACK="$TMP/fixtures-quota-fallback"; cp -R "$BASE" "$QUOTA_FALLBACK"
+rm -f "$QUOTA_FALLBACK/red.sh"
+fixture_error "$QUOTA_FALLBACK" red '{"type":"result","subtype":"success","is_error":true,"terminal_reason":"api_error","api_error_status":429,"result":"You have hit your usage limit; try again later","duration_ms":386,"num_turns":1,"total_cost_usd":0,"usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
+HOLD_STARTED_MS="$(node -e 'console.log(Date.now())')"
+EXPECT_HOLD_BEFORE_LABEL=ready run_pipeline "$EPIC_RUN" "$QUOTA_FALLBACK" --issue 42
+assert_rc "the fallback is still a successful hold" 0 "$RUN_RC"
+assert_contains "RESULT marks the fallback" "$RUN_OUT" '"fallback":true'
+assert_eq "fallback RESULT names issue, phase, and vendor" "42|code|claude" "$(result_json | jq -r '[.issue,.phase,.vendor] | join("|")' 2>/dev/null)"
+assert_contains "fallback RESULT retains the provider reason" "$(result_json | jq -r '.reason // empty' 2>/dev/null)" "try again later"
+assert_eq "fallback RESULT carries the durable holdUntil" "$(jq -r '.holdUntil' "$HOLD_FILE" 2>/dev/null || true)" "$(result_json | jq -r '.holdUntil // empty' 2>/dev/null)"
+assert_eq "the file marks the fallback" "true" "$(jq -r '.fallback' "$HOLD_FILE" 2>/dev/null || true)"
+FALLBACK_DELTA="$(HOLD_STARTED_MS="$HOLD_STARTED_MS" HOLD_FILE="$HOLD_FILE" node -e '
+  const fs = require("node:fs")
+  try {
+    const hold = JSON.parse(fs.readFileSync(process.env.HOLD_FILE, "utf8"))
+    console.log(Date.parse(hold.holdUntil) - Number(process.env.HOLD_STARTED_MS))
+  } catch { console.log("invalid") }
+')"
+assert_eq "the end-to-end fallback is thirty minutes from the run clock" "in-range" "$( [[ "$FALLBACK_DELTA" =~ ^[0-9]+$ ]] && (( FALLBACK_DELTA >= 1800000 && FALLBACK_DELTA < 1810000 )) && echo in-range || echo "$FALLBACK_DELTA" )"
+assert_contains "the fallback status still names the provider reason" "$(cat "$GH_LOG")" "try again later"
+
+scenario 'provider quota: stderr-only reset diagnostics drive and describe the hold'
+CODEX_QUOTA_STDERR_ONLY=1 EXPECT_HOLD_BEFORE_LABEL=ready run_pipeline "$EPIC_RUN" "$BASE" --issue 42 --engine codex
+assert_rc "the stderr-classified quota hold exits successfully" 0 "$RUN_RC"
+assert_eq "the hard quota is not respawned" 1 "$(wc -l < "$CODEX_LOG" | tr -d ' ')"
+assert_eq "the stderr reset parses instead of using the fallback" "false" "$(jq -r '.fallback' "$HOLD_FILE" 2>/dev/null || true)"
+assert_contains "the hold file retains the matching stderr diagnosis" "$(jq -r '.reason // empty' "$HOLD_FILE" 2>/dev/null || true)" "resets 7:50pm (UTC)"
+assert_contains "RESULT retains the matching stderr diagnosis" "$(result_json | jq -r '.reason // empty' 2>/dev/null)" "resets 7:50pm (UTC)"
+assert_contains "the final status retains the matching stderr diagnosis" "$(cat "$GH_LOG")" "resets 7:50pm (UTC)"
+
+scenario 'provider quota: a later host hold shares only timing with the current run'
+SEED_HOLD_RECORD='{"holdUntil":"2099-01-01T00:00:00.000Z","vendor":"codex","reason":"PRIVATE_REPO_A_SENTINEL","fallback":false}' \
+  EXPECT_HOLD_BEFORE_LABEL=ready run_pipeline "$EPIC_RUN" "$QUOTA" --issue 42
+assert_rc "the losing quota writer still produces a successful hold" 0 "$RUN_RC"
+assert_eq "the host file retains the later winner" "codex|PRIVATE_REPO_A_SENTINEL|2099-01-01T00:00:00.000Z" "$(jq -r '[.vendor,.reason,.holdUntil] | join("|")' "$HOLD_FILE" 2>/dev/null || true)"
+assert_eq "RESULT uses the host-wide winning deadline" "2099-01-01T00:00:00.000Z" "$(result_json | jq -r '.holdUntil // empty' 2>/dev/null)"
+assert_eq "RESULT names the current run's vendor" "claude" "$(result_json | jq -r '.vendor // empty' 2>/dev/null)"
+assert_contains "RESULT keeps the current provider diagnosis" "$(result_json | jq -r '.reason // empty' 2>/dev/null)" "resets 3:50pm (Europe/Amsterdam)"
+assert_not_contains "RESULT does not leak the other repository's diagnosis" "$(result_json)" "PRIVATE_REPO_A_SENTINEL"
+assert_not_contains "the issue status does not leak the other repository's diagnosis" "$(cat "$GH_LOG")" "PRIVATE_REPO_A_SENTINEL"
+
+scenario 'provider quota: an unwritable hold record fails closed through the blocker path'
+HOLD_FILE_AS_DIRECTORY=1 run_pipeline "$EPIC_RUN" "$QUOTA" --issue 42
+assert_rc "failure to persist the hold blocks the run" 3 "$RUN_RC"
+assert_not_contains "a failed durable write never advertises held" "$RUN_OUT" '"held":true'
+assert_eq "quota retry suppression still applies before the write failure" 1 "$(calls red)"
+assert_eq "the ordinary blocker terminal state is restored" "failed," "$(gh_labels)"
+assert_contains "the write failure posts the ordinary blocker comment" "$(gh_comments)" "🤖 epic-run blocked"
+
+scenario 'provider quota: an unverified ready transition is not a successful hold'
+EXPECT_HOLD_BEFORE_LABEL=ready GH_DROP_LABEL=ready run_pipeline "$EPIC_RUN" "$QUOTA" --issue 42
+assert_rc "failure to verify ready blocks the run" 3 "$RUN_RC"
+assert_not_contains "an unverified label transition never advertises held" "$RUN_OUT" '"held":true'
+assert_eq "the hold itself was durable before label restoration" "false" "$(jq -r '.fallback' "$HOLD_FILE" 2>/dev/null || true)"
+assert_eq "the issue falls back to the blocker terminal state" "failed," "$(gh_labels)"
+assert_contains "the failed transition posts the ordinary blocker comment" "$(gh_comments)" "🤖 epic-run blocked"
+
+scenario 'transient retry: an ordinary 429 still gets its one respawn'
+RATE429="$TMP/fixtures-rate429"; cp -R "$BASE" "$RATE429"
+fixture_error "$RATE429" red.0 '{"type":"result","subtype":"success","is_error":true,"terminal_reason":"api_error","api_error_status":429,"result":"Rate limit exceeded; retry shortly","duration_ms":386,"num_turns":1,"total_cost_usd":0,"usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
+run_pipeline "$EPIC_RUN" "$RATE429" --issue 42
+assert_rc "the momentary 429 recovers" 0 "$RUN_RC"
+assert_eq "the ordinary 429 gets exactly one respawn" 2 "$(calls red)"
+assert_contains "the ordinary 429 is announced as transient" "$RUN_OUT" "respawning once (transient)"
+assert_eq "the ordinary 429 is not classified as quota" "agent-failure" "$(usage_log | jq -r 'select(.label=="code:red" and .ok==false) | .failureKind')"
+if [[ ! -e "$HOLD_FILE" ]]; then ok "the ordinary 429 writes no host hold"; else nok "the ordinary 429 writes no host hold"; fi
+
+scenario 'provider quota: a parallel review hold preserves a resumable code checkpoint'
+QUOTA_REVIEW="$TMP/fixtures-quota-review"; cp -R "$BASE" "$QUOTA_REVIEW"
+fixture_error "$QUOTA_REVIEW" lens-security '{"type":"result","subtype":"success","is_error":true,"terminal_reason":"api_error","api_error_status":429,"result":"You have hit your usage limit; resets 7:50pm (UTC)","duration_ms":386,"num_turns":1,"total_cost_usd":0,"usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
+# This sibling finishes later with an ordinary failure. The latched quota must
+# still take precedence when the parallel batch reaches its fail-closed branch.
+printf '1' > "$QUOTA_REVIEW/lens-simplicity.0.rc"
+printf '1' > "$QUOTA_REVIEW/lens-simplicity.1.rc"
+printf '1' > "$QUOTA_REVIEW/lens-simplicity.0.sleep"
+printf '1' > "$QUOTA_REVIEW/lens-simplicity.1.sleep"
+EXPECT_HOLD_BEFORE_LABEL=ready run_pipeline "$EPIC_RUN" "$QUOTA_REVIEW" --issue 42
+assert_rc "the parallel quota becomes a hold" 0 "$RUN_RC"
+assert_held_contract "parallel review hold"
+assert_eq "the held result wins with the review phase" "review" "$(result_json | jq -r '.phase // empty' 2>/dev/null)"
+assert_eq "the quota lens is never respawned" 1 "$(calls lens-security)"
+assert_eq "the ordinary dead sibling retains its one respawn" 2 "$(calls lens-simplicity)"
+assert_eq "the held issue rests ready" "ready," "$(gh_labels)"
+assert_eq "the code checkpoint is pushed above the claim" 2 "$(origin_count epic/42-add-widget)"
+assert_contains "the checkpoint contains the completed implementation" "$(git -C "$ORIGIN" ls-tree -r --name-only epic/42-add-widget)" "frontend/src/widget.ts"
+assert_not_contains "the hold posts no blocker comment" "$(gh_comments)" "🤖 epic-run blocked"
+
+# A later manual/relaunched run is allowed even while a host hold exists. It
+# adopts the preserved branch and re-proves verification/review without paying
+# again for architecture, red, or green.
+run_pipeline "$EPIC_RUN" "$BASE" --issue 42
+assert_rc "the later run completes from the held branch" 0 "$RUN_RC"
+assert_contains "prepare detects the held checkpoint" "$RUN_OUT" "a code checkpoint is on it"
+assert_eq "the resumed run does not repeat architecture" 0 "$(calls design)"
+assert_eq "the resumed run does not repeat red" 0 "$(calls red)"
+assert_eq "the resumed run does not repeat green" 0 "$(calls green)"
+assert_contains "the resumed run still re-verifies the code" "$RUN_OUT" "Code: verify gate (resumed): verify green"
+assert_contains "the resumed run reaches the merge queue" "$RUN_OUT" '"readyToMerge":true'
 
 scenario 'transient retry: a timeout is never retried'
 SLOW="$TMP/fixtures-slow"; cp -R "$BASE" "$SLOW"
@@ -1007,6 +1325,19 @@ assert_contains "the PR was still opened" "$RUN_OUT" '"prUrl":"https://github.co
 assert_not_contains "missing post-fix evidence is not autonomously repairable" "$RUN_OUT" '"needsDefectFix":true'
 assert_eq "the issue stays ready-to-review" "ready-to-review," "$(gh_labels)"
 
+scenario 'provider quota: a normally-soft post-fix check holds the run instead'
+QUOTA_FIXCHECK="$TMP/fixtures-quota-fixcheck"; cp -R "$BASE" "$QUOTA_FIXCHECK"
+fixture_error "$QUOTA_FIXCHECK" fixcheck '{"type":"result","subtype":"success","is_error":true,"terminal_reason":"api_error","api_error_status":429,"result":"You have hit your usage limit; resets 7:50pm (UTC)","duration_ms":386,"num_turns":1,"total_cost_usd":0,"usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
+EXPECT_HOLD_BEFORE_LABEL=ready run_pipeline "$EPIC_RUN" "$QUOTA_FIXCHECK" --issue 42
+assert_rc "the soft-check quota becomes a successful hold" 0 "$RUN_RC"
+assert_held_contract "post-fix-check hold"
+assert_eq "the held phase is triage" "triage" "$(result_json | jq -r '.phase // empty' 2>/dev/null)"
+assert_eq "the quota-hit fix check is not respawned" 1 "$(calls fixcheck)"
+assert_eq "the issue returns to ready, not review" "ready," "$(gh_labels)"
+assert_eq "the hold is durable before ready is exposed" "" "$(hold_order_error)"
+assert_eq "ship never opens a PR after the quota" "" "$(gh_pr_created)"
+assert_not_contains "the soft check does not become a blocker comment" "$(gh_comments)" "🤖 epic-run blocked"
+
 scenario 'post-fix check: nothing confirmed means nothing to check'
 CLEANREV="$TMP/fixtures-cleanrev"; cp -R "$BASE" "$CLEANREV"
 fixture "$CLEANREV" lens-correctness '{"findings":[]}'
@@ -1037,6 +1368,19 @@ assert_contains "the gate says the items are unclassified" "$RUN_OUT" 'the defer
 assert_contains "the PR was still opened" "$RUN_OUT" '"prUrl":"https://github.com/o/r/pull/7"'
 assert_not_contains "missing deferral evidence is not autonomously repairable" "$RUN_OUT" '"needsDefectFix":true'
 assert_eq "the issue stays ready-to-review" "ready-to-review," "$(gh_labels)"
+
+scenario 'provider quota: a normally-soft deferral check holds before PR creation'
+QUOTA_DEFER="$TMP/fixtures-quota-defer"; cp -R "$DOWNGRADED" "$QUOTA_DEFER"
+fixture_error "$QUOTA_DEFER" defercheck '{"type":"result","subtype":"success","is_error":true,"terminal_reason":"api_error","api_error_status":429,"result":"You have hit your usage limit; resets 7:50pm (UTC)","duration_ms":386,"num_turns":1,"total_cost_usd":0,"usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
+EXPECT_HOLD_BEFORE_LABEL=ready run_pipeline "$EPIC_RUN" "$QUOTA_DEFER" --issue 42
+assert_rc "the soft deferral quota becomes a successful hold" 0 "$RUN_RC"
+assert_held_contract "deferral-check hold"
+assert_eq "the held phase is ship" "ship" "$(result_json | jq -r '.phase // empty' 2>/dev/null)"
+assert_eq "the quota-hit deferral check is not respawned" 1 "$(calls defercheck)"
+assert_eq "the issue returns to ready, not review" "ready," "$(gh_labels)"
+assert_eq "the hold is durable before ready is exposed" "" "$(hold_order_error)"
+assert_eq "the provider quota prevents PR creation" "" "$(gh_pr_created)"
+assert_not_contains "the soft check does not become a blocker comment" "$(gh_comments)" "🤖 epic-run blocked"
 
 scenario 'merge gate: one uncertain blocker keeps concrete defects out of autonomous repair'
 MIXED="$TMP/fixtures-mixed-gate"; cp -R "$HELD" "$MIXED"
@@ -1139,6 +1483,41 @@ assert_contains "the audit comment states main's intent" "$(gh_comments)" "origi
 assert_contains "the audit comment states the PR's intent" "$(gh_comments)" "the PR intended: the PR added a guard"
 assert_contains "the audit comment records the adversarial check" "$(gh_comments)" "confidence 88/100"
 assert_eq "the labels: ready-to-review, ladder kept, needs-judgment cleared" "fix-attempted,ready-to-review," "$(gh_labels)"
+
+scenario 'fix-run: a quota hold refunds its first conflict-fixer rung'
+seed_conflict
+BEFORE="$(origin_ref epic/42-add-widget)"
+FIXQUOTA="$TMP/fixtures-fix-quota"; cp -R "$FIXBASE" "$FIXQUOTA"
+fixture_error "$FIXQUOTA" fix-resolve '{"type":"result","subtype":"success","is_error":true,"terminal_reason":"api_error","api_error_status":429,"result":"You have hit your usage limit; resets 7:50pm (UTC)","duration_ms":386,"num_turns":1,"total_cost_usd":0,"usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
+EXPECT_HOLD_BEFORE_LABEL=failed run_fix "$FIXQUOTA" --issue 42 --session myapp-epic-42
+assert_rc "the conflict-fixer hold exits successfully" 0 "$RUN_RC"
+assert_held_contract "conflict-fixer hold"
+assert_contains "RESULT retains attempt one" "$RUN_OUT" '"attempt":1'
+assert_eq "RESULT names the resolve phase" "resolve" "$(result_json | jq -r '.phase // empty' 2>/dev/null)"
+assert_eq "the quota-hit resolver is not respawned" 1 "$(calls fix-resolve)"
+assert_eq "the issue returns to the conflict queue with no rung spent" "failed,needs-judgment," "$(gh_labels)"
+assert_eq "the hold is durable before failed is restored" "" "$(hold_order_error)"
+assert_not_contains "the rung added by this invocation was removed" "$(gh_labels)" "fix-attempted"
+assert_not_contains "no conflict blocker comment is posted" "$(gh_comments)" "🤖 fix-conflict blocked"
+assert_contains "the status comment says held" "$(cat "$GH_LOG")" "**held**: provider quota exhausted, resumes after"
+assert_eq "the PR branch is not pushed by the hold path" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+assert_eq "the fixer wrote the shared host hold" "claude|false" "$(jq -r '[.vendor,.fallback] | join("|")' "$HOLD_FILE" 2>/dev/null || true)"
+
+scenario 'fix-run: failed hold verification blocks without refunding the spent rung'
+seed_conflict
+GH_FAIL_READ_AFTER_REMOVE=fix-attempted run_fix "$FIXQUOTA" --issue 42 --session myapp-epic-42
+assert_rc "the unverified conflict-fixer hold blocks" 3 "$RUN_RC"
+assert_contains "RESULT reports the ordinary blocker outcome" "$RUN_OUT" '"blocked":true'
+assert_eq "the resting queue and spent rung are restored together" "failed,fix-attempted,needs-judgment," "$(gh_labels)"
+assert_contains "the blocker comment agrees that this was attempt one" "$(gh_comments)" "This was the first attempt (fix-attempted is on the issue)"
+assert_not_contains "an unverified transition is never reported as held" "$RUN_OUT" '"held":true'
+
+scenario 'fix-run: a partial hold transition blocks with the spent rung restored'
+seed_conflict
+GH_DROP_LABEL_ONCE=failed run_fix "$FIXQUOTA" --issue 42 --session myapp-epic-42
+assert_rc "the partial conflict-fixer hold blocks" 3 "$RUN_RC"
+assert_eq "fallback repairs the terminal state and retains the rung" "failed,fix-attempted,needs-judgment," "$(gh_labels)"
+assert_contains "the blocker report reflects the restored first attempt" "$(gh_comments)" "This was the first attempt (fix-attempted is on the issue)"
 
 scenario 'fix-run: the resolver escalates instead of guessing'
 seed_conflict
@@ -1259,6 +1638,46 @@ assert_contains "and gets the failing job log" "$FIXPROMPT" "expected createWidg
 assert_contains "and is told the failure reproduces locally" "$FIXPROMPT" "RED locally on this exact tree"
 assert_contains "and is forbidden to weaken a test" "$FIXPROMPT" "Never weaken, skip, delete or loosen a test"
 assert_eq "verify ran before and after the fix" 2 "$(grep -c '^run verify$' "$NPM_LOG")"
+
+scenario 'ci-run: a quota hold refunds only the retry rung it added'
+seed_ci_pr
+BEFORE="$(origin_ref epic/42-add-widget)"
+CIQUOTA="$TMP/fixtures-ci-quota"; cp -R "$CIBASE" "$CIQUOTA"
+fixture_error "$CIQUOTA" ci-fix '{"type":"result","subtype":"success","is_error":true,"terminal_reason":"api_error","api_error_status":429,"result":"You have hit your usage limit; resets 7:50pm (UTC)","duration_ms":386,"num_turns":1,"total_cost_usd":0,"usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
+EXPECT_HOLD_BEFORE_LABEL=failed CI_LABELS="failed,needs-ci-fix,ci-attempted" run_ci "$CI_RUN" "$CIQUOTA" --issue 42 --session myapp-epic-42
+assert_rc "the CI-fixer hold exits successfully" 0 "$RUN_RC"
+assert_held_contract "CI-fixer hold"
+assert_contains "RESULT retains attempt two" "$RUN_OUT" '"attempt":2'
+assert_eq "RESULT names the fix phase" "fix" "$(result_json | jq -r '.phase // empty' 2>/dev/null)"
+assert_eq "the quota-hit CI fixer is not respawned" 1 "$(calls ci-fix)"
+assert_eq "the prior rung remains but this run's retry rung is refunded" "ci-attempted,failed,needs-ci-fix," "$(gh_labels)"
+assert_eq "the hold is durable before failed is restored" "" "$(hold_order_error)"
+assert_not_contains "ci-retried is absent after the hold" "$(gh_labels)" "ci-retried"
+assert_not_contains "no CI blocker comment is posted" "$(gh_comments)" "🤖 fix-ci blocked"
+assert_contains "the status comment says held" "$(cat "$GH_LOG")" "**held**: provider quota exhausted, resumes after"
+assert_eq "the PR branch is not pushed by the hold path" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+assert_eq "the CI fixer wrote the shared host hold" "claude|false" "$(jq -r '[.vendor,.fallback] | join("|")' "$HOLD_FILE" 2>/dev/null || true)"
+
+scenario 'ci-run: failed hold verification blocks without refunding the retry rung'
+seed_ci_pr
+CI_LABELS="failed,needs-ci-fix,ci-attempted" GH_FAIL_READ_AFTER_REMOVE=ci-retried \
+  run_ci "$CI_RUN" "$CIQUOTA" --issue 42 --session myapp-epic-42
+assert_rc "the unverified CI-fixer hold blocks" 3 "$RUN_RC"
+assert_contains "RESULT reports the ordinary blocker outcome" "$RUN_OUT" '"blocked":true'
+assert_eq "the queue and both spent rungs are restored together" "ci-attempted,ci-retried,failed,needs-ci-fix," "$(gh_labels)"
+assert_contains "the blocker comment agrees that the retry is spent" "$(gh_comments)" "This was the RETRY (ci-attempted and ci-retried are both on the issue)"
+assert_not_contains "an unverified transition is never reported as held" "$RUN_OUT" '"held":true'
+
+scenario 'ci-run: hold failure and blocker fallback share one terminal deadline'
+seed_ci_pr
+HOLD_FALLBACK_START_MS="$(node -e 'console.log(Date.now())')"
+CI_LABELS="failed,needs-ci-fix,ci-attempted" GH_FAIL_READ_AFTER_REMOVE=ci-retried \
+  GH_TERMINAL_STALL_SECONDS=20 EPIC_TERMINAL_REPORT_MS=6000 \
+  run_ci "$CI_RUN" "$CIQUOTA" --issue 42 --session myapp-epic-42
+HOLD_FALLBACK_ELAPSED_MS="$(( $(node -e 'console.log(Date.now())') - HOLD_FALLBACK_START_MS ))"
+assert_rc "the stalled unverified hold still blocks" 3 "$RUN_RC"
+assert_eq "hold and fallback cannot each spend a fresh terminal window" "bounded" \
+  "$( (( HOLD_FALLBACK_ELAPSED_MS < 8000 )) && echo bounded || echo "spent ${HOLD_FALLBACK_ELAPSED_MS}ms" )"
 
 scenario 'ci-run: a failure that does not reproduce locally says so'
 GREENLOCAL="$TMP/fixtures-ci-green"; cp -R "$CIBASE" "$GREENLOCAL"
@@ -1422,6 +1841,35 @@ assert_contains "the skeptic sees the durable named defect" "$CHECKPROMPT" "Empt
 assert_contains "the skeptic is pointed at the exact captured-head delta" "$CHECKPROMPT" "git diff $BEFORE"
 assert_not_contains "the skeptic is blind to the fixer's explanation" "$CHECKPROMPT" "PRIVATE_FIXER_EXPLANATION"
 assert_eq "verify runs once after the edit" 1 "$(grep -c '^run verify$' "$NPM_LOG")"
+
+scenario 'defect-run: a quota hold refunds only the retry rung it added'
+seed_defect_pr
+BEFORE="$(origin_ref epic/42-add-widget)"
+DEFECTQUOTA="$TMP/fixtures-defect-quota"; cp -R "$DEFECTBASE" "$DEFECTQUOTA"
+fixture_error "$DEFECTQUOTA" defect-fix '{"type":"result","subtype":"success","is_error":true,"terminal_reason":"api_error","api_error_status":429,"result":"You have hit your usage limit; resets 7:50pm (UTC)","duration_ms":386,"num_turns":1,"total_cost_usd":0,"usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
+EXPECT_HOLD_BEFORE_LABEL=ready-to-review DEFECT_LABELS="ready-to-review,needs-defect-fix,defect-attempted" run_defect "$DEFECT_RUN" "$DEFECTQUOTA" --issue 42 --session myapp-epic-42
+assert_rc "the defect-fixer hold exits successfully" 0 "$RUN_RC"
+assert_held_contract "defect-fixer hold"
+assert_contains "RESULT retains attempt two" "$RUN_OUT" '"attempt":2'
+assert_eq "RESULT names the fix phase" "fix" "$(result_json | jq -r '.phase // empty' 2>/dev/null)"
+assert_eq "the quota-hit defect fixer is not respawned" 1 "$(calls defect-fix)"
+assert_eq "review and defect queue state return with only the prior rung" "defect-attempted,needs-defect-fix,ready-to-review," "$(gh_labels)"
+assert_eq "the hold is durable before ready-to-review is restored" "" "$(hold_order_error)"
+assert_not_contains "defect-retried is absent after the hold" "$(gh_labels)" "defect-retried"
+assert_not_contains "no defect blocker comment is posted" "$(gh_comments)" "🤖 fix-defect blocked"
+assert_contains "the status comment says held" "$(cat "$GH_LOG")" "**held**: provider quota exhausted, resumes after"
+assert_eq "the PR branch is not pushed by the hold path" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+assert_eq "the defect fixer wrote the shared host hold" "claude|false" "$(jq -r '[.vendor,.fallback] | join("|")' "$HOLD_FILE" 2>/dev/null || true)"
+
+scenario 'defect-run: failed hold verification blocks without refunding the retry rung'
+seed_defect_pr
+DEFECT_LABELS="ready-to-review,needs-defect-fix,defect-attempted" GH_FAIL_READ_AFTER_REMOVE=defect-retried \
+  run_defect "$DEFECT_RUN" "$DEFECTQUOTA" --issue 42 --session myapp-epic-42
+assert_rc "the unverified defect-fixer hold blocks" 3 "$RUN_RC"
+assert_contains "RESULT reports the ordinary blocker outcome" "$RUN_OUT" '"blocked":true'
+assert_eq "review, queue, and both spent rungs are restored together" "defect-attempted,defect-retried,needs-defect-fix,ready-to-review," "$(gh_labels)"
+assert_contains "the blocker comment agrees that the retry is spent" "$(gh_comments)" "This was the RETRY (defect-attempted and defect-retried are both on the issue)"
+assert_not_contains "an unverified transition is never reported as held" "$RUN_OUT" '"held":true'
 
 scenario 'defect-run: only trusted evidence for the selected PR head can direct the repair'
 seed_defect_pr
