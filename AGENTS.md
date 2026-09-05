@@ -200,6 +200,11 @@ than made launchable against a main without the code it describes.
 - GitHub artifacts a retry cannot undo — a filed follow-up, the deferred
   record — are created only after the PR exists, and a record already on the
   issue is left alone. Everything before the PR is idempotent under a re-run.
+- Follow-up URLs in defect evidence are correlated by opaque, run-local blocker
+  IDs assigned before ship, never by title, reason or occurrence. Ship copies
+  every known ID into any non-empty deferred ledger; unknown, repeated or
+  missing known IDs refuse before the PR is created. The IDs stay internal and
+  never enter the versioned defect-evidence envelope.
 - Epic-run adds `needs-defect-fix` only after it posts and reads back a
   structured repair envelope authored by the authenticated automation identity
   and bound to the issue, same-repository PR and captured head. Defect-run pins

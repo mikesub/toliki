@@ -40,7 +40,7 @@ import { initStatus, statusPhase, statusNote, statusFinish } from './lib/status.
 import { failureReason } from './lib/proc.mjs'
 import { ensureLabels, editLabels, issueLabels, issueView, comment, openPrs, prView, repositoryView, authenticatedLogin, readBack, waitedFor, terminalBudget, terminalTransition, verifyIssueEngine } from './lib/github.mjs'
 import { git, gitOut, discoverPackages, pkgList, ensureDeps, runVerify, pushRejected, intentToAdd } from './lib/repo.mjs'
-import { matchingDefectEvidence, matchingDefectRepair, renderDefectRepair } from './lib/defect-evidence.mjs'
+import { matchingDefectEvidenceComment, matchingDefectRepair, renderDefectEvidenceSection, renderDefectRepair } from './lib/defect-evidence.mjs'
 import { finalizeFixerIssue, finalizeFixerQuotaHold } from './lib/fixer-finalize.mjs'
 import { recordQuotaHold } from './quota-hold.mjs'
 
@@ -255,7 +255,7 @@ async function prepare(issue) {
       `The authenticated repair brief could not be verified (${e?.message || e}).`),
       'trusted defect-fix evidence could not be read', { removeQueue: true })
   }
-  const evidence = matchingDefectEvidence(comments.comments, {
+  const evidenceRecord = matchingDefectEvidenceComment(comments.comments, {
     actor, issue, prNumber: pr.number, branch: pr.headRefName, head: pr.headRefOid,
   })
   // No evidence for THIS head is the normal untrusted case — except in one
@@ -268,20 +268,21 @@ async function prepare(issue) {
   // stand in for evidence. Nothing else relaxes: fork PRs, stale heads and
   // mutable issue prose were already rejected above and still are.
   let landing = null
-  if (!evidence) {
+  if (!evidenceRecord) {
     const record = matchingDefectRepair(comments.comments, {
       actor, issue, prNumber: pr.number, branch: pr.headRefName, head: pr.headRefOid,
     })
-    const priorEvidence = record && matchingDefectEvidence(comments.comments, {
+    const priorEvidenceRecord = record && matchingDefectEvidenceComment(comments.comments, {
       actor, issue, prNumber: pr.number, branch: pr.headRefName, head: record.pr.priorHead,
     })
-    if (priorEvidence) landing = { record, evidence: priorEvidence }
+    if (priorEvidenceRecord) landing = { record, evidenceRecord: priorEvidenceRecord }
   }
-  if (!evidence && !landing) {
+  if (!evidenceRecord && !landing) {
     return refuseFinal(queueRefusal('🤖 fix-defect refused: missing trusted defect-fix evidence',
       'No canonical evidence comment authored by the authenticated automation identity matches this issue, PR, branch, and head.'),
       'missing trusted defect-fix evidence for the selected PR head', { removeQueue: true })
   }
+  const { evidence, summary: evidenceSummary } = evidenceRecord || landing.evidenceRecord
 
   // Count and verify the attempt before a model can edit anything.
   const attempt = labels.includes('defect-attempted') ? 2 : 1
@@ -294,8 +295,8 @@ async function prepare(issue) {
     return { refused: 'could not record the defect-fixer attempt (label write failed)' }
   }
   const base = {
-    attempt, branch: pr.headRefName, prUrl: pr.url, prNumber: pr.number, prHead: pr.headRefOid, repoName,
-    evidence: evidence || landing.evidence,
+    attempt, branch: pr.headRefName, prUrl: pr.url, prNumber: pr.number,
+    prHead: pr.headRefOid, repoName, evidence, evidenceSummary,
     ...(landing ? { landing: landing.record } : {}),
   }
 
@@ -487,7 +488,7 @@ const buildComment = (prep, fix, verifyDetail, check, amendedHead) => [
   `- attempt: ${prep.attempt}`,
   '',
   'Gate evidence:',
-  JSON.stringify(prep.evidence),
+  renderDefectEvidenceSection(prep.evidence, { summary: prep.evidenceSummary }),
   '',
   `Fix: ${fix.summary || 'not stated'}`,
   ...(Array.isArray(fix.files) && fix.files.length ? [`Files: ${fix.files.join(', ')}`] : []),

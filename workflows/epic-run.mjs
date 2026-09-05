@@ -230,8 +230,13 @@ Do NOT open anything under \`.epics/\` — it contains builder and fixer framing
   // Judgment only: what the PR says, what was left undone and how each item is
   // classed. The pipeline squashes, pushes, opens the PR, files the follow-ups
   // and labels the issue from the JSON — and counts the merge gate from `kind`.
-  ship: (dir, issue, design, triageStatus, tally) =>
+  ship: (dir, issue, design, triageStatus, tally, blockerCatalog) =>
 `Ship phase, autonomous. The work is complete and verified. You decide what the PR says and what was left undone; the pipeline then squashes, pushes, opens the PR, records deferrals on the issue and labels it from what you return. Run NO git or gh commands.
+
+Some unfinished items already have an opaque identity assigned by the orchestrator. Preserve that identity even when you rephrase the item:
+${blockerCatalog || '(none)'}
+
+Every deferred entry has a blockerId. Copy the exact blocker ID above when the entry represents that existing item. Use the literal string "new" only for a genuinely new deferral that has no corresponding item above. Never invent an ID or reuse one for two entries.
 
 Your output is schema-enforced JSON:
 
@@ -241,6 +246,7 @@ Your output is schema-enforced JSON:
 3. commitBody: a short commit body (the why and notable details), or an empty string.
 4. legalMarker: apply THIS project's own legal/compliance review trigger, if it has one: look in its AGENTS.md for a section defining when a change needs legal or policy review. If one exists, judge this diff against the criteria written there — not against any you remember from elsewhere — and when they are met, return the exact marker string that section specifies; the pipeline adds it to the commit body and the PR body. If the project defines no such trigger, or the criteria are not met, omit the field: do NOT invent criteria and do NOT import another project's.
 5. deferred: everything deferred or out of scope, one entry each; empty array when nothing was. Read ${dir}/epic.md's phase log and ${dir}/review.md. Use the FINAL ledger states: every OPEN finding IS deferred work. Only OPEN independently confirmed defects are kind "defect"; an unsupported repair, rejection or deferral is uncertainty (kind "other"), never a proven bug. Independently fixed or rejected findings are resolved and are NOT deferred work. Never use the coder's claimed action as the final verdict. Also collect: deferred review findings (with why), scope cut, edge cases intentionally skipped, clarifying answers that narrowed scope, uncovered test surfaces. For each entry:
+   - blockerId: the existing opaque ID listed above, or the literal string "new" for a genuinely new item.
    - title and why: one line each.
    - kind, judged honestly, because it drives a MERGE GATE:
      defect — a correctness, security, data-loss, or user-visible breakage bug that still exists on main AFTER this merges, whether this diff introduced it or merely exposed it. One defect holds the PR open for a human; none lets it merge unattended. A missing gate, a scope cut, a nice-to-have or a refactor idea is NOT a defect and must not inflate the count, and a real defect must not be relabelled to keep the merge: an independent check re-judges every item you do not call a defect, and its verdict wins.
@@ -439,8 +445,9 @@ const SHIP_SCHEMA = {
       description: 'everything deferred or out of scope; empty when nothing was',
       items: {
         type: 'object', additionalProperties: false,
-        required: ['title', 'why', 'kind', 'file'],
+        required: ['blockerId', 'title', 'why', 'kind', 'file'],
         properties: {
+          blockerId: { type: 'string', description: 'opaque existing blocker ID from the prompt, or the literal string new' },
           title: { type: 'string' },
           why: { type: 'string' },
           kind: { enum: ['defect', 'missing-gate', 'scope-cut', 'other'], description: 'defect = a bug still on main after this merges (holds the merge); see the prompt' },
@@ -455,6 +462,85 @@ const SHIP_SCHEMA = {
 const SUMMARY_SCHEMA = {
   type: 'object', additionalProperties: false, required: ['summary'],
   properties: { summary: { type: 'string', description: 'the run summary, markdown' } },
+}
+
+// A blocker can cross several independent model records before ship turns one
+// of them into a follow-up issue. Text is presentation and can be duplicated or
+// rephrased, so it is never an identity key. These IDs live only for this
+// process: WeakMap keeps them out of the versioned defect-evidence envelope,
+// while the reverse map validates the IDs ship copies from its prompt.
+const blockerIds = new WeakMap()
+const blockersById = new Map()
+let blockerIdSerial = 0
+const objectLike = value => value !== null && typeof value === 'object'
+
+function blockerIdFor(item) {
+  if (!objectLike(item)) return null
+  return blockerIds.get(item) || blockerIdFor(item.finding)
+}
+
+function ensureBlockerId(item) {
+  if (!objectLike(item)) throw new Error('cannot assign a blocker ID to a non-object item')
+  const existing = blockerIdFor(item)
+  if (existing) {
+    blockerIds.set(item, existing)
+    return existing
+  }
+  const identity = objectLike(item.finding) ? item.finding : item
+  const id = `blocker-${++blockerIdSerial}`
+  blockerIds.set(identity, id)
+  blockerIds.set(item, id)
+  blockersById.set(id, identity)
+  return id
+}
+
+function blockerCatalog(items) {
+  const seen = new Set()
+  const entries = []
+  for (const item of items) {
+    if (!objectLike(item)) continue
+    const blockerId = ensureBlockerId(item)
+    if (seen.has(blockerId)) continue
+    seen.add(blockerId)
+    entries.push({ blockerId, item })
+  }
+  const text = entries.map(({ blockerId, item }) => {
+    const source = objectLike(item.finding) ? item.finding : item
+    const title = String(source.title || item.title || '').replace(/\s+/g, ' ').trim()
+    const location = String(source.location || item.location || '').replace(/\s+/g, ' ').trim()
+    const reason = String(item.why || item.verdict?.reasoning || source.problem || source.why || '').replace(/\s+/g, ' ').trim()
+    return `- ${blockerId}: ${title}${location ? ` [${location}]` : ''}${reason ? ` — ${reason}` : ''}`
+  }).join('\n') || '(none)'
+  return { text, ids: new Set(entries.map(entry => entry.blockerId)) }
+}
+
+function registerShipDeferrals(decision, expectedIds) {
+  const used = new Set()
+  const deferred = Array.isArray(decision.deferred) ? decision.deferred : []
+  decision.deferred = deferred.map(raw => {
+    const requested = String(raw?.blockerId || '').trim()
+    if (!requested) throw new Error('Ship returned a deferred item without a blocker ID')
+    if (requested !== 'new' && !blockersById.has(requested)) {
+      throw new Error(`Ship returned unknown blocker ID ${requested}`)
+    }
+    if (requested !== 'new' && used.has(requested)) {
+      throw new Error(`Ship reused blocker ID ${requested} for more than one deferred item`)
+    }
+    const { blockerId: _blockerId, ...item } = raw
+    const id = requested === 'new' ? ensureBlockerId(item) : requested
+    blockerIds.set(item, id)
+    used.add(id)
+    return item
+  })
+  const missing = [...expectedIds].filter(id => !used.has(id))
+  // An empty ship ledger creates no follow-up link and the deterministic
+  // merge blockers below still hold the PR. Once ship returns any item, its
+  // ledger must cover every known blocker so a known item cannot masquerade
+  // as "new" or disappear beside an unrelated filed follow-up.
+  if (deferred.length && missing.length) {
+    throw new Error(`Ship omitted known blocker ID${missing.length === 1 ? '' : 's'} ${missing.join(', ')}`)
+  }
+  return decision
 }
 
 // ───────────────────────── Args & mode ─────────────────────────
@@ -694,31 +780,34 @@ async function shipTransport({ issue, slug, dir, decision }) {
   // than burning a run on it. Both are best effort — the PR is already open by here, and a link or a
   // label that failed to land is a queueing loss, not a reason to fail a finished run.
   let filed = 0
+  const followUps = new Map()
   if (deferred.length) {
     if (await hasDeferredRecord(issue)) {
       log('Ship: a deferred record from an earlier attempt is already on the issue — left as it is')
     } else {
       const rank = { defect: 0, 'missing-gate': 1, 'scope-cut': 2 }
       const eligible = deferred.filter(d => d.file === true && d.kind in rank).sort((a, b) => rank[a.kind] - rank[b.kind])
-      const links = new Map()
-      const blockerId = eligible.length ? await issueId(issue) : null
-      if (eligible.length && !blockerId) log(`Ship: #${issue}'s id could not be read — follow-ups are filed unqueued, for a human to order and label`)
-      if (blockerId) await ensureLabels(['ready'])
+      const issueNodeId = eligible.length ? await issueId(issue) : null
+      if (eligible.length && !issueNodeId) log(`Ship: #${issue}'s id could not be read — follow-ups are filed unqueued, for a human to order and label`)
+      if (issueNodeId) await ensureLabels(['ready'])
       for (const d of eligible.slice(0, 3)) {
         const url = await issueCreate({ title: d.issueTitle || d.title, body: `${String(d.issueBody || d.why).trim()}\n\nFollow-up to #${issue}` })
-        links.set(d, url)
+        followUps.set(blockerIdFor(d), url)
         filed++
         // Order first, queue second: a follow-up that got `ready` without its dependency would be
         // launchable immediately, against a main that does not yet carry the code it describes.
         const number = Number(String(url).trim().split('/').pop())
-        if (!Number.isInteger(number) || !blockerId) continue
-        const dep = await addBlockedBy(number, blockerId)
+        if (!Number.isInteger(number) || !issueNodeId) continue
+        const dep = await addBlockedBy(number, issueNodeId)
         if (!dep.ok) { log(`Ship: could not mark ${url} blocked_by #${issue} (${failureReason(dep)}) — left unqueued`); continue }
         const queued = await editLabels(number, { add: ['ready'] })
         if (!queued.ok) log(`Ship: could not queue ${url} (${failureReason(queued)}) — it is ordered but a human labels it`)
       }
       const lines = ['🤖 deferred / not done', '']
-      for (const d of deferred) lines.push(`- ${d.title} (${d.kind}): ${d.why}${d.checkNote ? ` — ${d.checkNote}` : ''}${links.has(d) ? ` — filed as ${links.get(d)}` : ''}`)
+      for (const d of deferred) {
+        const followUp = followUps.get(blockerIdFor(d))
+        lines.push(`- ${d.title} (${d.kind}): ${d.why}${d.checkNote ? ` — ${d.checkNote}` : ''}${followUp ? ` — filed as ${followUp}` : ''}`)
+      }
       if (eligible.length > filed) lines.push('', `${eligible.length} items qualified for a follow-up issue and ${filed} were filed (the cap is 3): needing more means this issue was under-scoped.`)
       await comment(issue, lines.join('\n'))
     }
@@ -731,7 +820,7 @@ async function shipTransport({ issue, slug, dir, decision }) {
   const flip = await editLabels(issue, { add: ['ready-to-review'], remove: ['in-progress'] }, spend())
   if (!flip.ok) log(`Ship: label flip to ready-to-review failed (${failureReason(flip)}) — the PR is open; a human finishes the labels`)
   updateEpicMd(dir, { phase: 'ship → done', log: `ship: PR opened ${prUrl}; ${deferred.length} deferred item(s), ${filed} filed, ${deferredDefects} defect(s)` })
-  return { prUrl, prNumber, prHead, deferredDefects, deferredCount: deferred.length, filed }
+  return { prUrl, prNumber, prHead, deferredDefects, deferredCount: deferred.length, filed, followUps }
 }
 
 // Transport, not judgment: the merge gate has already been computed from structured counts, and this
@@ -1353,10 +1442,18 @@ try {
     }
   }
 
-  const decision = await agent(PROMPTS.ship(dir, issue, design, triageStatus, reviewTally),
+  const knownBlockers = blockerCatalog([
+    ...fixBlockers.flatMap(blocker => Array.isArray(blocker.items) ? blocker.items : []),
+  ])
+  const decision = await agent(PROMPTS.ship(dir, issue, design, triageStatus, reviewTally, knownBlockers.text),
     { label: 'ship:pr', phase: 'Ship', step: 'code', schema: SHIP_SCHEMA },
   )
   if (!decision) return await fail('ship', 'Ship produced no PR description — nothing was pushed; the change is on epic/' + slug + ' (checkpoint commits + working tree).')
+  try {
+    registerShipDeferrals(decision, knownBlockers.ids)
+  } catch (e) {
+    return await fail('ship', `${e && e.message || e} — refusing to file or link follow-ups from ambiguous identity.`)
+  }
 
   // ───────────────────────── Deferral check ─────────────────────────
   // Ship's `kind` per deferral feeds the merge gate, and ship is the builder side. Every item it did
@@ -1450,7 +1547,9 @@ try {
           requirement: { title: requirementTitle, body: requirementBody },
           blockers: mergeBlockers.map(({ source, reason, items }) => ({ source, reason, items })),
         }
-        await comment(issue, renderDefectEvidence(evidence), spend())
+        await comment(issue, renderDefectEvidence(evidence, {
+          followUpFor: item => shipped.followUps.get(blockerIdFor(item)),
+        }), spend())
         // Read back until the comment GitHub accepted is visible on the issue, or
         // the window ends: a fresh comment can lag its own write by seconds, and a
         // single immediate read leaves a repairable PR with a human for nothing.
