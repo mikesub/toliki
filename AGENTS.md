@@ -239,8 +239,14 @@ than made launchable against a main without the code it describes.
   landing label GitHub already applied leaves a blocked run in
   `bin/merge-worker.sh`'s queue, where the failure path becomes a merge. A
   fixer's blocker also restores the queue label its own landing swap stripped,
-  so an unverified landing costs a retry, not the issue. Gated by
-  `tests/epic-run.test.sh`.
+  so an unverified landing costs a retry, not the issue. The verdict on a
+  terminal write is the readback, never the write's exit code: GitHub can apply
+  the label while the client still waits, so the readback runs whatever the
+  write returned, and a run reports only the state it read back. `ready-to-merge`
+  therefore rests on an issue only under a RESULT that claims it — an
+  unconfirmed promotion is taken back off and the demotion proved, and one that
+  can be neither confirmed nor proved undone blocks rather than resting on a
+  label it cannot account for. Gated by `tests/epic-run.test.sh`.
 - Terminal is the label, and a terminal label must settle for
   `TERMINAL_SETTLE_MINUTES` before a session is killed. Dispatch synchronously
   shields a fixer launch by swapping its resting terminal label to
@@ -258,7 +264,9 @@ than made launchable against a main without the code it describes.
   on what is LEFT of that window rather than on a second one. Reap floors the
   window (`MIN_TERMINAL_SETTLE_MINUTES`) so the two cannot be configured into a
   race. Never add a GitHub call — or a local git cleanup, which has a timeout of
-  its own — on the default timeout from a terminal label write onward.
+  its own — on the default timeout from a terminal label write onward. No model
+  step runs inside that window: `agent()` refuses a spawn once it is open, so
+  ship's deferral check runs before the `ready-to-review` write.
 - Dispatch launches but never claims. Two ticks racing on one issue is safe
   because the ref push decides.
 - The CLI binary moves only on an idle host, under dispatch's lock. Gated by
