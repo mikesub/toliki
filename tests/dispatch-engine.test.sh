@@ -225,7 +225,7 @@ printf 'ready' > "$TMP/labels/1"
 printf '%s\n' '{"holdUntil":"2099-01-01T00:00:00.000Z","vendor":"claude","reason":"session limit","fallback":false}' > "$TMP/provider-hold.json"
 run_dispatch
 assert_rc "an active hold is a clean tick" 0 "$RUN_RC"
-assert_eq "the required hold line is logged exactly once" 1 "$(printf '%s\n' "$RUN_OUT" | grep -c 'provider quota exhausted — holding launches until 2099-01-01T00:00:00.000Z' || true)"
+assert_eq "the required hold line is logged exactly once" 1 "$(printf '%s\n' "$RUN_OUT" | grep -c 'provider quota exhausted — holding launches until 2099-01-01 01:00:00 CET' || true)"
 assert_not_contains "a parsed reset has no fallback marker" "$RUN_OUT" "(fallback)"
 assert_eq "capacity is not even probed" "" "$(cat "$TMP/launch.log")"
 assert_eq "GitHub is untouched while held" "" "$(cat "$TMP/gh.log")"
@@ -238,7 +238,7 @@ printf 'ready' > "$TMP/labels/2"
 printf '%s\n' '{"holdUntil":"2099-01-01T00:00:00.000Z","vendor":"claude","reason":"limit without reset","fallback":true}' > "$TMP/provider-hold.json"
 run_dispatch --dry-run
 assert_rc "dry-run under a hold exits cleanly" 0 "$RUN_RC"
-assert_eq "dry-run logs one hold line" 1 "$(printf '%s\n' "$RUN_OUT" | grep -c 'provider quota exhausted — holding launches until 2099-01-01T00:00:00.000Z (fallback)' || true)"
+assert_eq "dry-run logs one hold line" 1 "$(printf '%s\n' "$RUN_OUT" | grep -c 'provider quota exhausted — holding launches until 2099-01-01 01:00:00 CET (fallback)' || true)"
 assert_eq "dry-run does not walk GitHub while held" "" "$(cat "$TMP/gh.log")"
 assert_eq "dry-run does not call launch, including capacity" "" "$(cat "$TMP/launch.log")"
 
