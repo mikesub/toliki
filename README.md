@@ -50,7 +50,11 @@ only where a judgment is needed. Claude Code and Codex are both supported.
    and reads back one automation-authored repair envelope bound to the PR head;
    the fixer accepts only that envelope, verifies and adversarially checks its
    exact delta, then returns the PR to that same merge queue. Mixed, missing or
-   stale evidence stays with a human.
+   stale evidence stays with a human. Every readback that confirms one of the
+   run's own writes — the PR head after a force push, the labels after a swap —
+   is retried over a bounded window rather than read once, and an attempt that
+   pushed a complete repair it could not label leaves a record that lets the
+   next attempt redo only the landing.
 5. **`bin/reap.sh`** (cron) — frees what finished runs leave behind (idle
    sessions, including settled dead quota-held sessions at `ready`, and stale
    claim refs), so the slot budget keeps rotating.

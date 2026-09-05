@@ -10,6 +10,23 @@
 // the issue returns to ready-to-merge for the merge worker's rebase and check
 // re-run. Everything else rests at ready-to-review for a human.
 //
+// Every readback that verifies one of this run's own writes — the PR head after
+// the force push, the labels after the landing swap — is bounded rather than
+// single-shot (readBack in lib/github.mjs): GitHub shows a force push seconds
+// after it lands, and one immediate read reported two complete repairs as
+// unverified landings. Retries change timing, never verdicts.
+//
+// Landing-only retry: an attempt that pushed a verified and checked repair and
+// then could not confirm the landing — the head readback or the label swap —
+// leaves the evidence envelope bound to the PRE-push head, so a relaunch finds
+// no matching evidence for the head the PR now carries. What is unfinished
+// there is the LANDING, not the repair: re-running the fixer would send a
+// second repair at defects already repaired. So the audit comment carries a
+// landing record bound to the amended head (see lib/defect-evidence.mjs) and is
+// posted as soon as the push is a fact, and a relaunch that finds one whose
+// priorHead has a matching evidence envelope skips Fix, Verify and Check and
+// redoes only the landing swap. The trust model is otherwise unchanged.
+//
 // Attempt ladder in labels: defect-attempted, then defect-retried. The labels
 // are never reset by automation, so this repair session cannot become a loop.
 // A hard provider-quota death cleans the unpushed edit and records the
@@ -21,9 +38,9 @@ import { agent, phase, log, initRuntime, onPhase, onLog, takeAgentFailure, withA
 import { parseArgs, finish, UsageError, EXIT } from './lib/cli.mjs'
 import { initStatus, statusPhase, statusNote, statusFinish } from './lib/status.mjs'
 import { failureReason } from './lib/proc.mjs'
-import { ensureLabels, editLabels, issueLabels, issueView, comment, openPrs, prView, repositoryView, authenticatedLogin, terminalBudget, terminalTransition } from './lib/github.mjs'
+import { ensureLabels, editLabels, issueLabels, issueView, comment, openPrs, prView, repositoryView, authenticatedLogin, readBack, waitedFor, terminalBudget, terminalTransition } from './lib/github.mjs'
 import { git, gitOut, discoverPackages, pkgList, ensureDeps, runVerify, pushRejected, intentToAdd } from './lib/repo.mjs'
-import { matchingDefectEvidence } from './lib/defect-evidence.mjs'
+import { matchingDefectEvidence, matchingDefectRepair, renderDefectRepair } from './lib/defect-evidence.mjs'
 import { finalizeFixerIssue, finalizeFixerQuotaHold } from './lib/fixer-finalize.mjs'
 import { recordQuotaHold } from './quota-hold.mjs'
 
@@ -237,7 +254,26 @@ async function prepare(issue) {
   const evidence = matchingDefectEvidence(comments.comments, {
     actor, issue, prNumber: pr.number, branch: pr.headRefName, head: pr.headRefOid,
   })
+  // No evidence for THIS head is the normal untrusted case — except in one
+  // shape: an earlier attempt already pushed the repair for this head and could
+  // not verify its landing swap, which leaves the envelope bound to the head
+  // before that push. The landing record it wrote says so, and it is trusted on
+  // exactly the terms the envelope is: authored by the current credential and
+  // bound to this issue, PR, branch and head. The envelope it names as the head
+  // it repaired FROM has to be a trusted one too, so a record alone can never
+  // stand in for evidence. Nothing else relaxes: fork PRs, stale heads and
+  // mutable issue prose were already rejected above and still are.
+  let landing = null
   if (!evidence) {
+    const record = matchingDefectRepair(comments.comments, {
+      actor, issue, prNumber: pr.number, branch: pr.headRefName, head: pr.headRefOid,
+    })
+    const priorEvidence = record && matchingDefectEvidence(comments.comments, {
+      actor, issue, prNumber: pr.number, branch: pr.headRefName, head: record.pr.priorHead,
+    })
+    if (priorEvidence) landing = { record, evidence: priorEvidence }
+  }
+  if (!evidence && !landing) {
     return refuseFinal(queueRefusal('🤖 fix-defect refused: missing trusted defect-fix evidence',
       'No canonical evidence comment authored by the authenticated automation identity matches this issue, PR, branch, and head.'),
       'missing trusted defect-fix evidence for the selected PR head', { removeQueue: true })
@@ -253,7 +289,11 @@ async function prepare(issue) {
     await settle(issue, '🤖 fix-defect blocked\n- phase: prepare\n- reason: could not record the defect-fixer attempt (label write failed)')
     return { refused: 'could not record the defect-fixer attempt (label write failed)' }
   }
-  const base = { attempt, branch: pr.headRefName, prUrl: pr.url, prNumber: pr.number, prHead: pr.headRefOid, repoName, evidence }
+  const base = {
+    attempt, branch: pr.headRefName, prUrl: pr.url, prNumber: pr.number, prHead: pr.headRefOid, repoName,
+    evidence: evidence || landing.evidence,
+    ...(landing ? { landing: landing.record } : {}),
+  }
 
   await git(['rebase', '--abort'])
   await gitOut(['fetch', 'origin', '--prune'], 'git fetch origin --prune')
@@ -267,10 +307,43 @@ async function prepare(issue) {
     return { ...base, gitBlocked: `the PR branch holds ${Number.isNaN(above) ? 'an unknown number of' : above} commit(s) above origin/main — an epic branch holds exactly one, so this is not a shape the defect fixer can amend` }
   }
 
+  // Landing only: the tree is already the repaired one, and nothing here will
+  // edit, verify or check it. The branch shape above still had to hold — this
+  // run relabels a PR, so the PR must still be the one the record describes.
+  if (base.landing) return base
+
   const packages = discoverPackages('.')
   if (!packages.length) return { ...base, gitBlocked: 'layout discovery found no package declaring an `npm run verify` script — refusing to ship a fix nothing would verify' }
   const depLines = await ensureDeps(packages, { pairs: [['origin/main', 'HEAD']] })
   return { ...base, packages, depLines }
+}
+
+// The landing half: the swap back into the unattended merge queue and the
+// readback that verifies it. Separate from the push half because a relaunch
+// after a pushed-but-unverified landing has only this left to do. The caller
+// posts its own audit comment first — before the swap, so the record it carries
+// is durable no matter how the landing then goes.
+async function land(issue) {
+  // From here the run is inside reap's settle window: the swap starts the clock
+  // the moment GitHub processes it, so the write and the readback after it share
+  // one budget (see terminalBudget) and the run still has a RESULT line to write.
+  // A readback that cannot confirm the landing drops into the blocker path, which
+  // transitions the labels again — inside THIS window, not a second one.
+  const budget = terminalBudget()
+  const absent = ['ready-to-review', 'in-progress', 'failed', 'needs-defect-fix']
+  await ensureLabels(['ready-to-merge'], { budget })
+  const flip = await editLabels(issue, { add: ['ready-to-merge'], remove: absent }, { budget })
+  let seen
+  try {
+    seen = await readBack(
+      () => issueLabels(issue, { budget }),
+      ls => ls.includes('ready-to-merge') && absent.every(l => !ls.includes(l)),
+      { budget })
+  } catch (e) {
+    return { labelled: false, note: e && e.message || String(e) }
+  }
+  const labels = seen.observed
+  return { labelled: seen.matched, note: seen.matched ? '' : (flip.ok ? `observed labels: ${labels.join(', ')}` : failureReason(flip)) }
 }
 
 async function ship(issue, prep, body) {
@@ -283,34 +356,31 @@ async function ship(issue, prep, body) {
 
   const push = await git(['push', `--force-with-lease=refs/heads/${prep.branch}:${prep.prHead}`, 'origin', `HEAD:refs/heads/${prep.branch}`])
   if (!push.ok) return { pushed: false, labelled: false, note: pushRejected(push) ? `rejected — ${prep.branch} moved on origin under this run` : failureReason(push) }
-  let observedPr
+  // The audit comment goes on the issue as soon as the push is a fact, before
+  // anything this run still has to verify. It carries the landing record, and
+  // the record's whole purpose is to survive a landing this run cannot finish:
+  // written after the head readback it would be missing in exactly the case it
+  // exists for, and the next attempt would repair defects already repaired.
+  await comment(issue, body(amendedHead))
+  // GitHub shows a force push seconds after it lands, so the head is re-read
+  // until it equals the amended commit or the window ends. No terminal label has
+  // been written yet, so this is on the default budget and outside reap's settle
+  // window. A read that errors still fails immediately: it carries no verdict.
+  const matches = observed => observed.number === prep.prNumber && observed.headRefName === prep.branch &&
+    observed.headRefOid === amendedHead && observed.isCrossRepository === false &&
+    prRepositoryName(observed).toLowerCase() === prep.repoName.toLowerCase()
+  let seen
   try {
-    observedPr = await prView(prep.prNumber, 'number,headRefName,headRefOid,isCrossRepository,headRepository,headRepositoryOwner')
+    seen = await readBack(
+      () => prView(prep.prNumber, 'number,headRefName,headRefOid,isCrossRepository,headRepository,headRepositoryOwner'),
+      matches)
   } catch (e) {
     return { pushed: true, labelled: false, note: `the selected PR could not be read after push (${e?.message || e})` }
   }
-  if (observedPr.number !== prep.prNumber || observedPr.headRefName !== prep.branch || observedPr.headRefOid !== amendedHead ||
-      observedPr.isCrossRepository !== false || prRepositoryName(observedPr).toLowerCase() !== prep.repoName.toLowerCase()) {
-    return { pushed: true, labelled: false, note: `selected PR head did not advance to amended HEAD ${amendedHead} (observed ${observedPr.headRefOid || 'missing'})` }
+  if (!seen.matched) {
+    return { pushed: true, labelled: false, note: `selected PR head did not advance to amended HEAD ${amendedHead} (observed ${seen.observed.headRefOid || 'missing'} after ${seen.reads} reads over ${waitedFor(seen.waitedMs)})` }
   }
-  await comment(issue, body)
-  // From here the run is inside reap's settle window: the swap starts the clock
-  // the moment GitHub processes it, so the write and the readback after it share
-  // one budget (see terminalBudget) and the run still has a RESULT line to write.
-  // A readback that cannot confirm the landing drops into the blocker path, which
-  // transitions the labels again — inside THIS window, not a second one.
-  const budget = terminalBudget()
-  await ensureLabels(['ready-to-merge'], { budget })
-  const flip = await editLabels(issue, { add: ['ready-to-merge'], remove: ['ready-to-review', 'in-progress', 'failed', 'needs-defect-fix'] }, { budget })
-  let labels
-  try {
-    labels = await issueLabels(issue, { budget })
-  } catch (e) {
-    return { pushed: true, labelled: false, note: e && e.message || String(e) }
-  }
-  const absent = ['ready-to-review', 'in-progress', 'failed', 'needs-defect-fix']
-  const labelled = labels.includes('ready-to-merge') && absent.every(l => !labels.includes(l))
-  return { pushed: true, labelled, note: labelled ? '' : (flip.ok ? `observed labels: ${labels.join(', ')}` : failureReason(flip)) }
+  return { pushed: true, amendedHead, ...(await land(issue)) }
 }
 
 const attemptRung = attempt => attempt === 2 ? 'defect-retried' : 'defect-attempted'
@@ -404,7 +474,10 @@ async function fail(failedPhase, reason) {
   return { blocked: true, issue, phase: failedPhase, reason, prUrl: prUrl || undefined, attempt }
 }
 
-const buildComment = (prep, fix, verifyDetail, check) => [
+// Posted BEFORE the landing swap, so the landing record it carries is durable
+// even when the swap that follows cannot be verified — which is the whole case
+// the record exists for.
+const buildComment = (prep, fix, verifyDetail, check, amendedHead) => [
   '🤖 fix-defect repaired ship-gate defects',
   `- pr: ${prep.prUrl}`,
   `- attempt: ${prep.attempt}`,
@@ -419,7 +492,29 @@ const buildComment = (prep, fix, verifyDetail, check) => [
   '',
   `verify: ${verifyDetail}`,
   '',
-  'The branch is amended and force-pushed; the issue is back to ready-to-merge. The merge worker rebases it onto current main and re-runs the real checks before anything lands.',
+  'The branch is amended and force-pushed. The issue goes back to ready-to-merge next, and the merge worker rebases it onto current main and re-runs the real checks before anything lands.',
+  '',
+  renderDefectRepair({
+    version: 1,
+    issue,
+    pr: { number: prep.prNumber, url: prep.prUrl, branch: prep.branch, head: amendedHead, priorHead: prep.prHead },
+    attempt: prep.attempt,
+    verify: verifyDetail,
+    checkConfidence: check.confidence,
+  }),
+].join('\n')
+
+// The landing-only relaunch's own record. It claims nothing about code: the
+// code claim belongs to the attempt that made it, and is named here as that
+// attempt's, not as this one's.
+const buildLandingComment = prep => [
+  '🤖 fix-defect finished an unverified landing',
+  `- pr: ${prep.prUrl}`,
+  `- attempt: ${prep.attempt}`,
+  '',
+  `Attempt ${prep.landing.attempt || 1} repaired the gate-named defects on this exact head (${prep.prHead}), verified them (${prep.landing.verify}) and had them survive a blind adversarial check (confidence ${prep.landing.checkConfidence}/100), pushed the amended commit, and then could not verify the label swap. The repair is on origin already.`,
+  '',
+  'Only the landing was redone here: no file was touched, no repair was re-run, and no second repair was sent at defects that are already repaired. The issue goes back to ready-to-merge next, and the merge worker rebases it onto current main and re-runs the real checks before anything lands.',
 ].join('\n')
 
 async function main() {
@@ -433,6 +528,31 @@ try {
   attempt = prep.attempt
   prUrl = prep.prUrl || null
   if (prep.gitBlocked) return await fail('prepare', prep.gitBlocked)
+
+  if (prep.landing) {
+    // Landing only. The repair on this head is already verified, checked and
+    // pushed; a second repair round here would edit defects that no longer
+    // exist. Nothing but the swap and its readback runs.
+    log(`Prepare: attempt ${attempt} on PR ${prep.prUrl}. A durable landing record binds this head to an already verified and checked repair — redoing the landing only, no repair round.`)
+    currentPhase = 'ship'
+    phase('Ship')
+    await comment(issue, buildLandingComment(prep))
+    const landed = await land(issue)
+    if (!landed.labelled) return await fail('ship', `the earlier attempt's repair is already pushed, but the ready-to-merge label swap could not be verified${landed.note ? ` (${landed.note})` : ''} — a human finishes the labels; the PR itself is fixed.`)
+    log(`Ship: landing redone and labelled ready-to-merge — ${prep.prUrl}`)
+    return {
+      issue,
+      prUrl: prep.prUrl,
+      branch: prep.branch,
+      attempt,
+      landingOnly: true,
+      verify: prep.landing.verify,
+      checkConfidence: prep.landing.checkConfidence,
+      note: `the repair on ${prep.prHead} was already verified and checked by attempt ${prep.landing.attempt || 1}; only the landing was redone`,
+      readyToMerge: true,
+    }
+  }
+
   log(`Prepare: attempt ${attempt} on PR ${prep.prUrl}. Durable gate evidence found; packages: ${pkgList(prep.packages)}. ${prep.depLines.join('; ')}`)
 
   currentPhase = 'fix'
@@ -466,7 +586,7 @@ try {
 
   currentPhase = 'ship'
   phase('Ship')
-  const shipped = await ship(issue, prep, buildComment(prep, fix, verified.detail, check))
+  const shipped = await ship(issue, prep, amendedHead => buildComment(prep, fix, verified.detail, check, amendedHead))
   if (!shipped.pushed) return await fail('ship', `the force-with-lease push did not land${shipped.note ? ` (${shipped.note})` : ''} — the branch on origin is untouched.`)
   if (!shipped.labelled) return await fail('ship', `pushed, but the ready-to-merge label swap could not be verified${shipped.note ? ` (${shipped.note})` : ''} — a human finishes the labels; the PR itself is fixed.`)
   log(`Ship: pushed and labelled ready-to-merge — ${prep.prUrl}`)

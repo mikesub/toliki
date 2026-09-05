@@ -63,6 +63,56 @@ export const terminalTimeout = () => (openWindow ? { timeoutMs: budgeted(openWin
 export const gh = (args, { budget, ...opts } = {}) =>
   sh('gh', args, { timeoutMs: budget ? budgeted(budget) : GH_TIMEOUT_MS, ...opts })
 
+// ───────────────────────── bounded readbacks ─────────────────────────
+// A readback verifies a write the run itself just made, and GitHub's own state
+// lags its writes: a force-pushed head, a label edit and a fresh comment all
+// take seconds to become visible to a read. One immediate read then reports a
+// write that landed as a write that did not — toliki #13 and #16 both pushed a
+// complete, verified repair and blocked on the PR head not having advanced yet.
+//
+// So a readback reads, and on a MISMATCH waits and reads again, over a window
+// well under a minute, stopping at the first read that matches. Retries change
+// timing, never verdicts: a readback that never matches still fails, with the
+// wording it always had. A read that ERRORS is not retried — a query that
+// errored carries no verdict, so it propagates to the caller's fail-closed
+// branch exactly as before.
+//
+// The waits are charged to the surrounding step's budget when it has one (the
+// terminal window), so a readback after a terminal label write still finishes
+// inside the reporting budget and never extends reap's settle window. The
+// interval is overridable so a test can set it to milliseconds; the defaults
+// are the contract.
+export const READBACK_INTERVAL_MS = Number(process.env.EPIC_READBACK_INTERVAL_MS) || 5 * 1000
+export const READBACK_READS = Number(process.env.EPIC_READBACK_READS) || 6
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
+
+// How long a readback waited, for the note a refusal writes.
+export const waitedFor = ms => (ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`)
+
+// readBack(read, matches, { reads, intervalMs, budget })
+//   -> { matched, observed, reads, waitedMs }
+// `observed` is the LAST observation either way, so a caller can name what it
+// saw. The first read is immediate: a match costs one call and no delay.
+export async function readBack(read, matches, { reads = READBACK_READS, intervalMs = READBACK_INTERVAL_MS, budget } = {}) {
+  const started = Date.now()
+  // The whole readback — its waits included — spends one step's share of the
+  // window, and the window's own deadline still caps every read underneath it.
+  const waitCap = budget ? budgeted(budget) : Infinity
+  let observed
+  let n = 0
+  while (true) {
+    observed = await read()
+    n++
+    if (matches(observed)) return { matched: true, observed, reads: n, waitedMs: Date.now() - started }
+    if (n >= reads) break
+    const wait = Math.min(intervalMs, waitCap - (Date.now() - started), budget ? budget.deadline - Date.now() : Infinity)
+    if (!(wait > 0)) break
+    await sleep(wait)
+  }
+  return { matched: false, observed, reads: n, waitedMs: Date.now() - started }
+}
+
 export async function ghJson(args, what, opts) {
   const out = must(await gh(args, opts), what)
   try {

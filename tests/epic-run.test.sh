@@ -224,7 +224,7 @@ if [[ -f "$state/terminal-stall-active" && -n "${GH_TERMINAL_STALL_SECONDS:-}" ]
     "label create"|"issue edit"|"issue view"|"issue comment"|"api --method") sleep "$GH_TERMINAL_STALL_SECONDS" ;;
   esac
 fi
-labels_json() { jq -R -s -c 'split("\n") | map(select(length > 0)) | map({name: .})' "$labels"; }
+labels_json() { jq -R -s -c 'split("\n") | map(select(length > 0)) | map({name: .})' "${1:-$labels}"; }
 # Labels are per issue: the run's own issue keeps $labels, and any other issue
 # ship touches (a follow-up it files and queues) gets its own file. One shared
 # file would let a follow-up's `ready` read back as the epic issue's own label.
@@ -247,19 +247,26 @@ case "${1:-} ${2:-}" in
     # The deferred-record probe reads comments; they are stored as blocks
     # separated by a lone --- line, exactly as the comment case writes them.
     if [[ "$*" == *comments* ]]; then
-      if [[ "${GH_EVIDENCE_READ_FAIL:-}" == "1" ]] && grep -q '^🤖 defect-fix evidence$' "$state/comments" 2>/dev/null; then
-        printf 'HTTP 502\n' >&2
-        exit 1
+      hide=0
+      if grep -q '^🤖 defect-fix evidence$' "$state/comments" 2>/dev/null; then
+        [[ "${GH_EVIDENCE_READ_FAIL:-}" != "1" ]] || { printf 'HTTP 502\n' >&2; exit 1; }
+        # A comment GitHub has accepted but not yet made visible to a read.
+        # Counted only over reads that could see the evidence, so an earlier
+        # deferred-record probe does not spend the stale window.
+        n="$(cat "$state/evidence-reads" 2>/dev/null || echo 0)"; n=$((n + 1)); printf '%s' "$n" > "$state/evidence-reads"
+        if [[ -n "${GH_EVIDENCE_STALE_READS:-}" && "$n" -le "${GH_EVIDENCE_STALE_READS}" ]]; then hide=1; fi
       fi
       if [[ -s "$state/comments" ]]; then
         authors="$(jq -cn --arg raw "${GH_SEED_COMMENT_AUTHORS:-}" '$raw | split(",") | map(select(length > 0))')"
-        jq -R -s --argjson authors "$authors" --arg login "${GH_AUTH_LOGIN:-toliki-bot}" \
-          'split("\n---\n") | map(select(length > 0)) | to_entries | map({body: .value, author: {login: ($authors[.key] // $login)}}) | {comments: .}' < "$state/comments"
+        jq -R -s --argjson authors "$authors" --argjson hide "$hide" --arg login "${GH_AUTH_LOGIN:-toliki-bot}" \
+          'split("\n---\n") | map(select(length > 0)) | to_entries | map({body: .value, author: {login: ($authors[.key] // $login)}})
+           | map(select($hide == 0 or (.body | startswith("🤖 defect-fix evidence") | not))) | {comments: .}' < "$state/comments"
       else
         printf '{"comments":[]}\n'
       fi
       exit 0
     fi
+    src="$labels"
     if [[ "$*" == *"--json labels"* ]]; then
       n="$(cat "$state/label-reads" 2>/dev/null || echo 0)"; n=$((n + 1)); printf '%s' "$n" > "$state/label-reads"
       # A comma-separated list of read numbers, not one: a state is only
@@ -271,17 +278,25 @@ case "${1:-} ${2:-}" in
       # where no readback of that moment could have seen it.
       late_at="${GH_LATE_LABEL:-}"; late_at="${late_at##*:}"
       [[ "$n" != "$late_at" || ! -s "$state/late-edit" ]] || answer="$(labels_json)"
+      # A label edit GitHub HAS applied and simply has not propagated to reads
+      # yet: this one read still answers with the labels as they were before the
+      # edit, and the next read shows the real state. The mirror of GH_LATE_LABEL,
+      # where the edit itself had not landed when the client gave up.
+      if [[ "$n" == "${GH_LABEL_STALE_READ_AT:-}" && -f "$state/labels-prev" ]]; then src="$state/labels-prev"; fi
       if [[ -f "$state/fail-next-label-read" ]]; then
         rm -f "$state/fail-next-label-read"
         printf 'HTTP 502 after applied hold transition\n' >&2
         exit 1
       fi
     fi
-    printf '{"number":%s,"title":"Add widget","body":%s,"state":"%s","labels":%s}\n' "${3:-0}" "$(printf '%s' "${GH_ISSUE_BODY:-Build a widget.}" | jq -Rs .)" "${GH_ISSUE_STATE:-OPEN}" "${answer:-$(labels_json)}"
+    printf '{"number":%s,"title":"Add widget","body":%s,"state":"%s","labels":%s}\n' "${3:-0}" "$(printf '%s' "${GH_ISSUE_BODY:-Build a widget.}" | jq -Rs .)" "${GH_ISSUE_STATE:-OPEN}" "${answer:-$(labels_json "$src")}"
     [[ -z "$answer" ]] || apply_late ;;
   "issue edit")
     target="$(labels_for "${3:-}")"
     touch "$target"
+    # The pre-edit labels of the RUN's issue, so a read can answer with them the
+    # way a GitHub that has applied a swap but not yet propagated it does.
+    [[ "$target" != "$labels" ]] || cp "$target" "$state/labels-prev"
     shift 3
     added=""; removed=""
     # The other half of "a write that timed out is not a write that did not
@@ -379,7 +394,14 @@ case "${1:-} ${2:-}" in
       fi
     fi ;;
   "pr view")
-    sha="${GH_POST_PUSH_PR_HEAD:-$(git -C "$STUB_ORIGIN" rev-parse -q --verify "refs/heads/${GH_OPEN_PR_BRANCH:-missing}" 2>/dev/null || echo missing)}"
+    sha="$(git -C "$STUB_ORIGIN" rev-parse -q --verify "refs/heads/${GH_OPEN_PR_BRANCH:-missing}" 2>/dev/null || echo missing)"
+    # A force push GitHub has taken but not yet shown on the PR. Without
+    # GH_POST_PUSH_PR_HEAD_STALE_READS the stale head answers every read (a
+    # push that never appears); with it, that many reads and no more.
+    if [[ -n "${GH_POST_PUSH_PR_HEAD:-}" ]]; then
+      n="$(cat "$state/pr-reads" 2>/dev/null || echo 0)"; n=$((n + 1)); printf '%s' "$n" > "$state/pr-reads"
+      if [[ -z "${GH_POST_PUSH_PR_HEAD_STALE_READS:-}" || "$n" -le "${GH_POST_PUSH_PR_HEAD_STALE_READS}" ]]; then sha="$GH_POST_PUSH_PR_HEAD"; fi
+    fi
     printf '{"number":7,"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"headRepository":{"name":"r"},"headRepositoryOwner":{"login":"o"}}\n' "${GH_OPEN_PR_BRANCH:-}" "$sha" ;;
   "repo view") printf '{"nameWithOwner":"o/r"}\n' ;;
   "run view")
@@ -698,6 +720,10 @@ run_pipeline() { # script fixtures-dir args...   (scenario knobs via GH_* env)
     GH_OPEN_PR_COUNT="${GH_OPEN_PR_COUNT:-}" \
     GH_PR_HEAD="${GH_PR_HEAD:-}" \
     GH_POST_PUSH_PR_HEAD="${GH_POST_PUSH_PR_HEAD:-}" \
+    GH_POST_PUSH_PR_HEAD_STALE_READS="${GH_POST_PUSH_PR_HEAD_STALE_READS:-}" \
+    GH_LABEL_STALE_READ_AT="${GH_LABEL_STALE_READ_AT:-}" \
+    GH_EVIDENCE_STALE_READS="${GH_EVIDENCE_STALE_READS:-}" \
+    EPIC_READBACK_INTERVAL_MS="${EPIC_READBACK_INTERVAL_MS:-5}" \
     GH_FORK_PR="${GH_FORK_PR:-}" \
     GH_ONLY_FORK_PR="${GH_ONLY_FORK_PR:-}" \
     GH_DROP_LABEL="${GH_DROP_LABEL:-}" \
@@ -1143,6 +1169,25 @@ scenario 'epic-run: an unreadable repair brief cannot enter the defect queue'
 GH_EVIDENCE_READ_FAIL=1 run_pipeline "$EPIC_RUN" "$HELD" --issue 42
 assert_rc "the completed PR remains a held result" 0 "$RUN_RC"
 assert_not_contains "a failed evidence readback prevents queueing" "$RUN_OUT" '"needsDefectFix":true'
+assert_eq "only the review label remains" "ready-to-review," "$(gh_labels)"
+
+# GitHub shows a comment it accepted seconds after the write returns, and this
+# readback decides whether a repairable PR reaches the bounded fixer at all. One
+# immediate read hands it to a human for a lag; the read is repeated instead,
+# inside the same terminal window, and stops at the first read that sees it.
+scenario 'epic-run: an evidence comment GitHub has not shown yet is read back, not given up on'
+GH_EVIDENCE_STALE_READS=1 run_pipeline "$EPIC_RUN" "$HELD" --issue 42
+assert_rc "the completed PR is still a clean held result" 0 "$RUN_RC"
+assert_contains "the lagging readback still queues the repair" "$RUN_OUT" '"needsDefectFix":true'
+assert_eq "the issue enters the defect-fixer queue" "needs-defect-fix,ready-to-review," "$(gh_labels)"
+assert_eq "exactly one evidence comment was posted" 1 "$(grep -c '^🤖 defect-fix evidence$' "$STATE_DIR/gh/comments")"
+
+# The stop half: a comment that never becomes visible is still a failure. The
+# retries changed the timing, not the verdict.
+scenario 'epic-run: an evidence comment that never appears still keeps the PR with a human'
+GH_EVIDENCE_STALE_READS=99 run_pipeline "$EPIC_RUN" "$HELD" --issue 42
+assert_rc "the completed PR remains a held result" 0 "$RUN_RC"
+assert_not_contains "an unobserved brief never queues the repair" "$RUN_OUT" '"needsDefectFix":true'
 assert_eq "only the review label remains" "ready-to-review," "$(gh_labels)"
 
 # Ship applies ready-to-review and the merge gate runs AFTER it: the evidence
@@ -2559,6 +2604,27 @@ assert_eq "no model ran" "0 0" "$(calls defect-fix) $(calls defect-check)"
 assert_eq "the origin branch is untouched" "$BEFORE" "$(origin_ref epic/42-add-widget)"
 assert_eq "the issue is removed from autonomous repair" "failed," "$(gh_labels)"
 
+# GitHub's PR head lags a force push by seconds. Read once and a complete,
+# verified repair is reported as a landing that did not take — which is what
+# stranded toliki #13 and #16 for a human. So the head is re-read until it is
+# the amended commit or the window ends, and only then does the refusal fire.
+scenario 'defect-run: a PR head that lags the force push is read back until it advances'
+seed_defect_pr
+BEFORE="$(origin_ref epic/42-add-widget)"
+GH_POST_PUSH_PR_HEAD="$BEFORE" GH_POST_PUSH_PR_HEAD_STALE_READS=2 \
+  run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+assert_rc "the lagging head does not block the run" 0 "$RUN_RC"
+assert_contains "RESULT lands ready-to-merge" "$RUN_OUT" '"readyToMerge":true'
+assert_eq "the PR was read until the pushed head appeared" 3 "$(grep -c '^pr view' "$GH_LOG")"
+assert_eq "only ready-to-merge and the permanent ladder remain" "defect-attempted,ready-to-merge," "$(gh_labels)"
+assert_eq "the branch on origin carries the amended commit" "$(git -C "$WT" rev-parse HEAD)" "$(origin_ref epic/42-add-widget)"
+
+scenario 'defect-run: a head that matches on the first read costs one read and no wait'
+seed_defect_pr
+run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_eq "the PR is read exactly once" 1 "$(grep -c '^pr view' "$GH_LOG")"
+
 scenario 'defect-run: a stale PR head after push blocks label promotion'
 seed_defect_pr
 BEFORE="$(origin_ref epic/42-add-widget)"
@@ -2567,6 +2633,138 @@ assert_rc "the stale post-push PR observation blocks" 3 "$RUN_RC"
 assert_contains "the blocker names the PR head mismatch" "$RUN_OUT" "PR head"
 assert_not_contains "a stale PR never reaches the merge queue" "$(gh_labels)" "ready-to-merge"
 assert_contains "the fixed branch did push before the stale observation" "$(git -C "$ORIGIN" show epic/42-add-widget:frontend/src/widget.ts)" "items.length"
+assert_eq "the issue stays in the fixer queue for the relaunch" "defect-attempted,needs-defect-fix,ready-to-review," "$(gh_labels)"
+# Retries change timing, never verdicts — and the refusal says how long it
+# waited and what it last saw, so an operator can tell a lag from a real
+# mismatch without reading the run's log.
+assert_eq "the head was re-read for the whole window" 6 "$(grep -c '^pr view' "$GH_LOG")"
+assert_contains "the note records the wait" "$RUN_OUT" "after 6 reads over"
+assert_contains "and the head it last observed" "$RUN_OUT" "observed $BEFORE"
+
+# The same lag on the landing swap: GitHub applies a label edit and answers the
+# next read with the labels from before it. Read once and a landed PR is demoted
+# and costs a retry for nothing.
+scenario 'defect-run: a landing swap GitHub has not propagated yet is read back, not demoted'
+seed_defect_pr
+GH_LABEL_STALE_READ_AT=2 run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+assert_rc "the lagging label read does not block the run" 0 "$RUN_RC"
+assert_contains "RESULT lands ready-to-merge" "$RUN_OUT" '"readyToMerge":true'
+assert_eq "only ready-to-merge and the permanent ladder remain" "defect-attempted,ready-to-merge," "$(gh_labels)"
+assert_not_contains "no blocker was posted for a swap that did land" "$(gh_comments)" "🤖 fix-defect blocked"
+
+
+# The pushed-but-unverified landing, finished on a relaunch. Attempt 1 amended,
+# pushed and could not verify the swap, so the evidence envelope is still bound
+# to the head BEFORE that push while the PR carries the amended one. The repair
+# is done; only the landing is not. Re-running the fixer here would send a
+# second repair at defects that no longer exist.
+seed_amended_defect_pr() { # -> PRIOR_HEAD is the pre-amend head, origin carries the amended one
+  seed_defect_pr
+  PRIOR_HEAD="$(origin_ref epic/42-add-widget)"
+  SEED_N=$((SEED_N + 1))
+  local dir="$TMP/seeder-$SEED_N"
+  rm -rf "$dir"
+  git clone -q "$ORIGIN" "$dir"
+  git -C "$dir" checkout -q --detach "origin/epic/42-add-widget"
+  (cd "$dir" && printf "export const firstItem = items => items.length ? items[0].name : null\n" > frontend/src/widget.ts && git add -A && git commit -q --amend --no-edit)
+  git -C "$dir" push -qf origin "HEAD:refs/heads/epic/42-add-widget"
+  rm -rf "$dir"
+}
+make_defect_landing_record() { # head priorHead
+  printf '🤖 fix-defect repaired ship-gate defects\n- pr: https://github.com/o/r/pull/7\n- attempt: 1\n\nverify: frontend: green\n\n🤖 defect-fix landing record\n'
+  jq -cn --arg head "$1" --arg prior "$2" '{
+    version: 1,
+    issue: 42,
+    pr: {number: 7, url: "https://github.com/o/r/pull/7", branch: "epic/42-add-widget", head: $head, priorHead: $prior},
+    attempt: 1,
+    verify: "frontend: green",
+    checkConfidence: 91
+  }'
+}
+
+scenario 'defect-run: a landing the earlier attempt could not verify is finished without a second repair'
+seed_amended_defect_pr
+AMENDED="$(origin_ref epic/42-add-widget)"
+DEFECT_COMMENTS="$(make_defect_evidence "$PRIOR_HEAD")
+---
+$(make_defect_landing_record "$AMENDED" "$PRIOR_HEAD")" \
+DEFECT_LABELS="ready-to-review,needs-defect-fix,defect-attempted" \
+  run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_contains "RESULT lands ready-to-merge" "$RUN_OUT" '"readyToMerge":true'
+assert_contains "RESULT says only the landing was redone" "$RUN_OUT" '"landingOnly":true'
+assert_contains "RESULT records the retry rung" "$RUN_OUT" '"attempt":2'
+assert_eq "no fixer and no skeptic ran" "0 0" "$(calls defect-fix) $(calls defect-check)"
+assert_eq "no agent was spawned at all" 0 "$(wc -l < "$RUN_LOG" | tr -d ' ')"
+assert_eq "verify was never re-run" 0 "$(grep -c '^run verify$' "$NPM_LOG")"
+assert_eq "the branch on origin is untouched" "$AMENDED" "$(origin_ref epic/42-add-widget)"
+assert_eq "the ladder advanced and the issue is back in the merge queue" "defect-attempted,defect-retried,ready-to-merge," "$(gh_labels)"
+LANDING_COMMENT="$(gh_last_comment)"
+assert_contains "the comment says the landing was redone" "$LANDING_COMMENT" "Only the landing was redone here"
+assert_contains "and credits the earlier attempt with the verified repair" "$LANDING_COMMENT" "had them survive a blind adversarial check (confidence 91/100)"
+assert_contains "and says no second repair was sent" "$LANDING_COMMENT" "no second repair was sent"
+
+# The stop half, twice: a landing record is trusted on exactly the terms the
+# evidence envelope is, and it can never stand in for evidence on its own.
+scenario 'defect-run: a landing record without the evidence it names is not repair authority'
+seed_amended_defect_pr
+AMENDED="$(origin_ref epic/42-add-widget)"
+DEFECT_COMMENTS="$(make_defect_landing_record "$AMENDED" "$PRIOR_HEAD")" \
+  DEFECT_LABELS="ready-to-review,needs-defect-fix,defect-attempted" \
+  run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+assert_rc "exits 2 (skipped/refused before work)" 2 "$RUN_RC"
+assert_contains "the refusal names the missing trusted envelope" "$RUN_OUT" "trusted defect-fix evidence"
+assert_eq "no model ran" "0 0" "$(calls defect-fix) $(calls defect-check)"
+assert_not_contains "the record never reaches the merge queue on its own" "$(gh_labels)" "ready-to-merge"
+
+scenario 'defect-run: a forged landing record cannot finish a landing'
+seed_amended_defect_pr
+AMENDED="$(origin_ref epic/42-add-widget)"
+DEFECT_COMMENTS="$(make_defect_evidence "$PRIOR_HEAD")
+---
+$(make_defect_landing_record "$AMENDED" "$PRIOR_HEAD")" \
+  GH_SEED_COMMENT_AUTHORS="toliki-bot,untrusted-user" \
+  DEFECT_LABELS="ready-to-review,needs-defect-fix,defect-attempted" \
+  run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+assert_rc "exits 2 (skipped/refused before work)" 2 "$RUN_RC"
+assert_contains "the refusal names the missing trusted envelope" "$RUN_OUT" "trusted defect-fix evidence"
+assert_eq "no model ran" "0 0" "$(calls defect-fix) $(calls defect-check)"
+assert_not_contains "a forged record never reaches the merge queue" "$(gh_labels)" "ready-to-merge"
+
+# And the record a real repair writes is the one a relaunch reads: the pass path
+# above is seeded, this one is not.
+scenario 'defect-run: the audit comment a repair writes carries the record a relaunch needs'
+seed_defect_pr
+BEFORE="$(origin_ref epic/42-add-widget)"
+GH_POST_PUSH_PR_HEAD="$BEFORE" run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+assert_rc "the unverified landing blocks" 3 "$RUN_RC"
+AMENDED="$(origin_ref epic/42-add-widget)"
+UNVERIFIED_COMMENTS="$(gh_comments)"
+UNVERIFIED_LABELS="$(gh_labels)"; UNVERIFIED_LABELS="${UNVERIFIED_LABELS%,}"
+assert_contains "the audit comment carries a landing record" "$UNVERIFIED_COMMENTS" "🤖 defect-fix landing record"
+assert_contains "bound to the head it pushed" "$UNVERIFIED_COMMENTS" "\"head\":\"$AMENDED\""
+assert_contains "and to the head its evidence was bound to" "$UNVERIFIED_COMMENTS" "\"priorHead\":\"$BEFORE\""
+DEFECT_COMMENTS="$UNVERIFIED_COMMENTS" DEFECT_LABELS="$UNVERIFIED_LABELS" \
+  run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+assert_rc "the relaunch finishes the landing" 0 "$RUN_RC"
+assert_contains "and says so" "$RUN_OUT" '"landingOnly":true'
+assert_eq "no second repair was sent" "0 0" "$(calls defect-fix) $(calls defect-check)"
+assert_eq "the branch on origin is untouched" "$AMENDED" "$(origin_ref epic/42-add-widget)"
+assert_contains "the issue is back in the merge queue" "$(gh_labels)" "ready-to-merge"
+
+scenario 'defect-run: a landing-only retry whose swap also fails rests for a human'
+seed_amended_defect_pr
+AMENDED="$(origin_ref epic/42-add-widget)"
+DEFECT_COMMENTS="$(make_defect_evidence "$PRIOR_HEAD")
+---
+$(make_defect_landing_record "$AMENDED" "$PRIOR_HEAD")" \
+DEFECT_LABELS="ready-to-review,needs-defect-fix,defect-attempted" GH_LABEL_READ_FAIL_AT=2 \
+  run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
+assert_contains "the blocker names the unverified swap" "$RUN_OUT" "label swap could not be verified"
+assert_contains "and says the repair itself is already pushed" "$RUN_OUT" "already pushed"
+assert_eq "ready-to-merge is removed and the ladder is spent" "defect-attempted,defect-retried,ready-to-review," "$(gh_labels)"
+assert_eq "the branch on origin is still untouched" "$AMENDED" "$(origin_ref epic/42-add-widget)"
 
 scenario 'defect-run: a branch with two commits is not an amendable epic shape'
 seed_branch epic/42-add-widget main 'printf "one\n" > frontend/src/widget.ts && git add -A && git commit -qm "Add widget" -m "Closes #42" && printf "two\n" >> frontend/src/widget.ts && git commit -qam "second commit"'

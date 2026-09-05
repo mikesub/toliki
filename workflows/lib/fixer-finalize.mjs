@@ -39,7 +39,12 @@
 // comment is the complete report and a blocker/audit comment would misclassify
 // the run.
 
-import { comment, editLabels, ensureLabels, issueLabels, terminalBudget } from './github.mjs'
+// The readback itself is bounded rather than single-shot: GitHub can take
+// seconds to show a label edit it has already applied, and a swap read once,
+// immediately, reports a landed transition as a half-landed one. The waiting is
+// charged to the same window, so the guidance still gets written.
+
+import { comment, editLabels, ensureLabels, issueLabels, readBack, terminalBudget } from './github.mjs'
 import { failureReason } from './proc.mjs'
 
 export async function finalizeFixerIssue({ issue, body, add, remove, required = add, absent = remove, budget = terminalBudget() }) {
@@ -51,7 +56,11 @@ export async function finalizeFixerIssue({ issue, body, add, remove, required = 
   try {
     await ensureLabels(add, { budget })
     const flip = await editLabels(issue, { add, remove }, { budget })
-    labels = await issueLabels(issue, { budget })
+    const seen = await readBack(
+      () => issueLabels(issue, { budget }),
+      ls => required.every(label => ls.includes(label)) && absent.every(label => !ls.includes(label)),
+      { budget })
+    labels = seen.observed
     readable = true
     missing = required.filter(label => !labels.includes(label))
     stuck = absent.filter(label => labels.includes(label))

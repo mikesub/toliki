@@ -195,7 +195,22 @@ than made launchable against a main without the code it describes.
   and bound to the issue, same-repository PR and captured head. Defect-run pins
   the original requirement from that envelope, rejects mutable issue prose,
   stale evidence and fork PRs before an attempt, and verifies the selected PR
-  advanced to the pushed head before promotion.
+  advanced to the pushed head before promotion — re-reading that head over a
+  bounded window rather than once, because GitHub shows a force push seconds
+  after it lands and a single immediate read reported two complete repairs as
+  landings that never happened.
+- Every readback that verifies a write the run itself just made — a PR head
+  after a push, labels after a swap, a comment after posting — reads again over
+  a bounded window and stops at the first read that matches (`readBack` in
+  `workflows/lib/github.mjs`, up to six reads about five seconds apart). Retries
+  change timing, never verdicts: a readback that never matches still fails, with
+  the wording it always had, and a read that ERRORS is not retried at all,
+  because a query that errored carries no verdict. The waits are charged to the
+  caller's budget, so a readback after a terminal label write stays inside the
+  one reporting window and never extends reap's settle window. Epic-run's
+  promotion readback is the deliberate exception: there a non-match is not a
+  verdict but the decision to take the promotion back off, so it reads once and
+  the readback that PROVES the demotion is the bounded one.
 - Architecture returns a proportional plan with a structured verification
   strategy (`test-first` or `direct`), its rationale and required evidence.
   Test-first establishes a clean verify baseline before writing tests and
@@ -274,8 +289,20 @@ than made launchable against a main without the code it describes.
   when its reporting comment fails, and any guidance that names a label is
   composed from that readback per label — an operator is asked to set what is
   missing and remove what is stuck, never to repair state that is already
-  right. Autonomous dispatch is opt-in per repo through
-  `DEFECT_FIX_REPOS`; manual `defect` remains an explicit override.
+  right. Its audit comment carries a landing record bound to the amended head
+  and to the head the evidence it repaired from was bound to, posted as soon as
+  the push is a fact rather than after the checks that follow it — the record
+  exists for a landing this run cannot finish, so it has to survive one. An
+  attempt that pushed a verified and checked repair and could not confirm the
+  landing leaves the envelope bound to the pre-push head, which is no longer the
+  PR's; a relaunch that finds only that record — authored by the same identity,
+  bound to this issue, PR, branch and current head, and naming a prior head
+  whose envelope matches — redoes the LANDING alone. It takes its ladder rung,
+  checks the branch shape, skips fix, verify and check, swaps the label and says
+  on the issue that the earlier attempt verified and checked this head, because
+  a second repair round would edit defects that are already repaired. Nothing
+  else about the trust model relaxes. Autonomous dispatch is opt-in per repo
+  through `DEFECT_FIX_REPOS`; manual `defect` remains an explicit override.
 - Every cleanup needs a positive proof of staleness: a claim ref only while its
   tip is still the claim commit and no session is live; a worktree only when its
   issue has no `epic/<N>-*` ref on origin at all. Liveness is read from tmux
@@ -311,10 +338,12 @@ than made launchable against a main without the code it describes.
   so a landing swap the run could not verify falls through to its blocker path
   on what is LEFT of that window rather than on a second one. Reap floors the
   window (`MIN_TERMINAL_SETTLE_MINUTES`) so the two cannot be configured into a
-  race. Never add a GitHub call — or a local git cleanup, which has a timeout of
-  its own — on the default timeout from a terminal label write onward. No model
-  step runs inside that window: `agent()` refuses a spawn once it is open, so
-  ship's deferral check runs before the `ready-to-review` write.
+  race. A bounded readback's waits are charged to that same window too, so
+  re-reading a label until it settles can never push the report past it. Never
+  add a GitHub call — or a local git cleanup, which has a timeout of its own —
+  on the default timeout from a terminal label write onward. No model step runs
+  inside that window: `agent()` refuses a spawn once it is open, so ship's
+  deferral check runs before the `ready-to-review` write.
 - A dead pipeline pane whose issue rests at `ready` is a completed quota hold,
   so reap applies the normal settle window and removes its session. A live
   `ready` pane is still working and a dead `in-progress` pane remains a crash

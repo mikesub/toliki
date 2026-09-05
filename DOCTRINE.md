@@ -81,7 +81,11 @@ don't get re-litigated from memory.
   rejects mutable issue prose, stale heads and fork PRs before spending an
   attempt. After the project verify gate and a blind adversarial check over the
   complete delta, the merge worker still rebases and re-runs the real checks
-  before landing it.
+  before landing it. What a rung may repeat is bounded the same way: an attempt
+  that pushed a verified and checked repair and could not confirm the label
+  swap left work to finish, but it is the LANDING, not the repair, so the next
+  rung redoes only that — from its own durable head-bound record — rather than
+  sending a second repair at defects that are already repaired.
 - **Crons watch, models act.** Dispatch, reap and merge ticks are plain shell
   reading labels; the first model to run is the epic that got launched.
 - **Exhausted allowance pauses admission, not work.** A provider's hard quota

@@ -32,7 +32,7 @@ import { HARNESS_DIR } from './lib/engine.mjs'
 import { parseArgs, finish, UsageError, EXIT } from './lib/cli.mjs'
 import { initStatus, statusPhase, statusNote, statusFinish } from './lib/status.mjs'
 import { sh, must, failureReason } from './lib/proc.mjs'
-import { ensureLabels, editLabels, issueLabels, issueView, comment, openPrs, terminalBudget, terminalTimeout, terminalTransition } from './lib/github.mjs'
+import { ensureLabels, editLabels, issueLabels, issueView, comment, openPrs, readBack, terminalBudget, terminalTimeout, terminalTransition } from './lib/github.mjs'
 import { git, gitOut, discoverPackages, pkgList, ensureDeps, runVerify, rebaseInProgress, pushRejected } from './lib/repo.mjs'
 import { finalizeFixerIssue, finalizeFixerQuotaHold } from './lib/fixer-finalize.mjs'
 import { recordQuotaHold } from './quota-hold.mjs'
@@ -314,14 +314,19 @@ async function ship(issue, prep, body) {
   await ensureLabels(['ready-to-merge'], { budget })
   const absent = ['in-progress', 'needs-judgment', 'ready-to-review', 'failed']
   const flip = await editLabels(issue, { add: ['ready-to-merge'], remove: absent }, { budget })
-  let labels
+  // Bounded, not single-shot: GitHub can take seconds to show a swap it has
+  // already applied, and one immediate read costs the run a retry for nothing.
+  let seen
   try {
-    labels = await issueLabels(issue, { budget })
+    seen = await readBack(
+      () => issueLabels(issue, { budget }),
+      ls => ls.includes('ready-to-merge') && absent.every(l => !ls.includes(l)),
+      { budget })
   } catch (e) {
     return { pushed: true, labelled: false, note: e && e.message || String(e) }
   }
-  const labelled = labels.includes('ready-to-merge') && absent.every(l => !labels.includes(l))
-  return { pushed: true, labelled, note: labelled ? '' : (flip.ok ? `observed labels: ${labels.join(', ')}` : failureReason(flip)) }
+  const labels = seen.observed
+  return { pushed: true, labelled: seen.matched, note: seen.matched ? '' : (flip.ok ? `observed labels: ${labels.join(', ')}` : failureReason(flip)) }
 }
 
 // What happens next is the LADDER's call, never the phase's — so it is a

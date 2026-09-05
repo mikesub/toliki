@@ -29,7 +29,7 @@ import { agent, phase, log, initRuntime, onPhase, onLog, takeAgentFailure, withA
 import { parseArgs, finish, UsageError, EXIT } from './lib/cli.mjs'
 import { initStatus, statusPhase, statusNote, statusFinish } from './lib/status.mjs'
 import { failureReason } from './lib/proc.mjs'
-import { gh, ensureLabels, editLabels, issueLabels, issueView, comment, openPrs, withBodyFile, terminalBudget, terminalTimeout, terminalTransition } from './lib/github.mjs'
+import { gh, ensureLabels, editLabels, issueLabels, issueView, comment, openPrs, withBodyFile, readBack, terminalBudget, terminalTimeout, terminalTransition } from './lib/github.mjs'
 import { git, gitOut, discoverPackages, pkgList, ensureDeps, runVerify, pushRejected } from './lib/repo.mjs'
 import { finalizeFixerIssue, finalizeFixerQuotaHold } from './lib/fixer-finalize.mjs'
 import { recordQuotaHold } from './quota-hold.mjs'
@@ -274,14 +274,19 @@ async function ship(issue, prep, body) {
   const budget = terminalBudget()
   await ensureLabels(['ready-to-merge'], { budget })
   const flip = await editLabels(issue, { add: ['ready-to-merge'], remove: ['in-progress', 'needs-ci-fix'] }, { budget })
-  let labels
+  // Bounded, not single-shot: GitHub can take seconds to show a swap it has
+  // already applied, and one immediate read demotes a landed PR for nothing.
+  let seen
   try {
-    labels = await issueLabels(issue, { budget })
+    seen = await readBack(
+      () => issueLabels(issue, { budget }),
+      ls => ls.includes('ready-to-merge') && !ls.includes('in-progress') && !ls.includes('needs-ci-fix'),
+      { budget })
   } catch (e) {
     return { pushed: true, labelled: false, note: e && e.message || String(e) }
   }
-  const labelled = labels.includes('ready-to-merge') && !labels.includes('in-progress') && !labels.includes('needs-ci-fix')
-  return { pushed: true, labelled, note: labelled ? '' : (flip.ok ? `observed labels: ${labels.join(', ')}` : failureReason(flip)) }
+  const labels = seen.observed
+  return { pushed: true, labelled: seen.matched, note: seen.matched ? '' : (flip.ok ? `observed labels: ${labels.join(', ')}` : failureReason(flip)) }
 }
 
 const attemptRung = attempt => attempt === 2 ? 'ci-retried' : 'ci-attempted'

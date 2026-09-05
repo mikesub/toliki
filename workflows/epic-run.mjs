@@ -56,7 +56,7 @@ import { validate } from './lib/schema.mjs'
 import {
   ensureLabels, editLabels, issueLabels, issueView, openBlockers, comment, assignSelf,
   openPrs, searchOpenPrs, prCreate, issueCreate, withBodyFile, hasDeferredRecord, issueId, addBlockedBy,
-  authenticatedLogin, terminalBudget, terminalSpend, terminalTransition,
+  authenticatedLogin, readBack, terminalBudget, terminalSpend, terminalTransition,
 } from './lib/github.mjs'
 import { matchingDefectEvidence, renderDefectEvidence } from './lib/defect-evidence.mjs'
 import {
@@ -812,7 +812,14 @@ async function handoff(issue, dir) {
   const rest = terminalTransition({ rest: 'ready-to-review' })
   await ensureLabels(rest.add, spend())
   const undo = await editLabels(issue, rest, spend())
-  const after = await readLabels()
+  // The demotion's readback IS the verdict that lets the PR be reported as held, so it is bounded
+  // rather than single-shot: GitHub can take seconds to show a strip it has already applied, and one
+  // immediate read would report a proved demotion as unresolved and block a complete PR. The read
+  // BEFORE the compensating transition is deliberately left single-shot — there a non-match is not a
+  // verdict but the decision to compensate, and a promotion that lands after the read has to be taken
+  // back off rather than waited for.
+  const after = (await readBack(readLabels,
+    ls => ls === null || (ls.includes('ready-to-review') && !ls.includes('ready-to-merge')), spend())).observed
   if (after && after.includes('ready-to-review') && !after.includes('ready-to-merge')) {
     return { labelled: false, summary: `${why} — the promotion was taken back off and ready-to-review confirmed` }
   }
@@ -1593,15 +1600,25 @@ try {
           blockers: mergeBlockers.map(({ source, reason, items }) => ({ source, reason, items })),
         }
         await comment(issue, renderDefectEvidence(evidence), spend())
-        const comments = await issueView(issue, 'comments', spend())
-        if (!matchingDefectEvidence(comments.comments, {
-          actor, issue, prNumber: shipped.prNumber, branch: `epic/${slug}`, head: shipped.prHead,
-        })) throw new Error('canonical defect-fix evidence was not observed after posting')
+        // Read back until the comment GitHub accepted is visible on the issue, or
+        // the window ends: a fresh comment can lag its own write by seconds, and a
+        // single immediate read leaves a repairable PR with a human for nothing.
+        // The waiting is charged to the same terminal window as the write.
+        const seen = await readBack(
+          () => issueView(issue, 'comments', spend()),
+          v => !!matchingDefectEvidence(v.comments, {
+            actor, issue, prNumber: shipped.prNumber, branch: `epic/${slug}`, head: shipped.prHead,
+          }),
+          spend())
+        if (!seen.matched) throw new Error('canonical defect-fix evidence was not observed after posting')
         await ensureLabels(['ready-to-review', 'needs-defect-fix'], spend())
         const queued = await editLabels(issue, { add: ['ready-to-review', 'needs-defect-fix'] }, spend())
         if (queued.ok) {
-          const labels = await issueLabels(issue, spend())
-          needsDefectFix = labels.includes('ready-to-review') && labels.includes('needs-defect-fix')
+          const labelled = await readBack(
+            () => issueLabels(issue, spend()),
+            ls => ls.includes('ready-to-review') && ls.includes('needs-defect-fix'),
+            spend())
+          needsDefectFix = labelled.matched
         }
       } catch (e) {
         log(`Merge gate: defect-fixer queue handoff could not be verified (${e && e.message || e}) — the PR remains ready-to-review.`)
