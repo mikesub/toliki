@@ -25,6 +25,7 @@ REPO="$TMP/repo"
 mkdir -p "$HARNESS" "$REPO/.git" "$TMP/bin" "$TMP/labels" "$TMP/blockers" "$TMP/locks"
 cp -R "$ROOT/bin" "$ROOT/etc" "$HARNESS/"
 cp "$ROOT/remote-control.sh" "$HARNESS/"
+cp "$ROOT/default-engine.sh" "$HARNESS/"
 # dispatch resolves the shared hold CLI relative to its own copied harness.
 # During RED the module intentionally does not exist yet.
 mkdir -p "$HARNESS/workflows"
@@ -81,6 +82,10 @@ exit 0
 STUB
 cat > "$TMP/bin/ssh" <<'STUB'
 #!/usr/bin/env bash
+if [[ "${EXEC_SSH_STDIN:-}" == "1" ]]; then
+  shift
+  exec "$@"
+fi
 printf '%s\n' "$*" > "$SSH_LOG"
 STUB
 
@@ -195,6 +200,23 @@ reset_state() {
 }
 
 assert_contains "the tracked config documents an empty-by-default defect allowlist" "$(cat "$ROOT/etc/repos.conf.template")" "DEFECT_FIX_REPOS=("
+
+printf '\ndefault engine: reports, validates, updates, and reads back live cron state\n'
+ENGINE_CRON="$TMP/harness-dispatch"
+cp "$HARNESS/etc/dispatch.cron" "$ENGINE_CRON"
+ENGINE_OUT="$(PATH="$TMP/bin:$PATH" EXEC_SSH_STDIN=1 DEFAULT_ENGINE_CRON="$ENGINE_CRON" bash "$HARNESS/default-engine.sh")"
+assert_contains "the current installed default is shown" "$ENGINE_OUT" "default: codex"
+assert_contains "every configured engine is shown" "$ENGINE_OUT" "available: claude codex codex+claude"
+PATH="$TMP/bin:$PATH" EXEC_SSH_STDIN=1 DEFAULT_ENGINE_CRON="$ENGINE_CRON" bash "$HARNESS/default-engine.sh" claude >/dev/null
+assert_eq "the selected engine is written once" "EPIC_ENGINE=claude" "$(grep '^EPIC_ENGINE=' "$ENGINE_CRON")"
+assert_contains "the rest of the cron file is preserved" "$(cat "$ENGINE_CRON")" "bin/merge-tick.sh"
+set +e
+ENGINE_OUT="$(PATH="$TMP/bin:$PATH" EXEC_SSH_STDIN=1 DEFAULT_ENGINE_CRON="$ENGINE_CRON" bash "$HARNESS/default-engine.sh" missing 2>&1)"
+ENGINE_RC=$?
+set -e
+assert_rc "an unknown engine is rejected" 1 "$ENGINE_RC"
+assert_contains "the rejection lists valid choices" "$ENGINE_OUT" "available: claude codex codex+claude"
+assert_eq "a rejected engine leaves the default unchanged" "EPIC_ENGINE=claude" "$(grep '^EPIC_ENGINE=' "$ENGINE_CRON")"
 
 printf '\ndispatch hold: an active record stops before capacity, GitHub, or labels\n'
 reset_state

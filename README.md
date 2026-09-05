@@ -104,7 +104,8 @@ agent CLIs. Route the next unassigned epic with
 `etc/engines.json` saying which vendor, model and effort runs each pipeline
 step, so one engine can code on Claude and review on Codex. Unlabeled issues
 run on the host's `EPIC_ENGINE` default, set in `etc/dispatch.cron` (claude
-when unset).
+when unset). From the laptop, `./default-engine.sh` prints the VM's installed
+default and available engines; pass an engine name to change the VM default.
 Turning the box autonomous is a deliberate last step: install the cron file
 per the comment at the top of `etc/dispatch.cron`.
 Defect repair is empty-by-default: add selected registered repo names to
