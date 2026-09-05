@@ -35,10 +35,30 @@ export const TERMINAL_REPORT_BUDGET_MS = Number(process.env.EPIC_TERMINAL_REPORT
 // than that runs out of window rather than extending it. An exhausted window
 // still runs its call, with a millisecond, so it fails fast and is reported
 // rather than skipped in silence.
+//
+// One window per RUN, and this is the only way to open one: opening a second is
+// how the invariant is lost. A landing swap that GitHub applied but the client
+// could not verify falls through to the blocker path, which transitions the
+// labels again and comments again — and a fresh budget there would hand that
+// fallback a second reporting window reap never agreed to, while the settle
+// clock has been running since the first write. So the call is idempotent: the
+// first terminal write opens the window, every caller after it — in this
+// process, in any module — gets what is LEFT of that same one.
+let openWindow = null
 export const terminalBudget = (budgetMs = TERMINAL_REPORT_BUDGET_MS) =>
-  ({ deadline: Date.now() + budgetMs, share: Math.max(1, Math.round(budgetMs / 4)) })
+  (openWindow ||= { deadline: Date.now() + budgetMs, share: Math.max(1, Math.round(budgetMs / 4)) })
 
 const budgeted = ({ deadline, share }) => Math.max(1, Math.min(share, deadline - Date.now()))
+
+// For callers that must not open the window themselves — everything a run does
+// BEFORE its first terminal label has no clock running and keeps the default
+// timeout, so this is empty until that write.
+export const terminalSpend = () => (openWindow ? { budget: openWindow } : undefined)
+
+// The same share, for work inside the window that is not a `gh` call. Local git
+// cleanup on a blocker path is on git's own five-minute timeout, which is just
+// as fatal to a report as a stalled gh call once the label is resting.
+export const terminalTimeout = () => (openWindow ? { timeoutMs: budgeted(openWindow) } : {})
 
 export const gh = (args, { budget, ...opts } = {}) =>
   sh('gh', args, { timeoutMs: budget ? budgeted(budget) : GH_TIMEOUT_MS, ...opts })
@@ -63,6 +83,7 @@ export const LABELS = {
   'ready-to-merge':  { color: '0E8A16', description: 'epic-run finished; PR open and gates cleared — queued for bin/merge-worker.sh' },
   'ready-to-review': { color: '0E8A16', description: 'epic-run finished; PR is open and awaiting review' },
   failed:            { color: 'B60205', description: 'epic-run stopped at a blocker; needs human attention' },
+  'needs-judgment':  { color: 'D93F0B', description: 'rebase conflict needs judgment — queued for an automated fixer session' },
   'fix-attempted':   { color: 'FEF2C0', description: 'a fixer session has attempted this conflict once' },
   'fix-retried':     { color: 'F9D0C4', description: 'the fixer retry is spent — the next failure waits for a human' },
   'needs-ci-fix':    { color: 'D93F0B', description: 'checks were red on the rebased head — queued for an automated CI fixer session' },
@@ -72,6 +93,25 @@ export const LABELS = {
   'defect-attempted': { color: 'FEF2C0', description: 'a defect fixer session has attempted this ship-gate repair once' },
   'defect-retried':   { color: 'F9D0C4', description: 'the defect fixer retry is spent — the next failure waits for a human' },
 }
+
+// The three labels a run can come to REST at, and they are mutually exclusive:
+// bin/merge-worker.sh selects on `ready-to-merge` alone, so a run that comes to
+// rest at `failed` while a landing label it already applied is still on the
+// issue is a failure path that becomes success. That is the whole hazard, and it
+// is one a hand-written remove list loses the moment a landing swap half-lands:
+// the fallback adds `failed`, strips `in-progress`, and leaves `ready-to-merge`
+// exactly where the merge worker looks.
+export const RESTING_LABELS = ['failed', 'ready-to-merge', 'ready-to-review']
+
+// So a terminal transition is written as the ONE label the run rests at plus the
+// queue labels that belong beside it, and the removes are DERIVED: every other
+// resting label, and `in-progress`. `queue` is a retry ladder's queue label,
+// restored because a landing swap may have stripped it on its way out; `drop` is
+// a queue label a final refusal takes off on purpose.
+export const terminalTransition = ({ rest, queue = [], drop = [] }) => ({
+  add: [rest, ...queue],
+  remove: ['in-progress', ...RESTING_LABELS.filter(l => l !== rest), ...drop],
+})
 
 // Idempotent and best-effort: `gh label create` fails when the label exists,
 // which is the common case and not an error.

@@ -805,6 +805,23 @@ assert_eq "the label GitHub applied before the stall is on the issue" "needs-def
 assert_not_contains "but an unverified handoff is never claimed" "$RUN_OUT" '"needsDefectFix":true'
 assert_contains "and the run still reports why the gate held" "$RUN_OUT" 'Critical: Null deref on empty list'
 
+# The merge gate is not the only terminal write epic-run makes. A run that blocks
+# BEFORE ship lands `failed` with no window open yet, and that write starts the
+# same settle clock the moment GitHub applies it. Left on the default gh timeout
+# it outlasts the shortest window reap will honour, so the sweep can kill the
+# session between the label and the record of what stopped the run.
+scenario 'epic-run: the pre-ship blocker write to failed is bounded, not left to the gh timeout'
+BLOCKER_START="$(date +%s)"
+EPIC_TERMINAL_REPORT_MS=3000 GH_SLOW_LABEL=failed:20 run_pipeline "$EPIC_RUN" "$DEADLENS" --issue 42
+BLOCKER_ELAPSED=$(( $(date +%s) - BLOCKER_START ))
+assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
+assert_eq "the run gave up on the stalled failed write" "bounded" "$( (( BLOCKER_ELAPSED < 15 )) && echo bounded || echo "waited ${BLOCKER_ELAPSED}s for a 20s stall" )"
+assert_eq "the label GitHub applied before the stall is on the issue" "failed," "$(gh_labels)"
+assert_contains "the blocker comment still reached the issue" "$(gh_comments)" "🤖 epic-run blocked"
+assert_contains "it still names the phase that stopped" "$(gh_comments)" "- phase: review"
+assert_contains "and the pane still gets its RESULT line" "$RUN_OUT" "RESULT "
+assert_contains "which records the blocked run" "$RUN_OUT" '"blocked":true'
+
 scenario 'epic-run: ship classifies deferrals; the script counts, files and records them'
 DEFER="$TMP/fixtures-defer"; cp -R "$BASE" "$DEFER"
 fixture "$DEFER" ship '{"title":"Add widget","body":"Adds a widget.","commitBody":"","legalMarker":"LEGAL-REVIEW: required","deferred":[
@@ -1222,6 +1239,42 @@ assert_eq "the branch was rebased onto the new main and pushed" 1 "$(origin_coun
 if git -C "$ORIGIN" merge-base --is-ancestor main epic/42-add-widget; then ok "and sits on top of main"; else nok "and sits on top of main"; fi
 assert_contains "the audit comment says the conflict evaporated" "$(gh_comments)" "the conflict had evaporated"
 
+# The fixer's landing swap is a terminal write too: `ready-to-review` rests the
+# issue and starts reap's settle clock as soon as GitHub applies it, while the
+# client can still be waiting on the response. The readback the label verdict is
+# composed from and the RESULT line both come after it, so the write opens the
+# window and spends it rather than running on the five-minute gh default.
+scenario 'fix-run: the ready-to-review landing write is bounded, not left to the gh timeout'
+seed_conflict
+LAND_START="$(date +%s)"
+EPIC_TERMINAL_REPORT_MS=3000 GH_SLOW_LABEL=ready-to-review:20 run_fix "$FIXBASE" --issue 42 --session myapp-epic-42
+LAND_ELAPSED=$(( $(date +%s) - LAND_START ))
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_eq "the run gave up on the stalled landing write" "bounded" "$( (( LAND_ELAPSED < 15 )) && echo bounded || echo "waited ${LAND_ELAPSED}s for a 20s stall" )"
+assert_eq "the label GitHub applied before the stall is on the issue, ladder kept" "fix-attempted,ready-to-review," "$(gh_labels)"
+assert_contains "the readback inside the window still confirmed the landing" "$RUN_OUT" '"readyToReview":true'
+assert_contains "and the audit comment written before it is on the issue" "$(gh_comments)" "origin/main intended: main renamed the helper"
+
+# Same stall, unverified: `ready-to-review` was applied and the readback never
+# came back. A run that blocks with the landing label it never confirmed still on
+# the issue reports one state and presents another — and it has silently left its
+# own retry queue, so nothing picks the conflict up again. The demotion restores
+# both halves inside the window the landing opened.
+scenario 'fix-run: a landing it could not verify is demoted and put back in its queue'
+seed_conflict
+UNVERIFIED_START="$(date +%s)"
+EPIC_TERMINAL_REPORT_MS=3000 GH_SLOW_LABEL=ready-to-review:20 GH_LABEL_READ_FAIL_AT=2 \
+  run_fix "$FIXBASE" --issue 42 --session myapp-epic-42
+UNVERIFIED_ELAPSED=$(( $(date +%s) - UNVERIFIED_START ))
+assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
+assert_contains "the blocker names the unverified swap" "$RUN_OUT" "label swap could not be verified"
+assert_eq "the whole fallback fits the window the landing opened" "bounded" "$( (( UNVERIFIED_ELAPSED < 15 )) && echo bounded || echo "waited ${UNVERIFIED_ELAPSED}s for a 20s stall" )"
+assert_eq "it rests at failed, back in the conflict fixer queue, ladder kept" "failed,fix-attempted,needs-judgment," "$(gh_labels)"
+assert_not_contains "no unconfirmed landing label survives the block" "$(gh_labels)" "ready-to-review"
+assert_contains "the blocker comment still reached the issue" "$(gh_comments)" "🤖 fix-conflict blocked"
+assert_contains "and the pane still gets its RESULT line" "$RUN_OUT" "RESULT "
+assert_contains "which records the blocked run" "$RUN_OUT" '"blocked":true'
+
 # ───────────────────────── ci-run ─────────────────────────
 # A finished epic PR the merge worker rebased and re-ran: its checks came back
 # red. The seed leaves the branch's single commit holding a test with no
@@ -1357,6 +1410,42 @@ CI_LABELS="failed" run_ci "$CI_RUN" "$CIBASE" --issue 42
 assert_rc "exits 2 (skipped)" 2 "$RUN_RC"
 assert_contains "the reason says so" "$RUN_OUT" 'not labelled needs-ci-fix'
 assert_eq "no fixer was woken" 0 "$(calls ci-fix)"
+
+# Same landing, same clock, on the fixer that restores unattended eligibility:
+# `ready-to-merge` rests the issue at the write, so the swap, the readback that
+# confirms it and the RESULT line all spend one window opened there.
+scenario 'ci-run: the ready-to-merge landing write is bounded, not left to the gh timeout'
+seed_ci_pr
+LAND_START="$(date +%s)"
+EPIC_TERMINAL_REPORT_MS=3000 GH_SLOW_LABEL=ready-to-merge:20 run_ci "$CI_RUN" "$CIBASE" --issue 42 --session myapp-epic-42
+LAND_ELAPSED=$(( $(date +%s) - LAND_START ))
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_eq "the run gave up on the stalled landing write" "bounded" "$( (( LAND_ELAPSED < 15 )) && echo bounded || echo "waited ${LAND_ELAPSED}s for a 20s stall" )"
+assert_eq "the label GitHub applied before the stall is on the issue, ladder kept" "ci-attempted,ready-to-merge," "$(gh_labels)"
+assert_contains "the readback inside the window still confirmed the landing" "$RUN_OUT" '"readyToMerge":true'
+assert_contains "and the audit comment written before it is on the issue" "$(gh_comments)" "Cause: createWidget was never exported"
+
+# The same stall, one step worse: GitHub applied `ready-to-merge` and the readback
+# that would confirm it never came back. The landing is unverified, so the run
+# blocks — and a blocked run must not leave the label bin/merge-worker.sh selects
+# on sitting beside `failed`, or the failure path lands the PR unattended. The
+# whole fallback — the demotion, the blocker comment, the RESULT line — spends
+# what is left of the window the landing write opened, never a second one.
+scenario 'ci-run: a landing it could not verify is demoted, never left for the merge worker'
+seed_ci_pr
+UNVERIFIED_START="$(date +%s)"
+EPIC_TERMINAL_REPORT_MS=3000 GH_SLOW_LABEL=ready-to-merge:20 GH_LABEL_READ_FAIL_AT=2 \
+  run_ci "$CI_RUN" "$CIBASE" --issue 42 --session myapp-epic-42
+UNVERIFIED_ELAPSED=$(( $(date +%s) - UNVERIFIED_START ))
+assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
+assert_contains "the blocker names the unverified swap" "$RUN_OUT" "label swap could not be verified"
+assert_eq "the whole fallback fits the window the landing opened" "bounded" "$( (( UNVERIFIED_ELAPSED < 15 )) && echo bounded || echo "waited ${UNVERIFIED_ELAPSED}s for a 20s stall" )"
+assert_eq "it rests at failed, back in the CI fixer queue, ladder kept" "ci-attempted,failed,needs-ci-fix," "$(gh_labels)"
+assert_not_contains "the merge worker has nothing to select" "$(gh_labels)" "ready-to-merge"
+assert_contains "the blocker comment still reached the issue" "$(gh_comments)" "🤖 fix-ci blocked"
+assert_contains "and names what happens next" "$(gh_comments)" "- next: This was the first attempt"
+assert_contains "and the pane still gets its RESULT line" "$RUN_OUT" "RESULT "
+assert_contains "which records the blocked run" "$RUN_OUT" '"blocked":true'
 
 # ───────────────────────── defect-run ─────────────────────────
 # A finished epic PR whose deterministic merge gate held only on concrete
@@ -1785,6 +1874,54 @@ assert_eq "the run gave up on the stalled write" "bounded" "$( (( WRITE_ELAPSED 
 assert_eq "the label GitHub had already applied is still observed" "failed," "$(gh_labels)"
 assert_contains "the refusal still reached the issue" "$(gh_comments)" "🤖 fix-defect refused: no open PR"
 assert_contains "with the guidance the stall could have cost" "$(gh_comments)" "needs-defect-fix has been removed automatically"
+
+# A landing swap GitHub applied but the run could not verify drops into the
+# blocker path, which transitions the labels again, comments again and only then
+# writes RESULT — with reap's settle clock running since that first write. Which
+# window those calls spend is not something each caller can be trusted to
+# remember: opening one is idempotent, so a second window cannot be created.
+scenario 'terminal budget: a run gets ONE window, whoever opens it'
+WINDOW="$(node -e "import('$ROOT/workflows/lib/github.mjs').then(m => {
+  const before = m.terminalSpend() === undefined ? 'closed' : 'open'
+  const first = m.terminalBudget()
+  const second = m.terminalBudget()
+  console.log(before, first === second ? 'one' : 'two', second.deadline - first.deadline,
+    m.terminalSpend().budget === first ? 'shared' : 'other')
+})")"
+assert_eq "closed before the first terminal write, one window after it, spent by every caller" "closed one 0 shared" "$WINDOW"
+
+# The other half of a terminal transition: a run rests at exactly ONE label. A
+# fallback that adds `failed` beside a `ready-to-merge` its landing already
+# applied is a blocked run in the merge worker's queue, so the removals are
+# derived from the resting label rather than listed per call site.
+scenario 'terminal transition: a run rests at one label and strips every other'
+TRANSITION="$(node -e "import('$ROOT/workflows/lib/github.mjs').then(m => {
+  const bad = []
+  for (const rest of m.RESTING_LABELS) {
+    const t = m.terminalTransition({ rest, queue: ['needs-ci-fix'] })
+    if (!t.add.includes(rest)) bad.push(rest + ': never applied')
+    if (!t.add.includes('needs-ci-fix')) bad.push(rest + ': queue label not restored')
+    if (!t.remove.includes('in-progress')) bad.push(rest + ': leaves in-progress')
+    for (const other of m.RESTING_LABELS) {
+      if (other !== rest && !t.remove.includes(other)) bad.push(rest + ': leaves ' + other)
+    }
+    for (const l of t.remove) if (t.add.includes(l)) bad.push(rest + ': adds and removes ' + l)
+  }
+  console.log(bad.length ? bad.join('; ') : 'exclusive')
+})")"
+assert_eq "every resting label strips the other two and in-progress" "exclusive" "$TRANSITION"
+# A transition names labels ensureLabels then has to create: one the table does
+# not know throws, and the throw lands in the finalizer's catch, where it costs
+# the whole swap rather than one label.
+assert_eq "every label a transition writes is one github.mjs can create" "creatable" \
+  "$(node -e "import('$ROOT/workflows/lib/github.mjs').then(m => {
+    const written = [...m.RESTING_LABELS, 'in-progress', 'needs-judgment', 'needs-ci-fix', 'needs-defect-fix']
+    const unknown = written.filter(l => !(l in m.LABELS))
+    console.log(unknown.length ? 'not in LABELS: ' + unknown.join(', ') : 'creatable')
+  })")"
+MERGE_QUEUE_LABEL="$(sed -n 's/.*--search "label:\([a-z-]*\) sort:created-asc".*/\1/p' "$ROOT/bin/merge-worker.sh")"
+assert_eq "the label the merge worker selects on is a resting label" "yes" \
+  "$(node -e "import('$ROOT/workflows/lib/github.mjs').then(m => console.log(m.RESTING_LABELS.includes('$MERGE_QUEUE_LABEL') ? 'yes' : 'no, $MERGE_QUEUE_LABEL is outside RESTING_LABELS'))")"
 
 # The other half of that contract lives in bin/reap.sh: the shortest settle
 # window it will ever honour has to be longer than everything a finished run

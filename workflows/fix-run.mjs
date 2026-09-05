@@ -22,7 +22,7 @@ import { HARNESS_DIR } from './lib/engine.mjs'
 import { parseArgs, finish, UsageError, EXIT } from './lib/cli.mjs'
 import { initStatus, statusPhase, statusNote, statusFinish } from './lib/status.mjs'
 import { sh, must, failureReason } from './lib/proc.mjs'
-import { ensureLabels, editLabels, issueLabels, issueView, comment, openPrs } from './lib/github.mjs'
+import { ensureLabels, editLabels, issueLabels, issueView, comment, openPrs, terminalBudget, terminalTimeout, terminalTransition } from './lib/github.mjs'
 import { git, gitOut, discoverPackages, pkgList, ensureDeps, runVerify, rebaseInProgress, pushRejected } from './lib/repo.mjs'
 import { finalizeFixerIssue } from './lib/fixer-finalize.mjs'
 
@@ -275,11 +275,17 @@ async function ship(issue, prep, body) {
   await comment(issue, body)
   // ready-to-review, NEVER ready-to-merge: a rewritten resolution needs a human glance before it may
   // merge unattended. The ladder labels stay: the ladder deliberately does not reset.
-  await ensureLabels(['ready-to-review'])
-  const flip = await editLabels(issue, { add: ['ready-to-review'], remove: ['in-progress', 'needs-judgment'] })
+  // From here the run is inside reap's settle window: the swap starts the clock
+  // the moment GitHub processes it, so the write and the readback after it share
+  // one budget (see terminalBudget) and the run still has a RESULT line to write.
+  // A readback that cannot confirm the landing drops into the blocker path, which
+  // transitions the labels again — inside THIS window, not a second one.
+  const budget = terminalBudget()
+  await ensureLabels(['ready-to-review'], { budget })
+  const flip = await editLabels(issue, { add: ['ready-to-review'], remove: ['in-progress', 'needs-judgment'] }, { budget })
   let labels
   try {
-    labels = await issueLabels(issue)
+    labels = await issueLabels(issue, { budget })
   } catch (e) {
     return { pushed: true, labelled: false, note: e && e.message || String(e) }
   }
@@ -294,19 +300,25 @@ async function ship(issue, prep, body) {
 // was already queued. Keep every disposition claim inside the block; a
 // `reason` string states what broke, never who picks it up.
 async function postBlocker({ issue, phase, reason, prUrl, attempt }) {
-  // The worktree must not be left mid-rebase for the next run to trip over.
-  if (await rebaseInProgress()) await git(['rebase', '--abort'])
+  // The worktree must not be left mid-rebase for the next run to trip over. Bounded by what the
+  // terminal window has left when it is ship's landing swap that failed: past that write reap's
+  // settle clock is running, and a stalled local git call costs the blocker report just as an
+  // unbounded gh call would. Before any terminal write there is no clock and git's own timeout stands.
+  if (await rebaseInProgress()) await git(['rebase', '--abort'], terminalTimeout())
   const ladder = attempt >= 2
     ? 'This was the RETRY (fix-attempted and fix-retried are both on the issue), so the fixer is done with it: resolve by hand, or strip the two fix-* labels to grant another round.'
     : attempt === 1
     ? 'This was the first attempt (fix-attempted is on the issue), so dispatch relaunches the fixer once, automatically, a few minutes after this session is reaped. Nothing to do unless the retry also fails.'
     : 'The attempt ladder was not reached, so dispatch will relaunch the fixer on its next tick.'
-  // needs-judgment keeps the issue in the fixer queue and the ladder labels bound the retries; both stay.
+  // needs-judgment keeps the issue in the fixer queue and the ladder labels bound the retries; both
+  // stay — and needs-judgment is RESTORED rather than assumed, because a landing swap that GitHub
+  // applied but this run could not verify has already stripped it and put `ready-to-review` on. A run
+  // resting at `failed` beside a landing label it never verified reports one state and presents
+  // another, so the transition names the one label it rests at and derives every removal from it.
   const settled = await finalizeFixerIssue({
     issue,
     body: `🤖 fix-conflict blocked\n- phase: ${phase}\n- reason: ${reason}\n- pr: ${prUrl || 'not resolved'}\n- next: ${ladder}\n`,
-    add: ['failed'],
-    remove: ['in-progress'],
+    ...terminalTransition({ rest: 'failed', queue: ['needs-judgment'] }),
   })
   if (!settled.reported) log(`blocked: GitHub report failed (${settled.reportError})`)
   if (!settled.settled) log(`blocked: terminal label restoration failed (${settled.stateError})`)
