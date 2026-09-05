@@ -41,6 +41,12 @@ assert_not_contains() { # name haystack needle
 assert_eq() { # name want got
   if [[ "$2" == "$3" ]]; then ok "$1"; else nok "$1 (want '$2', got '$3')"; fi
 }
+assert_matches() { # name value extended-regex
+  if [[ "$2" =~ $3 ]]; then ok "$1"; else
+    nok "$1"; printf '       expected pattern: %s\n' "$3"
+    printf '%s\n' "$2" | tail -n 8 | sed 's/^/       | /'
+  fi
+}
 
 # ───────────────────────── a throwaway project on a bare origin ─────────────────────────
 # One package declaring scripts.verify, .epics/ ignored, an AGENTS.md (the
@@ -716,6 +722,8 @@ run_pipeline() { # script fixtures-dir args...   (scenario knobs via GH_* env)
     CODEX_QUOTA_STDERR_ONLY="${CODEX_QUOTA_STDERR_ONLY:-}" \
     TMPDIR="$state/tmp" \
     EPIC_PROVIDER_HOLD_FILE="$state/provider-hold.json" \
+    HOST_TIMEZONE="${HOST_TIMEZONE:-}" \
+    TZ="${TZ:-}" \
     EPIC_USAGE_LOG="$state/usage.jsonl" \
     node "$script" "$@" 2>&1
   )" || RUN_RC=$?
@@ -793,6 +801,7 @@ assert_eq "records name the engines.json steps" "architect:1 code:3 confirm-revi
 assert_eq "tokens are what the CLI reported, all four kinds summed" "1600" "$(usage_log | jq -r 'select(.label=="architect:design") | .tokens.total')"
 assert_eq "cost and turns ride along" "0.05 3" "$(usage_log | jq -r 'select(.label=="architect:design") | "\(.costUsd) \(.turns)"')"
 assert_eq "every record carries the run, issue and engine" "8" "$(usage_log | jq -r 'select(.issue==42 and .engine=="claude" and (.runId|length)>0) | .step' | wc -l | tr -d ' ')"
+assert_eq "every usage timestamp stays canonical UTC ISO" "12" "$(usage_log | jq -r 'select(.ts | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$")) | .ts' | wc -l | tr -d ' ')"
 assert_not_contains "no usage went to GitHub" "$(cat "$GH_LOG")" "tokens"
 REPORT="$(node "$ROOT/workflows/usage-report.mjs" --log "$STATE_DIR/usage.jsonl")"
 assert_contains "the report groups by script" "$REPORT" "epic-run — 1 run(s): claude 1"
@@ -2776,7 +2785,7 @@ assert_not_contains "and the fixer is told nothing about groups" "$TRIAGE_PROMPT
 # It must be posted ONCE and edited thereafter: a comment per phase is the thing
 # that made per-phase commentary not worth having.
 scenario 'status comment: posted once, edited in place, ends with the outcome'
-run_pipeline "$EPIC_RUN" "$BASE" --issue 42 --session myapp-epic-42
+HOST_TIMEZONE=Europe/Amsterdam TZ=Pacific/Honolulu run_pipeline "$EPIC_RUN" "$BASE" --issue 42 --session myapp-epic-42
 assert_rc "exits 0" 0 "$RUN_RC"
 GH="$(cat "$GH_LOG")"
 CREATES="$(grep -c '^issue comment 42' "$GH_LOG" || true)"
@@ -2785,6 +2794,8 @@ assert_eq "exactly one comment is created" "1" "$CREATES"
 if [[ "$EDITS" -ge 1 ]]; then ok "later updates edit that comment ($EDITS)"; else nok "later updates edit that comment (got $EDITS)"; fi
 assert_contains "it names the phase and the session" "$GH" "epic-run"
 assert_contains "and the session name" "$GH" "myapp-epic-42"
+assert_matches "pane log prefixes use the configured human zone" "$RUN_OUT" '[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} (CET|CEST) \[epic-run myapp-epic-42\]'
+assert_matches "status started/updated fields use the configured human zone" "$GH" 'started [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} (CET|CEST) · updated [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} (CET|CEST)'
 assert_contains "the last write reports the outcome" "$GH" "queued for the merge worker"
 
 # GitHub renders every bare #N as that issue/PR's TITLE, so numbering findings

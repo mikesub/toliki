@@ -30,7 +30,35 @@ if [[ ! -f "$_LIB_DIR/repos.conf" ]]; then
   echo "  cp etc/repos.conf.template etc/repos.conf   # then edit it" >&2
   exit 1
 fi
+# HOST_TIMEZONE is machine-local registry state, not a caller override. Clear it
+# before loading repos.conf so an ssh caller, cron environment, or old tmux
+# server cannot choose how this host renders human timestamps.
+unset HOST_TIMEZONE
 source "$_LIB_DIR/repos.conf"
+
+# Empty and absent registries retain the historical UTC clock. A configured
+# value must be a safe relative TZif entry known by this host. The zoneinfo
+# directory also contains text metadata and administrative TZif copies; neither
+# names a host clock, and accepting one would let every tick present false time.
+HOST_TIMEZONE="${HOST_TIMEZONE:-UTC}"
+host_timezone_known() { # zone name
+  local zone="$1" magic
+  [[ "$zone" =~ ^[A-Za-z0-9._+-]+(/[A-Za-z0-9._+-]+)*$ ]] || return 1
+  [[ "/$zone/" != *"/../"* && "/$zone/" != *"/./"* ]] || return 1
+  case "$zone" in
+    localtime|posixrules|posix/*|right/*) return 1 ;;
+  esac
+  [[ -f "/usr/share/zoneinfo/$zone" ]] || return 1
+  magic="$(LC_ALL=C dd if="/usr/share/zoneinfo/$zone" bs=4 count=1 2>/dev/null)" || return 1
+  [[ "$magic" == "TZif" ]]
+}
+if ! host_timezone_known "$HOST_TIMEZONE"; then
+  echo "HOST_TIMEZONE must name a known, safe IANA zone, got '$HOST_TIMEZONE'" >&2
+  return 1 2>/dev/null || exit 1
+fi
+export HOST_TIMEZONE
+TZ="$HOST_TIMEZONE"
+export TZ
 
 # The first registry entry is the default when -r/--repo isn't given.
 DEFAULT_REPO="${REPOS[0]%%=*}"
@@ -120,9 +148,37 @@ slugify() {
 # Single-quote-escape a string for a shell command line.
 sq() { local s="${1//\'/\'\\\'\'}"; printf "'%s'" "$s"; }
 
-# UTC timestamp for log lines ("2026-08-11T09:45:02Z"). The cron-driven scripts
+# Host-zone timestamp for human-readable log lines. The cron-driven scripts
 # prefix every line with it via their say/warn helpers: three jobs append to
 # the same logs every five minutes, and an untimestamped line can't answer
-# which tick wrote it — or against which version of the script. Keep the flags
-# portable: the host's coreutils is uutils, not GNU.
-ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+# which tick wrote it — or against which version of the script. Machine records
+# and GitHub comparisons keep their own explicit UTC clocks.
+ts() { date '+%Y-%m-%d %H:%M:%S %Z'; }
+
+# Render a canonical machine instant for a human in the validated host zone.
+# uutils/GNU date use -d; the fallback keeps the helper usable with BSD date.
+human_ts() {
+  local epoch
+  [[ $# -eq 1 && -n "$1" ]] || return 1
+  date -d "$1" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null ||
+    { epoch="$(TZ=UTC date -j -f '%Y-%m-%dT%H:%M:%SZ' "$1" '+%s' 2>/dev/null)" &&
+      date -r "$epoch" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null; }
+}
+
+# Localize canonical UTC instants only at a human-output boundary. The value
+# feeding this helper remains unchanged, so JSON records and comparisons keep
+# their unambiguous UTC representation while messages can share the host clock.
+humanize_timestamps() {
+  local text="$*" out="" instant prefix rendered
+  while [[ "$text" =~ [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{3})?Z ]]; do
+    instant="${BASH_REMATCH[0]}"
+    prefix="${text%%"$instant"*}"
+    text="${text#*"$instant"}"
+    if rendered="$(human_ts "$instant")"; then
+      out="$out$prefix$rendered"
+    else
+      out="$out$prefix$instant"
+    fi
+  done
+  printf '%s' "$out$text"
+}

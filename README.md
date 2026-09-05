@@ -86,6 +86,15 @@ cp etc/repos.conf.template etc/repos.conf   # then edit: your repos + origins
 bin/provision.sh                            # idempotent; repeats until green
 ```
 
+Set `HOST_TIMEZONE` in the host's `etc/repos.conf` to an IANA zone such as
+`Europe/Amsterdam`; empty or unset means UTC. Provisioning applies that zone to
+the host and verifies the readback. Pane logs, live status comments, cron-script
+logs, and resource-report bounds then use `YYYY-MM-DD HH:mm:ss ABBR` with the
+abbreviation valid at that instant. The launcher passes the registry value into
+manual and dispatched tmux panes, so an SSH caller's timezone cannot override
+it. Parsed records—usage and resource JSON, hold deadlines, and GitHub time
+comparisons—remain canonical UTC ISO 8601.
+
 `provision.sh` installs everything else and prints an exact checklist of the
 few interactive steps it cannot do for you (logins, per-clone workspace
 trust, the bypass-permissions consent). It installs and authenticates both

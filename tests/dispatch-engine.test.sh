@@ -17,6 +17,7 @@ assert_rc() { if [[ "$2" == "$3" ]]; then ok "$1"; else nok "$1 (want rc $2, got
 assert_eq() { if [[ "$2" == "$3" ]]; then ok "$1"; else nok "$1 (want '$2', got '$3')"; fi; }
 assert_contains() { if [[ "$2" == *"$3"* ]]; then ok "$1"; else nok "$1 (missing: $3)"; fi; }
 assert_not_contains() { if [[ "$2" != *"$3"* ]]; then ok "$1"; else nok "$1 (unexpected: $3)"; fi; }
+assert_matches() { if [[ "$2" =~ $3 ]]; then ok "$1"; else nok "$1 (got '$2')"; fi; }
 issue_labels() { tr ',' '\n' < "$TMP/labels/$1" | sed '/^$/d' | sort | tr '\n' ','; }
 
 HARNESS="$TMP/harness"
@@ -37,6 +38,7 @@ NAMES=(alpha)
 NAME_MAX_LEN=40
 MAX_PARALLEL_EPICS=2
 DEFECT_FIX_REPOS=()
+HOST_TIMEZONE="Europe/Amsterdam"
 EOF
 
 set_defect_fix_repos() {
@@ -46,6 +48,11 @@ set_defect_fix_repos() {
 }
 unset_defect_fix_repos() {
   grep -v '^DEFECT_FIX_REPOS=' "$HARNESS/etc/repos.conf" > "$HARNESS/etc/repos.conf.next"
+  mv "$HARNESS/etc/repos.conf.next" "$HARNESS/etc/repos.conf"
+}
+set_host_timezone() {
+  grep -v '^HOST_TIMEZONE=' "$HARNESS/etc/repos.conf" > "$HARNESS/etc/repos.conf.next"
+  printf 'HOST_TIMEZONE="%s"\n' "$1" >> "$HARNESS/etc/repos.conf.next"
   mv "$HARNESS/etc/repos.conf.next" "$HARNESS/etc/repos.conf"
 }
 
@@ -59,6 +66,7 @@ chmod +x "$HARNESS/bin/launch.sh"
 
 cat > "$TMP/bin/flock" <<'STUB'
 #!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FLOCK_LOG"
 [[ "${FLOCK_BUSY:-}" != "1" ]] || exit 1
 exit 0
 STUB
@@ -148,10 +156,11 @@ RUN_RC=0
 run_dispatch() {
   : > "$TMP/launch.log"
   : > "$TMP/gh.log"
+  : > "$TMP/flock.log"
   RUN_RC=0
   RUN_OUT="$(
     PATH="$TMP/bin:$PATH" TMPDIR="$TMP/locks" \
-    LAUNCH_LOG="$TMP/launch.log" GH_LOG="$TMP/gh.log" \
+    LAUNCH_LOG="$TMP/launch.log" GH_LOG="$TMP/gh.log" FLOCK_LOG="$TMP/flock.log" \
     LABEL_DIR="$TMP/labels" BLOCKER_DIR="$TMP/blockers" \
     READY_QUEUE="${READY_QUEUE:-}" FIXER_QUEUE="${FIXER_QUEUE:-}" CI_QUEUE="${CI_QUEUE:-}" DEFECT_QUEUE="${DEFECT_QUEUE:-}" \
     FAIL_VIEW_ISSUE="${FAIL_VIEW_ISSUE:-}" FAIL_EDIT_ISSUE="${FAIL_EDIT_ISSUE:-}" \
@@ -161,6 +170,7 @@ run_dispatch() {
     FLOCK_BUSY="${FLOCK_BUSY:-}" STUB_SESSION_NAME="${STUB_SESSION_NAME:-}" \
     CAPACITY_RC="${CAPACITY_RC:-}" LAUNCH_RC="${LAUNCH_RC:-}" \
     EPIC_PROVIDER_HOLD_FILE="$TMP/provider-hold.json" \
+    HOST_TIMEZONE="Pacific/Honolulu" TZ="Pacific/Honolulu" \
     bash "$DISPATCH" "$@" 2>&1
   )" || RUN_RC=$?
 }
@@ -256,6 +266,27 @@ assert_contains "route-issue persists its label" "$(cat "$TMP/labels/7")" "engin
 assert_not_contains "route-issue does not report launch admission" "$RUN_OUT" "provider quota exhausted"
 assert_eq "the routing bypass leaves the active hold intact" "2099-01-01T00:00:00.000Z" "$(jq -r '.holdUntil' "$TMP/provider-hold.json" 2>/dev/null || true)"
 
+printf '\ndispatch: an invalid registry timezone fails before host-facing work\n'
+reset_state
+set_host_timezone "Mars/Olympus"
+run_dispatch
+assert_rc "an unknown HOST_TIMEZONE aborts the tick" 1 "$RUN_RC"
+assert_contains "the refusal names HOST_TIMEZONE" "$RUN_OUT" "HOST_TIMEZONE"
+assert_contains "the refusal names the rejected zone" "$RUN_OUT" "Mars/Olympus"
+assert_eq "the dispatch lock is never attempted" "" "$(cat "$TMP/flock.log")"
+assert_eq "GitHub is never queried" "" "$(cat "$TMP/gh.log")"
+assert_eq "launch.sh is never invoked" "" "$(cat "$TMP/launch.log")"
+
+set_host_timezone "zone.tab"
+run_dispatch
+assert_rc "an existing zoneinfo metadata file aborts the tick" 1 "$RUN_RC"
+assert_contains "the metadata refusal names HOST_TIMEZONE" "$RUN_OUT" "HOST_TIMEZONE"
+assert_contains "the metadata refusal names the rejected entry" "$RUN_OUT" "zone.tab"
+assert_eq "metadata validation happens before the dispatch lock" "" "$(cat "$TMP/flock.log")"
+assert_eq "metadata validation happens before GitHub" "" "$(cat "$TMP/gh.log")"
+assert_eq "metadata validation happens before launch.sh" "" "$(cat "$TMP/launch.log")"
+set_host_timezone "Europe/Amsterdam"
+
 printf '\ndispatch: an unknown defect-fixer opt-in fails before mutation or launch\n'
 reset_state
 set_defect_fix_repos "missingrepo"
@@ -272,6 +303,7 @@ printf 'ready' > "$TMP/labels/1"
 run_dispatch
 assert_rc "tick exits 0" 0 "$RUN_RC"
 assert_contains "Claude is passed to launch" "$(cat "$TMP/launch.log")" '--epic 1 --repo testrepo --engine claude'
+assert_matches "human dispatch logs use the configured zone" "$RUN_OUT" '[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} (CET|CEST) \[dispatch\]'
 
 printf '\ndispatch: EPIC_ENGINE sets the default for unlabeled work\n'
 reset_state

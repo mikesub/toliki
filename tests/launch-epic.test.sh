@@ -110,6 +110,7 @@ SSH_HOST="unused"
 NAMES=(alpha bravo)
 NAME_MAX_LEN=40
 MAX_PARALLEL_EPICS=2
+HOST_TIMEZONE="Europe/Amsterdam"
 EOF
 LAUNCH="$HARNESS/bin/launch.sh"
 WT_ROOT="$TMP/worktrees"
@@ -125,6 +126,8 @@ run_launch() {
     PATH="$TMP/bin:$PATH" \
     TMUX_LOG="$TMUX_LOG_FILE" \
     EPIC_WORKTREE_ROOT="$WT_ROOT" \
+    HOST_TIMEZONE="Pacific/Honolulu" \
+    TZ="Pacific/Honolulu" \
     HOME="$TMP/home" \
     bash "$LAUNCH" "$@" 2>&1
   )" || RUN_RC=$?
@@ -141,6 +144,7 @@ assert_contains "the default engine tag is Claude" "$(tmux_log)" "set-option -t 
 assert_contains "the pane runs the epic orchestrator" "$(tmux_log)" "workflows/epic-run.mjs' --issue 63"
 assert_contains "the session name is threaded through" "$(tmux_log)" "--session 'testrepo-epic-63'"
 assert_contains "the default engine reaches the orchestrator" "$(tmux_log)" "--engine 'claude'"
+assert_contains "the pane gets the registry zone despite hostile caller values" "$(tmux_log)" "TZ='Europe/Amsterdam' HOST_TIMEZONE='Europe/Amsterdam' node"
 assert_not_contains "no interactive claude is launched" "$(tmux_log)" "--remote-control"
 assert_file "the worktree exists" "$WT_ROOT/testrepo/testrepo-epic-63/frontend/package.json"
 
@@ -226,6 +230,7 @@ printf '\nlaunch: the interactive path is unchanged\n'
 run_launch --repo testrepo -m "look at the logs"
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_contains "it launches interactive claude" "$(tmux_log)" "claude --remote-control testrepo-look-at-the-logs --dangerously-skip-permissions --worktree testrepo-look-at-the-logs"
+assert_contains "interactive panes get the same registry zone" "$(tmux_log)" "TZ='Europe/Amsterdam' HOST_TIMEZONE='Europe/Amsterdam' claude"
 assert_contains "the message is passed as a positional prompt" "$(tmux_log)" "'look at the logs'"
 assert_contains "the pane starts in the clone, not a pipeline worktree" "$(tmux_log)" "-c $CLONE"
 

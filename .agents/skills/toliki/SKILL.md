@@ -15,20 +15,34 @@ surface is exactly the harness AGENTS.md's safe list: `gh` reads,
 ## 0. Setup
 
 Run laptop-side commands from the Toliki repository root (the checkout that
-contains this skill at `.agents/skills/toliki/SKILL.md`). Its machine-local
-`etc/repos.conf` is the only registry. Source `etc/lib.sh` under bash
-explicitly, since it locates itself via `BASH_SOURCE` and the interactive
-shell may be zsh:
+contains this skill at `.agents/skills/toliki/SKILL.md`). The laptop's
+machine-local `etc/repos.conf` is the connection and repository map; the host's
+independent registry is authoritative for its clock. Read both through the
+skill's helper:
 
 ```
-bash -c 'source etc/lib.sh && printf "%s\n" "SSH_HOST=$SSH_HOST" "HOST_CONTROL_DIR=$HOST_CONTROL_DIR" "${REPO_ORIGINS[@]}"'
+bash .agents/skills/toliki/scripts/host-clock.sh
 ```
 
 Every `REPO_ORIGINS` entry gets checked, always. `SSH_HOST` is the ssh
 destination and `HOST_CONTROL_DIR` is where `bin/` lives on the host; carry
-both into every ssh command below. If the command fails, report the message
-it prints. Never `cp etc/repos.conf.template etc/repos.conf`: that file is
-gitignored and machine-local, and the copy destroys the real registry.
+both into every ssh command below. `HOST_TIMEZONE` in the helper's output came
+from the host checkout over ssh, never from the laptop registry. If the command
+fails, report the message it prints. Never `cp etc/repos.conf.template
+etc/repos.conf`: that file is gitignored and machine-local, and the copy
+destroys the real registry.
+
+Harness-authored pane, status-comment, cron-log, and resource-report timestamps
+are already rendered in `HOST_TIMEZONE` as `YYYY-MM-DD HH:mm:ss ABBR`; read and
+report them as that host clock. Canonical UTC deadlines from machine interfaces
+must be converted with the host checkout's `human_ts` before presenting them:
+
+```
+bash .agents/skills/toliki/scripts/host-clock.sh --human-ts '<UTC instant>'
+```
+
+GitHub's own `updatedAt` values and comment dates are not harness timestamps:
+leave those values as GitHub returned or rendered them.
 
 ## 1. Host probes (read-only)
 
