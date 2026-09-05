@@ -248,6 +248,13 @@ than made launchable against a main without the code it describes.
 - Ship's deferral kinds feed the merge gate only after the skeptic re-judges
   every item ship did not call a defect; the skeptic can only escalate, and a
   dead check holds the PR. Gated by `tests/epic-run.test.sh`.
+- Ship rebases the run's checkpoint chain onto current origin/main before the
+  squash, because a run takes an hour and its PR is often held for hours more,
+  so the base has usually moved. A clean rebase re-runs the verify gate against
+  what landed; a red one blocks with the chain intact, so a re-run resumes from
+  its checkpoint. A failed fetch or a conflicted rebase ships on the run's own
+  base instead — the merge worker rebases and re-checks before anything lands,
+  and its fixers own that conflict. Gated by `tests/epic-run.test.sh`.
 - GitHub is the durable work state store: issues, labels, `blocked_by`, claim
   refs, PRs. The provider hold is the narrow host-fact exception, alongside
   locks and usage telemetry: it expires, orders no work, and is never a second

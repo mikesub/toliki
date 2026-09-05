@@ -105,6 +105,16 @@ seed_branch() {
   git -C "$dir" push -q origin "HEAD:refs/heads/$branch"
   rm -rf "$dir"
 }
+# A commit landing on the stub origin's main while a run is still going, the way
+# another PR merging does during an hour-long epic. Emitted as a bash snippet
+# for fixture_sh, so it runs inside a model spawn — after the run's last
+# checkpoint and before ship — with nothing but $STUB_ORIGIN to reach.
+land_on_main() { # path content -> snippet
+  printf 'd="$(mktemp -d)" && git clone -q "$STUB_ORIGIN" "$d" && printf "%%s\\n" %s > "$d/%s" && git -C "$d" add -A && git -C "$d" commit -qm "another PR landed" && git -C "$d" push -q origin HEAD:main && rm -rf "$d"' "$(printf '%q' "$2")" "$1"
+}
+ancestor_of() { # ref descendant -> yes|no
+  git -C "$ORIGIN" merge-base --is-ancestor "$1" "$2" >/dev/null 2>&1 && printf 'yes' || printf 'no'
+}
 scenario() { printf '\n%s\n' "$1"; reset_origin; }
 
 # ───────────────────────── the stub engine ─────────────────────────
@@ -1837,6 +1847,118 @@ assert_contains "the concrete unfixed finding still holds the gate" "$RUN_OUT" '
 assert_contains "the uncertain deferral also holds it" "$RUN_OUT" 'the deferral check produced no result'
 assert_not_contains "mixed evidence cannot enter autonomous repair" "$RUN_OUT" '"needsDefectFix":true'
 assert_eq "the issue remains only ready-to-review" "ready-to-review," "$(gh_labels)"
+
+# ───────────────────────── ship: rebase onto current origin/main ─────────────────────────
+# Base drift is the normal case, not the exception: a run takes an hour and its
+# PR is often held for hours more. Ship rebases the checkpoint chain onto what
+# actually landed and re-verifies, so the collision is met by the run that still
+# holds the change's context instead of by bin/merge-worker.sh's fixers. Each
+# scenario moves the stub origin's main from inside a model spawn that runs
+# AFTER the last checkpoint (the post-fix check), which is where a real merge
+# lands mid-run.
+
+scenario 'ship rebase: a base that moved mid-run is rebased onto, re-verified and shipped'
+ADVANCED="$TMP/fixtures-advanced"; cp -R "$BASE" "$ADVANCED"
+fixture_sh "$ADVANCED" fixcheck "$(land_on_main frontend/src/other.ts 'export const other = () => 1')"
+run_pipeline "$EPIC_RUN" "$ADVANCED" --issue 42
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_contains "the rebase is announced with what landed" "$RUN_OUT" "Ship: rebased onto current origin/main (1 commit(s) landed during the run)"
+assert_contains "the phase log records it too" "$(cat "$WT/.epics/42-add-widget/epic.md")" "ship: rebased onto current origin/main"
+assert_eq "the PR head is one commit above the NEW main" 1 "$(origin_count epic/42-add-widget)"
+assert_eq "the new main is an ancestor of the PR head" "yes" "$(ancestor_of main epic/42-add-widget)"
+assert_contains "what landed mid-run is in the shipped tree" "$(git -C "$ORIGIN" ls-tree -r --name-only epic/42-add-widget)" "frontend/src/other.ts"
+assert_eq "the verify gate ran once more, on the rebased tree" 5 "$(grep -c '^run verify$' "$NPM_LOG")"
+assert_contains "and that run is the post-rebase gate" "$RUN_OUT" "Ship: verify gate after rebase: verify green"
+assert_contains "the gate outcome is what it is without the move" "$RUN_OUT" '"readyToMerge":true'
+assert_eq "the issue still ends ready-to-merge and nothing else" "ready-to-merge," "$(gh_labels)"
+assert_eq "the rebase costs no model step" 8 "$(wc -l < "$RUN_LOG" | tr -d ' ')"
+assert_contains "the dep check still runs and finds nothing to do" "$RUN_OUT" "Ship: deps checked after rebase (frontend: deps present)"
+assert_eq "a base with no lockfile move installs nothing extra" 1 "$(grep -c '^ci$' "$NPM_LOG")"
+
+scenario 'ship rebase: a lockfile that landed mid-run is installed before the gate re-runs'
+# Otherwise the post-rebase gate verifies the rebased tree against the
+# node_modules the run started with — a green nothing installed.
+LOCKMOVED="$TMP/fixtures-lock-moved"; cp -R "$BASE" "$LOCKMOVED"
+fixture_sh "$LOCKMOVED" fixcheck "$(land_on_main frontend/package-lock.json '{"changed":true}')"
+run_pipeline "$EPIC_RUN" "$LOCKMOVED" --issue 42
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_contains "the chain was rebased onto it" "$RUN_OUT" "Ship: rebased onto current origin/main (1 commit(s) landed during the run)"
+assert_contains "the reinstall is reported with its reason" "$RUN_OUT" "Ship: deps checked after rebase (frontend: npm ci (lockfile changed))"
+assert_eq "deps are installed again for the discovered package" 2 "$(grep -c '^ci$' "$NPM_LOG")"
+assert_eq "the install lands between the rebase and the post-rebase verify" "ci run verify" "$(tail -n 2 "$NPM_LOG" | tr '\n' ' ' | sed 's/ $//')"
+assert_contains "and the gate then runs on the reinstalled tree" "$RUN_OUT" "Ship: verify gate after rebase: verify green"
+assert_contains "the lockfile that landed is in the shipped tree" "$(git -C "$ORIGIN" show epic/42-add-widget:frontend/package-lock.json)" '"changed":true'
+assert_contains "the run ships" "$RUN_OUT" '"readyToMerge":true'
+
+scenario 'ship rebase: work still loose in the tree is folded in, not read as a conflict'
+# A rebase refuses a dirty tree, and that refusal must never be reported as a
+# conflict. Ship folds the leftovers into the chain first, so the conflict
+# message only ever means a real conflict.
+LOOSE="$TMP/fixtures-loose"; cp -R "$BASE" "$LOOSE"
+fixture_sh "$LOOSE" fixcheck "$(land_on_main frontend/src/other.ts 'export const other = () => 1') && printf 'export const createWidget = () => ({ items: [], extra: 1 })\n' > frontend/src/widget.ts && printf 'export const stray = 1\n' > frontend/src/stray.ts"
+run_pipeline "$EPIC_RUN" "$LOOSE" --issue 42
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_contains "a dirty tree still rebases" "$RUN_OUT" "Ship: rebased onto current origin/main (1 commit(s) landed during the run)"
+assert_not_contains "and is never reported as a conflict" "$RUN_OUT" "the rebase conflicted"
+assert_contains "the loose edit reached the shipped tree" "$(git -C "$ORIGIN" show epic/42-add-widget:frontend/src/widget.ts)" "extra: 1"
+assert_contains "and so did the file it left untracked" "$(git -C "$ORIGIN" ls-tree -r --name-only epic/42-add-widget)" "frontend/src/stray.ts"
+assert_eq "still one commit above the new main" 1 "$(origin_count epic/42-add-widget)"
+assert_contains "the run ships" "$RUN_OUT" '"readyToMerge":true'
+
+scenario "ship rebase: a conflicting base ships on the run's own base for the merge worker"
+CONFLICT="$TMP/fixtures-conflict"; cp -R "$BASE" "$CONFLICT"
+# Same file the epic's code checkpoint creates, different content: an add/add
+# conflict the rebase cannot resolve.
+fixture_sh "$CONFLICT" fixcheck "$(land_on_main frontend/src/widget.ts 'export const createWidget = () => ({ landed: true })')"
+run_pipeline "$EPIC_RUN" "$CONFLICT" --issue 42
+assert_rc "the run still finishes" 0 "$RUN_RC"
+assert_contains "the conflict is announced and handed on" "$RUN_OUT" "origin/main moved by 1 commit(s) during the run and the rebase conflicted — shipping on the run's base; the merge worker rebases it and its fixers own the conflict"
+assert_contains "the phase log records it too" "$(cat "$WT/.epics/42-add-widget/epic.md")" "the rebase conflicted"
+assert_eq "no rebase is left in progress" "clean" "$([[ -d "$WT/.git/rebase-merge" || -d "$WT/.git/rebase-apply" ]] && echo stuck || echo clean)"
+assert_eq "the PR is one commit above the base the run started from" 1 "$(git -C "$ORIGIN" rev-list --count "$MAIN_INITIAL..epic/42-add-widget")"
+assert_eq "current main is NOT an ancestor of the PR head" "no" "$(ancestor_of main epic/42-add-widget)"
+assert_eq "a conflicted rebase re-runs no verify" 4 "$(grep -c '^run verify$' "$NPM_LOG")"
+assert_contains "and the run ends exactly as it would have" "$RUN_OUT" '"readyToMerge":true'
+assert_eq "the issue still ends ready-to-merge and nothing else" "ready-to-merge," "$(gh_labels)"
+
+scenario 'ship rebase: verify red on the rebased tree blocks with the chain preserved'
+# The post-fix check lands the commit AND arms the verify stub: every gate
+# before this point was green, so only the run against the new base is red.
+REDBASE="$TMP/fixtures-red-after-rebase"; cp -R "$BASE" "$REDBASE"
+fixture_sh "$REDBASE" fixcheck "$(land_on_main frontend/src/other.ts 'export const other = () => 1') && printf '1' > \"\$STUB_FIXTURES/verify.rc\""
+run_pipeline "$EPIC_RUN" "$REDBASE" --issue 42
+assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
+assert_contains "it blocks in the ship phase" "$RUN_OUT" '"phase":"ship"'
+assert_contains "the reason names the moved base and the red gate" "$RUN_OUT" 'origin/main moved by 1 commit(s) during the run and npm run verify is red after rebasing onto it'
+assert_contains "the reason carries the gate detail" "$RUN_OUT" 'expected 2 got 1'
+assert_contains "and says a re-run resumes from the checkpoint" "$RUN_OUT" 'resumes from that checkpoint'
+assert_eq "nothing shipped a PR" "" "$(gh_pr_created)"
+assert_eq "the issue ends failed and nothing else" "failed," "$(gh_labels)"
+assert_contains "the preserved branch still carries a resumable checkpoint" "$(git -C "$ORIGIN" log --format=%s "main..epic/42-add-widget")" "wip(epic 42-add-widget): code checkpoint"
+assert_eq "and it sits on the base that landed mid-run" "yes" "$(ancestor_of main epic/42-add-widget)"
+# The whole point of not squashing before the rebase: the next run resumes.
+run_pipeline "$EPIC_RUN" "$BASE" --issue 42
+assert_rc "the follow-up run ships" 0 "$RUN_RC"
+assert_contains "prepare resumed the preserved checkpoint" "$RUN_OUT" "a code checkpoint is on it"
+assert_contains "and implementation was skipped" "$RUN_OUT" "resumed from a code checkpoint — implementation skipped"
+assert_eq "architect never re-ran" 0 "$(calls design)"
+assert_contains "the follow-up opens the PR from the preserved work" "$RUN_OUT" '"prUrl":"https://github.com/o/r/pull/7"'
+assert_eq "as one commit above main" 1 "$(origin_count epic/42-add-widget)"
+
+scenario "ship rebase: a fetch that failed ships on the run's base"
+# The fetch URL is broken mid-run while the push URL stays good: the run cannot
+# see what landed, and must ship what it has rather than block on it.
+NOFETCH="$TMP/fixtures-nofetch"; cp -R "$BASE" "$NOFETCH"
+fixture_sh "$NOFETCH" fixcheck "$(land_on_main frontend/src/other.ts 'export const other = () => 1') && git remote set-url --push origin \"\$STUB_ORIGIN\" && git remote set-url origin \"\$STUB_ORIGIN.gone\""
+run_pipeline "$EPIC_RUN" "$NOFETCH" --issue 42
+assert_rc "the run still ships" 0 "$RUN_RC"
+assert_contains "the failed fetch is named, not swallowed" "$RUN_OUT" "Ship: fetch failed ("
+assert_contains "and it ships on the base it has" "$RUN_OUT" "shipping on the run's base"
+assert_eq "no verify re-runs without a fetch" 4 "$(grep -c '^run verify$' "$NPM_LOG")"
+assert_eq "the PR is one commit above the base the run started from" 1 "$(git -C "$ORIGIN" rev-list --count "$MAIN_INITIAL..epic/42-add-widget")"
+assert_eq "what landed mid-run is NOT under the PR head" "no" "$(ancestor_of main epic/42-add-widget)"
+assert_contains "the gate still decides normally" "$RUN_OUT" '"readyToMerge":true'
+assert_eq "the issue still ends ready-to-merge and nothing else" "ready-to-merge," "$(gh_labels)"
 
 scenario 'epic-run: a deferred record already on the issue is not doubled'
 # What a retry sees after a ship that died between recording the deferrals and

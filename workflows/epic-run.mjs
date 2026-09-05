@@ -45,6 +45,15 @@
 // them: every item ship did not call a defect is re-judged, and the skeptic
 // can only escalate. The builder side never has the last word on whether a
 // deferred item is a defect.
+//
+// Ship then rebases the checkpoint chain onto current origin/main BEFORE the
+// squash: a run takes an hour and its PR is often held for hours more, so the
+// base has usually moved by the time it ships. A clean rebase re-runs the
+// verify gate against what actually landed, and a red one blocks with the
+// chain intact so a re-run resumes from it. A fetch that failed or a rebase
+// that conflicted ships on the run's own base exactly as before — the merge
+// worker rebases and re-checks before anything lands, and its fixers own that
+// conflict.
 
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
@@ -61,7 +70,7 @@ import {
 import { matchingDefectEvidence, renderDefectEvidence } from './lib/defect-evidence.mjs'
 import {
   git, gitOut, discoverPackages, pkgList, ensureDeps, runVerify, ensureEpicsIgnored, checkpoint, intentToAdd,
-  pushRejected, slugify, epicDir, writeRequirements, readRequirements, initEpicMd, updateEpicMd,
+  pushRejected, rebaseInProgress, slugify, epicDir, writeRequirements, readRequirements, initEpicMd, updateEpicMd,
   renderArchitecture, renderReview,
 } from './lib/repo.mjs'
 import { recordQuotaHold } from './quota-hold.mjs'
@@ -837,9 +846,23 @@ async function preserveWork({ slug, phase }) {
     await gitOut(['add', '-A'], 'git add -A')
     if ((await git(['diff', '--cached', '--quiet'])).code !== 0) await gitOut(['commit', '-q', '-m', `wip: epic blocked at ${phase}`], 'git commit (wip)')
   }
-  const tracked = (await git(['rev-parse', '--verify', '-q', `refs/remotes/origin/${branch}`])).ok ? `origin/${branch}` : 'origin/main'
-  const ahead = Number((await git(['rev-list', '--count', `${tracked}..HEAD`])).out) || 0
-  if (ahead > 0) {
+  // "Ahead of the claimed ref" is the wrong question once ship can rebase: a rebase rewrites every
+  // commit above the base, so a chain that is genuinely unpushed can still count zero commits the
+  // remote lacks (a rebase that dropped work main already carried). What has to be pushed is a tip
+  // that DIFFERS from the ref this run claimed — unless the remote is strictly ahead of it, which is
+  // someone else's push and never something to overwrite. With no claimed ref yet, ahead of
+  // origin/main is still the only sensible test.
+  const claimed = `refs/remotes/origin/${branch}`
+  const hasClaim = (await git(['rev-parse', '--verify', '-q', claimed])).ok
+  let push
+  if (hasClaim) {
+    const head = (await git(['rev-parse', 'HEAD'])).out
+    const remote = (await git(['rev-parse', claimed])).out
+    push = !!head && !!remote && head !== remote && (await git(['merge-base', '--is-ancestor', 'HEAD', claimed])).code !== 0
+  } else {
+    push = (Number((await git(['rev-list', '--count', 'origin/main..HEAD'])).out) || 0) > 0
+  }
+  if (push) {
     const pushed = await git(['push', '--force-with-lease', '-u', 'origin', branch])
     if (!pushed.ok) throw new Error(`git push failed (${failureReason(pushed)})`)
   }
@@ -1494,6 +1517,62 @@ try {
     writeFileSync(path.join(dir, 'summary.md'), `${String(s.summary).trim()}\n`)
     updateEpicMd(dir, { phase: 'ship → done', log: 'ship: summary.md written (manual mode, no PR)' })
     return { slug, approach: design?.approach, greenStatus: green, findingsConfirmed: verified.length, findingsUnconfirmed: unconfirmed.length, triageStatus, summary: s.summary }
+  }
+
+  // ───────────────────────── Rebase onto current origin/main ─────────────────────────
+  // The base this run cut from is an hour old by here, and the PR it is about to open is often held
+  // for hours more, so main has usually moved. Shipping on the run's own base leaves that collision
+  // to be discovered in bin/merge-worker.sh, outside the epic, where the model that wrote the change
+  // no longer has any of its context. Rebasing HERE puts it in front of the run that still does.
+  //
+  // The chain is rebased AS IT IS — claim commit, code checkpoint, triage checkpoint(s) — and never
+  // squashed first: prepare recognises a leftover branch by those `wip(epic <slug>): ... checkpoint`
+  // subjects, so whatever blocks after this point has to leave a resumable chain behind.
+  //
+  // This is not a gate and does not fail closed. A fetch that failed or a rebase that conflicted
+  // ships on the run's base exactly as it did before, because the merge worker rebases and re-checks
+  // before anything lands and its fixers own that conflict. A CLEAN rebase is the case that changes
+  // something: the change now sits on code nothing verified it against, so the verify gate runs
+  // again, and red blocks the run rather than opening a PR whose green belongs to a base main left
+  // behind. Everything downstream reads the rebased tree on its own — DIFF is
+  // `git diff origin/main...HEAD`, and shipTransport takes the merge base fresh — so nothing here is
+  // captured for later.
+  //
+  // Whatever is still loose in the tree is folded in FIRST, with the very commit shipTransport makes
+  // below (which then finds nothing left to do). A rebase refuses a dirty tree, and that refusal
+  // would otherwise be reported as a conflict when it is nothing of the sort. The checkpoint chain
+  // underneath is untouched, so prepare still finds its code/triage subjects on a resume.
+  await gitOut(['add', '-A'], 'git add -A')
+  if ((await git(['diff', '--cached', '--quiet'])).code !== 0) await gitOut(['commit', '-q', '-m', `wip(epic ${slug}): pre-ship`], 'git commit (pre-ship)')
+
+  const fetched = await git(['fetch', 'origin'])
+  if (!fetched.ok) {
+    log(`Ship: fetch failed (${failureReason(fetched)}) — shipping on the run's base`)
+  } else {
+    const landed = Number(await gitOut(['rev-list', '--count', 'HEAD..origin/main'], 'git rev-list')) || 0
+    if (landed > 0) {
+      const beforeRebase = await gitOut(['rev-parse', 'HEAD'], 'git rev-parse HEAD')
+      const rebase = await git(['rebase', 'origin/main'])
+      if (!rebase.ok) {
+        if (await rebaseInProgress()) await git(['rebase', '--abort'])
+        const why = `origin/main moved by ${landed} commit(s) during the run and the rebase conflicted — shipping on the run's base; the merge worker rebases it and its fixers own the conflict`
+        log(`Ship: ${why}`)
+        updateEpicMd(dir, { log: `ship: ${why}` })
+      } else {
+        const what = `rebased onto current origin/main (${landed} commit(s) landed during the run)`
+        log(`Ship: ${what}`)
+        updateEpicMd(dir, { log: `ship: ${what}` })
+        // What landed can include a lockfile this run never installed, and the gate below would then
+        // verify the rebased tree against the node_modules the run started with. Same pair-diff
+        // prepare uses for its own base move: reinstall only where the lockfile actually differs.
+        const depLines = await ensureDeps(packages, { pairs: [[beforeRebase, 'HEAD']] })
+        log(`Ship: deps checked after rebase (${depLines.join('; ')})`)
+        const rebased = await verifyGate('Ship: verify gate after rebase')
+        if (!rebased.green) {
+          return await fail('ship', `origin/main moved by ${landed} commit(s) during the run and npm run verify is red after rebasing onto it (${rebased.detail}) — refusing to open a PR whose green belongs to the base this run started from. The rebased branch is preserved with its checkpoint chain: a re-run of /epic #${issue} resumes from that checkpoint, rebases again in prepare, and repairs from this failure.`)
+        }
+      }
+    }
   }
 
   const decision = await agent(PROMPTS.ship(dir, issue, design, triageStatus, reviewTally),

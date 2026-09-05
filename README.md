@@ -28,8 +28,12 @@ only where a judgment is needed. Claude Code and Codex are both supported.
    test-first red/green or a direct coding step. Both paths pass the project's
    verify gate run by the orchestrator. One general reviewer always runs; the
    plan may request one additional review for a concrete risk question.
-   Findings go through an independent skeptic and bounded repairs. The run
-   ends at an open PR with `ready-to-merge` (gates cleared, lands unattended)
+   Findings go through an independent skeptic and bounded repairs. Ship then
+   rebases the run's checkpoint chain onto current `main` and re-runs verify
+   before squashing, so a base that moved during the run is met here rather
+   than by the merge worker; a conflict or a failed fetch ships on the run's
+   own base and leaves it to the worker. The run ends at an open PR with
+   `ready-to-merge` (gates cleared, lands unattended)
    or `ready-to-review` (a human decides). A hard provider quota is a successful
    held outcome instead: the resumable branch is preserved, the issue returns
    to its queue without spending a fixer attempt, and automatic dispatch waits

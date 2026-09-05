@@ -70,7 +70,9 @@ don't get re-litigated from memory.
   there is no parallelism to be had. Its two decline classes that a machine can
   own — a judgment-class conflict and a red check — go to fixer runs rather
   than to a human, each under an adversarial check and each bounded by one
-  retry.
+  retry. An epic already rebases onto current `main` at ship, so this rebase
+  usually finds nothing left to do and a conflict here means `main` moved in
+  the window between ship and merge.
 - **Repair is bounded: two fix rounds inside the epic, then a new bounded
   session, never an unbounded loop.** Conflict, CI and ship-gate defect repair
   each have an independent two-attempt ladder in GitHub labels. The defect rung
