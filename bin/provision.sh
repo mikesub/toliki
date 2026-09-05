@@ -18,7 +18,8 @@ set -euo pipefail
 # what it found and what it changed, and nothing is reinstalled just because
 # the script ran. Versions already present are left alone rather than upgraded:
 # a provision run should not be able to move node or the CLIs under a fleet of
-# live sessions.
+# live sessions. HOST_TIMEZONE is checked and applied on every run so cron,
+# shells, and system tools agree with the harness's human-facing clock.
 #
 # The things a script fundamentally cannot do — credentialed logins, the
 # per-clone workspace-trust dialog, and the bypass-permissions acceptance, all
@@ -73,6 +74,7 @@ ver() { local out; out="$("$@" 2>/dev/null | head -n1)" || out=""; printf '%s' "
 # Keeping their install logic and Codex's auth gate in a sourced helper makes
 # them hermetically testable without a test-only mode in this provisioner.
 source "$HERE/provision-agent-clis.lib.sh"
+source "$HERE/provision-timezone.lib.sh"
 source "$HERE/../etc/wire-claude-content.sh"
 
 # ---------------------------------------------------------------- preflight --
@@ -88,6 +90,9 @@ else
   fi
   SUDO="sudo"
 fi
+
+say "host time zone"
+provision_host_timezone
 
 if [[ -r /etc/os-release ]]; then
   # shellcheck disable=SC1091

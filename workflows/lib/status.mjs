@@ -17,12 +17,10 @@
 // clock. A status comment is
 // reporting, never a gate — a GitHub blip must not fail a run that is building
 // correctly, and a run whose status went quiet is exactly the case the stale
-// timestamp is meant to describe.
+// timestamp is meant to describe. Started/updated use the same configured
+// host-zone clock as the pane.
 import { execFile } from 'node:child_process'
-
-// Its own clock rather than runtime's: runtime registers THIS module's hooks,
-// and importing back the other way would make the two files circular.
-const ts = () => new Date().toISOString().replace(/\.\d{3}Z$/, 'Z')
+import { humanTimestamp, humanizeTimestamps } from './time.mjs'
 
 const GH_TIMEOUT_MS = 20_000
 // Long enough that a chatty phase cannot turn into an API burst, short enough
@@ -59,7 +57,7 @@ export function initStatus({ issue: n, script: sc, session: s, phases: p } = {})
   if (sc) script = sc
   session = s || ''
   phases = Array.isArray(p) ? p : []
-  startedAt = ts()
+  startedAt = humanTimestamp()
 }
 
 function body() {
@@ -67,9 +65,9 @@ function body() {
   const step = i >= 0 && phases.length ? ` (${i + 1}/${phases.length})` : ''
   const lines = [
     `🤖 **${script}**${session ? ` · \`${session}\`` : ''} · phase: **${currentPhase || 'starting'}**${step}`,
-    `started ${startedAt} · updated ${ts()}`,
+    `started ${startedAt} · updated ${humanTimestamp()}`,
   ]
-  if (lastNote) lines.push('', lastNote)
+  if (lastNote) lines.push('', humanizeTimestamps(lastNote))
   lines.push('', '_Live status, edited in place. The PR carries what was built and the review outcome._')
   return lines.join('\n')
 }

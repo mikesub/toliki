@@ -6,6 +6,8 @@ set -euo pipefail
 # session, tags it with its repo and starts the run inside it.
 # remote-control.sh calls this over ssh; bin/dispatch.sh (host-side, cron)
 # calls it directly — keep it free of any ssh/laptop assumptions.
+# It writes the registry's HOST_TIMEZONE and TZ into every pane command rather
+# than trusting the ssh caller or a long-lived tmux server's cached environment.
 #
 # Two kinds of session, and they run different things:
 #   --epic N / --fix N / --ci N / --defect N
@@ -401,7 +403,7 @@ if [[ -n "$MODE" ]]; then
     ci)   SCRIPT="$HERE/../workflows/ci-run.mjs" ;;
     defect) SCRIPT="$HERE/../workflows/defect-run.mjs" ;;
   esac
-  LINE="node $(sq "$SCRIPT") --issue $ISSUE --session $(sq "$SESSION") --engine $(sq "$ENGINE")"
+  LINE="TZ=$(sq "$HOST_TIMEZONE") HOST_TIMEZONE=$(sq "$HOST_TIMEZONE") node $(sq "$SCRIPT") --issue $ISSUE --session $(sq "$SESSION") --engine $(sq "$ENGINE")"
 else
   # An interactive session. The name is threaded through --remote-control and
   # --worktree so it's identifiable in the Desktop app and reusable across
@@ -409,7 +411,7 @@ else
   # initial prompt (if any) is appended as a positional arg, quoted for the
   # pane's shell. NOTE: positional, not `-p` — `-p` is print/non-interactive
   # mode, which would run the prompt then exit and tear the session down.
-  LINE="claude --remote-control $SESSION --dangerously-skip-permissions --worktree $SESSION"
+  LINE="TZ=$(sq "$HOST_TIMEZONE") HOST_TIMEZONE=$(sq "$HOST_TIMEZONE") claude --remote-control $SESSION --dangerously-skip-permissions --worktree $SESSION"
   if [[ $HAVE_MESSAGE -eq 1 && -n "$MESSAGE" ]]; then
     LINE+=" $(sq "$MESSAGE")"
   fi

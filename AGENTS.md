@@ -109,6 +109,10 @@ than made launchable against a main without the code it describes.
 - `workflows/lib/runtime.mjs` owns phase execution, the concurrency gate,
   timeouts and signal forwarding. Deterministic control flow lives here or in
   scripts, never inside model judgment.
+- `etc/lib.sh` validates and exports the host-wide `HOST_TIMEZONE`, and
+  `workflows/lib/time.mjs` is the matching Node formatter. Human-facing pane,
+  status, script-log and resource-report timestamps use that zone; parsed usage,
+  resource and GitHub-comparison values remain UTC ISO.
 - `workflows/lib/github.mjs` and `workflows/lib/repo.mjs` are the pipelines'
   transport: every claim, label swap, comment, checkpoint, squash, push, PR,
   follow-up issue, layout discovery, `npm ci` and the fixer's verify run is
@@ -316,6 +320,11 @@ than made launchable against a main without the code it describes.
   `tests/update-claude.test.sh`.
 - Provisioning never upgrades a version already present, and never sets a
   consent flag. Gated by `tests/provision-agent-clis.test.sh`.
+- `HOST_TIMEZONE` comes only from `etc/repos.conf`; caller and tmux environments
+  cannot override it. An empty value means UTC, an unknown zone refuses before
+  host-facing work, and provisioning sets then verifies the host's effective
+  zone. Human timestamps include the instant's abbreviation; machine records
+  remain canonical UTC ISO. Gated by `tests/timezone.test.sh`.
 
 ## Traps the code cannot show you
 
@@ -334,6 +343,9 @@ than made launchable against a main without the code it describes.
   load on every tick.
 - Every name in `DEFECT_FIX_REPOS` must be registered in `REPOS`; empty or
   unset disables autonomous defect repair without disabling manual launches.
+- Changing `HOST_TIMEZONE` in the host registry requires a `bin/provision.sh`
+  run so the system timezone follows it. Existing panes keep their explicitly
+  launched zone; new manual and pipeline panes receive the new registry value.
 - Claude model names in `etc/engines.json` are CLI aliases resolved by the
   installed binary, so a stale binary silently turns them into pins.
 - The Docker GC policy loads only on a full daemon restart, and unknown keys
@@ -355,7 +367,7 @@ than made launchable against a main without the code it describes.
 4. When the contract or its rationale changes, update this file, DOCTRINE.md,
    README, the template or the script header. Never leave an invariant only in
    a commit message.
-5. Run every relevant suite; run all ten before handing off a broad change.
+5. Run every relevant suite; run all eleven before handing off a broad change.
 
 Trunk-based: when asked to commit or push, commit straight to `main` and push.
 No feature branches or PRs unless explicitly requested. Never commit or push
@@ -375,7 +387,7 @@ merely because the code is ready.
 
 ## Tests
 
-All ten suites are hermetic and need no network or credentials:
+All eleven suites are hermetic and need no network or credentials:
 
 ```bash
 for t in tests/*.test.sh; do bash "$t" || exit; done

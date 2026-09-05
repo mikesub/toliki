@@ -107,6 +107,13 @@ don't get re-litigated from memory.
 - **One contract per project.** A package is a directory whose `package.json`
   declares `scripts.verify`; everything the project wants gated goes inside
   that script. The pipeline discovers the rest from the repo itself.
+- **One human clock, UTC machine records.** Every timestamp the harness renders
+  for an operator uses one host-wide IANA zone from the machine registry,
+  including the real abbreviation at that instant. Values another script must
+  parse or compare stay UTC ISO 8601. A viewer elsewhere may need to convert a
+  stated host time, but daylight-saving changes can never reorder durable
+  records; per-user presentation was declined to keep panes, comments, cron,
+  and system tools on one clock.
 
 ## What it doesn't
 

@@ -39,9 +39,10 @@ QUEUE_LIMIT=20                       # candidates fetched per repo per tick
 EXIT_AT_CAPACITY=3                   # launch.sh's "host is full" code
 
 # Everything this script prints goes through these two, so each line carries
-# the UTC timestamp of the tick that wrote it (ts is in etc/lib.sh).
-say()  { echo "$(ts) [dispatch] $*"; }
-warn() { echo "$(ts) [dispatch] $*" >&2; }
+# the configured host-zone timestamp of the tick that wrote it (ts is in
+# etc/lib.sh).
+say()  { echo "$(ts) [dispatch] $(humanize_timestamps "$*")"; }
+warn() { echo "$(ts) [dispatch] $(humanize_timestamps "$*")" >&2; }
 
 usage() {
   cat <<EOF

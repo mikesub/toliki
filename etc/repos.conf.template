@@ -54,6 +54,12 @@ NAME_MAX_LEN=40
 # pipeline bug.
 MAX_PARALLEL_EPICS=2
 
+# IANA zone used for every timestamp rendered for a human (pane/status/script
+# logs and resource reports). Empty or unset means UTC. Provisioning applies
+# this as the system timezone too, so cron and host tools share the same clock;
+# etc/lib.sh refuses an unknown or unsafe name before a tick can do work.
+HOST_TIMEZONE="UTC"
+
 # Repositories allowed to run the bounded ship-gate defect fixer
 # autonomously. Empty/unset means the defect queue is only descriptive; an
 # operator can still launch one explicitly with `remote-control.sh defect`.

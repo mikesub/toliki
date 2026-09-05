@@ -27,6 +27,9 @@
 # short spikes worth catching. Only genuinely instantaneous values (load, RSS,
 # container count) are point samples, and they are labelled as such.
 #
+# The sample timestamp is a parsed machine record and therefore remains UTC
+# ISO 8601 even though resource-report renders its bounds in HOST_TIMEZONE.
+#
 # Phase detection is deliberately zero-touch — inferred here from process names
 # rather than emitted by the projects themselves. The alternative (each repo's
 # test-db.sh logging its own begin/end) is more precise and could time lock
@@ -34,6 +37,10 @@
 # resolution this does not need. The cost is accepted and named: a tier shorter
 # than the sample gap can slip through unseen, and lock-wait time is invisible.
 set -uo pipefail
+
+_RESOURCE_LOG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$_RESOURCE_LOG_DIR/resource-log.lib.sh"
+unset _RESOURCE_LOG_DIR
 
 LOG="${RESOURCE_LOG:-$HOME/resource.log}"
 PAGE_KB=$(( $(getconf PAGESIZE 2>/dev/null || echo 4096) / 1024 ))
@@ -72,7 +79,7 @@ pid_rss_kb() {
 n() { [[ "${1:-}" =~ ^[0-9]+$ ]] && echo "$1" || echo 0; }  # numeric or 0
 
 # --- sample ------------------------------------------------------------------
-TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+TS="$(resource_record_ts)"
 
 read -r LOAD1 LOAD5 LOAD15 PROCS _ < /proc/loadavg
 RUNNABLE="${PROCS%%/*}"

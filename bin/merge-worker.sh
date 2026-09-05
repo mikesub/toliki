@@ -69,7 +69,8 @@ CI_REGISTRATION_GRACE="${MERGE_CI_REGISTRATION_GRACE:-60}"
 # bug, and a run that hits it says so rather than looking like a clean drain.
 MAX_DRAIN=20
 
-# Every line carries the run's UTC timestamp (ts is in etc/lib.sh).
+# Every line carries the run's configured host-zone timestamp (ts is in
+# etc/lib.sh).
 say()  { printf '%s [merge] %s\n' "$(ts)" "$*"; }
 # Infrastructure died: stop the whole drain, label nothing, let cron retry.
 die()  { printf '%s [merge] %s\n' "$(ts)" "$*" >&2; exit 1; }

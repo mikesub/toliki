@@ -36,12 +36,15 @@
 // names it a pipeline ordering fault. A step moved after a terminal write
 // therefore yields a held or failed run with a legible reason instead of a
 // session reaped mid-sentence.
+// Pane narration uses the configured host-zone human clock; usage records keep
+// the separate UTC ISO timestamp another script parses.
 
 import os from 'node:os'
 import { resolveEngine, resolveVendor, STEPS, terminateAll, isTransient } from './engine.mjs'
 import { terminalSpend } from './github.mjs'
 import { validate } from './schema.mjs'
 import { recordUsage } from './usage.mjs'
+import { humanTimestamp } from './time.mjs'
 
 // The run's engine: a name in etc/engines.json, chosen by --engine (dispatch
 // passes the issue's label) or EPIC_ENGINE, claude when neither is set. Every
@@ -119,8 +122,6 @@ export function withAgentFailure(reason, failure = takeAgentFailure()) {
   return `${reason} ${category}: ${f.label} failed after ${tries} [${f.vendor} ${f.model}/${f.effort}] — ${f.reason}`
 }
 
-const ts = () => new Date().toISOString().replace(/\.\d{3}Z$/, 'Z')
-
 export function initRuntime({ scriptName, sessionName, defaultEngine, issue } = {}) {
   if (scriptName) SCRIPT = scriptName
   if (sessionName) SESSION = sessionName
@@ -145,12 +146,12 @@ export function onLog(fn) { logHook = fn }
 const fire = (fn, arg) => { if (fn) { try { fn(arg) } catch { /* reporting never fails a run */ } } }
 
 export function log(message) {
-  process.stdout.write(`${ts()} [${SCRIPT}${SESSION ? ` ${SESSION}` : ''}] ${message}\n`)
+  process.stdout.write(`${humanTimestamp()} [${SCRIPT}${SESSION ? ` ${SESSION}` : ''}] ${message}\n`)
   fire(logHook, message)
 }
 
 export function phase(title) {
-  process.stdout.write(`${ts()} [${SCRIPT}${SESSION ? ` ${SESSION}` : ''}] ── ${title} ──\n`)
+  process.stdout.write(`${humanTimestamp()} [${SCRIPT}${SESSION ? ` ${SESSION}` : ''}] ── ${title} ──\n`)
   fire(phaseHook, title)
 }
 

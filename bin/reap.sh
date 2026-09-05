@@ -93,7 +93,8 @@ WORKTREE_GRACE_HOURS="${WORKTREE_GRACE_HOURS:-24}"
 DRY_RUN=0
 NEEDS_HUMAN=0
 
-# Every line carries the sweep's UTC timestamp (ts is in etc/lib.sh).
+# Every line carries the sweep's configured host-zone timestamp (ts is in
+# etc/lib.sh). GitHub updatedAt values below remain UTC machine inputs.
 say()  { echo "$(ts) [reap] $*"; }
 # Anything reported here ends the run non-zero, so cron surfaces it.
 warn() { echo "$(ts) [reap] $*" >&2; NEEDS_HUMAN=1; }

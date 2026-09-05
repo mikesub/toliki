@@ -2,7 +2,8 @@
 #
 # Read back what bin/resource-log.sh sampled: bin/resource-report.sh [hours]
 # (default 24). Read-only — it opens the log and nothing else, so it is always
-# safe to run against a live host.
+# safe to run against a live host. Samples remain UTC machine records; their
+# first/last bounds are rendered in the registry's HOST_TIMEZONE.
 #
 # Every rate here is computed from the DELTA between consecutive samples, never
 # from a field in one sample. That is the whole point of the sampler recording
@@ -17,6 +18,9 @@
 # time is reported rather than silently excluded, because a report that quietly
 # summarizes 3 of 24 hours reads exactly like a quiet 24 hours.
 set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$HERE/../etc/lib.sh"
 
 HOURS="${1:-24}"
 LOG="${RESOURCE_LOG:-$HOME/resource.log}"
@@ -37,7 +41,9 @@ jq -rs --argjson hours "$HOURS" --argjson gapmax "$GAP_MAX_S" '
   def pct: if . == null then "-" else "\(. * 1000 | round / 10)%" end;
   def pad($n): (tostring | . + (" " * ($n - length)))[:$n];
 
-  map(select(.ts) | . + {t: (.ts | fromdateiso8601)}) | sort_by(.t)      as $all
+  map(select(.ts) | (.ts | fromdateiso8601) as $t
+      | . + {t: $t, human_ts: ($t | strflocaltime("%Y-%m-%d %H:%M:%S %Z"))})
+  | sort_by(.t)                                                           as $all
   | (($all[-1].t // 0) - ($hours * 3600))                                 as $cut
   | ($all | map(select(.t >= $cut)))                                      as $s
   | if ($s | length) < 2 then "not enough samples in the last \($hours)h (\($s|length) found)" else
@@ -66,7 +72,7 @@ jq -rs --argjson hours "$HOURS" --argjson gapmax "$GAP_MAX_S" '
   |
   [ "window     last \($hours)h — \($s|length) samples, \($span|hms) accounted"
     + (if $lost > 0 then ", \($lost|hms) dropped (gap/reboot)" else "" end),
-    "           \($s[0].ts) → \($s[-1].ts)",
+    "           \($s[0].human_ts) → \($s[-1].human_ts)",
     "",
     "CPU        utilization   avg \(($v|map(.util*.dt)|add) / (if $span>0 then $span else 1 end)|pct)   busiest minute \($v|map(.util)|max|pct)",
     "           stall some    \($v|map(.st_cpu)|add|hms) total   worst minute \($v|map(.st_cpu)|max|round)s",
