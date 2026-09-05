@@ -27,7 +27,9 @@ set -euo pipefail
 # The run itself no longer merges (bin/merge-worker.sh does, later), so a
 # session is finished while its issue is still OPEN. The done signal is
 # therefore the label — ready-to-merge, ready-to-review or failed — and not the
-# issue closing, which happens long after the slot should have been freed.
+# issue closing, which happens long after the slot should have been freed. A
+# dead pane at ready is also terminal: quota holds deliberately restore that
+# queue state, while a live ready pane is still finishing its hold report.
 #
 # Reaping is deliberately conservative in every pass: it only ever kills
 # sessions named <repo>-epic-<N> (pool-named and hand-made sessions are the
@@ -102,7 +104,8 @@ Usage: $0 [-n|--dry-run]
 
 Sweeps the host once and exits:
   1. kills the tmux session of every <repo>-epic-<N> whose issue has reached a
-     terminal state (labelled ready-to-merge/ready-to-review/failed, or closed)
+     terminal state (labelled ready-to-merge/ready-to-review/failed; a dead pane
+     labelled ready; or closed)
      and has sat still for \$TERMINAL_SETTLE_MINUTES (${TERMINAL_SETTLE_MINUTES}m, never under
      ${MIN_TERMINAL_SETTLE_MINUTES}m; a closed issue skips the wait — merged is delivered), and flags —
      without killing — any whose process died before it got there, because the
@@ -226,6 +229,9 @@ else
     elif [[ ",$labels," == *,failed,* ]]; then
       terminal=1
       reason="issue #$issue failed"
+    elif (( ! alive )) && [[ ",$labels," == *,ready,* ]]; then
+      terminal=1
+      reason="issue #$issue ready"
     fi
 
     # Let it settle: see TERMINAL_SETTLE_MINUTES. An unparseable timestamp is

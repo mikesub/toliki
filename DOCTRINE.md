@@ -79,6 +79,13 @@ don't get re-litigated from memory.
   rebases and re-runs the real checks before landing it.
 - **Crons watch, models act.** Dispatch, reap and merge ticks are plain shell
   reading labels; the first model to run is the epic that got launched.
+- **Exhausted allowance pauses admission, not work.** A provider's hard quota
+  is a host condition, so the run preserves its checkpoint and returns the
+  issue to its queue instead of manufacturing a project failure. One
+  lock-serialized hold pauses automatic dispatch until the provider reset;
+  explicit manual launches remain the operator's override. The host-wide blast
+  radius and a 30-minute fallback for unparseable reset text are deliberate:
+  they trade occasional idle capacity for avoiding a queue-wide failure storm.
 - **Models judge, the script acts.** The same split inside a run. Everything
   deterministic — the claim, the labels, the checkpoints, the squash, the push,
   the PR, the follow-up issues, the layout discovery, `npm run verify` — is the
@@ -91,8 +98,11 @@ don't get re-litigated from memory.
   verify output; a failed command or timeout is not a regression test. Both
   coding paths must finish with verify green because the orchestrator ran it,
   not because a step said so.
-- **State is GitHub.** Issues, lifecycle and engine-routing labels,
-  `blocked_by` edges, claim refs, PRs.
+- **Work state is GitHub.** Issues, lifecycle and engine-routing labels,
+  `blocked_by` edges, claim refs, PRs. Ephemeral machine facts stay on the
+  machine: locks, usage telemetry, and the provider-quota hold that answers
+  whether this host may currently admit another automatic run. The hold orders
+  no issue and expires without becoming a second work database.
   Workers are disposable: kill any run at any moment, re-run without cleanup.
 - **One contract per project.** A package is a directory whose `package.json`
   declares `scripts.verify`; everything the project wants gated goes inside
