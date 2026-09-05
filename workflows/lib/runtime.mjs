@@ -7,7 +7,8 @@
 //     wrong shape resolves null, which is what every `if (!x) return fail(…)`
 //     in the pipelines already reads. withAgentFailure() lets those branches
 //     append the adapter's final diagnostic without changing that null/output
-//     contract. An exception here would unwind PAST those fail-closed branches
+//     contract. takeAgentFailure() lets the caller consume hard-quota metadata;
+//     those deaths are never transient-respawned. An exception here would unwind PAST those fail-closed branches
 //     — the one failure mode this design cannot have, since they are what stop
 //     a half-run from shipping.
 //   - parallel() never rejects either: a thunk that throws lands as null in
@@ -85,13 +86,31 @@ const failureKind = (r) => QUOTA_EXHAUSTED.test(`${r?.reason || ''}\n${r?.stderr
   ? 'quota-exhausted'
   : r?.timedOut ? 'timeout' : 'agent-failure'
 
+// A provider can put its quota/reset diagnosis only on stderr while the
+// adapter's reason stays generic. Keep that matching evidence for the hold,
+// bounded to the same diagnostic size as the engine adapter, and avoid
+// repeating it when the adapter already folded it into reason.
+function failureDiagnostic(r, reason, kind) {
+  const primary = String(reason || 'unknown agent failure').replace(/\s+/g, ' ').trim()
+  if (kind !== 'quota-exhausted') return primary
+  const stderr = String(r?.stderrTail || '').replace(/\s+/g, ' ').trim()
+  if (!stderr || primary.includes(stderr)) return primary.slice(-2000)
+  if (stderr.includes(primary)) return stderr.slice(-2000)
+  return `${primary}; ${stderr}`.slice(-2000)
+}
+
 // Starting a later agent clears a stale soft failure, so a dead check that
 // merely holds a PR cannot be blamed for a later deterministic gate. Every
 // member of a parallel batch starts before any one settles; a terminal failure
 // is therefore still present for the batch's immediate fail-closed branch.
-export function withAgentFailure(reason) {
-  const f = lastAgentFailure
+export function takeAgentFailure() {
+  const failure = lastAgentFailure
   lastAgentFailure = null
+  return failure
+}
+
+export function withAgentFailure(reason, failure = takeAgentFailure()) {
+  const f = failure
   if (!f) return reason
   const category = f.kind === 'quota-exhausted' ? 'Provider usage quota exhausted'
     : f.kind === 'post-terminal' ? 'Pipeline ordering fault'
@@ -206,10 +225,13 @@ export async function agent(prompt, opts = {}) {
 
   let attempts = 0
   const rememberFailure = (r, reason = r?.reason, kind = failureKind({ ...r, reason })) => {
-    lastAgentFailure = {
+    const failure = {
       label, vendor: vendorName, model, effort, attempts, kind,
-      reason: String(reason || 'unknown agent failure').replace(/\s+/g, ' ').trim(),
+      reason: failureDiagnostic(r, reason, kind),
     }
+    // Parallel siblings finish in arbitrary order. Once one reports a hard
+    // quota, a later ordinary failure must not hide the admission signal.
+    if (lastAgentFailure?.kind !== 'quota-exhausted' || kind === 'quota-exhausted') lastAgentFailure = failure
   }
   const attempt = async (why) => {
     await acquire()
@@ -250,6 +272,7 @@ export async function agent(prompt, opts = {}) {
   // that dies twice is a dead step.
   const retryable = (r) => {
     if (shuttingDown || r.timedOut) return false
+    if (failureKind(r) === 'quota-exhausted') return false
     const verdict = isTransient(r)
     return verdict === true || (verdict === undefined && r.elapsedMs < FAST_DEATH_MS)
   }

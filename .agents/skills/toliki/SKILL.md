@@ -32,7 +32,7 @@ gitignored and machine-local, and the copy destroys the real registry.
 
 ## 1. Host probes (read-only)
 
-Run both first; §3 and §4 read their output.
+Run all three first; §3 and §4 read their output.
 
 - `./remote-control.sh ls`, run locally and never wrapped in `ssh` (it sshes
   to `SSH_HOST` itself). One line per session: name, repo, engine,
@@ -44,6 +44,10 @@ Run both first; §3 and §4 read their output.
   it could not check, and agent processes running with no live pipeline
   session. Lines starting `would kill`, `would delete` or `would remove` are
   the design working: say nothing about them.
+- `ssh $SSH_HOST "node '$HOST_CONTROL_DIR/workflows/quota-hold.mjs' peek"`:
+  read-only provider admission state. Exit 0 prints one active JSON record;
+  record its `holdUntil` and `fallback`. Exit 1 means absent or expired and is
+  silent. Do not run `status` here: unlike `peek`, it may clear expired state.
 
 ## 2. Per-issue evidence
 
@@ -57,8 +61,9 @@ gh issue list -R <owner/repo> --state open --limit 200 --json number,title,label
 Every run edits one status comment on its issue, starting `🤖 **epic-run**`
 (`fix-run` or `ci-run` for the fixers): the current phase and an `updated`
 timestamp while it runs, and on exit a note: `**blocked** at <phase>:
-<reason>`, `**skipped**: <reason>`, `**done** …`, or `**done, held for
-review** … (<reason>)`. Every other pipeline record is a 🤖 comment too. Read
+<reason>`, `**skipped**: <reason>`, `**done** …`, `**done, held for
+review** … (<reason>)`, or `**held**: provider quota exhausted …`. Every other
+pipeline record is a 🤖 comment too. Read
 them all in one call, oldest first:
 
 ```
@@ -104,6 +109,11 @@ gh issue view <N> -R <owner/repo> --json comments --jq '.comments[] | select(.bo
 Heuristics about *current* state, not reporting windows: say "looks stuck",
 not "is broken".
 
+- **Active provider quota hold**: report one host-level item with its
+  `holdUntil`; append “fallback reset” only when `fallback` is true. It explains
+  why every automatic queue is paused, including work routed to another
+  provider. Manual `remote-control.sh epic|fix|ci|defect` launches are still an
+  explicit override. Say nothing when `peek` reports absent or expired state.
 - **`ready-to-merge` open for over ~1h**: the worker drains in minutes.
   `grep "#<N>" ~/merge.log | tail` for the why; infrastructure aborts log
   "aborting the run" and write no label. An issue a fixer just returned here —
@@ -125,7 +135,8 @@ not "is broken".
   from crashed:
   - `**skipped**` or `**blocked**`: that is the item, and the note's reason
     is the one-line cause. `done` and `held for review` are already covered
-    by §3's labels: say nothing.
+    by §3's labels; provider `held` is covered by the host item above and its
+    dead `ready` session is normal reap work: say nothing.
   - the comment never reached `finished` (it still shows a phase): the run
     crashed, and the scrollback is the only record:
     `ssh $SSH_HOST 'tmux capture-pane -p -t <name> -S -60'`. Summarize the

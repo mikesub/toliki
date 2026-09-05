@@ -10,7 +10,7 @@
 import { engineNames } from './engine.mjs'
 
 export const EXIT = {
-  OK: 0,        // shipped, held for review, or a manual-mode summary
+  OK: 0,        // shipped, provider-held, held for review, or a manual-mode summary
   ERROR: 1,     // the run could not start (bad args) or crashed outside its own blocker path
   SKIPPED: 2,   // nothing ran and nothing changed (claimed elsewhere, closed, blocked_by, …)
   BLOCKED: 3,   // stopped at a blocker; the pipeline has commented on the issue

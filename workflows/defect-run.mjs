@@ -11,15 +11,20 @@
 //
 // Attempt ladder in labels: defect-attempted, then defect-retried. The labels
 // are never reset by automation, so this repair session cannot become a loop.
+// A hard provider-quota death cleans the unpushed edit and records the
+// host-wide hold before labels move. A verified hold refunds this invocation's
+// rung; an unverified transition restores it and blocks inside the same
+// terminal-report window.
 
-import { agent, phase, log, initRuntime, onPhase, onLog } from './lib/runtime.mjs'
+import { agent, phase, log, initRuntime, onPhase, onLog, takeAgentFailure, withAgentFailure } from './lib/runtime.mjs'
 import { parseArgs, finish, UsageError, EXIT } from './lib/cli.mjs'
 import { initStatus, statusPhase, statusNote, statusFinish } from './lib/status.mjs'
 import { failureReason } from './lib/proc.mjs'
 import { ensureLabels, editLabels, issueLabels, issueView, comment, openPrs, prView, repositoryView, authenticatedLogin, terminalBudget, terminalTransition } from './lib/github.mjs'
 import { git, gitOut, discoverPackages, pkgList, ensureDeps, runVerify, pushRejected, intentToAdd } from './lib/repo.mjs'
 import { matchingDefectEvidence } from './lib/defect-evidence.mjs'
-import { finalizeFixerIssue } from './lib/fixer-finalize.mjs'
+import { finalizeFixerIssue, finalizeFixerQuotaHold } from './lib/fixer-finalize.mjs'
+import { recordQuotaHold } from './quota-hold.mjs'
 
 const USAGE = `Usage: defect-run.mjs --issue <N> [--session <name>] [--engine <name>]
 
@@ -27,7 +32,7 @@ const USAGE = `Usage: defect-run.mjs --issue <N> [--session <name>] [--engine <n
   --session    name for log lines (the tmux session bin/launch.sh created)
   --engine     registered coding-agent engine for every phase
 
-Exit: 0 fixed, 1 usage/crash, 2 skipped/refused, 3 blocked.
+Exit: 0 fixed or provider-held, 1 usage/crash, 2 skipped/refused, 3 blocked.
 The final line is RESULT <json>.`
 
 const PROMPTS = {
@@ -111,6 +116,7 @@ initStatus({ issue: ARGS.issue, script: 'defect-run', session: ARGS.session, pha
 onPhase(statusPhase)
 onLog(statusNote)
 const issue = ARGS.issue
+let terminalWindow = null
 
 async function settle(issue, body, { terminal = 'review', removeQueue = false } = {}) {
   // One resting label, every other one derived off it (see terminalTransition): a refusal after the
@@ -125,6 +131,7 @@ async function settle(issue, body, { terminal = 'review', removeQueue = false } 
   // drift from the labels written here.
   const compose = typeof body === 'function' ? state => body({ ...state, resting: add[0] }) : body
   const settled = await finalizeFixerIssue({ issue, body: compose, add, remove, required: add, absent: remove })
+  terminalWindow = settled.budget
   if (!settled.reported) log(`blocked: GitHub report failed (${settled.reportError})`)
   if (!settled.settled) log(`blocked: terminal label restoration failed (${settled.stateError})`)
   return settled
@@ -305,20 +312,83 @@ async function ship(issue, prep, body) {
   return { pushed: true, labelled, note: labelled ? '' : (flip.ok ? `observed labels: ${labels.join(', ')}` : failureReason(flip)) }
 }
 
-async function postBlocker({ phase: failedPhase, reason, prUrl, attempt }) {
-  const next = attempt >= 2
+const attemptRung = attempt => attempt === 2 ? 'defect-retried' : 'defect-attempted'
+
+function attemptGuidance(attempt, state) {
+  const normal = attempt >= 2
     ? 'This was the RETRY (defect-attempted and defect-retried are both on the issue), so the defect fixer is done: repair by hand, or strip both defect-* attempt labels to grant another bounded round.'
     : attempt === 1
     ? 'This was the first attempt (defect-attempted is on the issue), so opted-in dispatch relaunches the fixer once after this session is reaped. A non-opted-in repo waits for an explicit operator launch.'
     : 'The attempt ladder was not reached; the issue remains ready-to-review for a human.'
-  await settle(issue, `🤖 fix-defect blocked\n- phase: ${failedPhase}\n- reason: ${reason}\n- pr: ${prUrl || 'not resolved'}\n- next: ${next}\n`)
+  if (!state || attempt < 1) return normal
+  const rung = attemptRung(attempt)
+  if (!state.readable) return `GitHub did not return a label readback; check that ${rung} is present before relaunching so this spent attempt is not refunded.`
+  if (!state.labels.includes(rung)) return `${rung} could NOT be restored; set it by hand before relaunching so this spent attempt is not refunded.`
+  return normal
+}
+
+const blockerBody = ({ failedPhase, reason, prUrl, attempt }, state) =>
+  `🤖 fix-defect blocked\n- phase: ${failedPhase}\n- reason: ${reason}\n- pr: ${prUrl || 'not resolved'}\n- next: ${attemptGuidance(attempt, state)}\n`
+
+async function postBlocker({ phase: failedPhase, reason, prUrl, attempt }) {
+  await settle(issue, state => blockerBody({ failedPhase, reason, prUrl, attempt }, state))
 }
 
 let currentPhase = 'prepare'
 let blockerPosted = false
 let prUrl = null
 let attempt = 0
+async function holdForQuota(failedPhase, failure, reason) {
+  try {
+    await git(['reset', '--mixed', 'HEAD'])
+    await git(['checkout', '-f', '--', '.'])
+    await git(['clean', '-fd'])
+    const { hostHold, trigger } = await recordQuotaHold({ vendor: failure.vendor, reason: failure.reason })
+    const rung = attemptRung(attempt)
+    const finalized = await finalizeFixerQuotaHold({
+      issue,
+      rung,
+      hold: {
+        add: ['ready-to-review', 'needs-defect-fix'],
+        remove: ['in-progress', 'failed', 'ready-to-merge', rung],
+      },
+      blocked: {
+        add: ['ready-to-review', 'needs-defect-fix'],
+        remove: ['in-progress', 'failed', 'ready-to-merge'],
+      },
+      body: (state, holdState) => blockerBody({
+        failedPhase,
+        reason: withAgentFailure(`${reason} Provider quota hold failed: ${holdState.stateError}.`, failure),
+        prUrl,
+        attempt,
+      }, state),
+    })
+    terminalWindow = finalized.budget
+    if (!finalized.held) {
+      blockerPosted = true
+      if (!finalized.blockState.reported) log(`blocked: GitHub report failed (${finalized.blockState.reportError})`)
+      if (!finalized.blockState.settled) log(`blocked: terminal label restoration failed (${finalized.blockState.stateError})`)
+      return {
+        blocked: true, issue, phase: failedPhase,
+        reason: withAgentFailure(`${reason} Provider quota hold failed: ${finalized.holdState.stateError}.`, failure),
+        prUrl: prUrl || undefined,
+        attempt,
+      }
+    }
+    return { held: true, issue, phase: failedPhase, ...hostHold, ...trigger, attempt }
+  } catch (error) {
+    return { error: error?.message || String(error) }
+  }
+}
+
 async function fail(failedPhase, reason) {
+  const failure = takeAgentFailure()
+  if (failure?.kind === 'quota-exhausted') {
+    const held = await holdForQuota(failedPhase, failure, reason)
+    if (!held.error) return held
+    reason = `${reason} Provider quota hold failed: ${held.error}.`
+  }
+  reason = withAgentFailure(reason, failure)
   if (!blockerPosted) {
     blockerPosted = true
     try {
@@ -416,5 +486,5 @@ try {
 }
 
 const RESULT = await main()
-await statusFinish(RESULT?.blocked ? `**blocked** at ${RESULT.phase}: ${RESULT.reason}` : RESULT?.skipped ? `**skipped**: ${RESULT.reason}` : RESULT?.readyToMerge ? `**done** — ${RESULT.prUrl} is back to ready-to-merge` : '**finished**')
+await statusFinish(RESULT?.held ? `**held**: provider quota exhausted, resumes after ${RESULT.holdUntil} — vendor: ${RESULT.vendor}; provider reason: "${RESULT.reason}"` : RESULT?.blocked ? `**blocked** at ${RESULT.phase}: ${RESULT.reason}` : RESULT?.skipped ? `**skipped**: ${RESULT.reason}` : RESULT?.readyToMerge ? `**done** — ${RESULT.prUrl} is back to ready-to-merge` : '**finished**', { budget: terminalWindow || undefined })
 process.exit(finish(RESULT))

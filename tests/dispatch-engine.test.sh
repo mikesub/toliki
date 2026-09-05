@@ -24,6 +24,10 @@ REPO="$TMP/repo"
 mkdir -p "$HARNESS" "$REPO/.git" "$TMP/bin" "$TMP/labels" "$TMP/blockers" "$TMP/locks"
 cp -R "$ROOT/bin" "$ROOT/etc" "$HARNESS/"
 cp "$ROOT/remote-control.sh" "$HARNESS/"
+# dispatch resolves the shared hold CLI relative to its own copied harness.
+# During RED the module intentionally does not exist yet.
+mkdir -p "$HARNESS/workflows"
+[[ ! -f "$ROOT/workflows/quota-hold.mjs" ]] || cp "$ROOT/workflows/quota-hold.mjs" "$HARNESS/workflows/"
 cat > "$HARNESS/etc/repos.conf" <<EOF
 REPOS=( testrepo=$REPO )
 REPO_ORIGINS=( testrepo=owner/testrepo )
@@ -156,12 +160,14 @@ run_dispatch() {
     COMMA_LABEL_ISSUE="${COMMA_LABEL_ISSUE:-}" \
     FLOCK_BUSY="${FLOCK_BUSY:-}" STUB_SESSION_NAME="${STUB_SESSION_NAME:-}" \
     CAPACITY_RC="${CAPACITY_RC:-}" LAUNCH_RC="${LAUNCH_RC:-}" \
+    EPIC_PROVIDER_HOLD_FILE="$TMP/provider-hold.json" \
     bash "$DISPATCH" "$@" 2>&1
   )" || RUN_RC=$?
 }
 
 reset_state() {
   rm -f "$TMP/labels"/* "$TMP/blockers"/*
+  rm -rf "$TMP/provider-hold.json"
   READY_QUEUE=""
   FIXER_QUEUE=""
   CI_QUEUE=""
@@ -179,6 +185,76 @@ reset_state() {
 }
 
 assert_contains "the tracked config documents an empty-by-default defect allowlist" "$(cat "$ROOT/etc/repos.conf.template")" "DEFECT_FIX_REPOS=("
+
+printf '\ndispatch hold: an active record stops before capacity, GitHub, or labels\n'
+reset_state
+READY_QUEUE=1
+printf 'ready' > "$TMP/labels/1"
+printf '%s\n' '{"holdUntil":"2099-01-01T00:00:00.000Z","vendor":"claude","reason":"session limit","fallback":false}' > "$TMP/provider-hold.json"
+run_dispatch
+assert_rc "an active hold is a clean tick" 0 "$RUN_RC"
+assert_eq "the required hold line is logged exactly once" 1 "$(printf '%s\n' "$RUN_OUT" | grep -c 'provider quota exhausted — holding launches until 2099-01-01T00:00:00.000Z' || true)"
+assert_not_contains "a parsed reset has no fallback marker" "$RUN_OUT" "(fallback)"
+assert_eq "capacity is not even probed" "" "$(cat "$TMP/launch.log")"
+assert_eq "GitHub is untouched while held" "" "$(cat "$TMP/gh.log")"
+assert_eq "the queued issue label is unchanged" "ready," "$(issue_labels 1)"
+
+printf '\ndispatch hold: fallback and dry-run use the same admission gate\n'
+reset_state
+READY_QUEUE=2
+printf 'ready' > "$TMP/labels/2"
+printf '%s\n' '{"holdUntil":"2099-01-01T00:00:00.000Z","vendor":"claude","reason":"limit without reset","fallback":true}' > "$TMP/provider-hold.json"
+run_dispatch --dry-run
+assert_rc "dry-run under a hold exits cleanly" 0 "$RUN_RC"
+assert_eq "dry-run logs one hold line" 1 "$(printf '%s\n' "$RUN_OUT" | grep -c 'provider quota exhausted — holding launches until 2099-01-01T00:00:00.000Z (fallback)' || true)"
+assert_eq "dry-run does not walk GitHub while held" "" "$(cat "$TMP/gh.log")"
+assert_eq "dry-run does not call launch, including capacity" "" "$(cat "$TMP/launch.log")"
+
+printf '\ndispatch hold: expiry is cleared and normal dispatch resumes\n'
+reset_state
+READY_QUEUE=3
+printf 'ready' > "$TMP/labels/3"
+printf '%s\n' '{"holdUntil":"2000-01-01T00:00:00.000Z","vendor":"claude","reason":"old limit","fallback":false}' > "$TMP/provider-hold.json"
+run_dispatch
+assert_rc "an expired hold does not block the tick" 0 "$RUN_RC"
+if [[ ! -e "$TMP/provider-hold.json" ]]; then ok "the expired hold is cleared under the tick lock"; else nok "the expired hold is cleared under the tick lock"; fi
+assert_contains "capacity is probed after expiry" "$(cat "$TMP/launch.log")" "--check-capacity"
+assert_contains "the ready issue launches after expiry" "$(cat "$TMP/launch.log")" "--epic 3 --repo testrepo --engine claude"
+
+printf '\ndispatch hold: malformed and unreadable host state fail closed\n'
+reset_state
+READY_QUEUE=4
+printf 'ready' > "$TMP/labels/4"
+printf '%s\n' '{broken' > "$TMP/provider-hold.json"
+run_dispatch
+assert_rc "malformed hold state makes the tick non-clean" 1 "$RUN_RC"
+assert_eq "malformed state blocks capacity and launch" "" "$(cat "$TMP/launch.log")"
+assert_eq "malformed state blocks every GitHub call" "" "$(cat "$TMP/gh.log")"
+reset_state
+READY_QUEUE=5
+printf 'ready' > "$TMP/labels/5"
+mkdir "$TMP/provider-hold.json"
+run_dispatch
+assert_rc "unreadable hold state makes the tick non-clean" 1 "$RUN_RC"
+assert_eq "unreadable state blocks capacity and launch" "" "$(cat "$TMP/launch.log")"
+assert_eq "unreadable state blocks every GitHub call" "" "$(cat "$TMP/gh.log")"
+
+printf '\ndispatch hold: routing-only modes bypass launch admission\n'
+reset_state
+READY_QUEUE=6
+printf 'ready' > "$TMP/labels/6"
+printf '%s\n' '{"holdUntil":"2099-01-01T00:00:00.000Z","vendor":"claude","reason":"session limit","fallback":false}' > "$TMP/provider-hold.json"
+run_dispatch --route-next codex
+assert_rc "route-next remains available during a hold" 0 "$RUN_RC"
+assert_contains "route-next persists its label" "$(cat "$TMP/labels/6")" "engine:codex"
+assert_not_contains "route-next does not report launch admission" "$RUN_OUT" "provider quota exhausted"
+assert_eq "route-next never probes capacity" "" "$(cat "$TMP/launch.log")"
+printf 'ready,engine:claude' > "$TMP/labels/7"
+run_dispatch --route-issue 7 codex --repo testrepo
+assert_rc "route-issue remains available during a hold" 0 "$RUN_RC"
+assert_contains "route-issue persists its label" "$(cat "$TMP/labels/7")" "engine:codex"
+assert_not_contains "route-issue does not report launch admission" "$RUN_OUT" "provider quota exhausted"
+assert_eq "the routing bypass leaves the active hold intact" "2099-01-01T00:00:00.000Z" "$(jq -r '.holdUntil' "$TMP/provider-hold.json" 2>/dev/null || true)"
 
 printf '\ndispatch: an unknown defect-fixer opt-in fails before mutation or launch\n'
 reset_state

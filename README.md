@@ -20,7 +20,9 @@ only where a judgment is needed. Claude Code and Codex are both supported.
 2. **`bin/dispatch.sh`** (cron, on the VPS) — walks each repo's `ready` queue
    and launches a tmux session per unblocked issue, up to the host's slot
    budget. Repair queues run first; ship-gate defect repair is walked only for
-   repositories listed in the machine-local `DEFECT_FIX_REPOS` allowlist.
+   repositories listed in the machine-local `DEFECT_FIX_REPOS` allowlist. A
+   provider quota hold stops an ordinary or dry-run tick before capacity or
+   GitHub until its UTC reset time; routing-only operations bypass the hold.
 3. **`workflows/epic-run.mjs`** (the session's pane) — claims the issue,
    makes a proportional architecture plan, then implements through either
    test-first red/green or a direct coding step. Both paths pass the project's
@@ -28,7 +30,10 @@ only where a judgment is needed. Claude Code and Codex are both supported.
    plan may request one additional review for a concrete risk question.
    Findings go through an independent skeptic and bounded repairs. The run
    ends at an open PR with `ready-to-merge` (gates cleared, lands unattended)
-   or `ready-to-review` (a human decides).
+   or `ready-to-review` (a human decides). A hard provider quota is a successful
+   held outcome instead: the resumable branch is preserved, the issue returns
+   to its queue without spending a fixer attempt, and automatic dispatch waits
+   for the shared host hold. Ordinary transient 429s still retry once.
 4. **`bin/merge-worker.sh`** (cron) — one PR at a time per repo: rebase onto
    current main, give checks time to register, then wait for every published
    check on the rebased head and squash-merge. An empty rollup after the grace
@@ -47,7 +52,8 @@ only where a judgment is needed. Claude Code and Codex are both supported.
    exact delta, then returns the PR to that same merge queue. Mixed, missing or
    stale evidence stays with a human.
 5. **`bin/reap.sh`** (cron) — frees what finished runs leave behind (idle
-   sessions, stale claim refs), so the slot budget keeps rotating.
+   sessions, including settled dead quota-held sessions at `ready`, and stale
+   claim refs), so the slot budget keeps rotating.
 
 The operator watches from a laptop with `./remote-control.sh ls` (and
 `./remote-control.sh usage` for what the steps cost), and reads a
@@ -56,7 +62,8 @@ final `RESULT` line. (Interactive sessions, started by hand, still connect via
 the Claude Code Desktop app's remote control; pipeline runs have no such
 channel, by design — the only mid-run lever is kill.) Everything
 else is scripts — no daemon, no database, no web UI; GitHub issues, labels and
-refs are the entire state store.
+refs are the durable work store. Host facts stay local: lock files, usage
+telemetry, and the expiring provider hold at `~/epic-provider-hold.json`.
 
 ## What it expects
 
@@ -94,6 +101,8 @@ per the comment at the top of `etc/dispatch.cron`.
 Defect repair is empty-by-default: add selected registered repo names to
 `DEFECT_FIX_REPOS=(...)` in the host's `etc/repos.conf`, or launch a marked
 issue explicitly with `./remote-control.sh defect N --engine <engine> -r <repo>`.
+All explicit `remote-control.sh epic|fix|ci|defect` launches bypass an active
+provider hold as a deliberate operator override.
 
 On the laptop:
 

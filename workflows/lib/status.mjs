@@ -12,7 +12,9 @@
 // spawn on the critical path. The PR keeps its job (what was built, the review
 // outcome, line comments); this only answers "alive, and where?".
 //
-// Every call is BEST EFFORT and swallows its errors. A status comment is
+// Every call is BEST EFFORT and swallows its errors. The final edit can share
+// the caller's terminal-report deadline after a label write starts reap's
+// clock. A status comment is
 // reporting, never a gate — a GitHub blip must not fail a run that is building
 // correctly, and a run whose status went quiet is exactly the case the stale
 // timestamp is meant to describe.
@@ -39,8 +41,10 @@ let lastWriteAt = 0
 let pending = Promise.resolve()
 let disabled = false
 
-const gh = (args) => new Promise((resolve) => {
-  execFile('gh', args, { timeout: GH_TIMEOUT_MS, maxBuffer: 1 << 20 }, (err, stdout) => {
+const budgeted = ({ deadline, share }) => Math.max(1, Math.min(share, deadline - Date.now()))
+
+const gh = (args, { budget } = {}) => new Promise((resolve) => {
+  execFile('gh', args, { timeout: budget ? budgeted(budget) : GH_TIMEOUT_MS, maxBuffer: 1 << 20 }, (err, stdout) => {
     resolve(err ? null : String(stdout || '').trim())
   })
 })
@@ -77,10 +81,10 @@ function body() {
 // leaves the comment showing an earlier phase for as long as the issue is open.
 // The throttle stays above the queue, so notes are dropped before they queue
 // rather than piling up behind one another.
-async function doWrite() {
+async function doWrite(budget) {
   const text = body()
   if (!commentId) {
-    const url = await gh(['issue', 'comment', String(issue), '--body', text])
+    const url = await gh(['issue', 'comment', String(issue), '--body', text], { budget })
     const m = url && url.match(/#issuecomment-(\d+)/)
     if (m) commentId = m[1]
     // No id parsed means every later update would post ANOTHER comment, so
@@ -88,16 +92,16 @@ async function doWrite() {
     else disabled = true
     return
   }
-  await gh(['api', '--method', 'PATCH', `repos/{owner}/{repo}/issues/comments/${commentId}`, '-f', `body=${text}`])
+  await gh(['api', '--method', 'PATCH', `repos/{owner}/{repo}/issues/comments/${commentId}`, '-f', `body=${text}`], { budget })
 }
 
-function write(force) {
+function write(force, budget) {
   if (disabled || !issue) return pending
   const now = Date.now()
   if (!force && now - lastWriteAt < MIN_INTERVAL_MS) return pending
   lastWriteAt = now
   // Both handlers, so a link that rejected cannot stop the writes behind it.
-  pending = pending.then(doWrite, doWrite)
+  pending = pending.then(() => doWrite(budget), () => doWrite(budget))
   return pending
 }
 
@@ -114,10 +118,10 @@ export function statusNote(message) {
   void write(false)                    // throttled: milestones can arrive in bursts
 }
 
-export function statusFinish(outcome) {
+export function statusFinish(outcome, { budget } = {}) {
   if (!issue) return Promise.resolve()
   currentPhase = 'finished'
   lastNote = outcome ? String(outcome) : ''
   lastWriteAt = 0
-  return write(true)
+  return write(true, budget)
 }
