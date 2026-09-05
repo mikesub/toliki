@@ -232,6 +232,15 @@ than made launchable against a main without the code it describes.
   tip is still the claim commit and no session is live; a worktree only when its
   issue has no `epic/<N>-*` ref on origin at all. Liveness is read from tmux
   before any GitHub query. Gated by `tests/reap-worktree.test.sh`.
+- A run comes to rest at exactly one of `failed`, `ready-to-merge` and
+  `ready-to-review`. Every terminal transition names that one label and derives
+  its removals from it (`terminalTransition` in `workflows/lib/github.mjs`),
+  never a hand-written remove list: a fallback that adds `failed` beside the
+  landing label GitHub already applied leaves a blocked run in
+  `bin/merge-worker.sh`'s queue, where the failure path becomes a merge. A
+  fixer's blocker also restores the queue label its own landing swap stripped,
+  so an unverified landing costs a retry, not the issue. Gated by
+  `tests/epic-run.test.sh`.
 - Terminal is the label, and a terminal label must settle for
   `TERMINAL_SETTLE_MINUTES` before a session is killed. Dispatch synchronously
   shields a fixer launch by swapping its resting terminal label to
@@ -240,11 +249,16 @@ than made launchable against a main without the code it describes.
   response, so the write itself and everything after it share ONE budget
   (`TERMINAL_REPORT_BUDGET_MS`, a share per call capped by what is left of the
   window): a fixer's swap, the readback its guidance is composed from and the
-  refusal comment; epic-run's merge gate, which runs after ship's
-  `ready-to-review`; the status comment's final edit. Reap floors the window
-  (`MIN_TERMINAL_SETTLE_MINUTES`) so the two cannot be configured into a race.
-  Never add a GitHub call on the default timeout from a terminal label write
-  onward.
+  refusal comment; a fixer's landing swap (`ready-to-review` / `ready-to-merge`)
+  and its readback; epic-run's merge gate, which runs after ship's
+  `ready-to-review`, and its blocker write to `failed`; the status comment's
+  final edit. One window per run, not per caller: `terminalBudget()` opens it at
+  whichever terminal write comes first and hands the same one back afterwards,
+  so a landing swap the run could not verify falls through to its blocker path
+  on what is LEFT of that window rather than on a second one. Reap floors the
+  window (`MIN_TERMINAL_SETTLE_MINUTES`) so the two cannot be configured into a
+  race. Never add a GitHub call — or a local git cleanup, which has a timeout of
+  its own — on the default timeout from a terminal label write onward.
 - Dispatch launches but never claims. Two ticks racing on one issue is safe
   because the ref push decides.
 - The CLI binary moves only on an idle host, under dispatch's lock. Gated by

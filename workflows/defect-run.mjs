@@ -16,7 +16,7 @@ import { agent, phase, log, initRuntime, onPhase, onLog } from './lib/runtime.mj
 import { parseArgs, finish, UsageError, EXIT } from './lib/cli.mjs'
 import { initStatus, statusPhase, statusNote, statusFinish } from './lib/status.mjs'
 import { failureReason } from './lib/proc.mjs'
-import { ensureLabels, editLabels, issueLabels, issueView, comment, openPrs, prView, repositoryView, authenticatedLogin, terminalBudget } from './lib/github.mjs'
+import { ensureLabels, editLabels, issueLabels, issueView, comment, openPrs, prView, repositoryView, authenticatedLogin, terminalBudget, terminalTransition } from './lib/github.mjs'
 import { git, gitOut, discoverPackages, pkgList, ensureDeps, runVerify, pushRejected, intentToAdd } from './lib/repo.mjs'
 import { matchingDefectEvidence } from './lib/defect-evidence.mjs'
 import { finalizeFixerIssue } from './lib/fixer-finalize.mjs'
@@ -113,10 +113,13 @@ onLog(statusNote)
 const issue = ARGS.issue
 
 async function settle(issue, body, { terminal = 'review', removeQueue = false } = {}) {
-  const add = terminal === 'failed' ? ['failed'] : ['ready-to-review']
-  const remove = terminal === 'failed'
-    ? ['in-progress', 'ready-to-review', 'ready-to-merge', ...(removeQueue ? ['needs-defect-fix'] : [])]
-    : ['in-progress', 'failed', 'ready-to-merge', ...(removeQueue ? ['needs-defect-fix'] : [])]
+  // One resting label, every other one derived off it (see terminalTransition): a refusal after the
+  // landing swap has to strip the `ready-to-merge` GitHub may already have applied, or a blocked run
+  // stays selectable by the merge worker.
+  const { add, remove } = terminalTransition({
+    rest: terminal === 'failed' ? 'failed' : 'ready-to-review',
+    drop: removeQueue ? ['needs-defect-fix'] : [],
+  })
   // A body that describes the resting state is a function of the readback, and
   // it is told which label this swap actually asked for, so its prose cannot
   // drift from the labels written here.
@@ -286,6 +289,8 @@ async function ship(issue, prep, body) {
   // From here the run is inside reap's settle window: the swap starts the clock
   // the moment GitHub processes it, so the write and the readback after it share
   // one budget (see terminalBudget) and the run still has a RESULT line to write.
+  // A readback that cannot confirm the landing drops into the blocker path, which
+  // transitions the labels again — inside THIS window, not a second one.
   const budget = terminalBudget()
   await ensureLabels(['ready-to-merge'], { budget })
   const flip = await editLabels(issue, { add: ['ready-to-merge'], remove: ['ready-to-review', 'in-progress', 'failed', 'needs-defect-fix'] }, { budget })

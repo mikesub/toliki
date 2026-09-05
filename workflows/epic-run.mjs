@@ -48,7 +48,7 @@ import { failureReason, must } from './lib/proc.mjs'
 import {
   ensureLabels, editLabels, issueLabels, issueView, openBlockers, comment, assignSelf,
   openPrs, searchOpenPrs, prCreate, issueCreate, withBodyFile, hasDeferredRecord, issueId, addBlockedBy,
-  authenticatedLogin, terminalBudget,
+  authenticatedLogin, terminalBudget, terminalSpend, terminalTransition,
 } from './lib/github.mjs'
 import { matchingDefectEvidence, renderDefectEvidence } from './lib/defect-evidence.mjs'
 import {
@@ -560,15 +560,16 @@ async function prepare(issue) {
   }
 }
 
-// One budget for everything from the run's first terminal label to its last GitHub call. Ship applies
-// `ready-to-review` and the merge gate runs AFTER it — the evidence comment and its readback, the queue
-// label edit, the promotion to `ready-to-merge`, a post-ship blocker report — while bin/reap.sh has
-// already started the settle clock at that label. On the default gh timeout any one of those calls is
-// longer than the shortest window reap will honour, so the sweep can kill a live session between the
-// label and the record of what the gate decided. Opened at the write, spent by every call after it;
-// before the write there is no clock running, so `spend()` is empty and the default timeout stands.
-let terminalWindow = null
-const spend = () => (terminalWindow ? { budget: terminalWindow } : undefined)
+// One budget for everything from the run's first terminal label to its last GitHub call. That label is
+// whichever terminal write comes first: ship's `ready-to-review`, or a pre-ship blocker's `failed`.
+// Everything after it — the evidence comment and its readback, the queue label edit, the promotion to
+// `ready-to-merge`, a post-ship blocker report — runs while bin/reap.sh has already started the settle
+// clock at that label. On the default gh timeout any one of those calls is longer than the shortest
+// window reap will honour, so the sweep can kill a live session between the label and the record of
+// what the gate decided. terminalBudget() opens the window at the first such write and hands the same
+// one back to every caller after it; before the write there is no clock running, so `spend()` is empty
+// and the default timeout stands.
+const spend = terminalSpend
 
 // Squash, push, open the PR, record deferrals, label — from ship's JSON.
 async function shipTransport({ issue, slug, dir, decision }) {
@@ -658,7 +659,7 @@ async function shipTransport({ issue, slug, dir, decision }) {
 
   // ready-to-review and nothing else: whether the PR may instead be queued for unattended merge is
   // the gate's decision, downstream of here. The assignee stays (it records ownership).
-  terminalWindow = terminalBudget()
+  terminalBudget()
   await ensureLabels(['ready-to-review'], spend())
   const flip = await editLabels(issue, { add: ['ready-to-review'], remove: ['in-progress'] }, spend())
   if (!flip.ok) log(`Ship: label flip to ready-to-review failed (${failureReason(flip)}) — the PR is open; a human finishes the labels`)
@@ -714,9 +715,14 @@ async function postBlocker({ issue, slug, phase, reason, prUrl }) {
   }
   await comment(issue, body, spend())
   // Every terminal label comes off — ready-to-merge above all, since leaving it would hand a failed
-  // run's PR to the merge worker. The assignee stays.
-  await ensureLabels(['failed'], spend())
-  const flip = await editLabels(issue, { add: ['failed'], remove: ['in-progress', 'ready-to-merge', 'ready-to-review'] }, spend())
+  // run's PR to the merge worker — so the removals are derived from the one label the run rests at.
+  // The assignee stays. `failed` is a terminal write like ship's, so a run blocked before ship opens
+  // the window here: the clock starts as GitHub applies it either way. A run blocked AFTER ship keeps
+  // the window ship opened; terminalBudget() never hands out a second one.
+  terminalBudget()
+  const rest = terminalTransition({ rest: 'failed' })
+  await ensureLabels(rest.add, spend())
+  const flip = await editLabels(issue, rest, spend())
   if (!flip.ok) log(`blocked: label flip to failed failed (${failureReason(flip)})`)
 }
 

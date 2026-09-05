@@ -25,7 +25,7 @@ import { agent, phase, log, initRuntime, onPhase, onLog, withAgentFailure } from
 import { parseArgs, finish, UsageError, EXIT } from './lib/cli.mjs'
 import { initStatus, statusPhase, statusNote, statusFinish } from './lib/status.mjs'
 import { failureReason } from './lib/proc.mjs'
-import { gh, ensureLabels, editLabels, issueLabels, issueView, comment, openPrs, withBodyFile } from './lib/github.mjs'
+import { gh, ensureLabels, editLabels, issueLabels, issueView, comment, openPrs, withBodyFile, terminalBudget, terminalTimeout, terminalTransition } from './lib/github.mjs'
 import { git, gitOut, discoverPackages, pkgList, ensureDeps, runVerify, pushRejected } from './lib/repo.mjs'
 import { finalizeFixerIssue } from './lib/fixer-finalize.mjs'
 
@@ -261,11 +261,17 @@ async function ship(issue, prep, body) {
   // ready-to-merge: back into the unattended queue, where the merge worker
   // rebases and RE-RUNS the real checks before anything lands. The ladder
   // labels stay — a second red check must not get a fresh pair of attempts.
-  await ensureLabels(['ready-to-merge'])
-  const flip = await editLabels(issue, { add: ['ready-to-merge'], remove: ['in-progress', 'needs-ci-fix'] })
+  // From here the run is inside reap's settle window: the swap starts the clock
+  // the moment GitHub processes it, so the write and the readback after it share
+  // one budget (see terminalBudget) and the run still has a RESULT line to write.
+  // A readback that cannot confirm the landing drops into the blocker path, which
+  // transitions the labels again — inside THIS window, not a second one.
+  const budget = terminalBudget()
+  await ensureLabels(['ready-to-merge'], { budget })
+  const flip = await editLabels(issue, { add: ['ready-to-merge'], remove: ['in-progress', 'needs-ci-fix'] }, { budget })
   let labels
   try {
-    labels = await issueLabels(issue)
+    labels = await issueLabels(issue, { budget })
   } catch (e) {
     return { pushed: true, labelled: false, note: e && e.message || String(e) }
   }
@@ -279,12 +285,15 @@ async function postBlocker({ issue, phase, reason, prUrl, attempt }) {
     : attempt === 1
     ? 'This was the first attempt (ci-attempted is on the issue), so dispatch relaunches the CI fixer once, automatically, a few minutes after this session is reaped. Nothing to do unless the retry also fails.'
     : 'The attempt ladder was not reached, so dispatch will relaunch the CI fixer on its next tick.'
-  // needs-ci-fix keeps the issue in the queue and the ladder labels bound the retries; both stay.
+  // needs-ci-fix keeps the issue in the queue and the ladder labels bound the retries; both stay —
+  // and `needs-ci-fix` is RESTORED rather than assumed, because a landing swap that GitHub applied
+  // but this run could not verify has already stripped it and put `ready-to-merge` on. Resting at
+  // `failed` beside that landing label would hand a blocked run's PR to the merge worker, so the
+  // transition names the one label the run rests at and derives every removal from it.
   const settled = await finalizeFixerIssue({
     issue,
     body: `🤖 fix-ci blocked\n- phase: ${phase}\n- reason: ${reason}\n- pr: ${prUrl || 'not resolved'}\n- next: ${ladder}\n`,
-    add: ['failed'],
-    remove: ['in-progress'],
+    ...terminalTransition({ rest: 'failed', queue: ['needs-ci-fix'] }),
   })
   if (!settled.reported) log(`blocked: GitHub report failed (${settled.reportError})`)
   if (!settled.settled) log(`blocked: terminal label restoration failed (${settled.stateError})`)
@@ -300,8 +309,11 @@ async function fail(phase, reason) {
   if (!blockerPosted) {
     blockerPosted = true
     try {
-      // Never leave a half-applied fix in a worktree the next run reuses.
-      await git(['checkout', '-f', '--', '.'])
+      // Never leave a half-applied fix in a worktree the next run reuses. Bounded by whatever the
+      // terminal window has left when ship's landing swap is what failed: past that write reap's
+      // settle clock is running, and a stalled local git call costs the blocker report just as an
+      // unbounded gh call would. Before any terminal write there is no clock and git's own timeout stands.
+      await git(['checkout', '-f', '--', '.'], terminalTimeout())
       await postBlocker({ issue, phase, reason, prUrl, attempt })
     } catch (e) {
       log(`blocked: could not report on GitHub (${e && e.message || e})`)

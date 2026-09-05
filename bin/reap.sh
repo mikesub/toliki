@@ -64,15 +64,18 @@ TERMINAL_SETTLE_MINUTES="${TERMINAL_SETTLE_MINUTES:-5}"
 # The floor under that knob, and the other half of a contract this file shares
 # with workflows/lib/github.mjs: a run writes its terminal label and THEN
 # finishes — the label readback a fixer's guidance is composed from, the refusal
-# comment itself, epic-run's merge gate after ship's ready-to-review, the status
-# comment's final edit. GitHub starts the settle clock this pass reads the moment
-# it applies that label, even if the client is still waiting on the response, so
-# the write and everything after it share one budget (TERMINAL_REPORT_BUDGET_MS,
-# plus status.mjs's own 20s) that stays well under a minute and a half. A window
-# configured below this floor could kill a run in the middle of it — no guidance
-# on the issue, no RESULT line in the pane — so a smaller value is raised rather
-# than honoured: settling late only delays cleanup, settling early destroys the
-# only report of why a run stopped.
+# comment itself, a fixer's landing swap (ready-to-review / ready-to-merge) and
+# its readback, the demotion a landing it could not verify falls through to,
+# epic-run's merge gate after ship's ready-to-review and its blocker write to
+# failed, the status comment's final edit. GitHub starts the settle clock this
+# pass reads the moment it applies that label, even if the client is still
+# waiting on the response, so the write and everything after it share ONE budget
+# for the whole run (TERMINAL_REPORT_BUDGET_MS, plus status.mjs's own 20s) that
+# stays well under a minute and a half. A window configured below this floor
+# could kill a run in the middle of it — no guidance on the issue, no RESULT line
+# in the pane — so a smaller value is raised rather than honoured: settling late
+# only delays cleanup, settling early destroys the only report of why a run
+# stopped.
 MIN_TERMINAL_SETTLE_MINUTES=3
 
 # How long a delivered run's worktree is kept before pass 3 removes it. Not a

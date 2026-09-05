@@ -27,6 +27,12 @@
 // start reap's settle clock — while the client is still waiting for the
 // response, so a swap on the default gh timeout can be killed by a sweep that
 // already considers the label settled, before the reporting has even begun.
+//
+// Often the window is already open when this runs: a fixer whose landing swap
+// could not be verified reaches its blocker path with `ready-to-merge` possibly
+// already resting on the issue and the settle clock already running. The budget
+// below is that same window rather than a fresh one, so this transition and its
+// report spend what the landing left, never a second budget.
 
 import { comment, editLabels, ensureLabels, issueLabels, terminalBudget } from './github.mjs'
 import { failureReason } from './proc.mjs'
