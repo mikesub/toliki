@@ -5,8 +5,8 @@
 // Issue mode (`--issue N`): preflight (closed? blocked_by?) → branch
 // epic/<N>-<slug> off origin/main and claim it by pushing the ref (atomic; a
 // run that loses the race skips), resuming an existing branch when one is left
-// over — and skipping architect and code when that branch already carries a
-// code checkpoint → checkpoint commits after code/fixes → squashed single-commit PR at
+// over — and skipping completed code when that branch already carries a code
+// checkpoint (recovering its structured review plan when needed) → checkpoint commits after code/fixes → squashed single-commit PR at
 // ship + blocker-comment → merge gate labels the issue ready-to-merge when
 // nothing was deferred, or ready-to-review when the PR is held; a hold made
 // exclusively of concrete defects also enters the separate bounded fixer queue.
@@ -20,13 +20,13 @@
 // orchestrator through lib/github.mjs and lib/repo.mjs, so a claim, a label, a
 // checkpoint or an open PR is a fact the script established, never a claim a
 // model reported. A model runs only where a judgment is needed: design, code,
-// the review lenses and their skeptic, the fixes, and what the PR says.
+// the independent reviewer(s) and their skeptic, the fixes, and what the PR says.
 //
-// `npm run verify` is likewise the orchestrator's to run: after the red step
-// it must be red (tests that pass against no implementation test nothing),
-// after green and after fixes it must be green. An agent's word that it ran
-// is never the gate; a wrong answer is handed back to that agent once, with
-// the output, then blocks the run.
+// `npm run verify` is likewise the orchestrator's to run. Test-first plans
+// require a clean baseline, a meaningful red regression, then green; direct
+// plans skip artificial RED but still require green after implementation.
+// After fixes it must be green too. An agent's word that it ran a gate is
+// never the gate; a wrong answer is handed back once, then blocks the run.
 //
 // The fixes themselves get one skeptic pass (fix-check) over exactly the
 // delta they produced. A fix the skeptic cannot confirm, a regression, a dead
@@ -45,6 +45,7 @@ import { agent, parallel, phase, log, initRuntime, onPhase, onLog, withAgentFail
 import { parseArgs, finish, UsageError, EXIT } from './lib/cli.mjs'
 import { initStatus, statusPhase, statusNote, statusFinish } from './lib/status.mjs'
 import { failureReason, must } from './lib/proc.mjs'
+import { validate } from './lib/schema.mjs'
 import {
   ensureLabels, editLabels, issueLabels, issueView, openBlockers, comment, assignSelf,
   openPrs, searchOpenPrs, prCreate, issueCreate, withBodyFile, hasDeferredRecord, issueId, addBlockedBy,
@@ -76,28 +77,47 @@ const PROMPTS = {
 `Read ${dir}/requirements.md and design the implementation approach for it. It goes straight to implementation.
 
 Ground the design in the real codebase: find how similar features here are already built and reuse their module boundaries, abstractions, and helpers. Default to the pragmatic path that fits existing patterns; introduce a new abstraction only when the requirements make its longevity worth the cost, and say so explicitly when you do.
+Keep obvious changes short; detail only the real implementation decisions and risks rather than filling every field with speculative machinery.
 
 Your output is schema-enforced JSON — populate every field, do not cram everything into one:
 - approach: a SHORT name for the design (3-6 words), used as its audit label.
-- rationale: 2-4 sentences on the core idea and why it fits this codebase.
-- steps: ordered build steps (one string per step); note which are independent vs. must serialize because they touch the same files.
+- rationale: a concise justification; one sentence is enough for an obvious change, with more detail only for real decisions or risks.
+- steps: only the ordered work needed (one string per step); one step is enough for an obvious edit.
 - files: files to create or modify (one per string, with a few words on what changes).
-- contract: the public contract / API surface, explicit enough that tests can be written against it WITHOUT seeing the implementation.
-- tradeoffs: what this approach deliberately accepts.`,
+- contract: the observable behavior or existing contract to preserve, explicit enough to verify without seeing the implementation. Say when no public API changes.
+- tradeoffs: what this approach deliberately accepts; say none when there is no meaningful trade-off.
+- verification: choose the lightest strategy that gives convincing evidence, respecting explicit project testing rules. Prefer direct for small, low-risk edits and changes adequately proved by existing checks or tests added alongside implementation. Choose test-first when a meaningful failing regression before implementation materially improves confidence in new behavior, a bug fix, or a risky contract, not merely because writing one is possible. Give a non-empty rationale and concrete evidence the completed implementation must provide. Direct still adds/updates tests when meaningful and always goes through the project's verify gate.
+- review: one concrete, change-specific question for a focused second reviewer when substantial authorization, data-integrity, concurrency, or similar narrow high-impact risk exists. Otherwise use an empty question; the broad reviewer still runs. Explain the choice either way.`,
+
+  architectRecover: (dir, diffCmd) =>
+`A previous run completed implementation and left a code checkpoint, but its structured architecture artifact is missing or invalid. Reconstruct the plan for review and audit only; do NOT edit files or replay implementation.
+
+Read ${dir}/requirements.md and inspect the existing implementation with \`${diffCmd}\`. Return schema-enforced JSON with approach, rationale, ordered steps, files, public contract, tradeoffs, verification, and review. Verification must contain mode (test-first or direct), a non-empty rationale, and a non-empty evidence array describing what proves this completed implementation. Review must contain a question and rationale: ask one concrete risk question for substantial authorization/data/concurrency risk, otherwise use an empty question and explain why broad review is sufficient. Describe what the checkpoint actually implemented; keep an obvious change short.`,
+
+  architectPartial: (dir, diffCmd) =>
+`This branch resumes work preserved from an interrupted coding phase. Read ${dir}/requirements.md and inspect both the source tree and \`${diffCmd}\`; design the smallest coherent continuation without deleting or restarting existing work. Return the same schema-enforced fields as a fresh design. Set verification.mode to direct because a fresh clean RED baseline no longer exists; the completed continuation still needs concrete non-empty evidence and the orchestrator's full verify gate. Record that resume constraint in the verification rationale. Plan the optional focused review normally.`,
 
   codeRed: (dir) =>
 `Code phase, RED step. Write tests ONLY (no implementation). Read ${dir}/requirements.md and ${dir}/architecture.md, and derive tests from the requirements + the public contract/API surface. Cover what is genuinely testable in this stack (units, pure logic, backend handlers, frontend component behavior); for hard-to-test surfaces (canvas/visual, external I/O), SKIP and note in ${dir}/epic.md what is uncovered and why — do not fake a test.
-Return the list of test files you created and a one-line confirmation they fail for the right reason. The pipeline then runs \`npm run verify\` itself and expects it to be red.`,
+Return structured testFiles, the exact distinctive assertion-failure excerpt you observed as expectedFailure, and why that failure demonstrates the missing required behavior. A typo, missing import, infrastructure error, timeout, or unrelated failure is not valid RED. The pipeline then runs \`npm run verify\` itself and requires that excerpt in its own failure output.`,
 
   codeGreen: (dir, red, pkgs) =>
 `Code phase, GREEN step. Read ${dir}/architecture.md and ${dir}/requirements.md and the existing failing tests:
-${red}
+${JSON.stringify(red, null, 2)}
 
 Implement the feature to make those tests pass, following architecture.md's build steps. Note any scope decision or wrong-test fix in ${dir}/epic.md's phase log. Run \`npm run verify\` in EACH touched package (this repo's packages: ${pkgs}) until green — that script is the project's whole gate, so whatever it runs (including any real-database tier it triggers for itself) has to be green, not just the unit tests.
 Leave everything in the working tree: do NOT commit or push; the pipeline checkpoints your work itself, and re-runs \`npm run verify\` after you return — a red run comes back to you once, then blocks the run. Return a short status: packages verified green, and any in-flight decisions or remaining failures you could not resolve.`,
 
-  review: (requirement, lens, diffCmd) =>
-`Review this change for the lens: ${lens}.
+  codeDirect: (dir, pkgs) =>
+`Code phase, direct implementation. Read ${dir}/requirements.md and ${dir}/architecture.md, then implement the feature in one coherent pass. Add or update tests where they meaningfully prove the architecture's verification evidence; do not manufacture a test for an untestable surface.
+
+Follow the architecture while preserving its requirement and public contract. If a codebase fact makes a planned detail wrong or impractical, make the smallest justified adjustment and record it in ${dir}/epic.md's phase log. Run \`npm run verify\` in EACH touched package (this repo's packages: ${pkgs}) until green.
+Leave everything in the working tree: do NOT commit or push; the pipeline checkpoints your work itself and re-runs verify after you return. Return a short status including evidence produced, tests added or updated, justified plan adjustments, and remaining failures.`,
+
+  review: (requirement, reviewer, diffCmd) =>
+`${reviewer.question
+    ? `Answer this concrete review question: ${reviewer.question}\nStay narrow: investigate this risk deeply, and report other issues only when they are necessary evidence for your answer. Do not repeat a general review of the whole change.`
+    : 'Independently review this change for requirements coverage, meaningful defects or regressions, and whether the verification adequately proves the changed behavior. Prioritize concrete consequences over stylistic preferences.'}
 
 Requirement to judge against — this is the ONLY spec context you get; reconstruct expected behavior from it + the diff alone:
 """
@@ -107,7 +127,7 @@ ${requirement}
 Read \`${diffCmd}\` / \`${diffCmd} --stat\` and the source tree to judge the change. Do NOT open ANY file under \`.epics/\` — architecture.md, epic.md, review.md and summary.md all encode the builder's intended behavior and would anchor you; you have the requirement above and do not need that directory.
 If nothing meets your confidence bar, return an empty findings array.`,
 
-  verify: (findings, diffCmd) =>
+  verify: (findings, requirement, diffCmd) =>
 `Adversarially verify ${findings.length === 1 ? 'a code-review finding' : `${findings.length} code-review findings reported against this change`}. Default to refuting each unless the code clearly bears it out.
 
 ${findings.map((f, i) => `--- Finding ${i + 1} ---
@@ -116,15 +136,20 @@ Severity: ${f.severity}
 Location: ${f.location}
 Claim: ${f.problem}`).join('\n\n')}
 
+Original requirement the change must satisfy:
+"""
+${requirement}
+"""
+
 Read the relevant code and \`${diffCmd}\`. Do NOT open anything under \`.epics/\` — it carries the builder's intent and would anchor you. For each finding, determine whether the claim genuinely holds (real) or is a false positive / already handled (not real). Set real=false if you cannot confirm it against the actual code.
 
 Return exactly ${findings.length} verdict${findings.length === 1 ? '' : 's'} — one per finding — with \`index\` set to that finding's number above (${findings.length === 1 ? '1' : `1-${findings.length}`}).${findings.length > 1 ? `
 
-These were reported independently by different review lenses, so several may be one defect restated in different words, often pointing at DIFFERENT files (the component, the gate that guards it, its test, the doc describing it). Judge each on its own merits: if two are the same defect, set \`sameDefectAs\` on the LATER one to the earlier one's number and let them stand or fall together — do NOT mark one not-real merely because it overlaps another. Group only findings ONE fix would genuinely resolve together; two distinct bugs that happen to sit in the same function are NOT the same defect.` : ''}`,
+Several may be one defect restated in different words, often pointing at DIFFERENT files (the component, the gate that guards it, its test, the doc describing it). Judge each on its own merits: if two are the same defect, set \`sameDefectAs\` on the LATER one to the earlier one's number and let them stand or fall together — do NOT mark one not-real merely because it overlaps another. Group only findings ONE fix would genuinely resolve together; two distinct bugs that happen to sit in the same function are NOT the same defect.` : ''}`,
 
   triage: (dir, pkgs, grouping) =>
-`Fixes-after-review phase, autonomous (NO user sign-off). Read ${dir}/review.md and the diff. Apply fixes for the CONFIRMED findings only, highest severity first — NEVER act on anything under "## Unconfirmed — not fixed" (those were refuted; they are listed for human eyes only). For every finding you fix, also add the automated check that would catch its whole CLASS, not just the instance in front of you — a test, a type, a lint rule, or a shared helper that makes the footgun impossible. Every review finding is a missing gate. Where this project's AGENTS.md states its own harden-the-gate rule, follow that wording; this instruction stands on its own where it does not.
-When the check that would catch a class is NOT expressible as a test/type/lint but is a convention (a rule about how to write something, a footgun only a human would know to avoid), write the rule into THIS project's own instructions instead: the relevant section of its AGENTS.md — the root one, or the per-directory AGENTS.md covering the code in question (or a \`.claude/rules/*.md\` file where this project still keeps those) — in the file's existing voice and length. Those are the only places you may write a rule. The skills, agents and this pipeline are shared harness files that live outside this repo and are used by other projects: a rule that belongs to one of them is out of scope for an epic, so do NOT edit or recreate one — record it as DEFERRED in ${dir}/epic.md's phase log, stating the rule you would have written and which harness file it belongs in, and leave the harness untouched. Note every amendment or deferral in ${dir}/epic.md's phase log so it surfaces in the PR body.
+`Fixes-after-review phase, autonomous (NO user sign-off). Read ${dir}/requirements.md, ${dir}/review.md and the diff. Apply the smallest correct repair for the CONFIRMED findings only, highest severity first — NEVER act on anything under "## Unconfirmed — not fixed" (those were refuted; they are listed for human eyes only). Add or update a regression check when it meaningfully protects the affected behavior. Follow the project's own explicit verification rules.
+Keep the repair proportional to the defect. A finding does not require a new abstraction, shared helper, lint rule or project instruction: introduce one only when necessary for this repair. Do not turn a local fix into prevention of an entire class of hypothetical problems. If a necessary repair changes a documented contract, update the relevant project instructions or documentation in their existing voice. Shared harness skills, agents and pipeline files outside this project remain out of scope; never edit or recreate them. Record material decisions and any concrete work left undone in ${dir}/epic.md's phase log, without inventing hardening work to justify a follow-up.
 If a finding is genuinely too risky or expensive to fix safely without a human decision, DO NOT guess — leave it, and record it as deferred (with why) in ${dir}/epic.md's phase log so the summary surfaces it.
 ${grouping}After fixes, re-run \`npm run verify\` in each touched package (this repo's packages: ${pkgs}) until green.
 Leave everything in the working tree: do NOT commit or push; the pipeline checkpoints your work itself, and re-runs \`npm run verify\` after you return — a red run comes back to you once, then blocks the run. Return:
@@ -135,7 +160,7 @@ Leave everything in the working tree: do NOT commit or push; the pipeline checkp
   redRetry: (gate) =>
 `
 
-The pipeline ran \`npm run verify\` after your previous RED step and it came back GREEN (${gate.detail}): the tests you wrote pass against a tree with NO implementation, so they test nothing. This is your one retry. Rewrite them so they fail for the right reason — an unmet assertion against the public contract in architecture.md — and confirm they fail before you return.`,
+The pipeline rejected your previous RED step: ${gate}. This is your one retry. Rewrite the tests so the project's verify command fails on a distinctive unmet assertion against the public contract in architecture.md, then return that exact observed assertion excerpt. Do not use an import error, timeout, infrastructure failure, or unrelated failure.`,
 
   verifyRetry: (gate) =>
 `
@@ -164,9 +189,9 @@ Refute each classification. Read \`${diffCmd}\` and the source tree; do NOT open
 Return exactly ${items.length} verdict${items.length === 1 ? '' : 's'} with \`index\` set to the item's number above.`,
 
   // Refute-by-default over the fix delta: the same adversarial shape as the review verify, aimed at
-  // the one diff no lens has seen.
-  fixCheck: (fixed, deltaCmd, diffCmd) =>
-`Check the fixes applied after review — you did not write them. An automated fixes-after-review step edited the change after five review lenses had judged it; its edits are exactly \`${deltaCmd}\` (also readable with --stat), applied on top of the reviewed change \`${diffCmd}\`. ${fixed.length ? `It reports these ${fixed.length} confirmed review finding(s) as FIXED:` : 'It reports no finding as fixed; check its edits for regressions only.'}
+  // the one diff no reviewer has seen.
+  fixCheck: (fixed, requirement, deltaCmd, diffCmd) =>
+`Check the fixes applied after review — you did not write them. An automated fixes-after-review step edited the change after independent review; its edits are exactly \`${deltaCmd}\` (also readable with --stat), applied on top of the reviewed change \`${diffCmd}\`. ${fixed.length ? `It reports these ${fixed.length} confirmed review finding(s) as FIXED:` : 'It reports no finding as fixed; check its edits for regressions only.'}
 
 ${fixed.map((f, i) => `--- Finding ${i + 1} ---
 Title: ${f.title}
@@ -175,9 +200,14 @@ Location: ${f.location}
 Claim: ${f.problem}
 Recommended fix: ${f.fix}`).join('\n\n')}
 
+Original requirement the change and its fixes must satisfy:
+"""
+${requirement}
+"""
+
 Two questions, refute-by-default:
 1. For each finding above: does the delta genuinely remove the defect? resolved=true only if the code now behaves correctly for the case the finding names. A test weakened, skipped or deleted so the finding no longer shows is NOT a fix, and neither is a comment or a suppression. resolved=false whenever you cannot confirm it against the code.
-2. Regressions: any defect the delta introduces that the reviewed change did not have — a behavior change outside the finding's scope, a dropped side effect, a broken neighbour, a new null path. Same bar as a review finding: report only what you are at least 75 confident of, with file:line, the problem, a concrete fix and the gate that would catch its class.
+2. Regressions: any defect the delta introduces that the reviewed change did not have — a behavior change outside the finding's scope, a dropped side effect, a broken neighbour, a new null path. Same bar as a review finding: report only what you are at least 75 confident of, with file:line, the problem, a concrete fix and useful targeted regression evidence (or why no meaningful automated check exists).
 
 Do NOT open anything under \`.epics/\` — it carries the builder's and the fixer's framing and would anchor you.
 Return exactly ${fixed.length} verdict${fixed.length === 1 ? '' : 's'}${fixed.length ? `, with \`index\` set to the finding's number above (${fixed.length === 1 ? '1' : `1-${fixed.length}`})` : ''}, and a regressions array (empty when none).`,
@@ -202,8 +232,8 @@ Your output is schema-enforced JSON:
      missing-gate — an automated check whose absence let a class of bug through, that could not be added inside this diff.
      scope-cut — a requirement stated in ${dir}/requirements.md that was deliberately not delivered.
      other — everything else: refactor and consolidation ideas, nice-to-haves, cosmetic nits, rare edge-case tests, uncovered surfaces with no known defect behind them, follow-up verification or eval runs (if a run is needed to trust THIS diff it is a blocker on this epic, not a deferral), and anything whose value depends on a diff that main will move past within days.
-   - file: whether it earns a follow-up issue. Filing is the EXCEPTION, not the default — the record the pipeline posts on the issue costs nothing, and an over-filed item rots in the backlog forever. true ONLY if the kind is defect, missing-gate or scope-cut AND it passes the slicing test: could ONE coherent PR close it and still mean something on its own? "Decide whether to X", "consider Y", "investigate Z" all FAIL — a question is not a mergeable change. The pipeline files at most 3, defects first, and notes in the record when more qualified: needing more than 3 means the issue was under-scoped, and that count is the signal.
-   - issueTitle and issueBody, for file=true: a clear title, and a body saying what it is and why it was deferred. The pipeline appends the \`Follow-up to #${issue}\` line and applies no label.`,
+   - file: whether it earns a follow-up issue. File concrete, materially useful work that needs its own durable issue after this one closes. true ONLY if the kind is defect, missing-gate or scope-cut AND it passes the slicing test: could ONE coherent PR close it and still mean something on its own? Its body must define the observable result, why it matters and what completes it. "Decide whether to X", "consider Y", "investigate Z" all FAIL — a question is not a mergeable change. Do not file speculative hardening, optional abstractions, already repaired findings, or accepted design choices merely because more work is possible. Filing no follow-ups is a normal successful outcome. The cap of 3 is a ceiling, never a target; defects take priority. Filing a follow-up does not resolve a blocker in this PR or make an unmet requirement complete.
+   - issueTitle and issueBody, for file=true: a clear title and a self-contained definition of done, including what it is and why it was deferred. The pipeline appends the \`Follow-up to #${issue}\` line, records the dependency on this issue, and then queues the follow-up with \`ready\` when ordering succeeds.`,
 
   summaryManual: (dir, design, triageStatus) =>
 `Write the run's summary and return it in the "summary" field, as markdown. This is the manual flow — do NOT commit, push, or open a PR; leave all changes in the working tree.
@@ -215,16 +245,16 @@ Capture, against ${dir}/requirements.md: what was built; the architecture approa
 // that step's row in the run's engine in etc/engines.json (--engine, or the issue's engine:<name> label).
 // What a row is written against:
 // architect — designs the epic in one pass. It is the one step that fixes the shape of everything downstream
-// (red writes its tests from that contract), so a weak call here is the most expensive kind.
-// code — red, green, and ship's judgment half (what the PR says, what was deferred and of what kind, the
+// (coding and verification follow that contract), so a weak call here is the most expensive kind.
+// code — red, green or direct, and ship's judgment half (what the PR says, what was deferred and of what kind, the
 // project's own legal trigger). Ship's `kind` per deferral feeds the merge gate, which is why it is not a
 // cheaper row.
 // confirm-review — the adversarial verifier is the last judgment before fixes-after-review AUTO-APPLIES a fix
 // with no human sign-off, so a wrong "real" here becomes a committed change and a wrong "not real" buries a
-// live bug. It runs once per batch (a handful of spawns), not once per lens, which is what makes
+// live bug. It runs once per batch (a handful of spawns), not once per reviewer, which is what makes
 // upgrading it cheap.
-// review — the five finders drive recall, and more cheap finders beat fewer expensive ones. If recall proves
-// weak, add a sixth lens rather than upgrading the existing five.
+// review — one independent general review is mandatory. The architect may request one additional focused
+// review for a concrete risk that merits a second pair of eyes; the orchestrator hard-bounds this at two.
 
 // This pipeline used to run its own real-database gate: an agent listed the changed paths, the script
 // path-matched them, and a second agent ran the project's `test:db` suite. That whole tier is gone — the
@@ -234,32 +264,65 @@ Capture, against ${dir}/requirements.md: what was built; the architecture approa
 // never reach. "verify green" now IMPLIES the real tier ran wherever it was needed, which is why nothing
 // downstream attests to it separately.
 
-// Lens 3 watches the boundary between the repo's halves — whichever two the repo actually has
-// (frontend↔backend, frontend↔worker). Derived from the discovered package list, since a seam named for
-// a package this repo does not have points the reviewer at nothing.
-const reviewLenses = (pkgs) => [
-  'correctness + concurrency (logic errors, null/undefined, races, dropped side-effects)',
-  'simplicity + DRY + project conventions',
-  pkgs.length > 1
-    ? `test honesty + the ${pkgs.join('↔')} seam (a bug that spans the package boundary, each side correct-looking alone)`
-    : 'test honesty + module seams (a bug that spans two modules, each correct-looking alone)',
-  'requirements coverage / acceptance (walk EVERY requirement in the spec above one by one: verify the diff actually delivers it, and flag anything unmet, partially met, or silently narrowed)',
-  'security + authorization (tenant/owner scoping on EVERY read and write, secret and token handling, injection, unsafe trust of client input)',
-]
+const reviewPlan = design => {
+  const focused = String(design?.review?.question || '').trim()
+  return [
+    { label: 'review:general', question: '', rationale: '' },
+    ...(focused ? [{ label: 'review:focus', question: focused, rationale: String(design.review.rationale || '').trim() }] : []),
+  ]
+}
 
 // ───────────────────────── Schemas ─────────────────────────
 const DESIGN_SCHEMA = {
   type: 'object', additionalProperties: false,
-  required: ['approach', 'rationale', 'steps', 'files', 'contract', 'tradeoffs'],
+  required: ['approach', 'rationale', 'steps', 'files', 'contract', 'tradeoffs', 'verification', 'review'],
   properties: {
     approach: { type: 'string', description: 'SHORT name for the design (3-6 words), used as its audit label' },
-    rationale: { type: 'string', description: '2-4 sentences: the core idea and why it fits this codebase' },
-    steps: { type: 'array', items: { type: 'string' }, description: 'ordered build steps; note which are independent vs. must serialize' },
+    rationale: { type: 'string', description: 'concise justification, one sentence for an obvious change; more detail only for real decisions or risks' },
+    steps: { type: 'array', items: { type: 'string' }, description: 'only the ordered work needed; one step is enough for an obvious edit' },
     files: { type: 'array', items: { type: 'string' }, description: 'files to create/modify, each with a few words on what changes' },
-    contract: { type: 'string', description: 'public contract / API surface, explicit enough to write tests against without the implementation' },
+    contract: { type: 'string', description: 'observable behavior or existing contract to preserve, explicit enough to verify without the implementation' },
     tradeoffs: { type: 'string', description: 'what this approach deliberately accepts' },
+    verification: {
+      type: 'object', additionalProperties: false, required: ['mode', 'rationale', 'evidence'],
+      properties: {
+        mode: { enum: ['test-first', 'direct'] },
+        rationale: { type: 'string' },
+        evidence: { type: 'array', items: { type: 'string' } },
+      },
+    },
+    review: {
+      type: 'object', additionalProperties: false, required: ['question', 'rationale'],
+      properties: { question: { type: 'string' }, rationale: { type: 'string' } },
+    },
   },
 }
+const RED_SCHEMA = {
+  type: 'object', additionalProperties: false, required: ['testFiles', 'expectedFailure', 'reason'],
+  properties: {
+    testFiles: { type: 'array', items: { type: 'string' } },
+    expectedFailure: { type: 'string', description: 'exact distinctive assertion-failure excerpt observed by the agent' },
+    reason: { type: 'string', description: 'why the assertion demonstrates missing required behavior' },
+  },
+}
+
+const nonblank = value => typeof value === 'string' && value.trim().length > 0
+const matchesSchema = (schema, value) => {
+  try { return validate(schema, value).length === 0 } catch { return false }
+}
+const validDesign = d => matchesSchema(DESIGN_SCHEMA, d) &&
+  nonblank(d.approach) && nonblank(d.rationale) && Array.isArray(d.steps) && Array.isArray(d.files) &&
+  nonblank(d.contract) && nonblank(d.tradeoffs) &&
+  ['test-first', 'direct'].includes(d.verification?.mode) && nonblank(d.verification?.rationale) &&
+  Array.isArray(d.verification?.evidence) && d.verification.evidence.length > 0 && d.verification.evidence.every(nonblank) &&
+  typeof d.review?.question === 'string' && nonblank(d.review?.rationale)
+
+const validRed = red => !!red && Array.isArray(red.testFiles) && red.testFiles.length > 0 &&
+  red.testFiles.every(nonblank) && nonblank(red.expectedFailure) && red.expectedFailure.trim().length >= 8 && nonblank(red.reason)
+
+const provesExpectedRed = (gate, red) => !gate.green && gate.failures?.length > 0 &&
+  gate.failures.every(f => !f.timedOut && !f.spawnError && Number.isInteger(f.code) && f.code !== 0) &&
+  gate.failures.some(f => f.output.includes(red.expectedFailure.trim()))
 const FINDINGS_SCHEMA = {
   type: 'object', additionalProperties: false, required: ['findings'],
   properties: {
@@ -275,7 +338,7 @@ const FINDINGS_SCHEMA = {
           location: { type: 'string', description: 'file:line (for an unmet requirement: the file where it should live, or the requirement itself)' },
           problem: { type: 'string', description: 'the behavior or guideline it breaks' },
           fix: { type: 'string', description: 'concrete fix' },
-          gate: { type: 'string', description: 'the automated check that would catch this whole class next time' },
+          gate: { type: 'string', description: 'useful targeted regression evidence for this defect, or empty when no automated check is meaningful' },
         },
       },
     },
@@ -487,6 +550,7 @@ async function prepare(issue) {
   let branch = local[0] || remote[0] || null
   let resumed = false
   let codeDone = false
+  let partialWork = false
   if (branch) {
     slug = branch.slice('epic/'.length)
     let sw
@@ -518,10 +582,11 @@ async function prepare(issue) {
       return { refused: `resume rebase onto origin/main conflicted — resolve manually on ${branch} or delete it for a fresh build` }
     }
     resumed = true
-    // A code checkpoint on the branch means an earlier run finished design and implementation; the
-    // expensive phases are not repeated, the verify gate re-proves the tree and review takes it from there.
+    // A code checkpoint means an earlier run finished implementation. Do not repeat it: recover the
+    // architecture plan if needed, re-prove the tree through verify, then review.
     const subjects = (await gitOut(['log', '--format=%s', 'origin/main..HEAD'], 'git log')).split('\n')
     codeDone = subjects.some(s => new RegExp(`^wip\\(epic ${slug.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\): (code|triage) checkpoint$`).test(s.trim()))
+    partialWork = !codeDone && subjects.some(s => s.trim() && !s.startsWith(`chore(epic ${issue}): claim`))
   } else {
     slug = slugify(issue, view.title)
     branch = `epic/${slug}`
@@ -554,7 +619,7 @@ async function prepare(issue) {
   const packages = discoverPackages('.')
   const depLines = packages.length ? await ensureDeps(packages, { pairs: [[base, 'HEAD']] }) : []
   return {
-    slug, branch, resumed, codeDone, requirement: readRequirements(dir),
+    slug, branch, resumed, codeDone, partialWork, requirement: readRequirements(dir),
     requirementTitle: String(view.title || ''), requirementBody: String(view.body || ''),
     packages, depLines,
   }
@@ -757,8 +822,12 @@ async function fail(phase, reason) {
 let requirement
 let requirementTitle = ''
 let requirementBody = ''
-// True when the resumed branch already carries a code checkpoint: architect, red and green are skipped.
+// True when the resumed branch already carries a code checkpoint: implementation is skipped;
+// architecture is reconstructed read-only only when its structured artifact did not survive.
 let codeDone = false
+// A resumed branch with preserved edits but no completed code checkpoint cannot recreate a clean
+// pre-RED baseline. Continue it directly; never discard work merely to replay the gate.
+let partialWork = false
 // Discovered layout: which packages the verify gate runs in. Fail closed, like every other gate in this
 // file: an empty package list would make the verify gate a silent no-op — the run finishes "green"
 // having verified nothing.
@@ -792,7 +861,8 @@ try {
     requirementTitle = prep.requirementTitle
     requirementBody = prep.requirementBody
     codeDone = !!prep.codeDone
-    log(`Prepare: requirements written, branch epic/${slug} ${prep.resumed ? 'resumed and rebased onto origin/main' : 'created off origin/main'}${codeDone ? ' (a code checkpoint is on it)' : ''}, deps checked (${prep.depLines.join('; ')}). Packages: ${pkgList(packages)}.`)
+    partialWork = !!prep.partialWork
+    log(`Prepare: requirements written, branch epic/${slug} ${prep.resumed ? 'resumed and rebased onto origin/main' : 'created off origin/main'}${codeDone ? ' (a code checkpoint is on it)' : partialWork ? ' (partial coding work was preserved)' : ''}, deps checked (${prep.depLines.join('; ')}). Packages: ${pkgList(packages)}.`)
   }
 
   const dir = epicDir(slug)
@@ -823,29 +893,43 @@ try {
 
   let design
   if (codeDone) {
-    // The design was made by the run that left the checkpoint. Its architecture.md survives when the
-    // worktree was reused (the host reuses one per issue); otherwise the PR body says where the
-    // approach came from.
-    const archFile = path.join(dir, 'architecture.md')
-    const m = existsSync(archFile) ? readFileSync(archFile, 'utf8').match(/^Approach: (.+?) — (.+)$/m) : null
-    design = m ? { approach: m[1], rationale: m[2] } : { approach: 'resumed from a code checkpoint', rationale: 'design and implementation were completed by an earlier run of this branch.' }
-    updateEpicMd(dir, { phase: 'architect → skipped', approach: design.approach, log: 'architect: skipped, the branch carries a code checkpoint' })
-    log(`Architect: skipped — the branch carries a code checkpoint (${design.approach}).`)
+    // Review needs the structured verification/review decisions even after a worktree is recreated.
+    // Prefer the scratch artifact; if it did not survive, reconstruct it read-only from the completed
+    // implementation. Code is never replayed merely to recover planning context.
+    const artifact = path.join(dir, 'architecture.json')
+    try { design = JSON.parse(readFileSync(artifact, 'utf8')) } catch { design = null }
+    if (!validDesign(design)) {
+      log('Architect: structured artifact missing or invalid on a code checkpoint — reconstructing it read-only.')
+      design = await agent(PROMPTS.architectRecover(dir, DIFF),
+        { label: 'architect:recover', phase: 'Architect', step: 'architect', schema: DESIGN_SCHEMA },
+      )
+      if (!validDesign(design)) return await fail('architect', 'Could not recover a valid structured architecture from the completed code checkpoint — refusing to review without its verification and review plan.')
+      renderArchitecture(dir, design)
+      updateEpicMd(dir, { phase: 'architect → recovered', approach: design.approach, log: `architect: recovered ${design.approach} from code checkpoint` })
+      log(`Architect: recovered plan for completed checkpoint (${design.approach}); code remains untouched.`)
+    } else {
+      // architecture.md is disposable scratch too; recreate it from the validated source before any
+      // retry or downstream phase tries to read it.
+      renderArchitecture(dir, design)
+      updateEpicMd(dir, { phase: 'architect → skipped', approach: design.approach, log: 'architect: skipped, valid structured plan recovered from the code checkpoint' })
+      log(`Architect: skipped — the branch carries a code checkpoint and structured plan (${design.approach}).`)
+    }
   } else {
-    design = await agent(PROMPTS.architectDesign(dir),
+    design = await agent(partialWork ? PROMPTS.architectPartial(dir, DIFF) : PROMPTS.architectDesign(dir),
       { label: 'architect:design', phase: 'Architect', step: 'architect', schema: DESIGN_SCHEMA },
     )
-    if (!design) return await fail('architect', 'Architect design failed — aborting before code.')
+    if (!validDesign(design)) return await fail('architect', 'Architect design was missing required verification evidence or review rationale — aborting before code.')
+    if (partialWork && design.verification.mode !== 'direct') return await fail('architect', 'Resumed partial work did not produce a direct continuation plan — refusing to replay RED against a dirty baseline.')
 
-    // Rendered here from the decided design: red and green both read architecture.md, so it exists
-    // before either runs, verbatim to what the architect returned.
+    // Rendered here from the decided design: every coding path reads architecture.md, so it exists
+    // before implementation runs, verbatim to what the architect returned.
     renderArchitecture(dir, design)
     updateEpicMd(dir, { phase: 'architect → done', approach: design.approach, log: `architect: ${design.approach}` })
     if (!existsSync(path.join(dir, 'architecture.md'))) return await fail('architect', 'architecture.md was not written — aborting before code, which reads it.')
     log(`Architecture: ${design.approach} — ${design.rationale}`)
   }
 
-  // ───────────────────────── Phase 2: Code (red → green → checkpoint) ─────────────────────────
+  // ───────────────────────── Phase 2: Code (adaptive verification → checkpoint) ─────────────────────────
   currentPhase = 'code'
   phase('Code')
 
@@ -856,54 +940,66 @@ try {
     return v
   }
 
-  // Red: tests only, written blind to any implementation (none exists yet), from requirements + the public
-  // contract. Then the gate: verify must be RED. Green here means the tests pass against no implementation
-  // — they test nothing, and every later gate would be verifying against them. Necessary, not sufficient:
-  // an exit code cannot tell an unmet assertion from a missing import, which is why the prompt still asks
-  // the agent to confirm the reason.
+  // Test-first starts only from a clean baseline, then requires the orchestrator's failure output to
+  // contain the exact assertion excerpt the RED agent reported. This rejects pre-existing, timeout,
+  // spawn and obvious unrelated failures. It does not pretend substring matching proves test semantics;
+  // the structured reason and later blind review remain the judgment layers.
   let red = null
   let green = null
   let gate
   if (codeDone) {
     // The checkpoint is the implementation. Re-prove it rather than trust it: the branch was rebased
     // onto a main that may have moved, so the gate runs exactly as it would after green.
-    log('Code: resumed from a code checkpoint — architect, red and green skipped; re-running the verify gate.')
+    log('Code: resumed from a code checkpoint — implementation skipped; re-running the verify gate.')
     red = 'the tests already on this branch'
     green = 'resumed from a code checkpoint'
     gate = await verifyGate('Code: verify gate (resumed)')
   } else {
-    red = await agent(PROMPTS.codeRed(dir),
-      { label: 'code:red', phase: 'Code', step: 'code' },
-    )
-    if (!red) return await fail('code', 'Red step failed — no tests written, aborting before implementation.')
-    gate = await verifyGate('Code: red gate')
-    if (gate.green) {
-      log('Code: the red tests pass against a tree with no implementation — respawning the red step once.')
-      red = await agent(PROMPTS.codeRed(dir) + PROMPTS.redRetry(gate),
-        { label: 'code:red:retry', phase: 'Code', step: 'code' },
-      )
-      if (!red) return await fail('code', 'Red step failed on its retry — no tests written, aborting before implementation.')
-      gate = await verifyGate('Code: red gate (retry)')
-      if (gate.green) return await fail('code', `the red tests pass before any implementation exists, twice (${gate.detail}) — they do not test the change, so nothing downstream would be verified against it.`)
-    }
-    log('Code: red tests written; verify is red as it should be.')
+    if (design.verification.mode === 'test-first') {
+      const baseline = await verifyGate('Code: test-first baseline')
+      if (!baseline.green) return await fail('code', `npm run verify was not green before RED (${baseline.detail}) — refusing to mistake an existing failure for a regression.`)
 
-    // Green: implement against architecture + the red tests, then pass the gate. Single agent to keep the
-    // working tree coherent. Then the gate: verify must be GREEN, by this script's own run.
-    green = await agent(PROMPTS.codeGreen(dir, red, pkgList(packages)),
-      { label: 'code:green', phase: 'Code', step: 'code' },
-    )
-    if (!green) return await fail('code', 'Green step failed — implementation did not complete, aborting before review.')
+      red = await agent(PROMPTS.codeRed(dir),
+        { label: 'code:red', phase: 'Code', step: 'code', schema: RED_SCHEMA },
+      )
+      if (!validRed(red)) return await fail('code', 'Red step returned no meaningful test files, assertion excerpt, or reason — aborting before implementation.')
+      gate = await verifyGate('Code: red gate')
+      if (!provesExpectedRed(gate, red)) {
+        const rejection = gate.green
+          ? `verify stayed green (${gate.detail})`
+          : `verify failed, but not with the reported assertion excerpt or a runnable test failure (${gate.detail})`
+        log(`Code: RED was not established — respawning the red step once (${rejection}).`)
+        red = await agent(PROMPTS.codeRed(dir) + PROMPTS.redRetry(rejection),
+          { label: 'code:red:retry', phase: 'Code', step: 'code', schema: RED_SCHEMA },
+        )
+        if (!validRed(red)) return await fail('code', 'Red step returned no meaningful evidence on its retry — aborting before implementation.')
+        gate = await verifyGate('Code: red gate (retry)')
+        if (!provesExpectedRed(gate, red)) return await fail('code', `RED could not be established twice (${gate.detail}) — refusing to implement against an unproven regression.`)
+      }
+      log('Code: the expected RED assertion failure was observed by the orchestrator; semantic relevance remains for blind review to judge.')
+
+      green = await agent(PROMPTS.codeGreen(dir, red, pkgList(packages)),
+        { label: 'code:green', phase: 'Code', step: 'code' },
+      )
+    } else {
+      green = await agent(PROMPTS.codeDirect(dir, pkgList(packages)),
+        { label: 'code:direct', phase: 'Code', step: 'code' },
+      )
+    }
+    if (!green) return await fail('code', 'Implementation step failed — implementation did not complete, aborting before review.')
     gate = await verifyGate('Code: verify gate')
   }
   if (!gate.green) {
-    log('Code: verify is red after the green step — respawning green once with the failure.')
-    green = await agent(PROMPTS.codeGreen(dir, red, pkgList(packages)) + PROMPTS.verifyRetry(gate),
-      { label: 'code:green:retry', phase: 'Code', step: 'code' },
+    const implementationPrompt = design.verification.mode === 'direct'
+      ? PROMPTS.codeDirect(dir, pkgList(packages))
+      : PROMPTS.codeGreen(dir, red, pkgList(packages))
+    log('Code: verify is red after implementation — respawning implementation once with the failure.')
+    green = await agent(implementationPrompt + PROMPTS.verifyRetry(gate),
+      { label: design.verification.mode === 'direct' ? 'code:direct:retry' : 'code:green:retry', phase: 'Code', step: 'code' },
     )
-    if (!green) return await fail('code', 'Green step failed on its retry — implementation did not complete, aborting before review.')
+    if (!green) return await fail('code', 'Implementation step failed on its retry — implementation did not complete, aborting before review.')
     gate = await verifyGate('Code: verify gate (retry)')
-    if (!gate.green) return await fail('code', `npm run verify is red after the green step and its retry (${gate.detail}) — refusing to review an unverified change.`)
+    if (!gate.green) return await fail('code', `npm run verify is red after implementation and its retry (${gate.detail}) — refusing to review an unverified change.`)
   }
   const codeCheckpoint = await checkpointWork('code')
   const codeSha = gitMode ? await gitOut(['rev-parse', 'HEAD'], 'git rev-parse HEAD') : null
@@ -914,32 +1010,30 @@ try {
   currentPhase = 'review'
   phase('Review')
 
-  // Built here, not at module scope: lens 3's seam names the packages discovery actually found.
-  const LENSES = reviewLenses(packages)
+  const reviewers = reviewPlan(design)
 
   // A finder that DIED must never look like a finder that found nothing. Coercing a null agent straight to []
-  // hands the rest of the phase a clean bill of health for a lens that never ran, and the tally then ASSERTS a
-  // full N-lens review in the PR body — the diff ships looking reviewed through a lens it never saw. The
+  // hands the rest of the phase a clean bill of health for a reviewer that never ran, and the tally then ASSERTS a
+  // complete review in the PR body — the diff ships looking reviewed by an agent that never ran. The
   // runtime respawns a transient death once; after that, fail closed: review is the only gate between code
   // and an auto-opened PR, so a hole in it stops the run.
-  const shortLens = i => LENSES[i].split(' (')[0]
-  const runLens = async (lens, i) => {
-    const r = await agent(PROMPTS.review(requirement, lens, DIFF),
-      { label: `review:${i}`, phase: 'Review', step: 'review', schema: FINDINGS_SCHEMA },
+  const runReviewer = async reviewer => {
+    const r = await agent(PROMPTS.review(requirement, reviewer, DIFF),
+      { label: reviewer.label, phase: 'Review', step: 'review', schema: FINDINGS_SCHEMA },
     ).catch(() => null)
     if (r && Array.isArray(r.findings)) return r.findings
-    return null // sentinel: the lens died. Distinct from [], which means "ran, found nothing".
+    return null // sentinel: the reviewer died. Distinct from [], which means "ran, found nothing".
   }
 
-  const lensResults = await parallel(LENSES.map((lens, i) => () => runLens(lens, i)))
-  const deadLenses = lensResults.map((r, i) => (r === null ? i : -1)).filter(i => i >= 0)
-  if (deadLenses.length) {
-    return await fail('review', `${deadLenses.length} of ${LENSES.length} review lenses produced no result after a respawn (${deadLenses.map(shortLens).map(n => `"${n}"`).join(', ')}) — the diff was never reviewed through them. Refusing to ship a PR whose body would claim a full ${LENSES.length}-lens review.`)
+  const reviewerResults = await parallel(reviewers.map(reviewer => () => runReviewer(reviewer)))
+  const deadReviewers = reviewerResults.map((r, i) => (r === null ? reviewers[i].label : null)).filter(Boolean)
+  if (deadReviewers.length) {
+    return await fail('review', `${deadReviewers.length} of ${reviewers.length} requested reviewer(s) produced no result after a respawn (${deadReviewers.join(', ')}) — refusing to ship a change missing independent review.`)
   }
-  const reviews = lensResults.flat()
+  const reviews = reviewerResults.flat()
 
-  // Soft dedup before the verify fan-out (free — reviews is already fully materialized). Overlapping lenses
-  // (correctness vs. the seam lens) can restate the same defect, which otherwise gets verified twice, listed
+  // Soft dedup before the verify fan-out (free — reviews is already fully materialized). Two reviewers
+  // can restate the same defect, which otherwise gets verified twice, listed
   // twice in review.md, and fixed twice. Collapse ONLY a confident duplicate — same location AND same
   // normalized title. Biased toward keeping: when in doubt we keep both, so distinct bugs at one file:line
   // survive (different titles) and nothing is ever dropped on location alone.
@@ -949,14 +1043,14 @@ try {
     return seen.has(k) ? false : seen.add(k)
   })
   // Cluster by FILE (line numbers stripped) before the adversarial fan-out. The title dedup above only catches
-  // verbatim restatements; overlapping lenses (correctness vs. the seam lens) word one defect differently and
-  // slip through. On #194 that put five paraphrases of a single history.ts bug in front of five separate
+  // verbatim restatements; independent reviewers can word one defect differently and
+  // slip through. On #194 that put paraphrases of a single history.ts bug in front of separate
   // skeptics, each re-reading the same diff to re-confirm it. One skeptic per batch pays that cost once and can
   // see the claims are one defect — a call the per-finding verifiers each had to make blind. Verdicts stay PER
   // FINDING: clustering changes who judges, never what survives.
   // Batches are sized, NOT keyed by file. Keying by file was the first version of this and it only caught
   // restatements that happen to land in the same file; on #69 one defect ("a parseable-but-unusable schedule
-  // renders no rate fields and does not block submit") arrived from four lenses pointing at a component, a
+  // renders no rate fields and does not block submit") arrived from reviewers pointing at a component, a
   // gate, a test and a doc — four files, so four skeptics, none of whom could see it was one defect. Three
   // more of that run's findings were a second defect split the same way: 18 findings, ~9 real defects.
   //
@@ -969,7 +1063,7 @@ try {
   const ordered = [...uniqueReviews].sort((a, b) => fileOf(a).localeCompare(fileOf(b)))
   const batches = []
   for (let i = 0; i < ordered.length; i += MAX_BATCH) batches.push(ordered.slice(i, i + MAX_BATCH))
-  log(`Review: ${reviews.length} raw finding(s) across ${LENSES.length} lenses; adversarially verifying ${uniqueReviews.length} in ${batches.length} batch(es) of up to ${MAX_BATCH}.`)
+  log(`Review: ${reviews.length} raw finding(s) across ${reviewers.length} blind reviewer(s); adversarially verifying ${uniqueReviews.length} in ${batches.length} batch(es) of up to ${MAX_BATCH}.`)
 
   // Adversarial verify: an independent skeptic tries to REFUTE each finding before it counts. Refuted /
   // low-confidence findings are NOT silently dropped — they land in review.md's "Unconfirmed" section for
@@ -979,21 +1073,37 @@ try {
   const noVerdict = f => ({
     finding: f,
     verdict: { real: false, confidence: 0, reasoning: 'Batched verifier returned no verdict for this finding — recorded as unconfirmed rather than dropped. Re-check by hand.' },
+    unknownEvidence: true,
   })
   const verdicts = (await parallel(batches.map((group, bi) => () =>
-    agent(PROMPTS.verify(group, DIFF),
+    agent(PROMPTS.verify(group, requirement, DIFF),
       { label: `verify:${bi + 1}/${batches.length}`, phase: 'Review', step: 'confirm-review', schema: VERDICT_SCHEMA },
-    ).then(v => group.map((f, i) => {
-      const got = v && Array.isArray(v.verdicts) ? v.verdicts.find(x => Number(x.index) === i + 1) : null
-      if (!got || typeof got.real !== 'boolean') return noVerdict(f)
-      // sameDefectAs is 1-based WITHIN this batch; resolve it to the actual finding while the
-      // batch is still in scope. Ignore a self-reference or an out-of-range index rather than
-      // trusting it — a bad link would silently merge unrelated defects.
-      const k = Number(got.sameDefectAs)
-      const twin = Number.isInteger(k) && k >= 1 && k <= group.length ? group[k - 1] : null
-      return { finding: f, verdict: got, twin: twin && twin !== f ? twin : null }
-    })).catch(() => group.map(noVerdict)),
+    ).then(v => {
+      const returned = v && Array.isArray(v.verdicts) ? v.verdicts : []
+      const indices = returned.map(x => Number(x.index))
+      const complete = returned.length === group.length && new Set(indices).size === group.length &&
+        indices.every(i => Number.isInteger(i) && i >= 1 && i <= group.length)
+      if (!complete) return group.map(noVerdict)
+      return group.map((f, i) => {
+        const got = returned.find(x => Number(x.index) === i + 1)
+        if (!got || typeof got.real !== 'boolean') return noVerdict(f)
+        // sameDefectAs is 1-based WITHIN this batch; resolve it to the actual finding while the
+        // batch is still in scope. Ignore a self-reference or an out-of-range index rather than
+        // trusting it — a bad link would silently merge unrelated defects.
+        const k = Number(got.sameDefectAs)
+        const twin = Number.isInteger(k) && k >= 1 && k <= group.length ? group[k - 1] : null
+        return { finding: f, verdict: got, twin: twin && twin !== f ? twin : null }
+      })
+    }).catch(() => group.map(noVerdict)),
   ))).flat().filter(Boolean)
+
+  // A skeptic is a gate, not a source of optional annotation. Unknown coverage must not be converted to
+  // real=false: that would make a dead, short or duplicate verifier response indistinguishable from a
+  // genuine refutation and could make the change mergeable.
+  const unknownVerdicts = verdicts.filter(r => r.unknownEvidence)
+  if (unknownVerdicts.length) {
+    return await fail('review', `adversarial verification produced no unique verdict for ${unknownVerdicts.length} finding(s) — refusing to treat unknown evidence as refuted.`)
+  }
 
   const confirmedRecs = verdicts.filter(r => r.verdict.real && r.verdict.confidence >= 75)
   const verified = confirmedRecs.map(r => r.finding)
@@ -1001,9 +1111,9 @@ try {
     .map(r => ({ ...r.finding, verdict: r.verdict }))
 
   // Collapse the confirmed findings into DEFECTS — the things a fix addresses — using the links the
-  // skeptics returned. Five lenses reporting one fault is the design working (it is how #66's migration
-  // bug was caught five times over), but handing fixes-after-review five items makes it fix and gate the
-  // same thing five times, and that is the longest phase in the run.
+  // skeptics returned. Multiple reviewers reporting one fault is the design working, but handing
+  // fixes-after-review duplicate items makes it fix and gate the
+  // same thing repeatedly, and that is the longest phase in the run.
   //
   // This is presentation, never a filter: every finding still reaches fixes-after-review, grouped, and the
   // grouping is advisory — it is told to split a group back apart if the findings are actually distinct. So a
@@ -1027,10 +1137,10 @@ try {
   // The one line of the review that has to outlive the worktree. review.md is gitignored and the PR body is
   // told to skip the refuted findings, so without this tally in the PR nothing records they were ever raised.
   // Both numbers stay in the tally on purpose. Reporting only the defect count would read as a WEAKER
-  // review than actually happened — the raw count is the only durable record that N independent lenses
+  // review than actually happened — the raw count is the only durable record that independent reviewers
   // converged on the same fault, and review.md dies with the worktree.
   const grouped = defects.length < verified.length ? `, which are ${defects.length} distinct defect(s)` : ''
-  let reviewTally = `${reviews.length} raw finding(s) across ${LENSES.length} blind lenses → ${verified.length} confirmed by adversarial verification${grouped}, ${unconfirmed.length} refuted`
+  let reviewTally = `${reviews.length} raw finding(s) across ${reviewers.length} blind reviewer(s) → ${verified.length} confirmed by adversarial verification${grouped}, ${unconfirmed.length} refuted`
   log(`Review: ${reviewTally}.`)
 
   // review.md, rendered from the surviving findings (+ the unconfirmed record).
@@ -1044,12 +1154,12 @@ try {
   let triageStatus = 'No confirmed findings — nothing to fix.'
   let triageDeferred = []
   if (verified.length) {
-    // Advisory grouping: the same defect, found by several lenses, arrives as several findings. Naming the
+    // Advisory grouping: the same defect, found by several reviewers, arrives as several findings. Naming the
     // groups lets the fixer fix and gate once instead of once per restatement — while every finding is still
     // listed, and it is told to split a group it disagrees with rather than silently honour it.
     const multi = defects.filter(g => g.length > 1)
     const grouping = multi.length
-      ? `\nSeveral findings are the SAME underlying defect, reported by different review lenses looking at different files. An independent verifier grouped them; one fix and one gate should resolve each group, so do NOT fix or gate the same fault once per finding:\n${multi.map((g, i) => `- Defect ${i + 1}:\n${g.map(f => `  - "${f.title}" (${f.location})`).join('\n')}`).join('\n')}\nThis grouping is a hint, not an instruction: if the findings in a group are genuinely distinct faults needing separate fixes, treat them separately and say so in your status. Every finding above must still end up either fixed or reported as deferred.\n`
+      ? `\nSeveral findings are the SAME underlying defect, reported by different reviewers looking at different files. An independent verifier grouped them; one fix and one gate should resolve each group, so do NOT fix or gate the same fault once per finding:\n${multi.map((g, i) => `- Defect ${i + 1}:\n${g.map(f => `  - "${f.title}" (${f.location})`).join('\n')}`).join('\n')}\nThis grouping is a hint, not an instruction: if the findings in a group are genuinely distinct faults needing separate fixes, treat them separately and say so in your status. Every finding above must still end up either fixed or reported as deferred.\n`
       : ''
     let triaged = await agent(PROMPTS.triage(dir, pkgList(packages), grouping),
       { label: 'fixes-after-review', phase: 'Fixes after review', step: 'fixes-after-review', schema: TRIAGE_SCHEMA },
@@ -1077,7 +1187,7 @@ try {
   log(`Fixes after review: ${triageStatus}`)
 
   // ───────────────────────── Post-fix check ─────────────────────────
-  // The fixes changed code no lens has seen. One skeptic pass over exactly that delta: does each fix
+  // The fixes changed code no reviewer has seen. One skeptic pass over exactly that delta: does each fix
   // resolve its finding, and does the delta introduce a defect of its own? Every bad answer changes the
   // label — the merge gate below holds the PR — never the tree. There is no second fix round, which is
   // what keeps it bounded. Git mode only: manual mode has no checkpoints and no gate.
@@ -1098,7 +1208,7 @@ try {
       })
       postFix = { confirmed: [], unresolved: fixed.map(f => ({ finding: f, verdict: { resolved: false, confidence: 0, reasoning: 'the fixes step produced no diff' } })), regressions: [], note: 'The fixes step reported fixes but produced no diff' }
     } else if (changed) {
-      const c = await agent(PROMPTS.fixCheck(fixed, `git diff ${codeSha} ${fixSha}`, DIFF),
+      const c = await agent(PROMPTS.fixCheck(fixed, requirement, `git diff ${codeSha} ${fixSha}`, DIFF),
         { label: 'fix-check', phase: 'Fixes after review', step: 'confirm-review', schema: FIXCHECK_SCHEMA },
       )
       if (!c) {
@@ -1211,7 +1321,7 @@ try {
 
   // ───────────────────────── The merge gate ─────────────────────────
   // Everything the pipeline could verify is green by here: verify per package (whatever that script gates,
-  // including any real-database tier the project triggers for itself), five blind lenses adversarially
+  // including any real-database tier the project triggers for itself), independent review adversarially
   // verified, and the fixes re-verified. What is left is the judgment calls the pipeline explicitly
   // refused to make. Those refusals ARE the gate — a deferred confirmed finding or a defect that outlives
   // this merge is the pipeline saying "a human decides this", and a human cannot decide it after it has

@@ -159,7 +159,7 @@ than made launchable against a main without the code it describes.
 
 ## Non-negotiable behavior
 
-- Fail closed. A failed or unreadable dependency check, review lens, schema,
+- Fail closed. A failed or unreadable dependency check, requested reviewer, schema,
   CI conclusion, ref listing, routing label or conflict classification is never
   a green gate. Gated by `tests/dispatch-engine.test.sh` and
   `tests/epic-run.test.sh`.
@@ -181,10 +181,29 @@ than made launchable against a main without the code it describes.
   the original requirement from that envelope, rejects mutable issue prose,
   stale evidence and fork PRs before an attempt, and verifies the selected PR
   advanced to the pushed head before promotion.
-- `npm run verify` is run by the orchestrator: red after the red step, green
-  after green and after fixes-after-review, each with one retry that hands the
-  output back to the agent, then a blocker. An agent's report that verify
-  passed is never the gate. Gated by `tests/epic-run.test.sh`.
+- Architecture returns a proportional plan with a structured verification
+  strategy (`test-first` or `direct`), its rationale and required evidence.
+  Test-first establishes a clean verify baseline before writing tests and
+  requires the expected assertion failure in the orchestrator's RED output;
+  an unrelated failure or timeout is not RED evidence. Direct skips the RED
+  agent, not verification. An interrupted partial implementation resumes with
+  a direct continuation plan, preserving the existing tests and edits rather
+  than demanding a new clean RED baseline. Both paths finish with orchestrator-run
+  `npm run verify`, as do fixes-after-review, with one bounded coding retry
+  before a blocker. An agent's report that verify passed is never the gate.
+  Gated by `tests/epic-run.test.sh`.
+- One general reviewer always judges the actual diff against the requirement.
+  Architecture can request at most one additional reviewer for a concrete risk
+  question. Reviewers stay blind to builder notes; the skeptic and fix checker
+  receive the original requirement too. Every finding needs a complete verdict:
+  missing or ambiguous evidence cannot become a refutation or merge clearance.
+  A resumed code checkpoint keeps its review plan, or reconstructs that plan
+  read-only when the local artifact is missing, without replaying code.
+- Review repairs apply the smallest correct change and meaningful regression
+  coverage. New abstractions or instruction rules are justified by the repair,
+  not mandated for every finding. Follow-up issues are still filed and queued
+  for concrete material work with a standalone definition of done; the cap is
+  a ceiling, not a target, and filing never clears the current PR's blockers.
 - The fixes-after-review delta gets one skeptic pass (fix-check). An
   unconfirmed fix, a regression, a dead check or a claimed fix with no diff
   holds the PR at `ready-to-review`; nothing starts a second fix round inside

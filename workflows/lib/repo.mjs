@@ -95,9 +95,12 @@ export async function ensureDeps(packages, { pairs = [] } = {}) {
 // The project's whole gate, package by package. The exit code is the verdict;
 // the detail line carries the first genuinely failing thing for a human, and
 // the tail carries the last lines of each failing run for an agent's retry.
+// Structured failures retain bounded output and process status so test-first
+// can match its expected assertion without treating a timeout or spawn failure as RED.
 export async function runVerify(packages, { timeoutMs = VERIFY_TIMEOUT_MS, tailLines = 40 } = {}) {
   const details = []
   const tails = []
+  const failures = []
   let green = true
   for (const pkg of packages) {
     const r = await sh('npm', ['run', 'verify'], { cwd: pkg === '.' ? '.' : pkg, timeoutMs, stdoutCap: 256 * 1024 })
@@ -106,9 +109,11 @@ export async function runVerify(packages, { timeoutMs = VERIFY_TIMEOUT_MS, tailL
     const lines = `${r.out}\n${r.err}`.split('\n').filter(l => l.trim())
     const last = r.timedOut ? 'timed out' : (lines.slice(-3).join(' | ') || `exit ${r.code}`)
     details.push(`${pkg} — fail: ${last}`)
+    const output = `${r.out}\n${r.err}`.trim()
     tails.push(`--- ${pkg}: npm run verify ${r.timedOut ? 'timed out' : `exited ${r.code}`} ---\n${lines.slice(-tailLines).join('\n')}`)
+    failures.push({ package: pkg, code: r.code, timedOut: r.timedOut, spawnError: !!r.spawnError, output })
   }
-  return { green, detail: details.join('; '), tail: tails.join('\n') }
+  return { green, detail: details.join('; '), tail: tails.join('\n'), failures }
 }
 
 // ───────────────────────── git state ─────────────────────────
@@ -241,9 +246,24 @@ ${d.contract}
 ## Trade-offs deliberately accepted
 
 ${d.tradeoffs}
+
+## Verification plan
+
+Mode: ${d.verification.mode}
+
+${d.verification.rationale}
+
+${d.verification.evidence.map(item => `- ${item}`).join('\n')}
+
+## Focused review
+
+Question: ${d.review.question || '(none — broad review only)'}
+
+${d.review.rationale}
 `
   mkdirSync(dir, { recursive: true })
   writeFileSync(path.join(dir, 'architecture.md'), text)
+  writeFileSync(path.join(dir, 'architecture.json'), `${JSON.stringify(d, null, 2)}\n`)
   return text
 }
 

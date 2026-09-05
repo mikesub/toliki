@@ -22,8 +22,11 @@ only where a judgment is needed. Claude Code and Codex are both supported.
    budget. Repair queues run first; ship-gate defect repair is walked only for
    repositories listed in the machine-local `DEFECT_FIX_REPOS` allowlist.
 3. **`workflows/epic-run.mjs`** (the session's pane) — claims the issue,
-   architects, implements with TDD under a verify gate the orchestrator runs
-   itself, reviews under five blind lenses plus an adversarial verifier, and
+   makes a proportional architecture plan, then implements through either
+   test-first red/green or a direct coding step. Both paths pass the project's
+   verify gate run by the orchestrator. One general reviewer always runs; the
+   plan may request one additional review for a concrete risk question.
+   Findings go through an independent skeptic and bounded repairs. The run
    ends at an open PR with `ready-to-merge` (gates cleared, lands unattended)
    or `ready-to-review` (a human decides).
 4. **`bin/merge-worker.sh`** (cron) — one PR at a time per repo: rebase onto

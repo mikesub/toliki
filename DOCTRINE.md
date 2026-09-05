@@ -13,10 +13,17 @@ don't get re-litigated from memory.
   each a complete definition of done, labeled `ready`. The only human gate in
   the system.
 - **Build** — cron dispatches one detached run per unblocked `ready` issue: a
-  plain Node orchestrator that walks a fixed sequence — architecture →
-  red-green TDD → blind review → fixes after review → an open, green PR —
-  spawning one short-lived headless agent process per judgment. The issue body
-  is the only requirement the run is judged against; nobody answers follow-up
+  plain Node orchestrator that walks architecture → implementation → blind
+  review → fixes after review → an open, green PR, spawning one short-lived
+  headless agent process per judgment. Architecture chooses a proportional
+  implementation plan and the evidence that proves it: `test-first` for a
+  meaningful failing regression, or `direct` implementation with appropriate
+  checks for changes that do not need a red/green split. An obvious edit earns
+  a short plan; a one-line change with serious consequences can still need TDD.
+  Neither choice skips the final project verify gate or independent review.
+  Interrupted partial work continues through direct implementation; an existing
+  failing test is not presented as newly established RED. The issue body is
+  the only requirement the run is judged against; nobody answers follow-up
   questions at 3 a.m., so a spec that needs clarification is a spec that fails.
 - **The pipeline outlives its engine.** Every phase is a process behind one
   adapter, so which vendor's CLI runs an epic is a routing value, not an
@@ -26,16 +33,30 @@ don't get re-litigated from memory.
   once per vendor, and watching the copies drift. It also moves the merge gate
   and the fail-closed branches out of a vendor's runtime and into ordinary code
   we can run in a test harness.
-- **Review** — blind and adversarial. Five lenses judge the diff against the
-  issue body alone, barred from the builder's notes; every finding goes to a
+- **Review** — blind and adversarial. One general reviewer judges the diff
+  against the issue body, barred from the builder's notes. Architecture may
+  request one additional reviewer for a concrete risk question, such as whether
+  a migration preserves existing records; it cannot disable the general review
+  or request an unbounded fan-out. Both review actual behavior and evidence,
+  without the builder's conclusions. Every finding goes to a
   skeptic instructed to refute it; survivors are auto-fixed, refuted ones
-  recorded as unconfirmed rather than deleted, and the fixes get one pass from
+  recorded as unconfirmed rather than deleted; missing verdicts block rather
+  than count as refutations. The skeptic and fix checker also receive the
+  original requirement. The fixes get one pass from
   the same skeptic — a fix it cannot confirm holds the PR instead of starting
   another round inside the same epic. A hold made entirely of concrete defects
   may enter a separate, label-bounded defect-fixer session in repositories that
   explicitly opt in; uncertainty still goes directly to a human. The strong
   model goes to design and adjudication, where being wrong is expensive;
   implementation runs on a cheaper model under the test gate.
+- **Repairs stay proportional.** Fix the named defect and add meaningful
+  regression coverage. A review finding does not automatically require a new
+  abstraction, lint rule or instruction to prevent an entire class of problems.
+  Follow-up issues remain durable delivery units, filed and queued for concrete
+  material work with a self-contained definition of done. Three per run is a
+  ceiling, never a target; speculative hardening and accepted trade-offs do not
+  earn an issue merely because more work is possible. A follow-up never clears
+  an unresolved blocker in the current delivery.
 - **Merge** — a serial per-repo worker rebases each finished PR onto current
   `main`, gives checks a short registration window, waits for every published
   check on the rebased head, then squash-merges. An empty check rollup after
@@ -63,10 +84,13 @@ don't get re-litigated from memory.
   the PR, the follow-up issues, the layout discovery, `npm run verify` — is the
   orchestrator's own work, so what a run did is a fact it established rather
   than a claim a model reported. Models are spawned only where a judgment is
-  needed: the design, the code, the review lenses and their skeptic, the fixes,
+  needed: the design, the code, the reviewers and their skeptic, the fixes,
   what the PR says. The rule that falls out of it: an agent's word that it ran
-  a gate is never the gate. Verify is red after the red step and green after
-  the green one because the orchestrator ran it, not because a step said so.
+  a gate is never the gate. Test-first establishes a clean baseline and requires
+  the red step's expected assertion failure to appear in the orchestrator's
+  verify output; a failed command or timeout is not a regression test. Both
+  coding paths must finish with verify green because the orchestrator ran it,
+  not because a step said so.
 - **State is GitHub.** Issues, lifecycle and engine-routing labels,
   `blocked_by` edges, claim refs, PRs.
   Workers are disposable: kill any run at any moment, re-run without cleanup.
@@ -87,8 +111,8 @@ don't get re-litigated from memory.
   values. A model asked "should this merge?" while holding a finished PR can
   talk itself past a slow gate.
 - **No cheerful defaults.** "Couldn't check" never becomes "fine": a dead
-  review lens blocks the run, an unreadable CI conclusion fails the merge, a
-  lost verdict is written down for a human. A gate that lies is worse than no
+  requested reviewer blocks the run, an unreadable CI conclusion fails the
+  merge, and a missing finding verdict blocks for a human. A gate that lies is worse than no
   gate. An empty, readable check rollup is different: after the registration
   grace it means this repo publishes no CI, so there is no check verdict to
   invent; any check that does register remains binding.

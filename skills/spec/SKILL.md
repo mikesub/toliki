@@ -31,7 +31,7 @@ Request: $ARGUMENTS
    - **Functional requirements.**
    - **Non-goals / out of scope**, naming the sibling that covers each: "X is out of scope, covered by #44." A sibling's work left unnamed reads as an unmet requirement, and fixes-after-review will then build it into this slice unattended. Ids do not exist yet: write the placeholder now and fill it in at step 7.
    - **Accepted trade-offs and deferrals**, each with the clarifying answer that narrowed scope.
-   - **Constraints**: only what constrains this build and is not already standing. Never restate the project's own rules: the pipeline's agents already read the project's `AGENTS.md`, and the coder runs red-green TDD under the `npm run verify` gate. A bullet earns its place only if it is particular to this feature: a compatibility boundary, a required interaction with existing data or a live surface, a security or privacy property the diff must hold. If nothing qualifies, omit the section.
+   - **Constraints**: only what constrains this build and is not already standing. Never restate the project's own rules: the pipeline's agents already read the project's `AGENTS.md`, and architecture selects test-first or direct implementation under the same mandatory `npm run verify` gate and independent review. A bullet earns its place only if it is particular to this feature: a compatibility boundary, a required interaction with existing data or a live surface, a security or privacy property the diff must hold. If nothing qualifies, omit the section.
 
    Show them to the user and fold in their edits. Confirm the titles. Do not invent labels or milestones: beyond the `ready` label applied in step 7, a spec issue carries none of the primitives in `ISSUE-TRACKING.md`.
 

@@ -12,13 +12,11 @@ The prompt may describe what the change does, its intended behavior, or focus ar
 
 - Build your own understanding of the behavior from the diff first, then reconcile it against the description. Where they diverge is often where the bug is.
 - Words like "intended", "idempotent", "safe" or "bounded" are hypotheses, not guarantees. An accepted trade-off only holds if the code actually upholds it: check it.
-- Focus areas are a floor, not a ceiling. Review the whole diff and report issues outside the listed areas with equal weight. A concern being named does not mean it was handled.
+- For a general review, inspect the whole diff. When the task explicitly asks one concrete risk question, investigate that question deeply without duplicating the general review; report an issue outside it only when that issue is necessary evidence for the answer. A concern being named does not mean it was handled.
 
 ## What to look for
 
-- **Project guidelines**: explicit rules on conventions, style, error handling, logging, testing, platform compatibility and naming.
-- **Bugs that will impact functionality**: logic errors, null/undefined handling, race conditions, memory leaks, security vulnerabilities, performance problems.
-- **Code quality**: duplication, missing critical error handling, accessibility problems, inadequate test coverage.
+Judge whether the diff actually satisfies the requirement, whether it introduces a meaningful defect or regression, and whether its verification is adequate for the behavior it changes. Trace actual consequences rather than producing a checklist of possible concerns. Project rules are binding when they apply, but style preferences and speculative hardening are not findings.
 
 Two techniques catch what reading the new code alone misses:
 - **Force a behavior diff on any removal or refactor.** Enumerate what the old path did and check the replacement covers each effect; the dangerous defect is an *absence* you cannot see by reading the new files.
@@ -28,10 +26,10 @@ Two techniques catch what reading the new code alone misses:
 
 Rate each potential issue 0-100 and **report only issues at 75 or above**: double-checked, very likely real, hit in practice, and either directly impacting functionality or directly stated in the project guidelines. A pre-existing issue, a nitpick, or a stylistic point the guidelines do not call out scores below the bar. Quality over quantity.
 
-## Harden the gate
+## Regression evidence
 
-Every finding is a missing automated check. For each real issue, also identify the gate that would catch its whole class next time (a test, a type, a real-DB or integration check, a lint, or a shared helper that makes the footgun impossible) and recommend it alongside the fix. Reviews are for judgment, not for mechanical divergences a machine can catch by running.
+For each real issue, recommend useful automated evidence that would expose the problem again: normally a focused regression test, but sometimes a type, lint rule, integration check or invariant assertion. Do not require a mechanism that prevents an entire broad class when a precise regression check is the honest gate.
 
 ## Output
 
-For each issue: a clear description with its confidence, file path and line, the guideline reference or bug explanation, a concrete fix, and the gate that would catch the class. Group by severity (Critical, Important). If no issue clears the bar, say so in a brief summary.
+For each issue: a clear description with its confidence, file path and line, the guideline reference or bug explanation, a concrete fix, and useful targeted regression evidence (or why no meaningful automated check exists). Group by severity (Critical, Important). If no issue clears the bar, say so in a brief summary.

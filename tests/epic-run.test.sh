@@ -124,13 +124,12 @@ prompt="$(cat)"
 key=unknown
 case "${EPIC_STEP_LABEL:-}" in
   architect:design)                            key=design ;;
+  architect:recover)                           key=recover ;;
   code:red|code:red:retry)                     key=red ;;
+  code:direct|code:direct:retry)                key=direct ;;
   code:green|code:green:retry)                 key=green ;;
-  review:0)                                    key=lens-correctness ;;
-  review:1)                                    key=lens-simplicity ;;
-  review:2)                                    key=lens-seam ;;
-  review:3)                                    key=lens-acceptance ;;
-  review:4)                                    key=lens-security ;;
+  review:general)                              key=review-general ;;
+  review:focus)                                key=review-focus ;;
   verify:*)                                    key=verify ;;
   fix-check)                                   key=fixcheck ;;
   deferral-check)                              key=defercheck ;;
@@ -169,7 +168,7 @@ chmod +x "$TMP/bin/claude"
 cat > "$TMP/bin/codex" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
-# One write per call: five lenses run in parallel and append to the same log,
+# One write per call: reviewers can run in parallel and append to the same log,
 # so a two-write line would interleave and undercount.
 printf '%s\n' "$(printf '%s' "$*" | tr '\n' ' ' | tr -s ' ')" >> "$STUB_CODEX_LOG"
 out=""
@@ -424,15 +423,13 @@ fixture_sh() { # dir key script
 # ───────────────────────── the happy-path fixture set ─────────────────────────
 BASE="$TMP/fixtures-base"
 mkdir -p "$BASE"
-fixture "$BASE" design '{"approach":"Thin widget module","rationale":"Fits the existing shape.","steps":["one","two"],"files":["src/widget.ts — new"],"contract":"createWidget(): Widget","tradeoffs":"No caching."}'
-fixture_text "$BASE" red "wrote widget.test.ts; fails on missing export"
+fixture "$BASE" design '{"approach":"Thin widget module","rationale":"Fits the existing shape.","steps":["one","two"],"files":["src/widget.ts — new"],"contract":"createWidget(): Widget","tradeoffs":"No caching.","verification":{"mode":"test-first","rationale":"The public export can be asserted before implementation.","evidence":["widget test passes"]},"review":{"question":"","rationale":"The change has no narrow high-impact risk beyond general review."}}'
+cp "$BASE/design.json" "$BASE/recover.json"
+fixture "$BASE" red '{"testFiles":["frontend/src/widget.test.ts"],"expectedFailure":"missing export createWidget","reason":"The required public export does not exist yet."}'
 fixture_sh "$BASE" red 'printf "test(\"widget\", () => {})\n" > frontend/src/widget.test.ts'
 fixture_text "$BASE" green "frontend verified green"
 fixture_sh "$BASE" green 'printf "export const createWidget = () => ({})\n" > frontend/src/widget.ts'
-for lens in lens-simplicity lens-seam lens-acceptance lens-security; do
-  fixture "$BASE" "$lens" '{"findings":[]}'
-done
-fixture "$BASE" lens-correctness '{"findings":[{"title":"Null deref on empty list","severity":"Critical","confidence":90,"location":"src/widget.ts:12","problem":"Crashes when items is empty.","fix":"Guard the access.","gate":"unit test for the empty case"}]}'
+fixture "$BASE" review-general '{"findings":[{"title":"Null deref on empty list","severity":"Critical","confidence":90,"location":"src/widget.ts:12","problem":"Crashes when items is empty.","fix":"Guard the access.","gate":"unit test for the empty case"}]}'
 fixture "$BASE" verify '{"verdicts":[{"index":1,"real":true,"confidence":90,"reasoning":"Confirmed against the code."}]}'
 fixture "$BASE" triage '{"status":"Fixed the null deref, verify green.","deferred":[]}'
 fixture_sh "$BASE" triage 'printf "export const createWidget = () => ({ items: [] })\n" > frontend/src/widget.ts'
@@ -457,6 +454,7 @@ run_pipeline() { # script fixtures-dir args...   (scenario knobs via GH_* env)
   [[ -z "${SEED_COMMENTS:-}" ]] || printf '%s\n---\n' "$SEED_COMMENTS" > "$state/gh/comments"
   : > "$RUN_LOG"; : > "$CODEX_LOG"; : > "$GH_LOG"; : > "$NPM_LOG"
   WT="$(fresh_clone)"
+  if [[ -d "$fixtures/worktree" ]]; then cp -R "$fixtures/worktree/." "$WT/"; fi
   RUN_RC=0
   RUN_OUT="$(
     cd "$WT" && \
@@ -525,24 +523,31 @@ assert_contains "RESULT says readyToMerge" "$RUN_OUT" '"readyToMerge":true'
 assert_not_contains "a clear gate never advertises defect repair" "$RUN_OUT" '"needsDefectFix":true'
 assert_contains "RESULT carries the PR url" "$RUN_OUT" '"prUrl":"https://github.com/o/r/pull/7"'
 assert_contains "review tally reported" "$RUN_OUT" '1 confirmed by adversarial verification, 0 refuted'
-assert_eq "exactly the twelve model steps ran" 12 "$(wc -l < "$RUN_LOG" | tr -d ' ')"
+assert_eq "exactly the eight model steps ran" 8 "$(wc -l < "$RUN_LOG" | tr -d ' ')"
 assert_eq "the fixes were checked once" 1 "$(calls fixcheck)"
 assert_eq "no deferrals, no deferral check" 0 "$(calls defercheck)"
 assert_contains "the tally records the fix check" "$RUN_OUT" "fix check: 1/1 fixes confirmed, 0 regression(s)"
 assert_contains "the fix check was handed the exact delta" "$(cat "$STATE_DIR/fixcheck.0.prompt")" "git diff "
+assert_contains "the skeptic receives the pinned requirement" "$(cat "$STATE_DIR/verify.0.prompt")" "Build a widget."
+assert_contains "the fix check receives the pinned requirement" "$(cat "$STATE_DIR/fixcheck.0.prompt")" "Build a widget."
+assert_contains "the fixer is asked for the smallest correct repair" "$(cat "$STATE_DIR/triage.0.prompt")" "smallest correct repair"
+assert_not_contains "the fixer is not forced into class-wide hardening" "$(cat "$STATE_DIR/triage.0.prompt")" "Every review finding is a missing gate"
+assert_contains "follow-up filing treats the cap as a ceiling" "$(cat "$STATE_DIR/ship.0.prompt")" "a ceiling, never a target"
+assert_contains "follow-ups retain dependency-first queueing" "$(cat "$STATE_DIR/ship.0.prompt")" 'records the dependency on this issue, and then queues the follow-up with `ready`'
 assert_contains "review.md carries the post-fix section" "$(cat "$WT/.epics/42-add-widget/review.md")" "## Post-fix check"
 # The usage log: one line per spawn, keyed by the engines.json step, never on GitHub.
-assert_eq "one usage record per spawn" 12 "$(usage_log | wc -l | tr -d ' ')"
-assert_eq "records name the engines.json steps" "architect:1 code:3 confirm-review:2 fixes-after-review:1 review:5" "$(usage_log | jq -r .step | sort | uniq -c | awk '{print $2":"$1}' | tr '\n' ' ' | sed 's/ $//')"
+assert_eq "one usage record per spawn" 8 "$(usage_log | wc -l | tr -d ' ')"
+assert_eq "records name the engines.json steps" "architect:1 code:3 confirm-review:2 fixes-after-review:1 review:1" "$(usage_log | jq -r .step | sort | uniq -c | awk '{print $2":"$1}' | tr '\n' ' ' | sed 's/ $//')"
 assert_eq "tokens are what the CLI reported, all four kinds summed" "1600" "$(usage_log | jq -r 'select(.label=="architect:design") | .tokens.total')"
 assert_eq "cost and turns ride along" "0.05 3" "$(usage_log | jq -r 'select(.label=="architect:design") | "\(.costUsd) \(.turns)"')"
-assert_eq "every record carries the run, issue and engine" "12" "$(usage_log | jq -r 'select(.issue==42 and .engine=="claude" and (.runId|length)>0) | .step' | wc -l | tr -d ' ')"
+assert_eq "every record carries the run, issue and engine" "8" "$(usage_log | jq -r 'select(.issue==42 and .engine=="claude" and (.runId|length)>0) | .step' | wc -l | tr -d ' ')"
 assert_not_contains "no usage went to GitHub" "$(cat "$GH_LOG")" "tokens"
 REPORT="$(node "$ROOT/workflows/usage-report.mjs" --log "$STATE_DIR/usage.jsonl")"
 assert_contains "the report groups by script" "$REPORT" "epic-run — 1 run(s): claude 1"
-assert_contains "and shows the review lenses as the biggest share" "$REPORT" "review"
-assert_contains "with percentages" "$REPORT" "41.7"
-assert_eq "all five lenses ran" 5 "$(( $(calls lens-correctness) + $(calls lens-simplicity) + $(calls lens-seam) + $(calls lens-acceptance) + $(calls lens-security) ))"
+assert_contains "and shows independent review usage" "$REPORT" "review"
+assert_contains "with percentages" "$REPORT" "37.5"
+assert_eq "the mandatory general reviewer ran once" 1 "$(calls review-general)"
+assert_eq "an empty review question does not add a focused reviewer" 0 "$(calls review-focus)"
 # What the orchestrator did to the repo and the issue.
 assert_eq "origin holds the branch as ONE commit above main" 1 "$(origin_count epic/42-add-widget)"
 assert_eq "the squashed commit's subject is the PR title" "Add widget" "$(git -C "$ORIGIN" log -1 --format=%s epic/42-add-widget)"
@@ -555,7 +560,7 @@ assert_eq "the issue ends ready-to-merge and nothing else" "ready-to-merge," "$(
 assert_not_contains "no deferred record was posted" "$(gh_comments)" "deferred / not done"
 assert_not_contains "no blocker was posted" "$(gh_comments)" "epic-run blocked"
 assert_eq "deps were installed once for the discovered package" 1 "$(grep -c '^ci$' "$NPM_LOG")"
-assert_eq "the orchestrator ran verify after red, green and the fixes" 3 "$(grep -c '^run verify$' "$NPM_LOG")"
+assert_eq "the orchestrator ran baseline, red, green and post-fix verify" 4 "$(grep -c '^run verify$' "$NPM_LOG")"
 assert_contains "the red gate saw red" "$RUN_OUT" "Code: red gate: verify RED"
 assert_contains "the green gate saw green" "$RUN_OUT" "Code: verify gate: verify green"
 assert_contains "the fixes gate saw green" "$RUN_OUT" "Fixes after review: verify gate: verify green"
@@ -580,7 +585,34 @@ assert_contains "architect and reviewer cannot write" "$ARGV" "--tools Glob,Grep
 assert_contains "the reviewer charter reaches the model" "$ARGV" "Review code against project guidelines"
 assert_contains "schemas are enforced by the engine" "$ARGV" "--json-schema"
 assert_contains "permissions are pre-granted for autonomy" "$ARGV" "--dangerously-skip-permissions"
-assert_contains "the review lens prompt still names its lens (routing did not rely on it)" "$(cat "$STATE_DIR/lens-security.0.prompt")" "security + authorization"
+assert_contains "the general reviewer judges meaningful defects" "$(cat "$STATE_DIR/review-general.0.prompt")" "meaningful defects or regressions"
+assert_not_contains "the reviewer never sees builder architecture" "$(cat "$STATE_DIR/review-general.0.prompt")" "Thin widget module"
+
+scenario 'epic-run: a direct plan uses one implementation pass and mandatory review'
+DIRECT="$TMP/fixtures-direct"; cp -R "$BASE" "$DIRECT"
+fixture "$DIRECT" design '{"approach":"Direct widget edit","rationale":"This small wiring change has no honest pre-implementation regression.","steps":["edit and verify"],"files":["src/widget.ts — new"],"contract":"createWidget(): Widget","tradeoffs":"No artificial RED.","verification":{"mode":"direct","rationale":"The change is verified by its final public behavior.","evidence":["widget export exists"]},"review":{"question":"","rationale":"General review is sufficient."}}'
+fixture_text "$DIRECT" direct "implemented widget and verified frontend"
+fixture_sh "$DIRECT" direct 'printf "export const createWidget = () => ({})\n" > frontend/src/widget.ts'
+fixture "$DIRECT" review-general '{"findings":[]}'
+run_pipeline "$EPIC_RUN" "$DIRECT" --issue 42
+assert_rc "clean direct plan ships" 0 "$RUN_RC"
+assert_eq "direct implementation runs once" 1 "$(calls direct)"
+assert_eq "direct plan never runs RED" 0 "$(calls red)"
+assert_eq "direct plan never runs test-first green" 0 "$(calls green)"
+assert_eq "direct plan still runs final verify" 1 "$(grep -c '^run verify$' "$NPM_LOG")"
+assert_eq "architect, direct coder, reviewer and ship are the four agents" 4 "$(wc -l < "$RUN_LOG" | tr -d ' ')"
+assert_eq "general review remains mandatory on direct work" 1 "$(calls review-general)"
+
+scenario 'epic-run: a red final verify retries direct implementation once'
+DIRECTRETRY="$TMP/fixtures-direct-retry"; cp -R "$DIRECT" "$DIRECTRETRY"
+rm -f "$DIRECTRETRY/direct.sh"
+fixture_sh "$DIRECTRETRY" direct.0 'printf "test(\"widget\", () => {})\n" > frontend/src/widget.test.ts'
+cp "$DIRECT/direct.sh" "$DIRECTRETRY/direct.1.sh"
+run_pipeline "$EPIC_RUN" "$DIRECTRETRY" --issue 42
+assert_rc "direct retry can recover" 0 "$RUN_RC"
+assert_eq "direct implementation is bounded to one retry" 2 "$(calls direct)"
+assert_contains "the direct retry gets the gate failure" "$(cat "$STATE_DIR/direct.1.prompt")" "missing export createWidget"
+assert_eq "final verify runs after both attempts" 2 "$(grep -c '^run verify$' "$NPM_LOG")"
 
 scenario 'epic-run: --engine codex routes every step to the Codex CLI'
 run_pipeline "$EPIC_RUN" "$BASE" --issue 42 --engine codex
@@ -592,7 +624,7 @@ assert_contains "every phase uses Sol" "$CODEX_ARGV" "--model gpt-5.6-sol"
 assert_not_contains "no phase falls to a cheaper Codex model" "$CODEX_ARGV" "gpt-5.6-luna"
 assert_contains "hidden Codex fan-out is disabled" "$CODEX_ARGV" "--disable multi_agent --disable enable_fanout"
 assert_contains "Codex runs are ephemeral" "$CODEX_ARGV" "--ephemeral"
-assert_eq "all five Codex review lenses ran" 5 "$(( $(calls lens-correctness) + $(calls lens-simplicity) + $(calls lens-seam) + $(calls lens-acceptance) + $(calls lens-security) ))"
+assert_eq "the mandatory Codex reviewer ran" 1 "$(calls review-general)"
 assert_eq "no Claude process was spawned" 0 "$(wc -l < "$RUN_LOG" | tr -d ' ')"
 assert_eq "origin holds the squashed branch" 1 "$(origin_count epic/42-add-widget)"
 assert_eq "Codex tokens are parsed from its event stream" "1234 1000 300 234" "$(usage_log | jq -r 'select(.label=="architect:design") | "\(.tokens.total) \(.tokens.input) \(.tokens.cacheRead) \(.tokens.output)"')"
@@ -618,7 +650,7 @@ run_pipeline "$EPIC_RUN" "$BASE" --issue 42 --engine codex+claude
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_contains "the run ships" "$RUN_OUT" '"readyToMerge":true'
 assert_contains "review went to Codex" "$(cat "$CODEX_LOG")" 'model_reasoning_effort="xhigh"'
-assert_eq "exactly the five lenses, the confirm batches and the fix check ran on Codex" "$(( 5 + $(calls verify) + $(calls fixcheck) ))" "$(grep -c -- '--model gpt-5.6-sol' "$CODEX_LOG" || true)"
+assert_eq "the reviewer, confirm batches and fix check ran on Codex" "$(( 1 + $(calls verify) + $(calls fixcheck) ))" "$(grep -c -- '--model gpt-5.6-sol' "$CODEX_LOG" || true)"
 assert_contains "coding stayed on Claude" "$(cat "$RUN_LOG")" "--model opus"
 assert_contains "the architect stayed on Claude" "$(cat "$RUN_LOG")" "--model fable"
 assert_contains "the pane names the vendor and model per step" "$RUN_OUT" "[codex gpt-5.6-sol/xhigh]"
@@ -706,12 +738,18 @@ assert_contains "the rejected push reads as a lost race" "$RUN_OUT" 'claimed by 
 assert_eq "nothing was designed" 0 "$(calls design)"
 assert_eq "no branch landed on origin" "" "$(origin_ref epic/42-add-widget)"
 
-scenario 'epic-run: a leftover branch with real work is resumed, not restarted'
-seed_branch epic/42-add-widget main 'printf "leftover\n" > frontend/src/leftover.ts && git add -A && git commit -qm "wip: epic blocked at architect"'
-run_pipeline "$EPIC_RUN" "$BASE" --issue 42
+scenario 'epic-run: interrupted red work is preserved and continued directly'
+seed_branch epic/42-add-widget main 'printf "leftover\n" > frontend/src/leftover.ts && printf "test(\"widget\", () => {})\n" > frontend/src/widget.test.ts && git add -A && git commit -qm "wip: epic blocked at architect"'
+PARTIAL="$TMP/fixtures-partial"; cp -R "$BASE" "$PARTIAL"
+fixture "$PARTIAL" design '{"approach":"Continue partial widget","rationale":"Preserves the existing partial edit.","steps":["finish widget"],"files":["src/widget.ts — finish"],"contract":"createWidget(): Widget","tradeoffs":"Continue directly.","verification":{"mode":"direct","rationale":"The baseline already contains partial work.","evidence":["widget test passes"]},"review":{"question":"","rationale":"General review is sufficient."}}'
+fixture_text "$PARTIAL" direct "continued partial widget; frontend verified green"
+fixture_sh "$PARTIAL" direct 'printf "export const createWidget = () => ({})\n" > frontend/src/widget.ts'
+run_pipeline "$EPIC_RUN" "$PARTIAL" --issue 42
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_contains "prepare resumed the branch" "$RUN_OUT" 'resumed and rebased onto origin/main'
 assert_eq "design ran: the branch held no code checkpoint" 1 "$(calls design)"
+assert_eq "partial work continues directly" 1 "$(calls direct)"
+assert_eq "partial work never replays RED" 0 "$(calls red)"
 assert_eq "the resumed branch still squashes to one commit" 1 "$(origin_count epic/42-add-widget)"
 assert_contains "the leftover work is in the squashed tree" "$(git -C "$ORIGIN" ls-tree -r --name-only epic/42-add-widget)" "frontend/src/leftover.ts"
 assert_contains "and so is the new work" "$(git -C "$ORIGIN" ls-tree -r --name-only epic/42-add-widget)" "frontend/src/widget.ts"
@@ -721,15 +759,31 @@ seed_branch epic/42-add-widget main 'printf "test(\"widget\", () => {})\n" > fro
 run_pipeline "$EPIC_RUN" "$BASE" --issue 42
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_contains "prepare saw the checkpoint" "$RUN_OUT" "a code checkpoint is on it"
-assert_contains "the code phase says what it skipped" "$RUN_OUT" "resumed from a code checkpoint — architect, red and green skipped"
+assert_contains "the code phase says implementation was skipped" "$RUN_OUT" "resumed from a code checkpoint — implementation skipped"
 assert_eq "no design" 0 "$(calls design)"
+assert_eq "missing structured plan is recovered once" 1 "$(calls recover)"
 assert_eq "no red" 0 "$(calls red)"
 assert_eq "no green" 0 "$(calls green)"
 assert_contains "the gate still ran on the resumed tree" "$RUN_OUT" "Code: verify gate (resumed): verify green"
-assert_eq "review still ran in full" 5 "$(( $(calls lens-correctness) + $(calls lens-simplicity) + $(calls lens-seam) + $(calls lens-acceptance) + $(calls lens-security) ))"
+assert_eq "the recovered plan still runs mandatory review" 1 "$(calls review-general)"
 assert_contains "the run ships" "$RUN_OUT" '"readyToMerge":true'
 assert_eq "as one commit above main" 1 "$(origin_count epic/42-add-widget)"
-assert_contains "the PR body names where the design came from" "$(cat "$STATE_DIR/ship.0.prompt")" "resumed from a code checkpoint"
+assert_contains "the PR body uses the recovered approach" "$(cat "$STATE_DIR/ship.0.prompt")" "Thin widget module"
+
+scenario 'resume: cached structured plan re-renders markdown and preserves focused review'
+seed_branch epic/42-add-widget main 'printf "test(\"widget\", () => {})\n" > frontend/src/widget.test.ts && printf "export const createWidget = () => ({})\n" > frontend/src/widget.ts && git add -A && git commit -qm "wip(epic 42-add-widget): code checkpoint"'
+CACHED="$TMP/fixtures-cached"; cp -R "$BASE" "$CACHED"
+fixture "$CACHED" review-focus '{"findings":[]}'
+mkdir -p "$CACHED/worktree/.epics/42-add-widget"
+printf '%s\n' '{"approach":"Cached widget plan","rationale":"Matches the checkpoint.","steps":["build widget"],"files":["frontend/src/widget.ts"],"contract":"createWidget(): Widget","tradeoffs":"No caching.","verification":{"mode":"test-first","rationale":"Public behavior is asserted.","evidence":["widget test passes"]},"review":{"question":"Can concurrent callers observe partial state?","rationale":"State construction crosses a boundary."}}' > "$CACHED/worktree/.epics/42-add-widget/architecture.json"
+run_pipeline "$EPIC_RUN" "$CACHED" --issue 42
+assert_rc "valid cached plan resumes" 0 "$RUN_RC"
+assert_eq "cached JSON needs no architect call" 0 "$(( $(calls design) + $(calls recover) ))"
+assert_eq "cached checkpoint replays no code" 0 "$(( $(calls red) + $(calls direct) + $(calls green) ))"
+assert_contains "missing markdown is re-rendered" "$(cat "$WT/.epics/42-add-widget/architecture.md")" "Approach: Cached widget plan"
+assert_not_contains "scratch architecture never enters the shipped tree" "$(git -C "$ORIGIN" ls-tree -r --name-only epic/42-add-widget)" ".epics/"
+assert_eq "cached optional focus is preserved" 1 "$(calls review-focus)"
+assert_contains "focused review gets the cached question" "$(cat "$STATE_DIR/review-focus.0.prompt")" "Can concurrent callers observe partial state?"
 
 scenario 'resume: a red code checkpoint gets one green attempt, then review'
 seed_branch epic/42-add-widget main 'printf "test(\"widget\", () => {})\n" > frontend/src/widget.test.ts && git add -A && git commit -qm "wip(epic 42-add-widget): code checkpoint"'
@@ -740,15 +794,15 @@ assert_eq "green ran once, handed the failure" 1 "$(calls green)"
 assert_contains "the retry prompt carries the verify output" "$(cat "$STATE_DIR/green.0.prompt")" "missing export createWidget"
 assert_contains "the run ships" "$RUN_OUT" '"readyToMerge":true'
 
-scenario 'epic-run: a dead review lens fails the run closed and preserves the work'
+scenario 'epic-run: a dead mandatory reviewer fails the run closed and preserves the work'
 DEADLENS="$TMP/fixtures-deadlens"; cp -R "$BASE" "$DEADLENS"
-printf '1' > "$DEADLENS/lens-security.0.rc"   # first attempt dies
-printf '1' > "$DEADLENS/lens-security.1.rc"   # and so does the retry
+printf '1' > "$DEADLENS/review-general.0.rc"   # first attempt dies
+printf '1' > "$DEADLENS/review-general.1.rc"   # and so does the retry
 run_pipeline "$EPIC_RUN" "$DEADLENS" --issue 42
 assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
 assert_contains "the blocker names the review phase" "$RUN_OUT" '"phase":"review"'
-assert_contains "the reason names the unreviewed lens" "$RUN_OUT" 'security + authorization'
-assert_eq "the lens was respawned exactly once" 2 "$(calls lens-security)"
+assert_contains "the reason names the missing reviewer" "$RUN_OUT" 'review:general'
+assert_eq "the reviewer was respawned exactly once" 2 "$(calls review-general)"
 assert_contains "the respawn was announced as transient" "$RUN_OUT" "respawning once (transient)"
 assert_contains "a blocker comment was posted" "$(gh_comments)" "🤖 epic-run blocked"
 assert_contains "it names the phase" "$(gh_comments)" "- phase: review"
@@ -759,6 +813,42 @@ assert_eq "nothing shipped a PR" "" "$(gh_pr_created)"
 assert_eq "the checkpoint was pushed so a re-run resumes it" 2 "$(origin_count epic/42-add-widget)"
 assert_contains "the pushed checkpoint holds the implementation" "$(git -C "$ORIGIN" ls-tree -r --name-only epic/42-add-widget)" "frontend/src/widget.ts"
 assert_not_contains "the WIP never carries a Closes line" "$(git -C "$ORIGIN" log --format=%B main..epic/42-add-widget)" "Closes #"
+
+scenario 'epic-run: a selected focused reviewer runs narrowly and is mandatory'
+FOCUSED="$TMP/fixtures-focused"; cp -R "$BASE" "$FOCUSED"
+fixture "$FOCUSED" design '{"approach":"Thin widget module","rationale":"Fits the existing shape.","steps":["one","two"],"files":["src/widget.ts — new"],"contract":"createWidget(): Widget","tradeoffs":"No caching.","verification":{"mode":"test-first","rationale":"The public export can be asserted before implementation.","evidence":["widget test passes"]},"review":{"question":"Can concurrent callers observe a partial widget?","rationale":"Construction crosses a state boundary."}}'
+fixture "$FOCUSED" review-focus '{"findings":[]}'
+run_pipeline "$EPIC_RUN" "$FOCUSED" --issue 42
+assert_rc "the focused review ships when it completes" 0 "$RUN_RC"
+assert_eq "general review remains mandatory" 1 "$(calls review-general)"
+assert_eq "exactly one focused reviewer is added" 1 "$(calls review-focus)"
+assert_contains "the focused prompt asks only the selected question" "$(cat "$STATE_DIR/review-focus.0.prompt")" "Can concurrent callers observe a partial widget?"
+assert_contains "the focused prompt avoids duplicate general review" "$(cat "$STATE_DIR/review-focus.0.prompt")" "Do not repeat a general review"
+assert_not_contains "the architect rationale does not anchor the reviewer" "$(cat "$STATE_DIR/review-focus.0.prompt")" "Construction crosses a state boundary"
+
+printf '1' > "$FOCUSED/review-focus.0.rc"; printf '1' > "$FOCUSED/review-focus.1.rc"
+scenario 'epic-run: a dead selected focused reviewer blocks'
+run_pipeline "$EPIC_RUN" "$FOCUSED" --issue 42
+assert_rc "a dead selected reviewer blocks" 3 "$RUN_RC"
+assert_contains "the missing focused reviewer is named" "$RUN_OUT" "review:focus"
+assert_eq "nothing ships without requested focused review" "" "$(gh_pr_created)"
+
+scenario 'review skeptic: dead evidence cannot become a refutation'
+DEADVERIFY="$TMP/fixtures-deadverify"; cp -R "$BASE" "$DEADVERIFY"
+printf '1' > "$DEADVERIFY/verify.0.rc"; printf '1' > "$DEADVERIFY/verify.1.rc"
+run_pipeline "$EPIC_RUN" "$DEADVERIFY" --issue 42
+assert_rc "a dead skeptic blocks before shipping" 3 "$RUN_RC"
+assert_contains "unknown evidence is not called refuted" "$RUN_OUT" "refusing to treat unknown evidence as refuted"
+assert_eq "no PR opens on a dead skeptic" "" "$(gh_pr_created)"
+
+scenario 'review skeptic: duplicate verdict indices cannot hide missing evidence'
+DUPVERIFY="$TMP/fixtures-dupverify"; cp -R "$BASE" "$DUPVERIFY"
+fixture "$DUPVERIFY" review-general '{"findings":[{"title":"First fault","severity":"Important","confidence":85,"location":"src/widget.ts:1","problem":"First behavior breaks.","fix":"Fix first.","gate":"focused test"},{"title":"Second fault","severity":"Important","confidence":85,"location":"src/widget.ts:2","problem":"Second behavior breaks.","fix":"Fix second.","gate":"focused test"}]}'
+fixture "$DUPVERIFY" verify '{"verdicts":[{"index":1,"real":false,"confidence":90,"reasoning":"Refuted."},{"index":1,"real":false,"confidence":90,"reasoning":"Duplicate."}]}'
+run_pipeline "$EPIC_RUN" "$DUPVERIFY" --issue 42
+assert_rc "duplicate skeptic coverage blocks" 3 "$RUN_RC"
+assert_contains "duplicate coverage stays unknown" "$RUN_OUT" "no unique verdict"
+assert_eq "no PR opens on malformed skeptic coverage" "" "$(gh_pr_created)"
 
 scenario 'epic-run: a deferred finding holds the merge gate'
 HELD="$TMP/fixtures-held"; cp -R "$BASE" "$HELD"
@@ -891,8 +981,42 @@ run_pipeline "$EPIC_RUN" "$VACUOUS" --issue 42
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_eq "red was spawned twice" 2 "$(calls red)"
 assert_contains "the retry was announced" "$RUN_OUT" "respawning the red step once"
-assert_contains "the retry prompt says why" "$(cat "$STATE_DIR/red.1.prompt")" "pass against a tree with NO implementation"
+assert_contains "the retry prompt says why" "$(cat "$STATE_DIR/red.1.prompt")" "verify stayed green"
 assert_contains "the run still ships" "$RUN_OUT" '"readyToMerge":true'
+
+scenario 'verify gate: a red test-first baseline blocks before writing tests'
+BADBASE="$TMP/fixtures-badbase"; cp -R "$BASE" "$BADBASE"
+printf '1' > "$BADBASE/verify.rc"
+run_pipeline "$EPIC_RUN" "$BADBASE" --issue 42
+assert_rc "a dirty baseline blocks" 3 "$RUN_RC"
+assert_contains "the blocker names the pre-existing red baseline" "$RUN_OUT" "not green before RED"
+assert_eq "RED never runs against a dirty baseline" 0 "$(calls red)"
+assert_eq "implementation never runs against a dirty baseline" 0 "$(calls green)"
+
+scenario 'verify gate: a reported assertion absent from RED output blocks'
+MISMATCH="$TMP/fixtures-red-mismatch"; cp -R "$BASE" "$MISMATCH"
+fixture "$MISMATCH" red '{"testFiles":["frontend/src/widget.test.ts"],"expectedFailure":"distinct assertion that never appears","reason":"Claims to prove the contract."}'
+run_pipeline "$EPIC_RUN" "$MISMATCH" --issue 42
+assert_rc "mismatched RED evidence blocks" 3 "$RUN_RC"
+assert_eq "the RED author gets one retry" 2 "$(calls red)"
+assert_contains "the mismatch is explicit" "$RUN_OUT" "not with the reported assertion excerpt"
+assert_eq "implementation never runs on unproven RED" 0 "$(calls green)"
+
+scenario 'architect gate: an empty verification strategy is refused'
+EMPTYPLAN="$TMP/fixtures-empty-plan"; cp -R "$BASE" "$EMPTYPLAN"
+fixture "$EMPTYPLAN" design '{"approach":"Thin widget module","rationale":"Fits.","steps":["one"],"files":["src/widget.ts"],"contract":"createWidget(): Widget","tradeoffs":"None.","verification":{"mode":"test-first","rationale":"","evidence":[]},"review":{"question":"","rationale":"General review."}}'
+run_pipeline "$EPIC_RUN" "$EMPTYPLAN" --issue 42
+assert_rc "empty verification evidence blocks" 3 "$RUN_RC"
+assert_contains "the architect phase owns the refusal" "$RUN_OUT" '"phase":"architect"'
+assert_eq "no code runs from an empty strategy" 0 "$(( $(calls red) + $(calls direct) + $(calls green) ))"
+
+scenario 'architect gate: an unknown verification strategy is refused'
+BADPLAN="$TMP/fixtures-bad-plan"; cp -R "$BASE" "$BADPLAN"
+fixture "$BADPLAN" design '{"approach":"Thin widget module","rationale":"Fits.","steps":["one"],"files":["src/widget.ts"],"contract":"createWidget(): Widget","tradeoffs":"None.","verification":{"mode":"sometimes","rationale":"Guess.","evidence":["maybe"]},"review":{"question":"","rationale":"General review."}}'
+run_pipeline "$EPIC_RUN" "$BADPLAN" --issue 42
+assert_rc "unknown verification mode blocks" 3 "$RUN_RC"
+assert_contains "the schema refusal stays in architect" "$RUN_OUT" '"phase":"architect"'
+assert_eq "no code runs from a malformed strategy" 0 "$(( $(calls red) + $(calls direct) + $(calls green) ))"
 
 scenario 'verify gate: red tests that pass twice block the run'
 VACUOUS2="$TMP/fixtures-vacuous2"; cp -R "$BASE" "$VACUOUS2"
@@ -900,7 +1024,7 @@ rm -f "$VACUOUS2/red.sh"
 run_pipeline "$EPIC_RUN" "$VACUOUS2" --issue 42
 assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
 assert_contains "it blocks in the code phase" "$RUN_OUT" '"phase":"code"'
-assert_contains "the reason says the tests test nothing" "$RUN_OUT" 'do not test the change'
+assert_contains "the reason says RED was never proven" "$RUN_OUT" 'unproven regression'
 assert_eq "green never ran" 0 "$(calls green)"
 assert_eq "the issue ends failed" "failed," "$(gh_labels)"
 
@@ -912,7 +1036,7 @@ cp "$BASE/green.sh" "$LATE/green.1.sh"
 run_pipeline "$EPIC_RUN" "$LATE" --issue 42
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_eq "green was spawned twice" 2 "$(calls green)"
-assert_contains "the retry was announced" "$RUN_OUT" "respawning green once with the failure"
+assert_contains "the retry was announced" "$RUN_OUT" "respawning implementation once with the failure"
 assert_contains "the retry prompt carries the verify output" "$(cat "$STATE_DIR/green.1.prompt")" "missing export createWidget"
 assert_contains "and says it is the one retry" "$(cat "$STATE_DIR/green.1.prompt")" "This is your one retry"
 assert_contains "the run still ships" "$RUN_OUT" '"readyToMerge":true'
@@ -923,10 +1047,10 @@ rm -f "$NEVER/green.sh"
 run_pipeline "$EPIC_RUN" "$NEVER" --issue 42
 assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
 assert_contains "it blocks in the code phase" "$RUN_OUT" '"phase":"code"'
-assert_contains "the reason names the red verify" "$RUN_OUT" 'npm run verify is red after the green step and its retry'
+assert_contains "the reason names the red verify" "$RUN_OUT" 'npm run verify is red after implementation and its retry'
 assert_eq "green was spawned twice" 2 "$(calls green)"
-assert_eq "no review lens ran on an unverified tree" 0 "$(calls lens-correctness)"
-assert_contains "the blocker comment says so" "$(gh_comments)" "red after the green step"
+assert_eq "no reviewer ran on an unverified tree" 0 "$(calls review-general)"
+assert_contains "the blocker comment says so" "$(gh_comments)" "red after implementation"
 
 scenario 'verify gate: fixes that leave verify red twice block the run'
 BROKEN="$TMP/fixtures-broken"; cp -R "$BASE" "$BROKEN"
@@ -1026,7 +1150,7 @@ assert_eq "the issue stays ready-to-review" "ready-to-review," "$(gh_labels)"
 
 scenario 'post-fix check: nothing confirmed means nothing to check'
 CLEANREV="$TMP/fixtures-cleanrev"; cp -R "$BASE" "$CLEANREV"
-fixture "$CLEANREV" lens-correctness '{"findings":[]}'
+fixture "$CLEANREV" review-general '{"findings":[]}'
 run_pipeline "$EPIC_RUN" "$CLEANREV" --issue 42
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_eq "no fixer ran" 0 "$(calls triage)"
@@ -1987,16 +2111,15 @@ assert_defect_handoff "claimed no-delta fix" "$NODIFF" "fixes step changed nothi
 assert_defect_handoff "ship deferral" "$DEFER" "Second defect"
 
 # ───────────────────── defect grouping (restatements across files) ─────────────────────
-# Five blind lenses reporting one fault is the design working — it is how #66's migration
-# bug was caught five times over — but the fixer must not then fix and gate that fault five
-# times. The skeptic links restatements with sameDefectAs; the script unions them into
+# Independent reviewers reporting one fault is useful convergence, but the fixer must not
+# then fix and gate that fault repeatedly. The skeptic links restatements with sameDefectAs; the script unions them into
 # defects and tells the fixer, WITHOUT dropping any finding.
 scenario 'grouping: restatements across files become one defect for the fixer'
 GROUP="$TMP/fixtures-group"
 cp -R "$BASE" "$GROUP"
-fixture "$GROUP" lens-correctness '{"findings":[{"title":"Unusable schedule does not block submit","severity":"Critical","confidence":90,"location":"src/dialog.tsx:40","problem":"Submit stays enabled.","fix":"Block it.","gate":"unit test"}]}'
-fixture "$GROUP" lens-simplicity '{"findings":[{"title":"Block gate tests the wrong condition","severity":"Important","confidence":85,"location":"src/gate.ts:12","problem":"Checks null, not empty.","fix":"Check emptiness.","gate":"unit test"}]}'
-fixture "$GROUP" lens-seam '{"findings":[{"title":"Test asserts the wrong guard","severity":"Important","confidence":80,"location":"src/gate.test.ts:8","problem":"Encodes the wrong rule.","fix":"Assert emptiness.","gate":"unit test"}]}'
+fixture "$GROUP" design '{"approach":"Thin widget module","rationale":"Fits the existing shape.","steps":["one","two"],"files":["src/widget.ts — new"],"contract":"createWidget(): Widget","tradeoffs":"No caching.","verification":{"mode":"test-first","rationale":"The public export can be asserted before implementation.","evidence":["widget test passes"]},"review":{"question":"Can an unusable schedule still permit submit?","rationale":"The validation crosses several modules."}}'
+fixture "$GROUP" review-general '{"findings":[{"title":"Unusable schedule does not block submit","severity":"Critical","confidence":90,"location":"src/dialog.tsx:40","problem":"Submit stays enabled.","fix":"Block it.","gate":"unit test"},{"title":"Block gate tests the wrong condition","severity":"Important","confidence":85,"location":"src/gate.ts:12","problem":"Checks null, not empty.","fix":"Check emptiness.","gate":"unit test"}]}'
+fixture "$GROUP" review-focus '{"findings":[{"title":"Test asserts the wrong guard","severity":"Important","confidence":80,"location":"src/gate.test.ts:8","problem":"Encodes the wrong rule.","fix":"Assert emptiness.","gate":"unit test"}]}'
 # One skeptic sees all three (one batch) and links 2 and 3 back to 1.
 fixture "$GROUP" verify '{"verdicts":[
   {"index":1,"real":true,"confidence":90,"reasoning":"Confirmed."},
