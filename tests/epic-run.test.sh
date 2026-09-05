@@ -211,8 +211,21 @@ labels_json() { jq -R -s -c 'split("\n") | map(select(length > 0)) | map({name: 
 # ship touches (a follow-up it files and queues) gets its own file. One shared
 # file would let a follow-up's `ready` read back as the epic issue's own label.
 labels_for() { [[ "$1" == "${GH_RUN_ISSUE:-42}" ]] && printf '%s' "$labels" || printf '%s' "$state/labels-$1"; }
+# The edit GH_LATE_LABEL held back, replayed onto the issue in the order the
+# client sent it: "+label" for an add, "-label" for a strip.
+apply_late() {
+  local op
+  while IFS= read -r op; do
+    case "$op" in
+      +*) grep -qx -- "${op#+}" "$labels" || printf '%s\n' "${op#+}" >> "$labels" ;;
+      -*) grep -vx -- "${op#-}" "$labels" > "$labels.tmp" || true; mv "$labels.tmp" "$labels" ;;
+    esac
+  done < "$state/late-edit"
+  rm -f "$state/late-edit"
+}
 case "${1:-} ${2:-}" in
   "issue view")
+    answer=""
     # The deferred-record probe reads comments; they are stored as blocks
     # separated by a lone --- line, exactly as the comment case writes them.
     if [[ "$*" == *comments* ]]; then
@@ -231,32 +244,51 @@ case "${1:-} ${2:-}" in
     fi
     if [[ "$*" == *"--json labels"* ]]; then
       n="$(cat "$state/label-reads" 2>/dev/null || echo 0)"; n=$((n + 1)); printf '%s' "$n" > "$state/label-reads"
-      if [[ "$n" == "${GH_LABEL_READ_FAIL_AT:-}" ]]; then printf 'HTTP 502\n' >&2; exit 1; fi
+      # A comma-separated list of read numbers, not one: a state is only
+      # unverifiable while every read of it fails, and a fallback that repairs
+      # the labels reads them again to prove it.
+      case ",${GH_LABEL_READ_FAIL_AT:-}," in *",$n,"*) printf 'HTTP 502\n' >&2; exit 1 ;; esac
+      # The edit GH_LATE_LABEL held back lands right AFTER this read is answered:
+      # the answer is the state the client saw, and the label appears behind it,
+      # where no readback of that moment could have seen it.
+      late_at="${GH_LATE_LABEL:-}"; late_at="${late_at##*:}"
+      [[ "$n" != "$late_at" || ! -s "$state/late-edit" ]] || answer="$(labels_json)"
     fi
-    printf '{"number":%s,"title":"Add widget","body":%s,"state":"%s","labels":%s}\n' "${3:-0}" "$(printf '%s' "${GH_ISSUE_BODY:-Build a widget.}" | jq -Rs .)" "${GH_ISSUE_STATE:-OPEN}" "$(labels_json)" ;;
+    printf '{"number":%s,"title":"Add widget","body":%s,"state":"%s","labels":%s}\n' "${3:-0}" "$(printf '%s' "${GH_ISSUE_BODY:-Build a widget.}" | jq -Rs .)" "${GH_ISSUE_STATE:-OPEN}" "${answer:-$(labels_json)}"
+    [[ -z "$answer" ]] || apply_late ;;
   "issue edit")
     target="$(labels_for "${3:-}")"
     touch "$target"
     shift 3
     added=""
+    # The other half of "a write that timed out is not a write that did not
+    # happen": GH_LATE_LABEL="<label>:<read>" fails this call with nothing applied
+    # and holds the WHOLE edit — the add and the strip it came with — until read
+    # <read> has been answered, so it lands where no readback could have seen it.
+    late_label="${GH_LATE_LABEL:-}"; late_label="${late_label%%:*}"
+    late=0
+    [[ -z "$late_label" || "$*" != *"--add-label $late_label"* ]] || late=1
     while [[ $# -gt 0 ]]; do
       case "$1" in
         --add-label)
           added+="$2,"
-          if [[ "$2" != "${GH_DROP_LABEL:-}" ]]; then
+          if (( late )); then printf '+%s\n' "$2" >> "$state/late-edit"
+          elif [[ "$2" != "${GH_DROP_LABEL:-}" ]]; then
             grep -qx -- "$2" "$target" || printf '%s\n' "$2" >> "$target"
           fi
           shift 2 ;;
         --remove-label)
           # GH_KEEP_LABEL is the mirror of GH_DROP_LABEL: the strip half of a
           # swap silently not landing, which is what a partial transition is.
-          if [[ "$2" != "${GH_KEEP_LABEL:-}" ]]; then
+          if (( late )); then printf -- '-%s\n' "$2" >> "$state/late-edit"
+          elif [[ "$2" != "${GH_KEEP_LABEL:-}" ]]; then
             grep -vx -- "$2" "$target" > "$target.tmp" || true; mv "$target.tmp" "$target"
           fi
           shift 2 ;;
         *) shift ;;
       esac
     done
+    (( ! late )) || { printf 'HTTP 502\n' >&2; exit 1; }
     # A write that hangs AFTER GitHub has applied it: the label is already
     # resting — and reap's settle clock already running — while the client waits
     # on the response. "<label>:<seconds>", so a scenario stalls exactly the
@@ -481,6 +513,7 @@ run_pipeline() { # script fixtures-dir args...   (scenario knobs via GH_* env)
     GH_ONLY_FORK_PR="${GH_ONLY_FORK_PR:-}" \
     GH_DROP_LABEL="${GH_DROP_LABEL:-}" \
     GH_KEEP_LABEL="${GH_KEEP_LABEL:-}" \
+    GH_LATE_LABEL="${GH_LATE_LABEL:-}" \
     GH_SLOW_COMMENT="${GH_SLOW_COMMENT:-}" \
     GH_SLOW_LABEL="${GH_SLOW_LABEL:-}" \
     EPIC_TERMINAL_REPORT_MS="${EPIC_TERMINAL_REPORT_MS:-}" \
@@ -499,6 +532,7 @@ run_pipeline() { # script fixtures-dir args...   (scenario knobs via GH_* env)
     node "$script" "$@" 2>&1
   )" || RUN_RC=$?
   STATE_DIR="$state"
+  assert_merge_label_agrees
 }
 calls() { cat "$STATE_DIR/$1.n" 2>/dev/null || echo 0; }
 usage_log() { cat "$STATE_DIR/usage.jsonl" 2>/dev/null || true; }
@@ -514,6 +548,21 @@ gh_last_comment() {
 }
 gh_issues_created() { cat "$STATE_DIR/gh/issues-created" 2>/dev/null || true; }
 gh_pr_created() { cat "$STATE_DIR/gh/pr-created" 2>/dev/null || true; }
+
+# The one invariant EVERY run here must satisfy, so it is asserted for every run
+# rather than per scenario: `ready-to-merge` is what bin/merge-worker.sh selects
+# on and RESULT is what the pane, the status comment and a human read. A run that
+# leaves that label on while reporting a held or blocked result hands the merge
+# worker a PR it says nobody cleared; a run that claims the queue without the
+# label reports a landing that will never happen. Both directions, checked after
+# every pipeline run, so no scenario can bless either of them — a terminal write
+# that stalls or half-lands is exactly where the two come apart.
+assert_merge_label_agrees() {
+  local labelled=no claimed=no
+  [[ ",$(gh_labels)" == *",ready-to-merge,"* ]] && labelled=yes
+  [[ "$RUN_OUT" == *'"readyToMerge":true'* ]] && claimed=yes
+  assert_eq "invariant: ready-to-merge is on the issue iff RESULT claims the merge queue" "$labelled" "$claimed"
+}
 
 # ───────────────────────── epic-run ─────────────────────────
 scenario 'epic-run: happy path ships and queues for merge'
@@ -909,6 +958,130 @@ assert_eq "the run gave up on the stalled failed write" "bounded" "$( (( BLOCKER
 assert_eq "the label GitHub applied before the stall is on the issue" "failed," "$(gh_labels)"
 assert_contains "the blocker comment still reached the issue" "$(gh_comments)" "🤖 epic-run blocked"
 assert_contains "it still names the phase that stopped" "$(gh_comments)" "- phase: review"
+assert_contains "and the pane still gets its RESULT line" "$RUN_OUT" "RESULT "
+assert_contains "which records the blocked run" "$RUN_OUT" '"blocked":true'
+
+# ship's `ready-to-review` is the FIRST terminal write of a shipping run, and the
+# whole merge gate comes after it: the evidence comment, the promotion, the
+# RESULT line. A model step is the one thing a reporting budget cannot cap —
+# agent() runs on a ninety-minute ceiling — so no spawn may happen once the
+# window is open. The stop scenario is here; the pass half is the happy path's
+# twelve spawns (every one of them before any terminal write) and the DEFER
+# scenario's single deferral check.
+scenario 'terminal window: a model step cannot spawn once the terminal label is resting'
+POST_TERMINAL_LOG="$TMP/post-terminal-stub.log"; : > "$POST_TERMINAL_LOG"
+POST_TERMINAL_WT="$(fresh_clone)"
+POST_TERMINAL="$(
+  cd "$POST_TERMINAL_WT" && \
+  PATH="$TMP/bin:$PATH" CLAUDE_BIN="$TMP/bin/claude" STUB_LOG="$POST_TERMINAL_LOG" \
+  STUB_STATE="$BASE" STUB_FIXTURES="$BASE" \
+  node -e "(async () => {
+    const rt = await import('$ROOT/workflows/lib/runtime.mjs')
+    const gh = await import('$ROOT/workflows/lib/github.mjs')
+    rt.initRuntime({ scriptName: 'test', defaultEngine: 'claude' })
+    gh.terminalBudget()
+    const out = await rt.agent('x', { label: 'ship:pr', step: 'code' })
+    console.log('RESOLVED ' + (out === null ? 'null' : JSON.stringify(out)))
+    console.log('FAILURE ' + rt.withAgentFailure('blocked.'))
+  })()" 2>&1
+)"
+assert_contains "a step requested after the terminal write resolves null, like any dead step" "$POST_TERMINAL" "RESOLVED null"
+assert_contains "the pane says the step was refused" "$POST_TERMINAL" "ship:pr: refused"
+assert_contains "and why — the run's terminal label is already resting" "$POST_TERMINAL" "terminal label"
+assert_contains "the caller's fail-closed branch gets a legible category" "$POST_TERMINAL" "Pipeline ordering fault: ship:pr"
+assert_contains "which says nothing was spawned" "$POST_TERMINAL" "0 attempts"
+assert_eq "and no vendor process was started" 0 "$(wc -l < "$POST_TERMINAL_LOG" | tr -d ' ')"
+
+# The deferral check is a model step ON the ship path, so its position relative to
+# ship's terminal write is a contract rather than an accident: after the flip the
+# runtime refuses to spawn it, and a refused check holds a PR that had nothing
+# wrong with it. With the check ahead of the write, a stalled flip costs the
+# label's confirmation and nothing else — the gate still decides, promotes and
+# reports, all inside the one window that write opened.
+scenario "epic-run: ship's own ready-to-review write is bounded and the gate still decides after it"
+CLEARDEFER="$TMP/fixtures-cleardefer"; cp -R "$BASE" "$CLEARDEFER"
+fixture "$CLEARDEFER" ship '{"title":"Add widget","body":"Adds a widget.","commitBody":"","deferred":[{"title":"Refactor the helpers","why":"Nice to have.","kind":"other","file":false}]}'
+fixture "$CLEARDEFER" defercheck '{"verdicts":[{"index":1,"defect":false,"confidence":90,"reasoning":"A refactor idea; nothing breaks."}]}'
+SHIP_WRITE_START="$(date +%s)"
+EPIC_TERMINAL_REPORT_MS=3000 GH_SLOW_LABEL=ready-to-review:20 run_pipeline "$EPIC_RUN" "$CLEARDEFER" --issue 42
+SHIP_WRITE_ELAPSED=$(( $(date +%s) - SHIP_WRITE_START ))
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_eq "the run gave up on the stalled ready-to-review write" "bounded" "$( (( SHIP_WRITE_ELAPSED < 15 )) && echo bounded || echo "waited ${SHIP_WRITE_ELAPSED}s for a 20s stall" )"
+assert_eq "the deferral check still ran" 1 "$(calls defercheck)"
+assert_contains "and ran BEFORE the write that opens the window" "${RUN_OUT%%Ship: PR opened*}" "deferral-check: "
+assert_contains "the stalled flip is reported, not swallowed" "$RUN_OUT" "label flip to ready-to-review failed"
+assert_eq "the gate still promoted the PR GitHub had already labelled" "ready-to-merge," "$(gh_labels)"
+assert_contains "and the run claims the merge queue it verified" "$RUN_OUT" '"readyToMerge":true'
+assert_contains "the pane still gets its RESULT line" "$RUN_OUT" "RESULT "
+assert_eq "the status comment's final edit still landed" "yes" "$(grep -q 'api --method PATCH' "$GH_LOG" && echo yes || echo no)"
+
+# The promotion is the run's second terminal write and its last chance to be
+# wrong: `ready-to-merge` is the label bin/merge-worker.sh selects on, and it
+# selects on the label ALONE — never on this run's exit code. GitHub can apply the
+# swap and still leave the client waiting, so a write that timed out is not a
+# write that did not happen: the readback after it is the verdict, and it runs
+# whatever the write returned. A promotion GitHub really applied is reported as
+# the merge queue it really is, inside what is LEFT of the window ship opened.
+scenario 'epic-run: a promotion the write never confirmed is claimed once the label itself is read back'
+PROMOTE_START="$(date +%s)"
+EPIC_TERMINAL_REPORT_MS=3000 GH_SLOW_LABEL=ready-to-merge:20 run_pipeline "$EPIC_RUN" "$BASE" --issue 42
+PROMOTE_ELAPSED=$(( $(date +%s) - PROMOTE_START ))
+assert_rc "exits 0 (the PR is real)" 0 "$RUN_RC"
+assert_eq "the run gave up on the stalled promotion" "bounded" "$( (( PROMOTE_ELAPSED < 15 )) && echo bounded || echo "waited ${PROMOTE_ELAPSED}s for a 20s stall" )"
+assert_eq "the label GitHub applied before the stall is on the issue" "ready-to-merge," "$(gh_labels)"
+assert_contains "and RESULT reports the queue that label really puts the PR in" "$RUN_OUT" '"readyToMerge":true'
+assert_contains "the unconfirmed write is still named in the pane" "$RUN_OUT" "the write itself was not confirmed"
+assert_contains "the pane still gets its RESULT line" "$RUN_OUT" "RESULT "
+assert_eq "the status comment's final edit still landed" "yes" "$(grep -q 'api --method PATCH' "$GH_LOG" && echo yes || echo no)"
+
+# The same write, half-landed: `ready-to-merge` on, the strip of `ready-to-review`
+# never applied. A run rests at exactly one label, and the one it must not leave
+# behind is the one the merge worker selects on — so an unconfirmed promotion is
+# taken back off and the demotion is PROVED before the PR is reported as held.
+scenario 'epic-run: a half-landed promotion is undone and proved, never left beside the held report'
+GH_KEEP_LABEL=ready-to-review run_pipeline "$EPIC_RUN" "$BASE" --issue 42
+assert_rc "exits 0 (the PR is real, just held)" 0 "$RUN_RC"
+assert_eq "the issue rests at the one label ship applied" "ready-to-review," "$(gh_labels)"
+assert_not_contains "the merge worker has nothing to select" "$(gh_labels)" "ready-to-merge"
+assert_not_contains "and RESULT never claims the queue it could not confirm" "$RUN_OUT" '"readyToMerge":true'
+assert_contains "the failed handoff is named" "$RUN_OUT" "handoff FAILED"
+assert_contains "and says the promotion was taken back off" "$RUN_OUT" "taken back off"
+assert_contains "the pane still gets its RESULT line" "$RUN_OUT" "RESULT "
+
+# The same write, landing LATE: GitHub had applied nothing when the client gave
+# up, so the readback shows exactly what ship left — and the promotion lands
+# straight after that read. A single read is a snapshot, not a promise, so a
+# handoff that took a clean `ready-to-review` as its verdict would report a held
+# PR and leave `ready-to-merge` behind it for bin/merge-worker.sh to select. The
+# compensating transition is therefore issued for EVERY promotion the write did
+# not confirm, not only for the ones a readback caught half-landed.
+scenario 'epic-run: a promotion that lands after the readback is still taken back off'
+GH_LATE_LABEL=ready-to-merge:1 run_pipeline "$EPIC_RUN" "$BASE" --issue 42
+assert_rc "exits 0 (the PR is real, just held)" 0 "$RUN_RC"
+assert_eq "the issue rests at the one label ship applied" "ready-to-review," "$(gh_labels)"
+assert_not_contains "the late promotion is not left for the merge worker" "$(gh_labels)" "ready-to-merge"
+assert_not_contains "and RESULT never claims the queue it could not confirm" "$RUN_OUT" '"readyToMerge":true'
+assert_contains "the failed handoff is named" "$RUN_OUT" "handoff FAILED"
+assert_contains "and says the promotion was taken back off" "$RUN_OUT" "taken back off"
+assert_eq "the demotion was proved by a second read, not assumed" 2 "$(cat "$STATE_DIR/gh/label-reads")"
+assert_contains "the pane still gets its RESULT line" "$RUN_OUT" "RESULT "
+
+# One step worse: the promotion stalled AND every readback of the labels failed,
+# so the run can neither confirm the promotion nor prove it undid it. That is not
+# a resting state, so the run blocks — and its blocker transition strips the merge
+# label a third time rather than resting at `failed` beside it, which is how a
+# failure path becomes an unattended merge.
+scenario 'epic-run: a promotion it can neither confirm nor prove undone blocks instead of resting'
+UNVERIFIED_START="$(date +%s)"
+EPIC_TERMINAL_REPORT_MS=3000 GH_SLOW_LABEL=ready-to-merge:20 GH_LABEL_READ_FAIL_AT=1,2 \
+  run_pipeline "$EPIC_RUN" "$BASE" --issue 42
+UNVERIFIED_ELAPSED=$(( $(date +%s) - UNVERIFIED_START ))
+assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
+assert_eq "the whole fallback fits the window ship's write opened" "bounded" "$( (( UNVERIFIED_ELAPSED < 15 )) && echo bounded || echo "waited ${UNVERIFIED_ELAPSED}s for a 20s stall" )"
+assert_contains "the blocker names the unverifiable promotion" "$RUN_OUT" "could not be verified"
+assert_eq "it rests at failed alone" "failed," "$(gh_labels)"
+assert_not_contains "the merge worker has nothing to select" "$(gh_labels)" "ready-to-merge"
+assert_contains "the blocker comment still reached the issue" "$(gh_comments)" "🤖 epic-run blocked"
 assert_contains "and the pane still gets its RESULT line" "$RUN_OUT" "RESULT "
 assert_contains "which records the blocked run" "$RUN_OUT" '"blocked":true'
 
