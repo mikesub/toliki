@@ -61,6 +61,20 @@ CLAIM_GRACE_HOURS="${CLAIM_GRACE_HOURS:-6}"
 # terminal state is truly resting without racing a newly launched fixer.
 TERMINAL_SETTLE_MINUTES="${TERMINAL_SETTLE_MINUTES:-5}"
 
+# The floor under that knob, and the other half of a contract this file shares
+# with workflows/lib/github.mjs: a run writes its terminal label and THEN
+# finishes — the label readback a fixer's guidance is composed from, the refusal
+# comment itself, epic-run's merge gate after ship's ready-to-review, the status
+# comment's final edit. GitHub starts the settle clock this pass reads the moment
+# it applies that label, even if the client is still waiting on the response, so
+# the write and everything after it share one budget (TERMINAL_REPORT_BUDGET_MS,
+# plus status.mjs's own 20s) that stays well under a minute and a half. A window
+# configured below this floor could kill a run in the middle of it — no guidance
+# on the issue, no RESULT line in the pane — so a smaller value is raised rather
+# than honoured: settling late only delays cleanup, settling early destroys the
+# only report of why a run stopped.
+MIN_TERMINAL_SETTLE_MINUTES=3
+
 # How long a delivered run's worktree is kept before pass 3 removes it. Not a
 # correctness bound — the branch being gone from origin is what proves the work
 # is delivered — but a deliberate margin: disk is cheap, an operator opening
@@ -83,8 +97,8 @@ Usage: $0 [-n|--dry-run]
 Sweeps the host once and exits:
   1. kills the tmux session of every <repo>-epic-<N> whose issue has reached a
      terminal state (labelled ready-to-merge/ready-to-review/failed, or closed)
-     and has sat still for \$TERMINAL_SETTLE_MINUTES (${TERMINAL_SETTLE_MINUTES}m; a closed issue
-     skips the wait — merged is delivered), and flags —
+     and has sat still for \$TERMINAL_SETTLE_MINUTES (${TERMINAL_SETTLE_MINUTES}m, never under
+     ${MIN_TERMINAL_SETTLE_MINUTES}m; a closed issue skips the wait — merged is delivered), and flags —
      without killing — any whose process died before it got there, because the
      pane's scrollback is the only record of why.
   2. deletes every epic/<N>-* ref on origin whose tip is still the claim commit
@@ -107,6 +121,11 @@ while [[ $# -gt 0 ]]; do
     *) warn "unknown argument '$1'"; usage >&2; exit 1 ;;
   esac
 done
+
+if (( TERMINAL_SETTLE_MINUTES < MIN_TERMINAL_SETTLE_MINUTES )); then
+  say "TERMINAL_SETTLE_MINUTES=${TERMINAL_SETTLE_MINUTES} is below the ${MIN_TERMINAL_SETTLE_MINUTES}m floor a finishing run's reporting needs — using ${MIN_TERMINAL_SETTLE_MINUTES}m"
+  TERMINAL_SETTLE_MINUTES="$MIN_TERMINAL_SETTLE_MINUTES"
+fi
 
 NOW="$(date +%s)"
 KILLED=0

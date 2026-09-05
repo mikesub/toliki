@@ -48,6 +48,9 @@ assert_eq() { # name want got
 # scenario starts from this pristine main with no epic branches.
 export GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.com GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.com
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+# Same insulation for the engine knob: a dispatch host exports EPIC_ENGINE
+# (codex+claude on the cron), which would retier every run that names no engine.
+unset EPIC_ENGINE
 ORIGIN="$TMP/origin.git"
 git init -q --bare "$ORIGIN"
 git -C "$ORIGIN" symbolic-ref HEAD refs/heads/main
@@ -236,17 +239,32 @@ case "${1:-} ${2:-}" in
     target="$(labels_for "${3:-}")"
     touch "$target"
     shift 3
+    added=""
     while [[ $# -gt 0 ]]; do
       case "$1" in
         --add-label)
+          added+="$2,"
           if [[ "$2" != "${GH_DROP_LABEL:-}" ]]; then
             grep -qx -- "$2" "$target" || printf '%s\n' "$2" >> "$target"
           fi
           shift 2 ;;
-        --remove-label) grep -vx -- "$2" "$target" > "$target.tmp" || true; mv "$target.tmp" "$target"; shift 2 ;;
+        --remove-label)
+          # GH_KEEP_LABEL is the mirror of GH_DROP_LABEL: the strip half of a
+          # swap silently not landing, which is what a partial transition is.
+          if [[ "$2" != "${GH_KEEP_LABEL:-}" ]]; then
+            grep -vx -- "$2" "$target" > "$target.tmp" || true; mv "$target.tmp" "$target"
+          fi
+          shift 2 ;;
         *) shift ;;
       esac
-    done ;;
+    done
+    # A write that hangs AFTER GitHub has applied it: the label is already
+    # resting — and reap's settle clock already running — while the client waits
+    # on the response. "<label>:<seconds>", so a scenario stalls exactly the
+    # write it means to and not the swaps around it.
+    if [[ -n "${GH_SLOW_LABEL:-}" && ",$added" == *",${GH_SLOW_LABEL%%:*},"* ]]; then
+      sleep "${GH_SLOW_LABEL##*:}"
+    fi ;;
   "issue comment")
     shift 3; body=""; body_file=0
     while [[ $# -gt 0 ]]; do
@@ -257,6 +275,10 @@ case "${1:-} ${2:-}" in
       printf 'HTTP 502\n' >&2
       exit 1
     fi
+    # A comment that hangs, the way a slow GitHub does. Body-file only, so the
+    # stall lands on a run's own reporting and not on the status comment, and
+    # BEFORE the write, so a caller that gave up leaves nothing on the issue.
+    [[ -z "${GH_SLOW_COMMENT:-}" || "$body_file" != "1" ]] || sleep "$GH_SLOW_COMMENT"
     printf '%s\n---\n' "$body" >> "$state/comments"
     printf 'https://github.com/o/r/issues/42#issuecomment-999001\n' ;;
   "issue create")
@@ -460,6 +482,10 @@ run_pipeline() { # script fixtures-dir args...   (scenario knobs via GH_* env)
     GH_FORK_PR="${GH_FORK_PR:-}" \
     GH_ONLY_FORK_PR="${GH_ONLY_FORK_PR:-}" \
     GH_DROP_LABEL="${GH_DROP_LABEL:-}" \
+    GH_KEEP_LABEL="${GH_KEEP_LABEL:-}" \
+    GH_SLOW_COMMENT="${GH_SLOW_COMMENT:-}" \
+    GH_SLOW_LABEL="${GH_SLOW_LABEL:-}" \
+    EPIC_TERMINAL_REPORT_MS="${EPIC_TERMINAL_REPORT_MS:-}" \
     GH_LABEL_READ_FAIL_AT="${GH_LABEL_READ_FAIL_AT:-}" \
     GH_BODY_FILE_COMMENT_FAIL="${GH_BODY_FILE_COMMENT_FAIL:-}" \
     GH_EVIDENCE_COMMENT_FAIL="${GH_EVIDENCE_COMMENT_FAIL:-}" \
@@ -480,6 +506,14 @@ calls() { cat "$STATE_DIR/$1.n" 2>/dev/null || echo 0; }
 usage_log() { cat "$STATE_DIR/usage.jsonl" 2>/dev/null || true; }
 gh_labels() { sort "$STATE_DIR/gh/labels" 2>/dev/null | tr '\n' ',' ; }
 gh_comments() { cat "$STATE_DIR/gh/comments" 2>/dev/null || true; }
+# The body of the LAST comment, without its --- terminator: an assertion on a
+# whole body has to see one comment, not the seeded evidence and status comment
+# above it.
+gh_last_comment() {
+  local all; all="$(cat "$STATE_DIR/gh/comments" 2>/dev/null || true)"
+  all="${all%$'\n---'}"
+  printf '%s' "${all##*$'\n---\n'}"
+}
 gh_issues_created() { cat "$STATE_DIR/gh/issues-created" 2>/dev/null || true; }
 gh_pr_created() { cat "$STATE_DIR/gh/pr-created" 2>/dev/null || true; }
 
@@ -755,6 +789,21 @@ GH_EVIDENCE_READ_FAIL=1 run_pipeline "$EPIC_RUN" "$HELD" --issue 42
 assert_rc "the completed PR remains a held result" 0 "$RUN_RC"
 assert_not_contains "a failed evidence readback prevents queueing" "$RUN_OUT" '"needsDefectFix":true'
 assert_eq "only the review label remains" "ready-to-review," "$(gh_labels)"
+
+# Ship applies ready-to-review and the merge gate runs AFTER it: the evidence
+# comment, its readback, the queue label edit. bin/reap.sh starts the settle
+# clock at that first terminal label, so every one of those calls is racing the
+# sweep and they spend ONE window opened at the write — not a five-minute gh
+# timeout each, which is longer than the shortest window reap will honour.
+scenario 'epic-run: the merge gate after ready-to-review is bounded, not left to the gh timeout'
+GATE_START="$(date +%s)"
+EPIC_TERMINAL_REPORT_MS=3000 GH_SLOW_LABEL=needs-defect-fix:20 run_pipeline "$EPIC_RUN" "$HELD" --issue 42
+GATE_ELAPSED=$(( $(date +%s) - GATE_START ))
+assert_rc "the completed PR is still a clean held result" 0 "$RUN_RC"
+assert_eq "the gate gave up on the stalled queue label" "bounded" "$( (( GATE_ELAPSED < 15 )) && echo bounded || echo "waited ${GATE_ELAPSED}s for a 20s stall" )"
+assert_eq "the label GitHub applied before the stall is on the issue" "needs-defect-fix,ready-to-review," "$(gh_labels)"
+assert_not_contains "but an unverified handoff is never claimed" "$RUN_OUT" '"needsDefectFix":true'
+assert_contains "and the run still reports why the gate held" "$RUN_OUT" 'Critical: Null deref on empty list'
 
 scenario 'epic-run: ship classifies deferrals; the script counts, files and records them'
 DEFER="$TMP/fixtures-defer"; cp -R "$BASE" "$DEFER"
@@ -1619,6 +1668,20 @@ assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
 
 scenario 'defect-run: no open epic PR is a final refusal'
 BEFORE="$(origin_ref epic/42-add-widget)"
+DEFECT_BRANCH= run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+assert_rc "exits 2 (skipped/refused)" 2 "$RUN_RC"
+assert_eq "no-PR rests at failed, out of the fixer queue" "failed," "$(gh_labels)"
+NO_PR_COMMENT="$(gh_comments)"
+assert_contains "the refusal keeps its header" "$NO_PR_COMMENT" "🤖 fix-defect refused: no open PR"
+assert_contains "the comment reports the automatic queue removal" "$NO_PR_COMMENT" "needs-defect-fix has been removed automatically"
+assert_contains "the comment names the label the issue rests at" "$NO_PR_COMMENT" "rests at failed"
+assert_contains "the comment names the one remaining human action" "$NO_PR_COMMENT" "restore or open the PR by hand"
+assert_not_contains "the comment never asks a human to strip a label" "$NO_PR_COMMENT" "strip"
+# The whole body, not a substring: every sentence of a state-derived comment has
+# to survive the swap it describes, and the way that breaks is one stale clause
+# beside a correct one — "is labelled needs-defect-fix … has been removed".
+assert_eq "the complete comment describes one consistent state" "🤖 fix-defect refused: no open PR
+The defect fixer found no open PR delivering issue #42 (branch epic/42-*). needs-defect-fix has been removed automatically, so the issue is out of the fixer queue and rests at failed. The only remaining step is human: restore or open the PR by hand." "$(gh_last_comment)"
 DEFECT_BRANCH= GH_BODY_FILE_COMMENT_FAIL=1 run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
 assert_rc "exits 2 (skipped/refused)" 2 "$RUN_RC"
 assert_contains "the reason names the missing PR" "$RUN_OUT" "no open PR"
@@ -1638,10 +1701,104 @@ assert_contains "the reason names the ambiguity" "$RUN_OUT" "multiple open PRs"
 assert_eq "no model ran" "0 0" "$(calls defect-fix) $(calls defect-check)"
 assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
 assert_eq "ambiguous PRs are left for review and removed from autonomous repair" "ready-to-review," "$(gh_labels)"
+MULTI_COMMENT="$(gh_comments)"
+assert_contains "the refusal keeps its header" "$MULTI_COMMENT" "🤖 fix-defect refused: multiple open PRs"
+assert_contains "the comment reports the automatic queue removal" "$MULTI_COMMENT" "needs-defect-fix has been removed automatically"
+assert_contains "the comment names the label the issue rests at" "$MULTI_COMMENT" "rests at ready-to-review"
+assert_contains "the comment names the one remaining human action" "$MULTI_COMMENT" "close the extra PR(s) by hand"
+assert_not_contains "the comment never asks a human to strip a label" "$MULTI_COMMENT" "strip"
+assert_eq "the complete comment describes one consistent state" "🤖 fix-defect refused: multiple open PRs
+Issue #42 has 2 open PRs on epic/42-* branches — ambiguous. needs-defect-fix has been removed automatically, so the issue is out of the fixer queue and rests at ready-to-review. The only remaining step is human: close the extra PR(s) by hand so one PR delivers the issue." "$(gh_last_comment)"
 MULTI_LABELS="$(gh_labels)"; MULTI_LABELS="${MULTI_LABELS%,}"
 DEFECT_LABELS="$MULTI_LABELS" GH_OPEN_PR_COUNT=2 run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
 assert_contains "another launch sees ambiguity is no longer queued" "$RUN_OUT" "not labelled needs-defect-fix"
 assert_not_contains "the final ambiguity refusal is not posted again" "$(gh_comments)" "fix-defect refused: multiple open PRs"
+
+# A terminal swap is several label writes and any of them can miss. Guidance
+# derived from "did the whole swap land" then repairs the wrong half: it tells a
+# human to strip a label that is already gone, or to set one already there. Both
+# partial shapes get a scenario, plus the unreadable state that is the only one
+# allowed to ask for both.
+scenario 'defect-run: a half-landed transition asks only for the label still missing'
+BEFORE="$(origin_ref epic/42-add-widget)"
+GH_DROP_LABEL=failed DEFECT_BRANCH= run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+assert_rc "exits 2 (skipped/refused)" 2 "$RUN_RC"
+assert_eq "the queue label came off but the resting label never landed" "" "$(gh_labels)"
+assert_contains "the run logs the unfinished transition" "$RUN_OUT" "terminal label restoration failed"
+PARTIAL_COMMENT="$(gh_comments)"
+assert_contains "the observed queue removal is still reported as done" "$PARTIAL_COMMENT" "needs-defect-fix has been removed automatically"
+assert_contains "the comment says the transition did not complete" "$PARTIAL_COMMENT" "but the transition did not complete"
+assert_contains "and asks only for the label that is missing" "$PARTIAL_COMMENT" "set failed by hand"
+assert_not_contains "never a repair for an already-absent label" "$PARTIAL_COMMENT" "remove needs-defect-fix"
+assert_not_contains "a removal it observed is never called unverified" "$PARTIAL_COMMENT" "could NOT"
+assert_contains "the structural action still follows" "$PARTIAL_COMMENT" "Then: restore or open the PR by hand"
+assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+
+scenario 'defect-run: a retained queue label is reported as retained, not as removed'
+seed_defect_pr
+GH_KEEP_LABEL=needs-defect-fix GH_OPEN_PR_COUNT=2 run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+assert_rc "exits 2 (skipped/refused)" 2 "$RUN_RC"
+assert_eq "the resting label is set and the queue label survived" "needs-defect-fix,ready-to-review," "$(gh_labels)"
+STUCK_COMMENT="$(gh_comments)"
+assert_contains "the retained queue label is named" "$STUCK_COMMENT" "needs-defect-fix could NOT be removed"
+assert_contains "and so is the dispatchability it leaves behind" "$STUCK_COMMENT" "may still be in the fixer queue and dispatchable"
+assert_contains "the repair asked for is the stuck label" "$STUCK_COMMENT" "remove needs-defect-fix by hand"
+assert_not_contains "never a repair for an already-set label" "$STUCK_COMMENT" "set ready-to-review"
+assert_not_contains "an unfinished removal is never reported as done" "$STUCK_COMMENT" "has been removed automatically"
+assert_contains "the structural action still follows" "$STUCK_COMMENT" "Then: close the extra PR(s) by hand"
+
+scenario 'defect-run: an unreadable label readback is the only conservative case'
+DEFECT_BRANCH= GH_LABEL_READ_FAIL_AT=1 run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+assert_rc "exits 2 (skipped/refused)" 2 "$RUN_RC"
+UNREAD_COMMENT="$(gh_comments)"
+assert_contains "the comment says the state could not be read" "$UNREAD_COMMENT" "The resulting labels could NOT be read back"
+assert_contains "so both halves are left for the operator to check" "$UNREAD_COMMENT" "check by hand that needs-defect-fix is gone and failed is set"
+assert_not_contains "an unread state never claims the removal landed" "$UNREAD_COMMENT" "has been removed automatically"
+assert_not_contains "nor claims a label it never observed" "$UNREAD_COMMENT" "rests at failed"
+assert_contains "the structural action still follows" "$UNREAD_COMMENT" "Then: restore or open the PR by hand"
+
+# Reap kills a session whose terminal label has sat still for the settle window,
+# and the label's own write starts that clock — so everything the run still has
+# to say happens inside it. Left on the default gh timeout, one stalled comment
+# is longer than the whole window: the sweep kills the run and the issue never
+# gets its guidance. The budget is injected short here; the stall is not.
+scenario 'fixer finalize: post-terminal reporting is bounded, not left to the gh timeout'
+FINALIZE_START="$(date +%s)"
+DEFECT_BRANCH= EPIC_TERMINAL_REPORT_MS=3000 GH_SLOW_COMMENT=20 run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+FINALIZE_ELAPSED=$(( $(date +%s) - FINALIZE_START ))
+assert_rc "exits 2 (skipped/refused)" 2 "$RUN_RC"
+assert_eq "the run gave up on the stalled comment" "bounded" "$( (( FINALIZE_ELAPSED < 15 )) && echo bounded || echo "waited ${FINALIZE_ELAPSED}s for a 20s stall" )"
+assert_eq "the terminal transition still settled" "failed," "$(gh_labels)"
+assert_contains "the abandoned report is on the run's log" "$RUN_OUT" "blocked: GitHub report failed"
+assert_contains "and names the bound it hit" "$RUN_OUT" "timed out"
+
+# The write is the call that starts the clock, so it is the one that must not run
+# on the default timeout: GitHub applies the label and can leave the client
+# waiting for the response, which spends the whole settle window before the
+# readback the guidance is composed from has even been made.
+scenario 'fixer finalize: the terminal label write is bounded, not only the report after it'
+WRITE_START="$(date +%s)"
+DEFECT_BRANCH= EPIC_TERMINAL_REPORT_MS=3000 GH_SLOW_LABEL=failed:20 run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+WRITE_ELAPSED=$(( $(date +%s) - WRITE_START ))
+assert_rc "exits 2 (skipped/refused)" 2 "$RUN_RC"
+assert_eq "the run gave up on the stalled write" "bounded" "$( (( WRITE_ELAPSED < 15 )) && echo bounded || echo "waited ${WRITE_ELAPSED}s for a 20s stall" )"
+assert_eq "the label GitHub had already applied is still observed" "failed," "$(gh_labels)"
+assert_contains "the refusal still reached the issue" "$(gh_comments)" "🤖 fix-defect refused: no open PR"
+assert_contains "with the guidance the stall could have cost" "$(gh_comments)" "needs-defect-fix has been removed automatically"
+
+# The other half of that contract lives in bin/reap.sh: the shortest settle
+# window it will ever honour has to be longer than everything a finished run
+# still does. Both numbers are constants in two languages, so assert the
+# relationship rather than either value.
+scenario 'fixer finalize: the reporting budget fits inside the shortest window reap allows'
+FINALIZE_BUDGET_MS="$(node -e "import('$ROOT/workflows/lib/github.mjs').then(m => console.log(m.TERMINAL_REPORT_BUDGET_MS))")"
+STATUS_BUDGET_MS="$(sed -n 's/^const GH_TIMEOUT_MS = \([0-9_]*\)$/\1/p' "$ROOT/workflows/lib/status.mjs" | tr -d _)"
+SETTLE_FLOOR_MIN="$(sed -n 's/^MIN_TERMINAL_SETTLE_MINUTES=\([0-9]*\)$/\1/p' "$ROOT/bin/reap.sh")"
+assert_eq "the finalizer's budget is the default, not a leaked test value" 60000 "$FINALIZE_BUDGET_MS"
+assert_eq "the status comment's final edit is bounded too" 20000 "$STATUS_BUDGET_MS"
+assert_eq "reap floors its settle window" 3 "$SETTLE_FLOOR_MIN"
+assert_eq "post-terminal reporting finishes well inside that floor" "fits" \
+  "$( (( FINALIZE_BUDGET_MS + STATUS_BUDGET_MS < SETTLE_FLOOR_MIN * 60000 / 2 )) && echo fits || echo "budget $(( FINALIZE_BUDGET_MS + STATUS_BUDGET_MS ))ms against a ${SETTLE_FLOOR_MIN}m floor" )"
 
 # The queue label and its canonical evidence are one invariant. Carry the real
 # comments and labels produced by epic-run into a fresh defect-run process;

@@ -14,6 +14,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+unset EPIC_ENGINE   # a host default must not leak in; the scenarios that need it export their own
 
 PASS=0
 FAIL=0
