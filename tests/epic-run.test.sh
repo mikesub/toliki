@@ -21,6 +21,8 @@ CI_RUN="$ROOT/workflows/ci-run.mjs"
 DEFECT_RUN="$ROOT/workflows/defect-run.mjs"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+SUITE_STDERR="$TMP/suite.stderr"
+exec 3>&2 2>"$SUITE_STDERR"
 
 PASS=0
 FAIL=0
@@ -100,7 +102,7 @@ seed_branch() {
   local dir="$TMP/seeder-$SEED_N"
   rm -rf "$dir"
   git clone -q "$ORIGIN" "$dir"
-  git -C "$dir" switch -q -c "$branch" "origin/$base"
+  git -C "$dir" switch -q -C "$branch" "origin/$base"
   (cd "$dir" && bash -c "$script")
   git -C "$dir" push -q origin "HEAD:refs/heads/$branch"
   rm -rf "$dir"
@@ -3994,6 +3996,9 @@ run_fix "$FIXBASE" --issue 42 --session myapp-epic-42
 GH="$(cat "$GH_LOG")"
 assert_contains "the comment names fix-run" "$GH" "fix-run"
 assert_not_contains "and never claims to be epic-run" "$GH" "**epic-run**"
+
+exec 2>&3 3>&-
+assert_eq "suite stderr stays clean" "" "$(cat "$SUITE_STDERR")"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
