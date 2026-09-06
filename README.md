@@ -21,8 +21,9 @@ only where a judgment is needed. Claude Code and Codex are both supported.
    and launches a tmux session per unblocked issue, up to the host's slot
    budget. Repair queues run first; ship-gate defect repair is walked only for
    repositories listed in the machine-local `DEFECT_FIX_REPOS` allowlist. A
-   provider quota hold stops an ordinary or dry-run tick before capacity or
-   GitHub until its UTC reset time; routing-only operations bypass the hold.
+   provider quota hold skips ordinary or dry-run candidates whose engine uses
+   that vendor until its UTC reset time, while candidates on other vendors keep
+   launching; routing-only operations bypass the hold.
 3. **`workflows/epic-run.mjs`** (the session's pane) — claims the issue,
    makes a proportional architecture plan, then implements through either
    test-first red/green or a direct coding step. Both paths pass the project's
@@ -37,7 +38,8 @@ only where a judgment is needed. Claude Code and Codex are both supported.
    or `ready-to-review` (a human decides). A hard provider quota is a successful
    held outcome instead: the resumable branch is preserved, the issue returns
    to its queue without spending a fixer attempt, and automatic dispatch waits
-   for the shared host hold. Ordinary transient 429s still retry once.
+   only for the failed step's vendor hold. Ordinary transient 429s still retry
+   once.
 4. **`bin/merge-worker.sh`** (cron) — one PR at a time per repo: rebase onto
    current main, give checks time to register, then wait for every published
    check on the rebased head and squash-merge. An empty rollup after the grace
@@ -120,7 +122,8 @@ Defect repair is empty-by-default: add selected registered repo names to
 `DEFECT_FIX_REPOS=(...)` in the host's `etc/repos.conf`, or launch a marked
 issue explicitly with `./remote-control.sh defect N --engine <engine> -r <repo>`.
 All explicit `remote-control.sh epic|fix|ci|defect` launches bypass an active
-provider hold as a deliberate operator override.
+provider hold as a deliberate operator override. A mixed engine waits if any
+vendor it uses is held; admission never reroutes an issue to a different engine.
 
 On the laptop:
 
