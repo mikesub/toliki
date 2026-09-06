@@ -416,10 +416,17 @@ const coversEveryIndex = (entries, count) => Array.isArray(entries) && entries.l
   entries.every(e => Number.isInteger(e.index) && e.index >= 1 && e.index <= count)
 const validAssessments = (value, count) => matchesSchema(TRIAGE_SCHEMA, value) &&
   coversEveryIndex(value.assessments, count) && value.assessments.every(a => nonblank(a.reason))
+// `defect` is a cross-field claim, not an independent flag: it authorizes the
+// bounded repair queue for an unresolved finding whose bug was positively shown
+// to remain. A verdict that clears a finding AND asserts a concrete defect
+// contradicts itself, and the gate reads whichever half it happens to look at —
+// so the whole review is invalid rather than half-believed, which lands every
+// finding in the unadjudicated hold below.
 const validFinalReview = (value, count) => matchesSchema(FINAL_REVIEW_SCHEMA, value) &&
   coversEveryIndex(value.verdicts, count) &&
   value.verdicts.every(v => nonblank(v.reasoning) && typeof v.defect === 'boolean' &&
-    Number.isFinite(v.confidence) && v.confidence >= 0 && v.confidence <= 100) &&
+    Number.isFinite(v.confidence) && v.confidence >= 0 && v.confidence <= 100 &&
+    (v.defect !== true || (v.verdict === 'unresolved' && v.confidence >= 75))) &&
   value.regressions.every(r => nonblank(r.title) && nonblank(r.location) && nonblank(r.problem) &&
     Number.isFinite(r.confidence) && r.confidence >= 0 && r.confidence <= 100) &&
   value.unmetRequirements.every(u => nonblank(u.requirement) && nonblank(u.evidence))
@@ -1314,7 +1321,11 @@ try {
           item.verdict = verdict.verdict === 'resolved' && !changed
             ? { verdict: 'unresolved', confidence: 0, defect: false, reasoning: 'The fixer reported a repair but produced no diff' }
             : verdict
-          item.cleared = ['resolved', 'disproved'].includes(item.verdict.verdict) && item.verdict.confidence >= 75
+          // `defect: true` is validated as unresolved-only above; requiring it
+          // false here too keeps clearance from ever resting on a verdict that
+          // says a concrete defect remains.
+          item.cleared = ['resolved', 'disproved'].includes(item.verdict.verdict) &&
+            item.verdict.confidence >= 75 && item.verdict.defect !== true
         })
         // Regressions become ordinary open items with the repaired tree as
         // their baseline: they are what the repair itself broke.

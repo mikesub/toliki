@@ -84,8 +84,13 @@ reset_origin() {
   done
   rm -f "$ORIGIN/hooks/pre-receive"
 }
+# mktemp, not $RANDOM, for the same reason seed_branch below uses a counter: a
+# suite this long draws the same number twice, and a clone into a path a
+# previous run already owns resumes ITS branch with this scenario's assertions
+# still armed. A counter cannot serve here — this runs in a command
+# substitution, so an increment would never leave the subshell.
 fresh_clone() { # -> path; detached at origin/main, like launch.sh's worktree
-  local dir="$TMP/run-$RANDOM$RANDOM"
+  local dir; dir="$(mktemp -d "$TMP/run-XXXXXXXX")"
   git clone -q "$ORIGIN" "$dir"
   git -C "$dir" checkout -q --detach main
   printf '%s' "$dir"
@@ -814,13 +819,15 @@ RUN_OUT=""
 RUN_RC=0
 RUN_LOG=""
 WT=""
+PIPE_N=0
 run_pipeline() { # script fixtures-dir args...   (scenario knobs via GH_* env)
   local script="$1" fixtures="$2"; shift 2
-  local state="$TMP/state.$RANDOM$RANDOM"
-  RUN_LOG="$TMP/argv.$RANDOM$RANDOM"
-  CODEX_LOG="$TMP/codex-argv.$RANDOM$RANDOM"
-  GH_LOG="$TMP/gh.$RANDOM$RANDOM"
-  NPM_LOG="$TMP/npm.$RANDOM$RANDOM"
+  PIPE_N=$((PIPE_N + 1))
+  local state="$TMP/state.$PIPE_N"
+  RUN_LOG="$TMP/argv.$PIPE_N"
+  CODEX_LOG="$TMP/codex-argv.$PIPE_N"
+  GH_LOG="$TMP/gh.$PIPE_N"
+  NPM_LOG="$TMP/npm.$PIPE_N"
   mkdir -p "$state/gh" "$state/tmp"
   [[ "${HOLD_FILE_AS_DIRECTORY:-}" != "1" ]] || mkdir "$state/provider-hold.json"
   if [[ -n "${SEED_HOLD_RECORD:-}" && "${HOLD_FILE_AS_DIRECTORY:-}" != "1" ]]; then
@@ -1421,7 +1428,7 @@ git -C "$BROKEN_WT" remote set-url origin "$TMP/no-such-origin.git"
 fresh_clone() { printf '%s' "$BROKEN_WT"; }
 run_pipeline "$EPIC_RUN" "$BASE" --issue 42
 unset -f fresh_clone
-fresh_clone() { local dir="$TMP/run-$RANDOM$RANDOM"; git clone -q "$ORIGIN" "$dir"; git -C "$dir" checkout -q --detach main; printf '%s' "$dir"; }
+fresh_clone() { local dir; dir="$(mktemp -d "$TMP/run-XXXXXXXX")"; git clone -q "$ORIGIN" "$dir"; git -C "$dir" checkout -q --detach main; printf '%s' "$dir"; }
 assert_rc "exits 2 (skipped)" 2 "$RUN_RC"
 assert_contains "the reason names the unconfirmed base" "$RUN_OUT" 'refusing to build against an unconfirmed base'
 assert_eq "nothing was designed" 0 "$(calls design)"
@@ -2292,6 +2299,36 @@ assert_not_contains "a missing verdict is not autonomously repairable" "$RUN_OUT
 assert_eq "the issue stays ready-to-review" "ready-to-review," "$(gh_labels)"
 assert_eq "exactly two attempts, and no repair round after them" "2 1" "$(calls finalreview) $(calls triage)"
 
+# `defect: true` says a concrete bug still exists, so it belongs only to an
+# unresolved verdict. A verdict that clears the finding and asserts the defect
+# at once decides nothing: the gate would clear the finding and the repair queue
+# would claim it. Both halves are refused — the review is invalid and everything
+# it was asked to decide rests with a human.
+scenario 'final review: a clearing verdict that also asserts a defect decides nothing'
+CONTRADICT="$TMP/fixtures-contradict"; cp -R "$BASE" "$CONTRADICT"
+fixture "$CONTRADICT" finalreview '{"verdicts":[{"index":1,"verdict":"disproved","confidence":90,"defect":true,"reasoning":"The baseline already guarded the empty list, and the empty-list access still throws at src/widget.ts:12."}],"regressions":[],"unmetRequirements":[]}'
+run_pipeline "$EPIC_RUN" "$CONTRADICT" --issue 42
+assert_rc "exits 0 (the PR is real, just held)" 0 "$RUN_RC"
+assert_contains "the gate calls the verdicts invalid" "$RUN_OUT" 'returned incomplete, duplicate or invalid verdicts'
+assert_contains "the repair itself is left unadjudicated" "$RUN_OUT" '"findingsPending":1'
+assert_not_contains "a contradictory disproof cannot merge" "$RUN_OUT" '"readyToMerge":true'
+assert_not_contains "nor is it evidence authorizing a bounded repair" "$RUN_OUT" '"needsDefectFix":true'
+assert_eq "the issue rests at ready-to-review for a human" "ready-to-review," "$(gh_labels)"
+assert_not_contains "and no repair envelope is posted" "$(gh_comments)" "🤖 defect-fix evidence"
+assert_eq "the contradiction starts no second repair round" "1 1" "$(calls triage) $(calls finalreview)"
+assert_contains "review.md keeps the finding open" "$(cat "$WT/.epics/42-add-widget/review.md")" "OPEN — unresolved; a human decides"
+assert_contains "and names it" "$(cat "$WT/.epics/42-add-widget/review.md")" 'Null deref on empty list'
+
+scenario 'final review: a resolved verdict that also asserts a defect decides nothing'
+CONTRADICT2="$TMP/fixtures-contradict-resolved"; cp -R "$BASE" "$CONTRADICT2"
+fixture "$CONTRADICT2" finalreview '{"verdicts":[{"index":1,"verdict":"resolved","confidence":90,"defect":true,"reasoning":"The guard was added, and the empty-list access still throws at src/widget.ts:12."}],"regressions":[],"unmetRequirements":[]}'
+run_pipeline "$EPIC_RUN" "$CONTRADICT2" --issue 42
+assert_rc "exits 0 (the PR is real, just held)" 0 "$RUN_RC"
+assert_contains "the gate calls the verdicts invalid" "$RUN_OUT" 'returned incomplete, duplicate or invalid verdicts'
+assert_not_contains "a contradictory resolution cannot merge" "$RUN_OUT" '"readyToMerge":true'
+assert_not_contains "nor can it enter the bounded repair queue" "$RUN_OUT" '"needsDefectFix":true'
+assert_eq "the issue rests at ready-to-review for a human" "ready-to-review," "$(gh_labels)"
+
 # `resolved` is a claim about what the change did, so it cannot clear a finding
 # on a tree the fixer never touched — even when the same run disputed another
 # finding and therefore earned a final review.
@@ -2516,7 +2553,7 @@ run_manual() {
   fresh_clone() { printf '%s' "$MANUAL_WT"; }
   run_pipeline "$EPIC_RUN" "$1" --slug 42-add-widget
   unset -f fresh_clone
-  fresh_clone() { local dir="$TMP/run-$RANDOM$RANDOM"; git clone -q "$ORIGIN" "$dir"; git -C "$dir" checkout -q --detach main; printf '%s' "$dir"; }
+  fresh_clone() { local dir; dir="$(mktemp -d "$TMP/run-XXXXXXXX")"; git clone -q "$ORIGIN" "$dir"; git -C "$dir" checkout -q --detach main; printf '%s' "$dir"; }
 }
 run_manual "$MANUAL"
 assert_rc "exits 0" 0 "$RUN_RC"
