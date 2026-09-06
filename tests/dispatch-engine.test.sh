@@ -244,6 +244,7 @@ unset EPIC_ENGINE
 assert_rc "selective admission is a clean tick" 0 "$RUN_RC"
 assert_eq "the default mixed engine logs one Claude hold line" 1 "$(printf '%s\n' "$RUN_OUT" | grep -c '#1: held (claude quota until 2099-01-01 01:00:00 CET)' || true)"
 assert_eq "the explicit Claude engine logs one Claude hold line" 1 "$(printf '%s\n' "$RUN_OUT" | grep -c '#2: held (claude quota until 2099-01-01 01:00:00 CET)' || true)"
+assert_not_contains "selective held lines do not expose the canonical UTC deadline" "$RUN_OUT" "2099-01-01T00:00:00.000Z"
 assert_contains "engine:codex candidate launches while claude is held" "$(cat "$TMP/launch.log")" '--epic 3 --repo testrepo --engine codex'
 assert_not_contains "the mixed engine is not launched" "$(cat "$TMP/launch.log")" '--epic 1'
 assert_not_contains "the Claude engine is not launched" "$(cat "$TMP/launch.log")" '--epic 2'
@@ -274,6 +275,8 @@ assert_rc "an all-held tick is clean" 0 "$RUN_RC"
 assert_eq "the mixed candidate gets exactly one held line" 1 "$(printf '%s\n' "$RUN_OUT" | grep -c '#6: held (' || true)"
 assert_contains "the mixed held line names Claude" "$RUN_OUT" "#6: held (claude quota until 2099-01-01 01:00:00 CET"
 assert_contains "the mixed held line also names Codex" "$RUN_OUT" "codex quota until 2099-01-02 01:00:00 CET"
+assert_not_contains "mixed-vendor held lines do not expose Claude's canonical UTC deadline" "$RUN_OUT" "2099-01-01T00:00:00.000Z"
+assert_not_contains "mixed-vendor held lines do not expose Codex's canonical UTC deadline" "$RUN_OUT" "2099-01-02T00:00:00.000Z"
 assert_eq "both held vendors launch no candidate" "" "$(grep -- '--epic' "$TMP/launch.log" || true)"
 assert_eq "an all-held tick writes no labels" "" "$(grep 'issue edit' "$TMP/gh.log" || true)"
 
