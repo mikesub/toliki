@@ -118,7 +118,13 @@ agent CLIs. Route the next unassigned epic with
 step, so one engine can code on Claude and review on Codex. Unlabeled issues
 run on the host's `EPIC_ENGINE` default, set in `etc/dispatch.cron` (claude
 when unset). From the laptop, `./default-engine.sh` prints the VM's installed
-default and available engines; pass an engine name to change the VM default.
+default and available engines; pass an engine name to change the VM default
+for future unpinned claims. An unlabeled issue consults that default only for
+its first claim. Once the claim succeeds, the run snapshots its selection as
+the issue's sole `engine:<name>` label and reads it back before any model starts.
+That GitHub write/readback is a hard gate: resumes and every fixer require the
+same exact pin rather than falling back to a later host default, and missing,
+mismatched, or conflicting pins stop for an operator without being rewritten.
 Turning the box autonomous is a deliberate last step: install the cron file
 per the comment at the top of `etc/dispatch.cron`.
 Defect repair is empty-by-default: add selected registered repo names to

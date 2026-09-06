@@ -29,7 +29,7 @@ import { agent, phase, log, initRuntime, onPhase, onLog, takeAgentFailure, withA
 import { parseArgs, finish, UsageError, EXIT } from './lib/cli.mjs'
 import { initStatus, statusPhase, statusNote, statusFinish } from './lib/status.mjs'
 import { failureReason } from './lib/proc.mjs'
-import { gh, ensureLabels, editLabels, issueLabels, issueView, comment, openPrs, withBodyFile, readBack, terminalBudget, terminalTimeout, terminalTransition } from './lib/github.mjs'
+import { gh, ensureLabels, editLabels, issueLabels, issueView, comment, openPrs, withBodyFile, readBack, terminalBudget, terminalTimeout, terminalTransition, verifyIssueEngine } from './lib/github.mjs'
 import { git, gitOut, discoverPackages, pkgList, ensureDeps, runVerify, pushRejected } from './lib/repo.mjs'
 import { finalizeFixerIssue, finalizeFixerQuotaHold } from './lib/fixer-finalize.mjs'
 import { recordQuotaHold } from './quota-hold.mjs'
@@ -181,6 +181,10 @@ async function prepare(issue) {
   const labels = Array.isArray(view.labels) ? view.labels.map(l => l.name) : []
   if (String(view.state || '').toUpperCase() === 'CLOSED') return { refused: `issue #${issue} is closed` }
   if (!labels.includes('needs-ci-fix')) return { refused: `issue #${issue} is not labelled needs-ci-fix — not a CI fixer's issue` }
+
+  // A fixer inherits the claim's durable route; it cannot fall back to a host
+  // default that may have changed since the original epic ran.
+  await verifyIssueEngine(issue, ARGS.engine)
 
   const refuseFinal = async (body, reason) => {
     const settled = await finalizeFixerIssue({ issue, body, add: ['failed'], remove: ['in-progress'] })

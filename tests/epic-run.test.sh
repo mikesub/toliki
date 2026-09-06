@@ -292,7 +292,10 @@ case "${1:-} ${2:-}" in
       # yet: this one read still answers with the labels as they were before the
       # edit, and the next read shows the real state. The mirror of GH_LATE_LABEL,
       # where the edit itself had not landed when the client gave up.
-      if [[ "$n" == "${GH_LABEL_STALE_READ_AT:-}" && -f "$state/labels-prev" ]]; then src="$state/labels-prev"; fi
+      if [[ "$n" == "${GH_LABEL_STALE_READ_AT:-}" && -f "$state/labels-prev" ]]; then
+        src="$state/labels-prev"
+        touch "$state/stale-label-read-served"
+      fi
       if [[ -f "$state/fail-next-label-read" ]]; then
         rm -f "$state/fail-next-label-read"
         printf 'HTTP 502 after applied hold transition\n' >&2
@@ -826,7 +829,12 @@ run_pipeline() { # script fixtures-dir args...   (scenario knobs via GH_* env)
 }
 calls() { cat "$STATE_DIR/$1.n" 2>/dev/null || echo 0; }
 usage_log() { cat "$STATE_DIR/usage.jsonl" 2>/dev/null || true; }
-gh_labels() { sort "$STATE_DIR/gh/labels" 2>/dev/null | tr '\n' ',' ; }
+# Keep routing state separate from lifecycle state: an engine pin survives every
+# terminal transition, while most existing assertions intentionally describe
+# only the mutually exclusive lifecycle/queue labels.
+gh_labels() { awk '!/^engine:/' "$STATE_DIR/gh/labels" 2>/dev/null | sort | tr '\n' ',' ; }
+gh_engine_labels() { awk '/^engine:/' "$STATE_DIR/gh/labels" 2>/dev/null | sort | tr '\n' ',' ; }
+engine_label_writes() { grep -E 'issue edit .*--add-label engine:' "$GH_LOG" 2>/dev/null || true; }
 gh_comments() { cat "$STATE_DIR/gh/comments" 2>/dev/null || true; }
 # The body of the LAST comment, without its --- terminator: an assertion on a
 # whole body has to see one comment, not the seeded evidence and status comment
@@ -874,6 +882,11 @@ assert_merge_label_agrees() {
 # ───────────────────────── epic-run ─────────────────────────
 scenario 'epic-run: happy path ships and queues for merge'
 run_pipeline "$EPIC_RUN" "$BASE" --issue 42
+assert_eq "successful default claim snapshots engine:claude" "engine:claude," "$(gh_engine_labels)"
+ENGINE_WRITE_LINE="$(grep -nE 'issue edit .*--add-label engine:claude' "$GH_LOG" | head -n1 | cut -d: -f1)"
+IN_PROGRESS_LINE="$(grep -nE 'issue edit .*--add-label in-progress' "$GH_LOG" | head -n1 | cut -d: -f1)"
+assert_eq "the engine snapshot precedes the in-progress lifecycle signal" "before" \
+  "$( [[ -n "$ENGINE_WRITE_LINE" && -n "$IN_PROGRESS_LINE" && "$ENGINE_WRITE_LINE" -lt "$IN_PROGRESS_LINE" ]] && echo before || echo not-before )"
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_contains "RESULT says readyToMerge" "$RUN_OUT" '"readyToMerge":true'
 assert_not_contains "a clear gate never advertises defect repair" "$RUN_OUT" '"needsDefectFix":true'
@@ -977,6 +990,7 @@ assert_eq "final verify runs after both attempts" 2 "$(grep -c '^run verify$' "$
 scenario 'epic-run: --engine codex routes every step to the Codex CLI'
 run_pipeline "$EPIC_RUN" "$BASE" --issue 42 --engine codex
 assert_rc "exits 0" 0 "$RUN_RC"
+assert_eq "a fresh explicit Codex selection is snapshotted" "engine:codex," "$(gh_engine_labels)"
 assert_contains "RESULT says readyToMerge" "$RUN_OUT" '"readyToMerge":true'
 CODEX_ARGV="$(cat "$CODEX_LOG")"
 assert_contains "every phase runs at xhigh effort" "$CODEX_ARGV" 'model_reasoning_effort="xhigh"'
@@ -995,9 +1009,57 @@ assert_eq "and say the figure was computed, not billed" "table" "$(usage_log | j
 scenario 'epic-run: EPIC_ENGINE=codex routes every phase without a flag'
 EPIC_ENGINE=codex run_pipeline "$EPIC_RUN" "$BASE" --issue 42
 assert_rc "exits 0" 0 "$RUN_RC"
+assert_eq "the changed host default is snapshotted on its fresh claim" "engine:codex," "$(gh_engine_labels)"
 assert_contains "the run ships" "$RUN_OUT" '"readyToMerge":true'
 assert_contains "every phase went to Codex" "$(cat "$CODEX_LOG")" "--model gpt-5.6-sol"
 assert_eq "no phase went to Claude directly" 0 "$(grep -c -- '--model' "$RUN_LOG" || true)"
+
+scenario 'epic-run: a matching explicit route is honored without rewriting it'
+GH_ISSUE_LABELS='ready,engine:codex' run_pipeline "$EPIC_RUN" "$BASE" --issue 42 --engine codex
+assert_rc "the explicitly routed claim ships" 0 "$RUN_RC"
+assert_eq "the explicit route remains the sole engine pin" "engine:codex," "$(gh_engine_labels)"
+assert_eq "the matching explicit route is not rewritten" "" "$(engine_label_writes)"
+assert_contains "the explicit route still selects Codex" "$(cat "$CODEX_LOG")" "--model gpt-5.6-sol"
+
+scenario 'epic-run: a fresh claim never overwrites a mismatched explicit route'
+GH_ISSUE_LABELS='ready,engine:codex' run_pipeline "$EPIC_RUN" "$BASE" --issue 42 --engine claude
+assert_rc "a mismatched explicit route exits 3 (blocked)" 3 "$RUN_RC"
+assert_contains "the mismatch names the engine gate" "$RUN_OUT" "engine"
+assert_eq "the explicit route is not replaced" "engine:codex," "$(gh_engine_labels)"
+assert_eq "the mismatch writes no replacement engine label" "" "$(engine_label_writes)"
+assert_eq "the mismatched fresh claim starts no model" 0 "$(wc -l < "$RUN_LOG" | tr -d ' ')"
+assert_eq "the mismatched fresh claim is preserved" "present" \
+  "$( [[ -n "$(origin_ref epic/42-add-widget)" ]] && echo present || echo missing )"
+assert_eq "the mismatched claim follows the normal blocker path" "failed," "$(gh_labels)"
+
+scenario 'epic-run: a stale snapshot read is retried before model work'
+GH_LABEL_STALE_READ_AT=2 run_pipeline "$EPIC_RUN" "$BASE" --issue 42
+assert_rc "one stale engine-label read recovers" 0 "$RUN_RC"
+assert_eq "the recovered snapshot is durable" "engine:claude," "$(gh_engine_labels)"
+if [[ -f "$STATE_DIR/gh/stale-label-read-served" ]]; then ok "the snapshot readback exercised the stale observation"; else nok "the snapshot readback exercised the stale observation"; fi
+assert_eq "the snapshot readback continued past the stale observation" "retried" \
+  "$( (( $(cat "$STATE_DIR/gh/label-reads" 2>/dev/null || echo 0) > 2 )) && echo retried || echo stopped )"
+assert_eq "model work begins only after the recovered pin" 1 "$(calls design)"
+
+scenario 'epic-run: a dropped engine snapshot blocks with its claim preserved'
+GH_DROP_LABEL=engine:claude run_pipeline "$EPIC_RUN" "$BASE" --issue 42
+assert_rc "an unpersisted engine snapshot exits 3 (blocked)" 3 "$RUN_RC"
+assert_contains "the blocker names engine routing" "$RUN_OUT" "engine"
+assert_eq "no model starts without a durable snapshot" 0 "$(wc -l < "$RUN_LOG" | tr -d ' ')"
+assert_eq "the rejected snapshot installs no dependencies" 0 "$(wc -l < "$NPM_LOG" | tr -d ' ')"
+assert_eq "the claimed branch is preserved for inspection or resume" "present" \
+  "$( [[ -n "$(origin_ref epic/42-add-widget)" ]] && echo present || echo missing )"
+assert_eq "the normal blocker path rests the issue at failed" "failed," "$(gh_labels)"
+assert_eq "the missing snapshot is never reported as persisted" "" "$(gh_engine_labels)"
+
+scenario 'epic-run: an unreadable engine snapshot blocks before model work'
+GH_LABEL_READ_FAIL_AT=2 run_pipeline "$EPIC_RUN" "$BASE" --issue 42
+assert_rc "an unreadable engine snapshot exits 3 (blocked)" 3 "$RUN_RC"
+assert_contains "the failed strong read reaches the blocker" "$RUN_OUT" "gh issue view 42 --json labels"
+assert_eq "an unreadable snapshot starts no model" 0 "$(wc -l < "$RUN_LOG" | tr -d ' ')"
+assert_eq "the claim survives a failed snapshot readback" "present" \
+  "$( [[ -n "$(origin_ref epic/42-add-widget)" ]] && echo present || echo missing )"
+assert_eq "the applied pin is retained rather than guessed away" "engine:claude," "$(gh_engine_labels)"
 
 scenario 'epic-run: an unknown EPIC_ENGINE is refused before any side effect'
 EPIC_ENGINE=future run_pipeline "$EPIC_RUN" "$BASE" --issue 42
@@ -1038,6 +1100,8 @@ assert_rc "exits 2 (skipped)" 2 "$RUN_RC"
 assert_contains "the reason names the state" "$RUN_OUT" 'issue #42 is closed'
 assert_eq "no branch was claimed" "" "$(origin_ref epic/42-add-widget)"
 assert_eq "nothing was designed" 0 "$(calls design)"
+assert_eq "a closed pre-claim refusal writes no engine label" "" "$(engine_label_writes)"
+assert_eq "a closed pre-claim refusal leaves routing unpinned" "" "$(gh_engine_labels)"
 
 scenario 'epic-run: open blocked_by dependencies skip the issue'
 GH_BLOCKED_BY='[{"number":41,"state":"open"},{"number":40,"state":"closed"}]' run_pipeline "$EPIC_RUN" "$BASE" --issue 42
@@ -1045,6 +1109,7 @@ assert_rc "exits 2 (skipped)" 2 "$RUN_RC"
 assert_contains "the reason names the open blocker only" "$RUN_OUT" 'blocked by open issue(s) #41'
 assert_not_contains "a closed dependency does not block" "$RUN_OUT" '#40'
 assert_eq "no branch was claimed" "" "$(origin_ref epic/42-add-widget)"
+assert_eq "an open dependency writes no engine label before claim" "" "$(engine_label_writes)"
 
 scenario 'epic-run: a dependency check that cannot be read is not a green gate'
 GH_DEPS_FAIL=1 run_pipeline "$EPIC_RUN" "$BASE" --issue 42
@@ -1052,6 +1117,7 @@ assert_rc "exits 2 (skipped)" 2 "$RUN_RC"
 assert_contains "the reason says it refused to guess" "$RUN_OUT" 'dependency check could not be read'
 assert_eq "no branch was claimed" "" "$(origin_ref epic/42-add-widget)"
 assert_eq "nothing was designed" 0 "$(calls design)"
+assert_eq "an unreadable dependency gate writes no engine label" "" "$(engine_label_writes)"
 
 scenario 'epic-run: a failed fetch refuses rather than building on an unconfirmed base'
 # The clone is handed a dead origin, so `git fetch origin` fails the way an
@@ -1082,6 +1148,8 @@ assert_contains "the reason survives verbatim" "$RUN_OUT" 'claimed by another ru
 assert_eq "nothing was designed" 0 "$(calls design)"
 assert_eq "the other run's claim ref is untouched" "$CLAIM" "$(origin_ref epic/42-add-widget)"
 assert_not_contains "no blocker was posted" "$(gh_comments)" "epic-run blocked"
+assert_eq "another run's claim causes no engine-label write" "" "$(engine_label_writes)"
+assert_eq "this losing process does not pin the issue" "" "$(gh_engine_labels)"
 
 scenario 'epic-run: losing the claim push race is a skip, not a retry'
 cat > "$ORIGIN/hooks/pre-receive" <<'HOOK'
@@ -1097,6 +1165,8 @@ assert_rc "exits 2 (skipped)" 2 "$RUN_RC"
 assert_contains "the rejected push reads as a lost race" "$RUN_OUT" 'claimed by another run'
 assert_eq "nothing was designed" 0 "$(calls design)"
 assert_eq "no branch landed on origin" "" "$(origin_ref epic/42-add-widget)"
+assert_eq "a lost claim race writes no engine label" "" "$(engine_label_writes)"
+assert_eq "the lost race leaves routing unpinned" "" "$(gh_engine_labels)"
 
 scenario 'epic-run: interrupted red work is preserved and continued directly'
 seed_branch epic/42-add-widget main 'printf "leftover\n" > frontend/src/leftover.ts && printf "test(\"widget\", () => {})\n" > frontend/src/widget.test.ts && git add -A && git commit -qm "wip: epic blocked at architect"'
@@ -1104,7 +1174,7 @@ PARTIAL="$TMP/fixtures-partial"; cp -R "$BASE" "$PARTIAL"
 fixture "$PARTIAL" design '{"approach":"Continue partial widget","rationale":"Preserves the existing partial edit.","steps":["finish widget"],"files":["src/widget.ts — finish"],"contract":"createWidget(): Widget","tradeoffs":"Continue directly.","verification":{"mode":"direct","rationale":"The baseline already contains partial work.","evidence":["widget test passes"]},"review":{"question":"","rationale":"General review is sufficient."}}'
 fixture_text "$PARTIAL" direct "continued partial widget; frontend verified green"
 fixture_sh "$PARTIAL" direct 'printf "export const createWidget = () => ({})\n" > frontend/src/widget.ts'
-run_pipeline "$EPIC_RUN" "$PARTIAL" --issue 42
+GH_ISSUE_LABELS='ready,engine:claude' run_pipeline "$EPIC_RUN" "$PARTIAL" --issue 42
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_contains "prepare resumed the branch" "$RUN_OUT" 'resumed and rebased onto origin/main'
 assert_eq "design ran: the branch held no code checkpoint" 1 "$(calls design)"
@@ -1116,8 +1186,10 @@ assert_contains "and so is the new work" "$(git -C "$ORIGIN" ls-tree -r --name-o
 
 scenario 'resume: a branch with a code checkpoint skips architect, red and green'
 seed_branch epic/42-add-widget main 'printf "test(\"widget\", () => {})\n" > frontend/src/widget.test.ts && printf "export const createWidget = () => ({})\n" > frontend/src/widget.ts && git add -A && git commit -qm "wip(epic 42-add-widget): code checkpoint"'
-run_pipeline "$EPIC_RUN" "$BASE" --issue 42
+EPIC_ENGINE=codex GH_ISSUE_LABELS='ready,engine:claude' run_pipeline "$EPIC_RUN" "$BASE" --issue 42 --engine claude
 assert_rc "exits 0" 0 "$RUN_RC"
+assert_eq "the persisted route survives a later host-default change" "engine:claude," "$(gh_engine_labels)"
+assert_eq "the resumed run stays on the persisted Claude route" 0 "$(wc -l < "$CODEX_LOG" | tr -d ' ')"
 assert_contains "prepare saw the checkpoint" "$RUN_OUT" "a code checkpoint is on it"
 assert_contains "the code phase says implementation was skipped" "$RUN_OUT" "resumed from a code checkpoint — implementation skipped"
 assert_eq "no design" 0 "$(calls design)"
@@ -1136,7 +1208,7 @@ CACHED="$TMP/fixtures-cached"; cp -R "$BASE" "$CACHED"
 fixture "$CACHED" review-focus '{"findings":[]}'
 mkdir -p "$CACHED/worktree/.epics/42-add-widget"
 printf '%s\n' '{"approach":"Cached widget plan","rationale":"Matches the checkpoint.","steps":["build widget"],"files":["frontend/src/widget.ts"],"contract":"createWidget(): Widget","tradeoffs":"No caching.","verification":{"mode":"test-first","rationale":"Public behavior is asserted.","evidence":["widget test passes"]},"review":{"question":"Can concurrent callers observe partial state?","rationale":"State construction crosses a boundary."}}' > "$CACHED/worktree/.epics/42-add-widget/architecture.json"
-run_pipeline "$EPIC_RUN" "$CACHED" --issue 42
+GH_ISSUE_LABELS='ready,engine:claude' run_pipeline "$EPIC_RUN" "$CACHED" --issue 42
 assert_rc "valid cached plan resumes" 0 "$RUN_RC"
 assert_eq "cached JSON needs no architect call" 0 "$(( $(calls design) + $(calls recover) ))"
 assert_eq "cached checkpoint replays no code" 0 "$(( $(calls red) + $(calls direct) + $(calls green) ))"
@@ -1147,12 +1219,30 @@ assert_contains "focused review gets the cached question" "$(cat "$STATE_DIR/rev
 
 scenario 'resume: a red code checkpoint gets one green attempt, then review'
 seed_branch epic/42-add-widget main 'printf "test(\"widget\", () => {})\n" > frontend/src/widget.test.ts && git add -A && git commit -qm "wip(epic 42-add-widget): code checkpoint"'
-run_pipeline "$EPIC_RUN" "$BASE" --issue 42
+GH_ISSUE_LABELS='ready,engine:claude' run_pipeline "$EPIC_RUN" "$BASE" --issue 42
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_eq "no red" 0 "$(calls red)"
 assert_eq "green ran once, handed the failure" 1 "$(calls green)"
 assert_contains "the retry prompt carries the verify output" "$(cat "$STATE_DIR/green.0.prompt")" "missing export createWidget"
 assert_contains "the run ships" "$RUN_OUT" '"readyToMerge":true'
+
+assert_resume_engine_refusal() { # case initial-engine-labels expected-engine-labels
+  local route_case="$1" initial="$2" expected="$3" before
+  scenario "resume: $route_case engine routing is rejected before model work"
+  seed_branch epic/42-add-widget main 'printf "test(\"widget\", () => {})\n" > frontend/src/widget.test.ts && printf "export const createWidget = () => ({})\n" > frontend/src/widget.ts && git add -A && git commit -qm "wip(epic 42-add-widget): code checkpoint"'
+  before="$(origin_ref epic/42-add-widget)"
+  GH_ISSUE_LABELS="ready${initial:+,$initial}" run_pipeline "$EPIC_RUN" "$BASE" --issue 42 --engine claude
+  assert_rc "$route_case resume exits 3 (blocked)" 3 "$RUN_RC"
+  assert_contains "$route_case resume names the engine gate" "$RUN_OUT" "engine"
+  assert_eq "$route_case resume starts no model" 0 "$(wc -l < "$RUN_LOG" | tr -d ' ')"
+  assert_eq "$route_case resume installs no dependencies" 0 "$(wc -l < "$NPM_LOG" | tr -d ' ')"
+  assert_eq "$route_case resume preserves the claimed branch" "$before" "$(origin_ref epic/42-add-widget)"
+  assert_eq "$route_case resume keeps routing unchanged" "$expected" "$(gh_engine_labels)"
+  assert_eq "$route_case resume follows the normal blocker path" "failed," "$(gh_labels)"
+}
+assert_resume_engine_refusal "missing" "" ""
+assert_resume_engine_refusal "conflicting" "engine:claude,engine:codex" "engine:claude,engine:codex,"
+assert_resume_engine_refusal "mismatched" "engine:codex" "engine:codex,"
 
 scenario 'epic-run: a dead mandatory reviewer fails the run closed and preserves the work'
 DEADLENS="$TMP/fixtures-deadlens"; cp -R "$BASE" "$DEADLENS"
@@ -1451,14 +1541,16 @@ assert_contains "the pane still gets its RESULT line" "$RUN_OUT" "RESULT "
 # compensating transition is therefore issued for EVERY promotion the write did
 # not confirm, not only for the ones a readback caught half-landed.
 scenario 'epic-run: a promotion that lands after the readback is still taken back off'
-GH_LATE_LABEL=ready-to-merge:1 run_pipeline "$EPIC_RUN" "$BASE" --issue 42
+GH_LATE_LABEL=ready-to-merge:3 run_pipeline "$EPIC_RUN" "$BASE" --issue 42
 assert_rc "exits 0 (the PR is real, just held)" 0 "$RUN_RC"
 assert_eq "the issue rests at the one label ship applied" "ready-to-review," "$(gh_labels)"
 assert_not_contains "the late promotion is not left for the merge worker" "$(gh_labels)" "ready-to-merge"
 assert_not_contains "and RESULT never claims the queue it could not confirm" "$RUN_OUT" '"readyToMerge":true'
 assert_contains "the failed handoff is named" "$RUN_OUT" "handoff FAILED"
 assert_contains "and says the promotion was taken back off" "$RUN_OUT" "taken back off"
-assert_eq "the demotion was proved by a second read, not assumed" 2 "$(cat "$STATE_DIR/gh/label-reads")"
+# Reads 1-2 persist and verify the fresh claim's engine pin; reads 3-4 are
+# still the promotion verdict followed by proof of the compensating demotion.
+assert_eq "the demotion was proved by a second read, not assumed" 4 "$(cat "$STATE_DIR/gh/label-reads")"
 assert_contains "the pane still gets its RESULT line" "$RUN_OUT" "RESULT "
 
 # One step worse: the promotion stalled AND every readback of the labels failed,
@@ -1468,7 +1560,7 @@ assert_contains "the pane still gets its RESULT line" "$RUN_OUT" "RESULT "
 # failure path becomes an unattended merge.
 scenario 'epic-run: a promotion it can neither confirm nor prove undone blocks instead of resting'
 UNVERIFIED_START="$(date +%s)"
-EPIC_TERMINAL_REPORT_MS=3000 GH_SLOW_LABEL=ready-to-merge:20 GH_LABEL_READ_FAIL_AT=1,2 \
+EPIC_TERMINAL_REPORT_MS=3000 GH_SLOW_LABEL=ready-to-merge:20 GH_LABEL_READ_FAIL_AT=3,4 \
   run_pipeline "$EPIC_RUN" "$BASE" --issue 42
 UNVERIFIED_ELAPSED=$(( $(date +%s) - UNVERIFIED_START ))
 assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
@@ -1783,7 +1875,7 @@ assert_not_contains "the hold posts no blocker comment" "$(gh_comments)" "🤖 e
 # A later manual/relaunched run is allowed even while a host hold exists. It
 # adopts the preserved branch and re-proves verification/review without paying
 # again for architecture, red, or green.
-run_pipeline "$EPIC_RUN" "$BASE" --issue 42
+GH_ISSUE_LABELS='ready,engine:claude' run_pipeline "$EPIC_RUN" "$BASE" --issue 42
 assert_rc "the later run completes from the held branch" 0 "$RUN_RC"
 assert_contains "prepare detects the held checkpoint" "$RUN_OUT" "a code checkpoint is on it"
 assert_eq "the resumed run does not repeat architecture" 0 "$(calls design)"
@@ -2187,8 +2279,9 @@ assert_eq "nothing shipped a PR" "" "$(gh_pr_created)"
 assert_eq "the issue ends failed and nothing else" "failed," "$(gh_labels)"
 assert_contains "the preserved branch still carries a resumable checkpoint" "$(git -C "$ORIGIN" log --format=%s "main..epic/42-add-widget")" "wip(epic 42-add-widget): code checkpoint"
 assert_eq "and it sits on the base that landed mid-run" "yes" "$(ancestor_of main epic/42-add-widget)"
-# The whole point of not squashing before the rebase: the next run resumes.
-run_pipeline "$EPIC_RUN" "$BASE" --issue 42
+# The whole point of not squashing before the rebase: the next run resumes on
+# the claim-time engine pin the blocked run left behind.
+GH_ISSUE_LABELS='failed,engine:claude' run_pipeline "$EPIC_RUN" "$BASE" --issue 42
 assert_rc "the follow-up run ships" 0 "$RUN_RC"
 assert_contains "prepare resumed the preserved checkpoint" "$RUN_OUT" "a code checkpoint is on it"
 assert_contains "and implementation was skipped" "$RUN_OUT" "resumed from a code checkpoint — implementation skipped"
@@ -2316,13 +2409,38 @@ fixture "$FIXBASE" fix-resolve '{"completed":true,"resolutions":[{"file":"fronte
 # What the resolver does to the tree: settle the marked block, stage, continue.
 fixture_sh "$FIXBASE" fix-resolve 'printf "export const items = [] // main-rename pr-guard\n" > frontend/src/index.ts && git add frontend/src/index.ts && GIT_EDITOR=true git rebase --continue >/dev/null'
 fixture "$FIXBASE" fix-check '{"survives":true,"confidence":88,"reasoning":"Both changes are present at HEAD."}'
-run_fix() { GH_ISSUE_LABELS="${FIX_LABELS:-failed,needs-judgment}" GH_OPEN_PR_BRANCH=epic/42-add-widget run_pipeline "$FIX_RUN" "$@"; }
+run_fix() {
+  GH_ISSUE_LABELS="${FIX_LABELS:-failed,needs-judgment},${FIX_ENGINE_LABELS-engine:claude}" \
+    GH_OPEN_PR_BRANCH=epic/42-add-widget run_pipeline "$FIX_RUN" "$@"
+}
+
+assert_fix_engine_refusal() { # case engine-labels expected-engine-labels
+  local route_case="$1" initial="$2" expected="$3" before
+  scenario "fix-run: $route_case engine routing is rejected before attempt consumption"
+  seed_conflict
+  before="$(origin_ref epic/42-add-widget)"
+  FIX_ENGINE_LABELS="$initial" run_fix "$FIXBASE" --issue 42 --engine claude
+  assert_rc "$route_case conflict-fixer route exits 3 (blocked)" 3 "$RUN_RC"
+  assert_contains "$route_case conflict-fixer refusal names the engine gate" "$RUN_OUT" "engine"
+  assert_eq "$route_case conflict-fixer starts no model" 0 "$(calls fix-resolve)"
+  assert_not_contains "$route_case conflict-fixer spends no attempt rung" "$(gh_labels)" "fix-attempted"
+  assert_not_contains "$route_case conflict-fixer spends no retry rung" "$(gh_labels)" "fix-retried"
+  assert_eq "$route_case conflict-fixer restores its blocker queue" "failed,needs-judgment," "$(gh_labels)"
+  assert_eq "$route_case conflict-fixer leaves routing unchanged" "$expected" "$(gh_engine_labels)"
+  assert_eq "$route_case conflict-fixer leaves the PR branch untouched" "$before" "$(origin_ref epic/42-add-widget)"
+}
+assert_fix_engine_refusal "missing" "" ""
+assert_fix_engine_refusal "conflicting" "engine:claude,engine:codex" "engine:claude,engine:codex,"
+assert_fix_engine_refusal "mismatched" "engine:codex" "engine:codex,"
 
 scenario 'fix-run: judgment hunk resolved, verified, checked, shipped ready-to-merge'
 seed_conflict
 BEFORE="$(origin_ref epic/42-add-widget)"
-run_fix "$FIXBASE" --issue 42 --session myapp-epic-42
+EPIC_ENGINE=claude FIX_ENGINE_LABELS=engine:codex run_fix "$FIXBASE" --issue 42 --engine codex --session myapp-epic-42
 assert_rc "exits 0" 0 "$RUN_RC"
+assert_eq "the conflict fixer preserves the selected engine pin" "engine:codex," "$(gh_engine_labels)"
+assert_eq "the host default does not retier the conflict fixer" 0 "$(wc -l < "$RUN_LOG" | tr -d ' ')"
+assert_contains "the conflict fixer honors its persisted Codex route" "$(cat "$CODEX_LOG")" "--model gpt-5.6-sol"
 assert_contains "RESULT lands ready-to-merge" "$RUN_OUT" '"readyToMerge":true'
 assert_contains "it records one judgment hunk" "$RUN_OUT" '"resolvedHunks":1'
 assert_not_contains "and never rests for a human instead" "$RUN_OUT" 'readyToReview'
@@ -2454,7 +2572,7 @@ assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
 
 scenario 'fix-run: no open PR is a final refusal'
 seed_conflict
-GH_OPEN_PR_BRANCH="" GH_ISSUE_LABELS="failed,needs-judgment" run_pipeline "$FIX_RUN" "$FIXBASE" --issue 42
+GH_OPEN_PR_BRANCH="" GH_ISSUE_LABELS="failed,needs-judgment,engine:claude" run_pipeline "$FIX_RUN" "$FIXBASE" --issue 42
 assert_rc "exits 2 (skipped)" 2 "$RUN_RC"
 assert_contains "the reason names the missing PR" "$RUN_OUT" 'no open PR on an epic/42-* branch'
 assert_contains "the refusal was commented" "$(gh_comments)" "🤖 fix-conflict refused: no open PR"
@@ -2497,7 +2615,7 @@ assert_contains "and the audit comment written before it is on the issue" "$(gh_
 scenario 'fix-run: a landing it could not verify is demoted and put back in its queue'
 seed_conflict
 UNVERIFIED_START="$(date +%s)"
-EPIC_TERMINAL_REPORT_MS=3000 GH_SLOW_LABEL=ready-to-merge:20 GH_LABEL_READ_FAIL_AT=2 \
+EPIC_TERMINAL_REPORT_MS=3000 GH_SLOW_LABEL=ready-to-merge:20 GH_LABEL_READ_FAIL_AT=3 \
   run_fix "$FIXBASE" --issue 42 --session myapp-epic-42
 UNVERIFIED_ELAPSED=$(( $(date +%s) - UNVERIFIED_START ))
 assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
@@ -2522,13 +2640,38 @@ mkdir -p "$CIBASE"
 fixture "$CIBASE" ci-fix '{"completed":true,"cause":"createWidget was never exported","summary":"Exports createWidget from the widget module.","files":["frontend/src/widget.ts"]}'
 fixture_sh "$CIBASE" ci-fix 'printf "export const createWidget = () => ({})\n" > frontend/src/widget.ts'
 fixture "$CIBASE" ci-check '{"survives":true,"confidence":91,"reasoning":"The export is added and nothing else changed."}'
-run_ci() { GH_ISSUE_LABELS="${CI_LABELS:-failed,needs-ci-fix}" GH_OPEN_PR_BRANCH=epic/42-add-widget GH_RED_CHECKS="${CI_RED-build}" run_pipeline "$@"; }
+run_ci() {
+  GH_ISSUE_LABELS="${CI_LABELS:-failed,needs-ci-fix},${CI_ENGINE_LABELS-engine:claude}" \
+    GH_OPEN_PR_BRANCH=epic/42-add-widget GH_RED_CHECKS="${CI_RED-build}" run_pipeline "$@"
+}
+
+assert_ci_engine_refusal() { # case engine-labels expected-engine-labels
+  local route_case="$1" initial="$2" expected="$3" before
+  scenario "ci-run: $route_case engine routing is rejected before attempt consumption"
+  seed_ci_pr
+  before="$(origin_ref epic/42-add-widget)"
+  CI_ENGINE_LABELS="$initial" run_ci "$CI_RUN" "$CIBASE" --issue 42 --engine claude
+  assert_rc "$route_case CI-fixer route exits 3 (blocked)" 3 "$RUN_RC"
+  assert_contains "$route_case CI-fixer refusal names the engine gate" "$RUN_OUT" "engine"
+  assert_eq "$route_case CI-fixer starts no model" 0 "$(calls ci-fix)"
+  assert_not_contains "$route_case CI-fixer spends no attempt rung" "$(gh_labels)" "ci-attempted"
+  assert_not_contains "$route_case CI-fixer spends no retry rung" "$(gh_labels)" "ci-retried"
+  assert_eq "$route_case CI-fixer restores its blocker queue" "failed,needs-ci-fix," "$(gh_labels)"
+  assert_eq "$route_case CI-fixer leaves routing unchanged" "$expected" "$(gh_engine_labels)"
+  assert_eq "$route_case CI-fixer leaves the PR branch untouched" "$before" "$(origin_ref epic/42-add-widget)"
+}
+assert_ci_engine_refusal "missing" "" ""
+assert_ci_engine_refusal "conflicting" "engine:claude,engine:codex" "engine:claude,engine:codex,"
+assert_ci_engine_refusal "mismatched" "engine:codex" "engine:codex,"
 
 scenario 'ci-run: a red check is repaired, checked, and put back in the merge queue'
 seed_ci_pr
 BEFORE="$(origin_ref epic/42-add-widget)"
-run_ci "$CI_RUN" "$CIBASE" --issue 42 --session myapp-epic-42
+EPIC_ENGINE=claude CI_ENGINE_LABELS=engine:codex run_ci "$CI_RUN" "$CIBASE" --issue 42 --engine codex --session myapp-epic-42
 assert_rc "exits 0" 0 "$RUN_RC"
+assert_eq "the CI fixer preserves the selected engine pin" "engine:codex," "$(gh_engine_labels)"
+assert_eq "the host default does not retier the CI fixer" 0 "$(wc -l < "$RUN_LOG" | tr -d ' ')"
+assert_contains "the CI fixer honors its persisted Codex route" "$(cat "$CODEX_LOG")" "--model gpt-5.6-sol"
 assert_contains "RESULT lands ready-to-merge" "$RUN_OUT" '"readyToMerge":true'
 assert_contains "it names the check that was red" "$RUN_OUT" '"failedChecks":["build"]'
 assert_eq "the branch on origin was amended" "$(git -C "$WT" rev-parse HEAD)" "$(origin_ref epic/42-add-widget)"
@@ -2708,7 +2851,7 @@ assert_contains "and the audit comment written before it is on the issue" "$(gh_
 scenario 'ci-run: a landing it could not verify is demoted, never left for the merge worker'
 seed_ci_pr
 UNVERIFIED_START="$(date +%s)"
-EPIC_TERMINAL_REPORT_MS=3000 GH_SLOW_LABEL=ready-to-merge:20 GH_LABEL_READ_FAIL_AT=2 \
+EPIC_TERMINAL_REPORT_MS=3000 GH_SLOW_LABEL=ready-to-merge:20 GH_LABEL_READ_FAIL_AT=3 \
   run_ci "$CI_RUN" "$CIBASE" --issue 42 --session myapp-epic-42
 UNVERIFIED_ELAPSED=$(( $(date +%s) - UNVERIFIED_START ))
 assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
@@ -2750,17 +2893,39 @@ run_defect() {
   if [[ -n "${DEFECT_COMMENTS+x}" ]]; then comments="$DEFECT_COMMENTS"
   else comments="$(make_defect_evidence "$(origin_ref epic/42-add-widget)")"
   fi
-  GH_ISSUE_LABELS="${DEFECT_LABELS-ready-to-review,needs-defect-fix}" \
+  GH_ISSUE_LABELS="${DEFECT_LABELS-ready-to-review,needs-defect-fix},${DEFECT_ENGINE_LABELS-engine:claude}" \
   GH_OPEN_PR_BRANCH="${DEFECT_BRANCH-epic/42-add-widget}" \
   SEED_COMMENTS="$comments" \
     run_pipeline "$@"
 }
 
+assert_defect_engine_refusal() { # case engine-labels expected-engine-labels
+  local route_case="$1" initial="$2" expected="$3" before
+  scenario "defect-run: $route_case engine routing is rejected before attempt consumption"
+  seed_defect_pr
+  before="$(origin_ref epic/42-add-widget)"
+  DEFECT_ENGINE_LABELS="$initial" run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42 --engine claude
+  assert_rc "$route_case defect-fixer route exits 3 (blocked)" 3 "$RUN_RC"
+  assert_contains "$route_case defect-fixer refusal names the engine gate" "$RUN_OUT" "engine"
+  assert_eq "$route_case defect-fixer starts no model" 0 "$(calls defect-fix)"
+  assert_not_contains "$route_case defect-fixer spends no attempt rung" "$(gh_labels)" "defect-attempted"
+  assert_not_contains "$route_case defect-fixer spends no retry rung" "$(gh_labels)" "defect-retried"
+  assert_eq "$route_case defect-fixer restores its review queue" "needs-defect-fix,ready-to-review," "$(gh_labels)"
+  assert_eq "$route_case defect-fixer leaves routing unchanged" "$expected" "$(gh_engine_labels)"
+  assert_eq "$route_case defect-fixer leaves the PR branch untouched" "$before" "$(origin_ref epic/42-add-widget)"
+}
+assert_defect_engine_refusal "missing" "" ""
+assert_defect_engine_refusal "conflicting" "engine:claude,engine:codex" "engine:claude,engine:codex,"
+assert_defect_engine_refusal "mismatched" "engine:codex" "engine:codex,"
+
 scenario 'defect-run: named gate defects are repaired, checked, and returned to the merge queue'
 seed_defect_pr
 BEFORE="$(origin_ref epic/42-add-widget)"
-run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42 --session myapp-epic-42
+EPIC_ENGINE=claude DEFECT_ENGINE_LABELS=engine:codex run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42 --engine codex --session myapp-epic-42
 assert_rc "exits 0" 0 "$RUN_RC"
+assert_eq "the defect fixer preserves the selected engine pin" "engine:codex," "$(gh_engine_labels)"
+assert_eq "the host default does not retier the defect fixer" 0 "$(wc -l < "$RUN_LOG" | tr -d ' ')"
+assert_contains "the defect fixer honors its persisted Codex route" "$(cat "$CODEX_LOG")" "--model gpt-5.6-sol"
 assert_contains "RESULT lands ready-to-merge" "$RUN_OUT" '"readyToMerge":true'
 assert_contains "RESULT records attempt 1" "$RUN_OUT" '"attempt":1'
 assert_eq "the branch on origin was amended" "$(git -C "$WT" rev-parse HEAD)" "$(origin_ref epic/42-add-widget)"
@@ -2937,14 +3102,14 @@ assert_not_contains "an uncertain fix never reaches the merge queue" "$(gh_label
 
 scenario 'defect-run: failed merge-label readback is actively demoted to review on the first attempt'
 seed_defect_pr
-GH_LABEL_READ_FAIL_AT=2 run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+GH_LABEL_READ_FAIL_AT=3 run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
 assert_rc "the unverified handoff blocks" 3 "$RUN_RC"
 assert_contains "the ship blocker names label verification" "$RUN_OUT" "label swap could not be verified"
 assert_eq "ready-to-merge is removed during review restoration" "defect-attempted,ready-to-review," "$(gh_labels)"
 
 scenario 'defect-run: failed merge-label readback is actively demoted to review on the retry'
 seed_defect_pr
-DEFECT_LABELS="ready-to-review,needs-defect-fix,defect-attempted" GH_LABEL_READ_FAIL_AT=2 \
+DEFECT_LABELS="ready-to-review,needs-defect-fix,defect-attempted" GH_LABEL_READ_FAIL_AT=3 \
   run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
 assert_rc "the unverified retry handoff blocks" 3 "$RUN_RC"
 assert_eq "ready-to-merge is absent and the bounded ladder remains" "defect-attempted,defect-retried,ready-to-review," "$(gh_labels)"
@@ -3044,7 +3209,7 @@ assert_contains "and the head it last observed" "$RUN_OUT" "observed $BEFORE"
 # and costs a retry for nothing.
 scenario 'defect-run: a landing swap GitHub has not propagated yet is read back, not demoted'
 seed_defect_pr
-GH_LABEL_STALE_READ_AT=2 run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+GH_LABEL_STALE_READ_AT=3 run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
 assert_rc "the lagging label read does not block the run" 0 "$RUN_RC"
 assert_contains "RESULT lands ready-to-merge" "$RUN_OUT" '"readyToMerge":true'
 assert_eq "only ready-to-merge and the permanent ladder remain" "defect-attempted,ready-to-merge," "$(gh_labels)"
@@ -3156,7 +3321,7 @@ AMENDED="$(origin_ref epic/42-add-widget)"
 DEFECT_COMMENTS="$(make_defect_evidence "$PRIOR_HEAD")
 ---
 $(make_defect_landing_record "$AMENDED" "$PRIOR_HEAD")" \
-DEFECT_LABELS="ready-to-review,needs-defect-fix,defect-attempted" GH_LABEL_READ_FAIL_AT=2 \
+DEFECT_LABELS="ready-to-review,needs-defect-fix,defect-attempted" GH_LABEL_READ_FAIL_AT=3 \
   run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
 assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
 assert_contains "the blocker names the unverified swap" "$RUN_OUT" "label swap could not be verified"
@@ -3293,7 +3458,7 @@ assert_not_contains "an unfinished removal is never reported as done" "$STUCK_CO
 assert_contains "the structural action still follows" "$STUCK_COMMENT" "Then: close the extra PR(s) by hand"
 
 scenario 'defect-run: an unreadable label readback is the only conservative case'
-DEFECT_BRANCH= GH_LABEL_READ_FAIL_AT=1 run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+DEFECT_BRANCH= GH_LABEL_READ_FAIL_AT=2 run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
 assert_rc "exits 2 (skipped/refused)" 2 "$RUN_RC"
 UNREAD_COMMENT="$(gh_comments)"
 assert_contains "the comment says the state could not be read" "$UNREAD_COMMENT" "The resulting labels could NOT be read back"

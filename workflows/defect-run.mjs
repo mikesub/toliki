@@ -38,7 +38,7 @@ import { agent, phase, log, initRuntime, onPhase, onLog, takeAgentFailure, withA
 import { parseArgs, finish, UsageError, EXIT } from './lib/cli.mjs'
 import { initStatus, statusPhase, statusNote, statusFinish } from './lib/status.mjs'
 import { failureReason } from './lib/proc.mjs'
-import { ensureLabels, editLabels, issueLabels, issueView, comment, openPrs, prView, repositoryView, authenticatedLogin, readBack, waitedFor, terminalBudget, terminalTransition } from './lib/github.mjs'
+import { ensureLabels, editLabels, issueLabels, issueView, comment, openPrs, prView, repositoryView, authenticatedLogin, readBack, waitedFor, terminalBudget, terminalTransition, verifyIssueEngine } from './lib/github.mjs'
 import { git, gitOut, discoverPackages, pkgList, ensureDeps, runVerify, pushRejected, intentToAdd } from './lib/repo.mjs'
 import { matchingDefectEvidence, matchingDefectRepair, renderDefectRepair } from './lib/defect-evidence.mjs'
 import { finalizeFixerIssue, finalizeFixerQuotaHold } from './lib/fixer-finalize.mjs'
@@ -207,6 +207,10 @@ async function prepare(issue) {
   const labels = Array.isArray(view.labels) ? view.labels.map(l => l.name) : []
   if (String(view.state || '').toUpperCase() === 'CLOSED') return { refused: `issue #${issue} is closed` }
   if (!labels.includes('needs-defect-fix')) return { refused: `issue #${issue} is not labelled needs-defect-fix — not a defect fixer's issue` }
+
+  // The later defect session is still part of the claimed change. Its engine
+  // must match the durable singleton before evidence reads or attempt writes.
+  await verifyIssueEngine(issue, ARGS.engine)
   if (labels.includes('defect-retried')) {
     return refuseFinal('🤖 fix-defect refused: attempt ladder exhausted\nTwo defect fixer attempts already ran (defect-attempted + defect-retried are both on the issue). A human decides now: repair the named defects by hand, or strip both defect-* attempt labels to grant another bounded round.',
       'attempt ladder exhausted (defect-retried present)')

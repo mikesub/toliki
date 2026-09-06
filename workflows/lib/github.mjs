@@ -189,6 +189,44 @@ export async function issueLabels(issue, opts) {
   return Array.isArray(v.labels) ? v.labels.map(l => l.name) : []
 }
 
+// An issue's engine label is durable routing state once its claim exists. A
+// fresh claim may fill an absent pin, but no pipeline run may replace or clean
+// up a different/duplicate pin: that would silently retier work whose selected
+// engine is already ambiguous. Matching existing pins are read, not rewritten.
+//
+// The write result is not the verdict. GitHub can apply an edit while the CLI
+// still times out, and its reads can briefly lag the write, so a newly created
+// pin is accepted only after the usual bounded readback sees the exact
+// singleton. A read error still throws immediately because it has no verdict.
+export async function verifyIssueEngine(issue, selected, { allowCreate = false } = {}) {
+  const expected = `engine:${selected}`
+  const engineLabels = labels => labels.filter(label => String(label).startsWith('engine:'))
+  const matches = labels => {
+    const routed = engineLabels(labels)
+    return routed.length === 1 && routed[0] === expected
+  }
+  const observed = await issueLabels(issue)
+  if (matches(observed)) return { label: expected, created: false }
+
+  const routed = engineLabels(observed)
+  if (routed.length || !allowCreate) {
+    throw new Error(`issue #${issue} engine routing must be exactly ${expected}; observed ${routed.join(', ') || 'no engine:* label'}`)
+  }
+
+  // Label creation is idempotent and best-effort: an existing repository label
+  // makes `gh label create` fail even though the issue edit can still succeed.
+  await gh(['label', 'create', expected, '--color', '5319E7', '--description', `Route autonomous pipeline runs to ${selected}`])
+  const write = await editLabels(issue, { add: [expected] })
+  const seen = await readBack(() => issueLabels(issue), matches)
+  if (!seen.matched) {
+    const detail = write.ok
+      ? `observed ${engineLabels(seen.observed).join(', ') || 'no engine:* label'}`
+      : `label write failed (${write.err || write.out || `exit ${write.code}`})`
+    throw new Error(`could not persist and verify ${expected} for issue #${issue}: ${detail}`)
+  }
+  return { label: expected, created: true }
+}
+
 export async function issueView(issue, fields, opts) {
   return ghJson(['issue', 'view', String(issue), '--json', fields], `gh issue view ${issue}`, opts)
 }

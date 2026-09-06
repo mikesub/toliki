@@ -32,7 +32,7 @@ import { HARNESS_DIR } from './lib/engine.mjs'
 import { parseArgs, finish, UsageError, EXIT } from './lib/cli.mjs'
 import { initStatus, statusPhase, statusNote, statusFinish } from './lib/status.mjs'
 import { sh, must, failureReason } from './lib/proc.mjs'
-import { ensureLabels, editLabels, issueLabels, issueView, comment, openPrs, readBack, terminalBudget, terminalTimeout, terminalTransition } from './lib/github.mjs'
+import { ensureLabels, editLabels, issueLabels, issueView, comment, openPrs, readBack, terminalBudget, terminalTimeout, terminalTransition, verifyIssueEngine } from './lib/github.mjs'
 import { git, gitOut, discoverPackages, pkgList, ensureDeps, runVerify, rebaseInProgress, pushRejected } from './lib/repo.mjs'
 import { finalizeFixerIssue, finalizeFixerQuotaHold } from './lib/fixer-finalize.mjs'
 import { recordQuotaHold } from './quota-hold.mjs'
@@ -206,6 +206,10 @@ async function prepare(issue) {
   const labels = Array.isArray(view.labels) ? view.labels.map(l => l.name) : []
   if (String(view.state || '').toUpperCase() === 'CLOSED') return { refused: `issue #${issue} is closed` }
   if (!labels.includes('needs-judgment')) return { refused: `issue #${issue} is not labelled needs-judgment — not a fixer's issue` }
+
+  // Routing is permanent once the epic claimed the issue. Verify the strong
+  // issue-label view before consuming a retry rung or touching the PR tree.
+  await verifyIssueEngine(issue, ARGS.engine)
 
   // A refusal a retry cannot fix is commented and left `failed` for a human.
   const refuseFinal = async (body, reason) => {
