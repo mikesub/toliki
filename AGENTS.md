@@ -305,7 +305,8 @@ than made launchable against a main without the code it describes.
   A matching record with either ladder label refuses without a model even if
   `needs-judgment` was retained; clearing both ladder labels explicitly grants
   one bounded round over only those declines, and a moved main holds for a
-  human instead of reconstructing stale intent. Its push is
+  human instead of reconstructing stale intent, refunding the newly recorded
+  rung because no model attempt ran. Its push is
   the last step after verify and an adversarial check of every indexed repaired
   and declined claim. A complete landing is safe for the same reason the CI fixer's is
   — the merge worker rebases and RE-RUNS the real checks before anything

@@ -14,8 +14,9 @@
 // head-bound record names only the declined hunks and their original diff3
 // sides. An automatic redispatch of that head is refused; after a human clears
 // both ladder labels and restores the queue, one bounded round consumes only
-// those declines, and only while the captured main head is unchanged. The
-// merge worker rebases a complete repair again and
+// those declines, and only while the captured main head is unchanged. A stale
+// captured main returns to human review without spending that granted rung.
+// The merge worker rebases a complete repair again and
 // RE-RUNS THE REAL CHECKS before anything lands. That re-run is what makes the
 // landing safe: a resolution that breaks a check cannot merge. What it cannot
 // catch is a resolution that is green and wrong, which is what the adversarial
@@ -510,15 +511,15 @@ async function prepare(issue) {
       const reason = `origin/main moved after the partial-conflict evidence was captured (${partialRecord.base.mainHead} → ${mainHead}); only a human can reconcile new base changes with the recorded declines`
       return refuseFinal(state => {
         const transition = state.settled
-          ? 'The issue is held at ready-to-review with needs-judgment removed, so no automatic retry can reinterpret the stale record.'
+          ? `The issue is held at ready-to-review with needs-judgment and ${ladderLabel} removed, so no automatic retry can reinterpret the stale record and no model attempt was spent.`
           : !state.readable
-          ? `The human-held label transition could not be read back (${state.stateError}); check by hand that ready-to-review is set and needs-judgment is gone.`
+          ? `The human-held label transition could not be read back (${state.stateError}); check by hand that ready-to-review is set and needs-judgment and ${ladderLabel} are gone.`
           : `The human-held label transition could not be verified (${state.stateError}); ${[
               ...(state.missing.length ? [`set ${state.missing.join(', ')}`] : []),
               ...(state.stuck.length ? [`remove ${state.stuck.join(', ')}`] : []),
             ].join(' and ') || 'inspect the labels'} by hand.`
         return `🤖 fix-conflict held: partial-conflict evidence is stale\n${reason}. This invocation ran no resolver and left the branch unchanged. ${transition}`
-      }, reason, terminalTransition({ rest: 'ready-to-review', drop: ['needs-judgment'] }))
+      }, reason, terminalTransition({ rest: 'ready-to-review', drop: ['needs-judgment', ladderLabel] }))
     }
     const above = Number((await git(['rev-list', '--count', 'origin/main..HEAD'])).out)
     if (above !== 1) {

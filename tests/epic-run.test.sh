@@ -2874,14 +2874,16 @@ seed_branch main main 'printf "main advanced\n" > README.md && git add README.md
 FIX_LABELS="failed,needs-judgment" SEED_COMMENTS="$STALE_CONTINUATION_COMMENTS" run_fix "$GRANTED" --issue 42
 assert_rc "a stale granted continuation is a final human hold" 2 "$RUN_RC"
 assert_eq "the stale continuation starts no resolver or checker" "0 0" "$(calls fix-resolve) $(calls fix-check)"
+assert_eq "the stale continuation runs no project verification" 0 "$(grep -c '^run verify$' "$NPM_LOG" || true)"
 assert_eq "the stale continuation leaves the partial branch unchanged" "$STALE_CONTINUATION_HEAD" "$(origin_ref epic/42-add-widget)"
-assert_eq "the stale continuation rests human-only with its rung recorded" "fix-attempted,ready-to-review," "$(gh_labels)"
+assert_eq "the stale continuation rests human-only without spending a rung" "ready-to-review," "$(gh_labels)"
 assert_contains "the stale continuation audit names the moved main" "$(gh_last_comment)" "origin/main moved after the partial-conflict evidence was captured"
 STALE_FINAL_LABELS="$(gh_labels)"; STALE_FINAL_LABELS="${STALE_FINAL_LABELS%,}"
 FIX_LABELS="$STALE_FINAL_LABELS" run_fix "$GRANTED" --issue 42
 assert_rc "the human-only stale continuation is absent from the next fixer launch" 2 "$RUN_RC"
 assert_contains "the subsequent launch sees no conflict-fixer queue label" "$RUN_OUT" "not labelled needs-judgment"
 assert_eq "the subsequent launch still starts no resolver or checker" "0 0" "$(calls fix-resolve) $(calls fix-check)"
+assert_eq "the subsequent launch preserves the human-only label state" "$STALE_FINAL_LABELS," "$(gh_labels)"
 
 scenario 'fix-run: partial-head guard reports only the labels still needing repair'
 seed_conflict_three

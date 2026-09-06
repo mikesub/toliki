@@ -156,8 +156,9 @@ export const RESTING_LABELS = ['failed', 'ready-to-merge', 'ready-to-review']
 // So a terminal transition is written as the ONE label the run rests at plus the
 // queue labels that belong beside it, and the removes are DERIVED: every other
 // resting label, and `in-progress`. `queue` is a retry ladder's queue label,
-// restored because a landing swap may have stripped it on its way out; `drop` is
-// a queue label a final refusal takes off on purpose.
+// restored because a landing swap may have stripped it on its way out; `drop`
+// is any queue or freshly written rung label a final refusal deliberately takes
+// off (for example, a stale human-granted continuation that spent no model work).
 export const terminalTransition = ({ rest, queue = [], drop = [] }) => ({
   add: [rest, ...queue],
   remove: ['in-progress', ...RESTING_LABELS.filter(l => l !== rest), ...drop],
