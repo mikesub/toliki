@@ -312,7 +312,11 @@ NAME_MAX_LEN=40
 MAX_PARALLEL_EPICS=2
 HOST_TIMEZONE="Europe/Amsterdam"
 CONF
+# DEFAULT_ENGINE_CRON is pinned at a path that does not exist: dispatch now
+# reads the host default out of the installed cron file, and this scenario is
+# about timestamps, not about whatever engine this machine dispatches on.
 DISPATCH_OUT="$(HOST_TIMEZONE=Pacific/Honolulu TZ=Pacific/Honolulu \
+  DEFAULT_ENGINE_CRON="$TMP/no-installed-cron" \
   bash "$DISPATCH_HARNESS/bin/dispatch.sh" --repo 2026-09-05T12:31:14.000Z 2>&1 || true)"
 assert_contains "dispatch messages localize an embedded machine deadline" \
   "$DISPATCH_OUT" "2026-09-05 14:31:14 CEST"

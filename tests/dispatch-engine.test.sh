@@ -9,6 +9,18 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 unset EPIC_ENGINE   # a host default must not leak in; the scenarios that need it export their own
 
+# The host default is read from the INSTALLED cron file, which on a real box is
+# /etc/cron.d/harness-dispatch. Pin it at a throwaway path for every scenario
+# here: unpinned, this suite would read whatever engine the machine running the
+# tests happens to dispatch on, and a malformed file there would fail runs that
+# have nothing to do with the change under test. Absent by default, so a
+# scenario that wants a host default writes one.
+INSTALLED_CRON="$TMP/installed-cron"
+export DEFAULT_ENGINE_CRON="$INSTALLED_CRON"
+write_cron() { printf '%s\n' "$@" > "$INSTALLED_CRON"; }   # one line per argument
+set_cron_engine() { write_cron "EPIC_ENGINE=$1"; }
+clear_cron() { rm -f "$INSTALLED_CRON"; }
+
 PASS=0
 FAIL=0
 ok() { PASS=$((PASS + 1)); printf '  ok   %s\n' "$1"; }
@@ -110,7 +122,7 @@ case "${1:-} ${2:-}" in
     n="$3"
     [[ "${FAIL_VIEW_ISSUE:-}" != "$n" ]] || exit 9
     labels="$(cat "$LABEL_DIR/$n" 2>/dev/null || true)"
-    printf 'OPEN\n'
+    if [[ "${CLOSED_ISSUE:-}" == "$n" ]]; then printf 'CLOSED\n'; else printf 'OPEN\n'; fi
     if [[ "${COMMA_LABEL_ISSUE:-}" == "$n" ]]; then
       printf 'ready\ncustomer,engine:codex\n'
     elif [[ -n "$labels" ]]; then
@@ -166,13 +178,19 @@ chmod +x "$TMP/bin/flock" "$TMP/bin/tmux" "$TMP/bin/ssh" "$TMP/bin/gh"
 
 DISPATCH="$HARNESS/bin/dispatch.sh"
 RUN_OUT=""
+RUN_STDOUT=""
 RUN_RC=0
+# The streams are captured apart as well as together: --resolve-issue's whole
+# contract is that its answer is exactly one line on STDOUT, and a scenario
+# cannot check "exactly one line" against a view that also carries the
+# timestamped log lines and warnings. RUN_OUT stays the combined view every
+# other scenario reads.
 run_dispatch() {
   : > "$TMP/launch.log"
   : > "$TMP/gh.log"
   : > "$TMP/flock.log"
   RUN_RC=0
-  RUN_OUT="$(
+  set +e
     PATH="$TMP/bin:$PATH" TMPDIR="$TMP/locks" \
     LAUNCH_LOG="$TMP/launch.log" GH_LOG="$TMP/gh.log" FLOCK_LOG="$TMP/flock.log" \
     LABEL_DIR="$TMP/labels" BLOCKER_DIR="$TMP/blockers" \
@@ -186,9 +204,40 @@ run_dispatch() {
     FLOCK_BUSY="${FLOCK_BUSY:-}" STUB_SESSION_NAME="${STUB_SESSION_NAME:-}" \
     CAPACITY_RC="${CAPACITY_RC:-}" LAUNCH_RC="${LAUNCH_RC:-}" \
     EPIC_PROVIDER_HOLD_FILE="$TMP/provider-hold.json" \
+    CLOSED_ISSUE="${CLOSED_ISSUE:-}" \
     HOST_TIMEZONE="Pacific/Honolulu" TZ="Pacific/Honolulu" \
-    bash "$DISPATCH" "$@" 2>&1
-  )" || RUN_RC=$?
+    bash "$DISPATCH" "$@" >"$TMP/dispatch.out" 2>"$TMP/dispatch.err"
+  RUN_RC=$?
+  set -e
+  RUN_STDOUT="$(cat "$TMP/dispatch.out")"
+  RUN_OUT="$(cat "$TMP/dispatch.out" "$TMP/dispatch.err")"
+}
+
+# The laptop-to-host flow, end to end and hermetic: the ssh stub's
+# EXEC_SSH_STDIN path runs remote-control.sh's remote heredoc in place, so the
+# real dispatch.sh and the stub launch.sh see the same fake host the tick
+# scenarios use.
+CONTROL_OUT=""
+CONTROL_RC=0
+run_control() {
+  : > "$TMP/launch.log"
+  : > "$TMP/gh.log"
+  : > "$TMP/flock.log"
+  : > "$TMP/ssh.log"
+  set +e
+    PATH="$TMP/bin:$PATH" TMPDIR="$TMP/locks" EXEC_SSH_STDIN=1 \
+    LAUNCH_LOG="$TMP/launch.log" GH_LOG="$TMP/gh.log" FLOCK_LOG="$TMP/flock.log" \
+    SSH_LOG="$TMP/ssh.log" \
+    LABEL_DIR="$TMP/labels" BLOCKER_DIR="$TMP/blockers" \
+    FAIL_VIEW_ISSUE="${FAIL_VIEW_ISSUE:-}" FAIL_EDIT_ISSUE="${FAIL_EDIT_ISSUE:-}" \
+    CLOSED_ISSUE="${CLOSED_ISSUE:-}" \
+    FLOCK_BUSY="${FLOCK_BUSY:-}" STUB_SESSION_NAME="${STUB_SESSION_NAME:-}" \
+    EPIC_PROVIDER_HOLD_FILE="$TMP/provider-hold.json" \
+    HOST_TIMEZONE="Pacific/Honolulu" TZ="Pacific/Honolulu" \
+    bash "$HARNESS/remote-control.sh" "$@" >"$TMP/control.out" 2>&1
+  CONTROL_RC=$?
+  set -e
+  CONTROL_OUT="$(cat "$TMP/control.out")"
 }
 
 reset_state() {
@@ -203,6 +252,8 @@ reset_state() {
   FAIL_BLOCKER_ISSUE=""
   FAIL_QUEUE=""
   COMMA_LABEL_ISSUE=""
+  CLOSED_ISSUE=""
+  clear_cron
   REROUTE_AFTER_SHIELD_ISSUE=""
   REROUTE_AFTER_SHIELD_ENGINE=""
   FLOCK_BUSY=""
@@ -399,7 +450,12 @@ assert_rc "tick exits 0" 0 "$RUN_RC"
 assert_contains "Claude is passed to launch" "$(cat "$TMP/launch.log")" '--epic 1 --repo testrepo --engine claude'
 assert_matches "human dispatch logs use the configured zone" "$RUN_OUT" '[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} (CET|CEST) \[dispatch\]'
 
-printf '\ndispatch: EPIC_ENGINE sets the default for unlabeled work\n'
+printf '\ndispatch: with no installed cron file both paths take the built-in claude\n'
+# The tick's own EPIC_ENGINE must not select anything. A queue tick inherits it
+# from cron's environment and a manual `remote-control.sh epic N` over ssh does
+# not, so honouring it here would make the same unlabeled issue resolve to two
+# different vendors a second apart. No installed file means nothing is
+# configured, and both paths get claude.
 reset_state
 READY_QUEUE=1
 printf 'ready' > "$TMP/labels/1"
@@ -407,16 +463,55 @@ export EPIC_ENGINE=codex
 run_dispatch
 unset EPIC_ENGINE
 assert_rc "tick exits 0" 0 "$RUN_RC"
-assert_contains "the env default reaches launch" "$(cat "$TMP/launch.log")" '--epic 1 --repo testrepo --engine codex'
+assert_contains "the tick ignores its own EPIC_ENGINE" "$(cat "$TMP/launch.log")" '--epic 1 --repo testrepo --engine claude'
+
+reset_state
+printf 'ready' > "$TMP/labels/9"
+run_control epic 9 -r testrepo
+assert_rc "a manual launch with no forwarded EPIC_ENGINE exits 0" 0 "$CONTROL_RC"
+assert_contains "and lands on the same built-in default" "$(cat "$TMP/launch.log")" '--epic 9 --repo testrepo --engine claude'
+assert_contains "which the operator is told is the built-in one" "$CONTROL_OUT" "engine claude selected by the built-in claude default"
+
 reset_state
 READY_QUEUE=1
 printf 'ready' > "$TMP/labels/1"
-export EPIC_ENGINE=future
+set_cron_engine future
 run_dispatch
-unset EPIC_ENGINE
-assert_rc "an unknown EPIC_ENGINE stops the tick" 1 "$RUN_RC"
+assert_rc "an unknown installed EPIC_ENGINE stops the tick" 1 "$RUN_RC"
 assert_contains "and names the knob" "$RUN_OUT" "EPIC_ENGINE must name an engine"
 assert_not_contains "nothing is launched on it" "$(cat "$TMP/launch.log")" '--epic'
+
+printf '\ndispatch: the installed cron file is the host default for a tick\n'
+# cron and an ssh command have different process environments, so the host
+# default cannot live in EPIC_ENGINE-as-inherited alone: a tick and a manual
+# launch a second later have to agree, and the installed file is what both read.
+reset_state
+READY_QUEUE=1
+printf 'ready' > "$TMP/labels/1"
+set_cron_engine codex
+run_dispatch
+assert_rc "a tick reading the installed default exits 0" 0 "$RUN_RC"
+assert_contains "the installed default reaches launch" "$(cat "$TMP/launch.log")" '--epic 1 --repo testrepo --engine codex'
+
+reset_state
+READY_QUEUE=1
+printf 'ready' > "$TMP/labels/1"
+set_cron_engine codex
+export EPIC_ENGINE=claude
+run_dispatch
+unset EPIC_ENGINE
+assert_rc "an env default disagreeing with the installed file stops the tick" 1 "$RUN_RC"
+assert_contains "the disagreement names EPIC_ENGINE" "$RUN_OUT" "EPIC_ENGINE"
+assert_eq "nothing is launched on a disputed default" "" "$(cat "$TMP/launch.log")"
+assert_eq "no label is written on a disputed default" "" "$(grep 'issue edit' "$TMP/gh.log" || true)"
+
+reset_state
+READY_QUEUE=1
+printf 'ready' > "$TMP/labels/1"
+write_cron 'EPIC_ENGINE=codex' 'EPIC_ENGINE=claude'
+run_dispatch
+assert_rc "a cron file with two EPIC_ENGINE lines stops the tick" 1 "$RUN_RC"
+assert_eq "nothing is launched on an unreadable default" "" "$(cat "$TMP/launch.log")"
 
 printf '\ndispatch: an explicit Codex route is preserved\n'
 reset_state
@@ -729,17 +824,149 @@ run_dispatch --route-issue '#' codex --repo testrepo
 assert_rc "an empty stripped route-issue is rejected" 1 "$RUN_RC"
 assert_not_contains "it cannot fall through into a real tick" "$(cat "$TMP/launch.log")" '--epic 14'
 
+printf '\nresolve-issue: routing is reported without a single write\n'
+reset_state
+printf 'ready,engine:codex' > "$TMP/labels/20"
+run_dispatch --resolve-issue 20 --repo testrepo
+assert_rc "resolve-issue exits 0" 0 "$RUN_RC"
+assert_eq "resolve-issue prints the engine and the label that chose it" "codex label" "$RUN_STDOUT"
+assert_eq "resolve-issue writes no label" "" "$(grep 'issue edit' "$TMP/gh.log" || true)"
+assert_eq "resolve-issue launches nothing" "" "$(cat "$TMP/launch.log")"
+assert_eq "the issue's labels are unchanged afterwards" "ready,engine:codex" "$(cat "$TMP/labels/20")"
+
+reset_state
+printf 'ready' > "$TMP/labels/21"
+set_cron_engine codex
+run_dispatch --resolve-issue 21 --repo testrepo
+assert_rc "an unlabeled issue resolves cleanly" 0 "$RUN_RC"
+assert_eq "resolve-issue names the host default as the source" "codex host-default" "$RUN_STDOUT"
+assert_eq "an inherited host default writes no label" "" "$(grep 'issue edit' "$TMP/gh.log" || true)"
+assert_eq "the issue stays unlabeled" "ready" "$(cat "$TMP/labels/21")"
+
+reset_state
+printf 'ready' > "$TMP/labels/22"
+run_dispatch --resolve-issue 22 --repo testrepo
+assert_rc "a host with no configured default resolves cleanly" 0 "$RUN_RC"
+assert_eq "resolve-issue falls back to the built-in engine" "claude builtin" "$RUN_STDOUT"
+assert_eq "the built-in fallback writes no label" "" "$(grep 'issue edit' "$TMP/gh.log" || true)"
+
+printf '\nresolve-issue: every uncertainty refuses before anything is launched\n'
+# One shape for all of them: a resolve that cannot be certain prints no answer,
+# touches no label and starts nothing. Guessing here would send an epic to a
+# vendor nobody chose, and the answer is consumed by a launch one line later.
+resolve_refuses() { # description, then dispatch args
+  local what="$1"; shift
+  run_dispatch "$@"
+  assert_rc "$what exits 1" 1 "$RUN_RC"
+  assert_eq "$what prints no engine line" "" "$RUN_STDOUT"
+  assert_eq "$what writes no label" "" "$(grep 'issue edit' "$TMP/gh.log" || true)"
+  assert_eq "$what launches nothing" "" "$(cat "$TMP/launch.log")"
+}
+
+reset_state
+printf 'ready,engine:claude,engine:codex' > "$TMP/labels/23"
+resolve_refuses "conflicting engine labels" --resolve-issue 23 --repo testrepo
+assert_eq "conflicting labels are left exactly as found" "ready,engine:claude,engine:codex" "$(cat "$TMP/labels/23")"
+
+reset_state
+printf 'ready,engine:future' > "$TMP/labels/24"
+resolve_refuses "an unknown engine label" --resolve-issue 24 --repo testrepo
+
+reset_state
+printf 'ready,engine:codex' > "$TMP/labels/25"
+FAIL_VIEW_ISSUE=25
+resolve_refuses "an unreadable issue" --resolve-issue 25 --repo testrepo
+
+reset_state
+printf 'ready,engine:codex' > "$TMP/labels/26"
+CLOSED_ISSUE=26
+resolve_refuses "a closed issue" --resolve-issue 26 --repo testrepo
+
+reset_state
+printf 'ready,engine:codex' > "$TMP/labels/27"
+FLOCK_BUSY=1
+resolve_refuses "a busy dispatch lock" --resolve-issue 27 --repo testrepo
+
+reset_state
+printf 'ready,engine:codex' > "$TMP/labels/28"
+resolve_refuses "a resolve without --repo" --resolve-issue 28
+
+reset_state
+printf 'ready' > "$TMP/labels/29"
+write_cron 'EPIC_ENGINE=codex' 'EPIC_ENGINE=claude'
+resolve_refuses "a cron file with two EPIC_ENGINE lines" --resolve-issue 29 --repo testrepo
+
+reset_state
+printf 'ready' > "$TMP/labels/30"
+set_cron_engine future
+resolve_refuses "an unknown engine in the cron file" --resolve-issue 30 --repo testrepo
+assert_contains "an invalid host default names the knob" "$RUN_OUT" "EPIC_ENGINE must name an engine"
+
+reset_state
+printf 'ready' > "$TMP/labels/31"
+set_cron_engine codex
+export EPIC_ENGINE=claude
+resolve_refuses "an env default disagreeing with the cron file" --resolve-issue 31 --repo testrepo
+unset EPIC_ENGINE
+
 printf '\nremote control: next preserves host-wide selection unless narrowed\n'
 SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/remote-control.sh" next codex
 assert_contains "host-wide next omits a repo filter" "$(cat "$TMP/ssh.log")" 'dispatch.sh --route-next'
 assert_not_contains "host-wide next does not default to the first repo" "$(cat "$TMP/ssh.log")" '--repo'
 SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/remote-control.sh" next claude -r testrepo
 assert_contains "an explicit repo is forwarded" "$(cat "$TMP/ssh.log")" "--repo 'testrepo'"
-set +e
-SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/remote-control.sh" epic 10 >/dev/null 2>&1
-CONTROL_RC=$?
-set -e
-assert_rc "manual epic requires an explicit engine" 1 "$CONTROL_RC"
+
+printf '\nremote control: an omitted engine is inherited, never written back\n'
+reset_state
+printf 'ready,engine:codex' > "$TMP/labels/10"
+run_control epic 10 -r testrepo
+assert_rc "a manual epic without --engine launches" 0 "$CONTROL_RC"
+assert_contains "the issue's own route reaches launch.sh" "$(cat "$TMP/launch.log")" '--epic 10 --repo testrepo --engine codex'
+assert_eq "an inherited launch writes no label" "" "$(grep 'issue edit' "$TMP/gh.log" || true)"
+assert_eq "the issue's labels are unchanged" "ready,engine:codex" "$(cat "$TMP/labels/10")"
+assert_contains "the operator is told which label chose the engine" "$CONTROL_OUT" "engine codex selected by the issue's engine:codex label"
+assert_contains "and that nothing was persisted" "$CONTROL_OUT" "no label written"
+
+for kind in fix ci defect; do
+  reset_state
+  printf 'ready,engine:codex' > "$TMP/labels/11"
+  run_control "$kind" 11 -r testrepo
+  assert_rc "a manual $kind without --engine launches" 0 "$CONTROL_RC"
+  assert_contains "the inherited engine reaches launch.sh for $kind" "$(cat "$TMP/launch.log")" "--$kind 11 --repo testrepo --engine codex"
+  assert_eq "an inherited $kind launch writes no label" "" "$(grep 'issue edit' "$TMP/gh.log" || true)"
+done
+
+reset_state
+printf 'ready' > "$TMP/labels/12"
+set_cron_engine codex
+run_control epic 12 -r testrepo
+assert_rc "an unlabeled issue inherits the host default" 0 "$CONTROL_RC"
+assert_contains "the host default reaches launch.sh" "$(cat "$TMP/launch.log")" '--epic 12 --repo testrepo --engine codex'
+assert_contains "the operator is told the host default chose it" "$CONTROL_OUT" "engine codex selected by the host's EPIC_ENGINE default"
+assert_eq "inheriting the host default writes no label" "" "$(grep 'issue edit' "$TMP/gh.log" || true)"
+assert_eq "and leaves the issue unlabeled" "ready" "$(cat "$TMP/labels/12")"
+
+reset_state
+printf 'ready' > "$TMP/labels/13"
+run_control epic 13 -r testrepo
+assert_rc "a host with no configured default still launches" 0 "$CONTROL_RC"
+assert_contains "the built-in engine reaches launch.sh" "$(cat "$TMP/launch.log")" '--epic 13 --repo testrepo --engine claude'
+assert_contains "the operator is told it is the built-in default" "$CONTROL_OUT" "engine claude selected by the built-in claude default"
+
+reset_state
+printf 'ready,engine:claude,engine:codex' > "$TMP/labels/14"
+run_control epic 14 -r testrepo
+assert_rc "conflicting labels refuse the manual launch" 1 "$CONTROL_RC"
+assert_eq "a refused inherit launches nothing" "" "$(cat "$TMP/launch.log")"
+assert_eq "a refused inherit writes no label" "" "$(grep 'issue edit' "$TMP/gh.log" || true)"
+
+reset_state
+run_control start --engine codex -r testrepo
+assert_rc "--engine is still refused for interactive sessions" 1 "$CONTROL_RC"
+assert_contains "and says it is pipeline-only" "$CONTROL_OUT" "only applies to manual epic/fix/ci/defect launches"
+assert_eq "a refused interactive --engine launches nothing" "" "$(cat "$TMP/launch.log")"
+
+reset_state
 SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/remote-control.sh" epic 10 --engine codex
 assert_contains "manual epic forwards its explicit engine" "$(cat "$TMP/ssh.log")" "--engine 'codex'"
 assert_contains "manual epic persists the engine first" "$(cat "$TMP/ssh.log")" "--route-issue '10' 'codex'"

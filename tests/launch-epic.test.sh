@@ -16,6 +16,13 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 unset EPIC_ENGINE   # a host default must not leak in; the scenarios that need it export their own
 
+# The host default is read from the installed cron file (/etc/cron.d/harness-dispatch
+# on a real box). Pin it at a throwaway path so these launches can never inherit
+# — or be refused by — whatever the machine running the tests dispatches on.
+# Absent by default; the scenario that wants a host default writes one.
+INSTALLED_CRON="$TMP/installed-cron"
+export DEFAULT_ENGINE_CRON="$INSTALLED_CRON"
+
 PASS=0
 FAIL=0
 ok() { PASS=$((PASS + 1)); printf '  ok   %s\n' "$1"; }
@@ -197,19 +204,52 @@ assert_rc "exits 0" 0 "$RUN_RC"
 assert_contains "the Codex engine tag is set" "$(tmux_log)" "set-option -t testrepo-epic-64 @engine codex"
 assert_contains "Codex reaches the orchestrator" "$(tmux_log)" "--engine 'codex'"
 
-printf '\nlaunch --epic: EPIC_ENGINE is the default when --engine is absent\n'
+printf '\nlaunch --epic: with no installed cron file the default is the built-in claude\n'
+# This process's EPIC_ENGINE never selects: cron exports one into a tick and an
+# ssh command has none, so reading it here would split the host default in two.
 export EPIC_ENGINE=codex
 run_launch --epic 65 --repo testrepo
 unset EPIC_ENGINE
 assert_rc "exits 0" 0 "$RUN_RC"
-assert_contains "the env default is tagged" "$(tmux_log)" "set-option -t testrepo-epic-65 @engine codex"
-assert_contains "and reaches the orchestrator" "$(tmux_log)" "--engine 'codex'"
-export EPIC_ENGINE=nope
+assert_contains "an ambient EPIC_ENGINE is ignored" "$(tmux_log)" "set-option -t testrepo-epic-65 @engine claude"
+assert_contains "and claude reaches the orchestrator" "$(tmux_log)" "--engine 'claude'"
+printf 'EPIC_ENGINE=nope\n' > "$INSTALLED_CRON"
 run_launch --epic 66 --repo testrepo
-unset EPIC_ENGINE
-assert_rc "an unknown EPIC_ENGINE exits 1" 1 "$RUN_RC"
+rm -f "$INSTALLED_CRON"
+assert_rc "an unknown installed EPIC_ENGINE exits 1" 1 "$RUN_RC"
 assert_contains "and names the knob" "$RUN_OUT" "EPIC_ENGINE must name an engine"
 assert_not_contains "before any session is created" "$(tmux_log)" "new-session -d -s testrepo-epic-66"
+
+printf '\nlaunch --epic: the installed cron file is the host default\n'
+# cron and an ssh command have different process environments, so a manual
+# launch cannot read the host default out of its own env: it reads the same
+# installed file the dispatch tick does, and the two must never disagree.
+printf 'EPIC_ENGINE=codex\n' > "$INSTALLED_CRON"
+run_launch --epic 67 --repo testrepo
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_contains "the installed default is tagged" "$(tmux_log)" "set-option -t testrepo-epic-67 @engine codex"
+assert_contains "and reaches the orchestrator" "$(tmux_log)" "--engine 'codex'"
+
+export EPIC_ENGINE=claude
+run_launch --epic 68 --repo testrepo
+unset EPIC_ENGINE
+assert_rc "an env default disagreeing with the installed file exits 1" 1 "$RUN_RC"
+assert_contains "and names the knob" "$RUN_OUT" "EPIC_ENGINE"
+assert_not_contains "before any session is created" "$(tmux_log)" "new-session -d -s testrepo-epic-68"
+
+printf 'EPIC_ENGINE=codex\nEPIC_ENGINE=claude\n' > "$INSTALLED_CRON"
+run_launch --epic 69 --repo testrepo
+assert_rc "an installed file with two EPIC_ENGINE lines exits 1" 1 "$RUN_RC"
+assert_not_contains "and starts nothing" "$(tmux_log)" "new-session -d -s testrepo-epic-69"
+
+# The probes answer a counting question. They must not acquire an opinion about
+# engine config, or a malformed cron file would stop dispatch's capacity probe
+# and update-claude's idle check along with the launches.
+run_launch --check-capacity
+assert_rc "the capacity probe ignores a malformed installed file" 0 "$RUN_RC"
+run_launch --check-idle
+assert_rc "the idle probe ignores a malformed installed file" 0 "$RUN_RC"
+rm -f "$INSTALLED_CRON"
 
 printf '\nlaunch --epic: a reused worktree is scrubbed but keeps ignored files\n'
 WT="$WT_ROOT/testrepo/testrepo-epic-63"

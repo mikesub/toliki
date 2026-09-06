@@ -42,8 +42,10 @@ this script creates its git worktree under \${EPIC_WORKTREE_ROOT:-\$HOME/.epic-w
 and the pane runs the corresponding workflows/*-run.mjs there. They take no
 session name and no -m — both are derived from the issue number.
 --engine is pipeline-only: a name from etc/engines.json, the vendor/model/effort
-table the run uses per step (default: \$EPIC_ENGINE from the environment,
-claude when unset). Currently: $(engine_names | tr '\n' ' ')
+table the run uses per step. Omitted, a pipeline run takes the host default —
+the EPIC_ENGINE line of the installed cron file (/etc/cron.d/harness-dispatch),
+claude when that file is absent — and refuses if that file and this process's
+environment disagree. Currently: $(engine_names | tr '\n' ' ')
 
 Without them the session is an interactive claude. Name resolution when no name
 is given: with -m, the session is named after the message (slugified); otherwise
@@ -67,7 +69,7 @@ CHECK_IDLE=0
 REPO="$DEFAULT_REPO"
 MODE=""       # "" = interactive claude; otherwise the selected pipeline run
 ISSUE=""
-ENGINE="$DEFAULT_ENGINE"   # from etc/lib.sh: EPIC_ENGINE, claude when unset
+ENGINE=""     # a pipeline run with no --engine resolves the host default below
 HAVE_ENGINE=0
 
 POSITIONAL=()
@@ -168,14 +170,20 @@ if [[ ${#POSITIONAL[@]} -gt 1 ]]; then
 fi
 SESSION="${POSITIONAL[0]:-}"
 
-if ! engine_known "$ENGINE"; then
-  src="--engine"; [[ $HAVE_ENGINE -eq 1 ]] || src="EPIC_ENGINE"
-  echo "[launch] $src must name an engine in etc/engines.json ($(engine_names | tr '\n' ' ')), got '$ENGINE'" >&2
-  exit 1
-fi
-if [[ $HAVE_ENGINE -eq 1 && -z "$MODE" ]]; then
-  echo "[launch] --engine only applies to --epic/--fix/--ci/--defect pipeline runs" >&2
-  exit 1
+# An explicit engine is validated here, before anything is named or counted.
+# The host default is NOT read here: --check-capacity and --check-idle answer a
+# counting question and exit below, and a probe that refused on a malformed
+# cron file would stop dispatch's capacity check and update-claude's idle check
+# along with the launches they gate.
+if [[ $HAVE_ENGINE -eq 1 ]]; then
+  if ! engine_known "$ENGINE"; then
+    echo "[launch] --engine must name an engine in etc/engines.json ($(engine_names | tr '\n' ' ')), got '$ENGINE'" >&2
+    exit 1
+  fi
+  if [[ -z "$MODE" ]]; then
+    echo "[launch] --engine only applies to --epic/--fix/--ci/--defect pipeline runs" >&2
+    exit 1
+  fi
 fi
 
 # A pipeline run owns its own naming: the session name IS the issue, because
@@ -257,6 +265,21 @@ if [[ $CHECK_IDLE -eq 1 ]]; then
   fi
   echo "[launch] idle"
   exit 0
+fi
+
+# The host default, for a pipeline run that named no engine: the installed cron
+# file's EPIC_ENGINE (etc/lib.sh), which is what the dispatch tick reads too —
+# a manual launch arriving over ssh has an environment cron never touched, so
+# the file is the only value the two can share. Resolved after the probes above
+# and before the session is created, so a refusal costs no worktree and no
+# session. An interactive session keeps an empty ENGINE: it runs claude by
+# construction, and the @engine tag describes pipeline routing.
+if [[ -n "$MODE" && $HAVE_ENGINE -eq 0 ]]; then
+  if ! resolve_host_default_engine; then
+    echo "[launch] $HOST_DEFAULT_ENGINE_ERROR" >&2
+    exit 1
+  fi
+  ENGINE="$HOST_DEFAULT_ENGINE"
 fi
 
 # First pool name with no existing tmux session for this repo (running or dead).
