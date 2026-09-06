@@ -73,6 +73,10 @@ cat > "$HARNESS/bin/launch.sh" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$LAUNCH_LOG"
 if [[ "$*" == "--check-capacity" ]]; then exit "${CAPACITY_RC:-0}"; fi
+# A host standing at MAX_PARALLEL_EPICS: the real launch.sh refuses with exit 3
+# unless the launch carries the override, so a scenario that sets this can only
+# reach exit 0 by actually delivering the flag.
+if [[ "${STUB_AT_CAPACITY:-}" == "1" && "$*" != *--over-capacity* ]]; then exit 3; fi
 exit "${LAUNCH_RC:-0}"
 STUB
 chmod +x "$HARNESS/bin/launch.sh"
@@ -232,6 +236,7 @@ run_control() {
     FAIL_VIEW_ISSUE="${FAIL_VIEW_ISSUE:-}" FAIL_EDIT_ISSUE="${FAIL_EDIT_ISSUE:-}" \
     CLOSED_ISSUE="${CLOSED_ISSUE:-}" \
     FLOCK_BUSY="${FLOCK_BUSY:-}" STUB_SESSION_NAME="${STUB_SESSION_NAME:-}" \
+    STUB_AT_CAPACITY="${STUB_AT_CAPACITY:-}" \
     EPIC_PROVIDER_HOLD_FILE="$TMP/provider-hold.json" \
     HOST_TIMEZONE="Pacific/Honolulu" TZ="Pacific/Honolulu" \
     bash "$HARNESS/remote-control.sh" "$@" >"$TMP/control.out" 2>&1
@@ -996,6 +1001,95 @@ CONTROL_RC=$?
 set -e
 assert_rc "a bare # manual ref is rejected locally" 1 "$CONTROL_RC"
 assert_not_contains "no remote command is sent" "$(cat "$TMP/ssh.log")" 'unused'
+
+
+printf '\nremote control: --over-capacity is manual, pipeline-only and never routed\n'
+# The override may ride only the launch.sh segment of a named pipeline launch.
+# On the --route-issue segment it would be an unknown flag to dispatch.sh; on
+# any other command it would either be swallowed as a session name or reach a
+# queue-driven path, which is the leak the cap cannot survive.
+: > "$TMP/ssh.log"
+set +e
+SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/remote-control.sh" epic 10 --engine codex --over-capacity >/dev/null 2>&1
+CONTROL_RC=$?
+set -e
+assert_rc "manual epic accepts the override" 0 "$CONTROL_RC"
+assert_contains "manual epic forwards the override on the launch segment" "$(cat "$TMP/ssh.log")" "--epic '10' --engine 'codex' --over-capacity"
+assert_contains "and the routing segment ends before it" "$(cat "$TMP/ssh.log")" "--route-issue '10' 'codex' --repo 'testrepo' &&"
+: > "$TMP/ssh.log"
+set +e
+SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/remote-control.sh" fix 10 --engine codex --over-capacity >/dev/null 2>&1
+CONTROL_RC=$?
+set -e
+assert_rc "a manual fixer accepts it too" 0 "$CONTROL_RC"
+assert_contains "the fixer forwards it on the launch segment" "$(cat "$TMP/ssh.log")" "--fix '10' --engine 'codex' --over-capacity"
+assert_contains "and its routing segment ends before it" "$(cat "$TMP/ssh.log")" "--route-issue '10' 'codex' --repo 'testrepo' &&"
+for bad in "next codex" "start" "ls" "-m hello"; do
+  : > "$TMP/ssh.log"
+  set +e
+  SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/remote-control.sh" $bad --over-capacity >/dev/null 2>&1
+  CONTROL_RC=$?
+  set -e
+  assert_rc "'$bad' cannot carry the override" 1 "$CONTROL_RC"
+  assert_eq "'$bad' sends nothing to the host" "" "$(cat "$TMP/ssh.log")"
+done
+# The flag on its own leaves no command behind, and the no-command path prints
+# usage and exits 0. That success would report the one cap bypass as accepted
+# usage, so it is refused before the usage exit like every other non-pipeline use.
+: > "$TMP/ssh.log"
+set +e
+SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/remote-control.sh" --over-capacity >/dev/null 2>&1
+CONTROL_RC=$?
+set -e
+assert_rc "a bare --over-capacity is refused, not usage" 1 "$CONTROL_RC"
+assert_eq "and sends nothing to the host" "" "$(cat "$TMP/ssh.log")"
+
+printf '\nremote control: the override reaches an inherited-engine launch too\n'
+# Omitting --engine takes the other remote path: the heredoc that resolves the
+# engine on the host and then launches. Its launch.sh call is a separate
+# invocation from the explicit-engine one above, so the override has to be
+# carried into it too — otherwise `epic 10 --over-capacity` would quietly be an
+# ordinary launch and refuse with exit 3 at the cap. STUB_AT_CAPACITY makes the
+# host full, so only a launch that really received the flag can exit 0.
+STUB_AT_CAPACITY=1
+reset_state
+printf 'ready,engine:codex' > "$TMP/labels/10"
+run_control epic 10 -r testrepo --over-capacity
+assert_rc "an inherited-engine epic is admitted over the cap" 0 "$CONTROL_RC"
+assert_contains "the override reaches launch.sh beside the inherited engine" "$(cat "$TMP/launch.log")" '--epic 10 --repo testrepo --engine codex --over-capacity'
+assert_not_contains "the read-only resolve step is never given it" "$CONTROL_OUT" "unknown argument"
+assert_eq "an over-capacity inherit still writes no label" "" "$(grep 'issue edit' "$TMP/gh.log" || true)"
+assert_eq "and leaves the issue's labels alone" "ready,engine:codex" "$(cat "$TMP/labels/10")"
+
+for kind in fix ci defect; do
+  reset_state
+  printf 'ready' > "$TMP/labels/11"
+  set_cron_engine codex
+  run_control "$kind" 11 -r testrepo --over-capacity
+  assert_rc "an inherited-engine $kind is admitted over the cap" 0 "$CONTROL_RC"
+  assert_contains "the override reaches launch.sh for $kind" "$(cat "$TMP/launch.log")" "--$kind 11 --repo testrepo --engine codex --over-capacity"
+done
+
+# Same launch, no flag: refused. That is what makes the four assertions above
+# say something about the override rather than about the stub.
+reset_state
+printf 'ready,engine:codex' > "$TMP/labels/10"
+run_control epic 10 -r testrepo
+assert_rc "the same inherited launch without the flag is refused at capacity" 3 "$CONTROL_RC"
+assert_eq "and nothing forged the flag for it" "" "$(grep -- '--over-capacity' "$TMP/launch.log" || true)"
+STUB_AT_CAPACITY=""
+
+printf '\ndispatch: queue-driven launches never carry the override\n'
+reset_state
+FIXER_QUEUE=90
+READY_QUEUE=91
+printf 'failed,needs-judgment,engine:codex' > "$TMP/labels/90"
+printf 'ready,engine:claude' > "$TMP/labels/91"
+run_dispatch
+assert_rc "tick exits 0" 0 "$RUN_RC"
+assert_contains "the fixer is launched" "$(cat "$TMP/launch.log")" '--fix 90 --repo testrepo --engine codex'
+assert_contains "the ready epic is launched" "$(cat "$TMP/launch.log")" '--epic 91 --repo testrepo --engine claude'
+assert_eq "and no dispatch launch carries the override" "" "$(grep -- '--over-capacity' "$TMP/launch.log" || true)"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
