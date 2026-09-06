@@ -32,7 +32,12 @@ don't get re-litigated from memory.
   half below — under test): the alternative was writing the pipeline twice,
   once per vendor, and watching the copies drift. It also moves the merge gate
   and the fail-closed branches out of a vendor's runtime and into ordinary code
-  we can run in a test harness.
+  we can run in a test harness. The host default chooses only an unpinned first
+  claim; winning that claim snapshots the engine on GitHub before model work,
+  and every resume or fixer requires the same exact pin. This deliberately makes
+  GitHub label persistence and readback a hard gate: refusing an unavailable or
+  ambiguous route is safer than silently retiering an existing change after a
+  default changes.
 - **Review** — blind and adversarial. One general reviewer judges the diff
   against the issue body, barred from the builder's notes. Architecture may
   request one additional reviewer for a concrete risk question, such as whether

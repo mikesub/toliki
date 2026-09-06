@@ -54,7 +54,9 @@ in the same change.
   every guard covers them.
 - **Engine**: a top-level key of `etc/engines.json`, selected per issue by the
   `engine:<name>` label. An unlabeled issue uses `EPIC_ENGINE` from
-  `etc/dispatch.cron` (claude when unset). The label survives fixer retries.
+  `etc/dispatch.cron` (claude when unset) only until its first successful claim,
+  which snapshots that selection before model work. Resumes and fixers require
+  the exact persisted singleton; the label survives fixer retries.
 - **Step**: one of the seven pipeline steps in `STEPS` in
   `workflows/lib/engine.mjs`, each a judgment call. Pipelines name steps; the
   engine file says who runs them; `STEPS` fixes each step's charter and tool
@@ -89,7 +91,9 @@ Lifecycle labels are owned by automation. Do not add or repurpose one.
 | issue closed | merged |
 
 `engine:<name>` is the separate routing namespace and is never cleared by a
-lifecycle change. A follow-up issue ship files is queued as it is filed —
+lifecycle change. A claimed branch with no exact matching engine pin is blocked
+rather than inferred from the current host default; a mismatched or conflicting
+pin is never rewritten by a run. A follow-up issue ship files is queued as it is filed —
 `ready`, and `blocked_by` the issue it came out of, so it cannot run until that
 one closes — and links back with a `Follow-up to #N` line in the body. Ordering
 is written before the label: an unordered follow-up is left unqueued rather

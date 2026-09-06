@@ -65,7 +65,7 @@ import { validate } from './lib/schema.mjs'
 import {
   ensureLabels, editLabels, issueLabels, issueView, openBlockers, comment, assignSelf,
   openPrs, searchOpenPrs, prCreate, issueCreate, withBodyFile, hasDeferredRecord, issueId, addBlockedBy,
-  authenticatedLogin, readBack, terminalBudget, terminalSpend, terminalTransition,
+  authenticatedLogin, readBack, terminalBudget, terminalSpend, terminalTransition, verifyIssueEngine,
 } from './lib/github.mjs'
 import { matchingDefectEvidence, renderDefectEvidence } from './lib/defect-evidence.mjs'
 import {
@@ -595,6 +595,12 @@ async function prepare(issue) {
       must(push, 'git push (claim)')
     }
   }
+
+  // The claim makes this engine selection durable. Only a newly won claim may
+  // fill an absent route; a resumed branch must already have the exact pin its
+  // launcher selected. This hard gate precedes lifecycle signalling, installs,
+  // and every model spawn, and never overwrites an explicit/conflicting route.
+  await verifyIssueEngine(issue, ARGS.engine, { allowCreate: !resumed })
 
   // Signal on GitHub that autonomous work has started — now, before the slow deps step. Best-effort:
   // a failure is noted in the phase log (so it surfaces in the PR body) and never aborts the run.
