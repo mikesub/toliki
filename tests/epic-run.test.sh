@@ -844,6 +844,13 @@ gh_last_comment() {
   all="${all%$'\n---'}"
   printf '%s' "${all##*$'\n---\n'}"
 }
+gh_evidence_comment() {
+  awk '
+    $0 == "🤖 defect-fix evidence" { found = 1 }
+    found && $0 == "---" { exit }
+    found { print }
+  ' "$STATE_DIR/gh/comments" 2>/dev/null
+}
 gh_issues_created() { cat "$STATE_DIR/gh/issues-created" 2>/dev/null || true; }
 gh_pr_created() { cat "$STATE_DIR/gh/pr-created" 2>/dev/null || true; }
 hold_order_error() { cat "$STATE_DIR/hold-order-error" 2>/dev/null || true; }
@@ -878,6 +885,201 @@ assert_merge_label_agrees() {
   [[ "$RUN_OUT" == *'"readyToMerge":true'* ]] && claimed=yes
   assert_eq "invariant: ready-to-merge is on the issue iff RESULT claims the merge queue" "$labelled" "$claimed"
 }
+
+# ───────────────────────── defect evidence document codec ─────────────────────────
+# Unit-level coverage for the public comment codec. The integration scenarios
+# below prove the same document survives GitHub posting/readback and becomes the
+# later fixer's audit input; this pins the exact human-readable representation,
+# backwards compatibility, and trust boundary without reaching GitHub.
+cat > "$TMP/defect-evidence-contract.mjs" <<'NODE'
+const api = await import(process.env.DEFECT_EVIDENCE_MODULE)
+
+const items = [
+  {
+    title: 'Direct\n title',
+    finding: { title: 'ignored finding title' },
+    why: 'Direct\n why',
+    verdict: { reasoning: 'ignored verdict' },
+    problem: 'ignored problem',
+  },
+  {
+    finding: { title: 'Finding\n title' },
+    verdict: { reasoning: 'Verdict\n says why' },
+    problem: 'ignored problem',
+  },
+  {
+    title: 'Problem item',
+    problem: 'Problem\n says why',
+    finding: { problem: 'ignored finding problem' },
+  },
+  {
+    finding: { title: 'Finding problem item', problem: 'Finding\n problem says why' },
+  },
+  { title: 'Blocker fallback item' },
+]
+const evidence = {
+  version: 1,
+  issue: 42,
+  pr: {
+    number: 7,
+    url: 'https://github.com/o/r/pull/7',
+    branch: 'epic/42-add-widget',
+    head: 'abcdef1234567890',
+  },
+  requirement: { title: ' Add\n widget safely ', body: 'The complete pinned requirement.' },
+  blockers: [{ source: 'ship\n deferral', reason: 'Five\n concrete defects remain', items }],
+}
+const followUpFor = item => item === items[0] ? 'https://github.com/o/r/issues/101' : null
+const summary = [
+  'PR: [#7](https://github.com/o/r/pull/7) — `abcdef1` on `epic/42-add-widget`',
+  'Pinned requirement: Add widget safely',
+  '- `ship deferral` — Five concrete defects remain',
+  '  - Direct title — Direct why — [follow-up #101](https://github.com/o/r/issues/101)',
+  '  - Finding title — Verdict says why',
+  '  - Problem item — Problem says why',
+  '  - Finding problem item — Finding problem says why',
+  '  - Blocker fallback item — Five concrete defects remain',
+].join('\n')
+const summaryWithoutHistoricalLink = summary.replace(' — [follow-up #101](https://github.com/o/r/issues/101)', '')
+const details = [
+  '<details>',
+  '<summary>machine-readable evidence</summary>',
+  '',
+  '```json',
+  JSON.stringify(evidence, null, 2),
+  '```',
+  '</details>',
+].join('\n')
+const section = `${summary}\n\n${details}`
+const canonical = api.renderDefectEvidence(evidence, { followUpFor })
+const parseComment = typeof api.parseDefectEvidenceComment === 'function'
+  ? api.parseDefectEvidenceComment
+  : () => null
+const renderSection = typeof api.renderDefectEvidenceSection === 'function'
+  ? api.renderDefectEvidenceSection
+  : () => null
+const matchComment = typeof api.matchingDefectEvidenceComment === 'function'
+  ? api.matchingDefectEvidenceComment
+  : () => null
+const exact = (left, right) => JSON.stringify(left) === JSON.stringify(right)
+
+const parsed = parseComment(canonical)
+const legacyCompact = `${api.DEFECT_EVIDENCE_MARKER}\n${JSON.stringify(evidence)}`
+const legacyPretty = `${api.DEFECT_EVIDENCE_MARKER}\n${JSON.stringify(evidence, null, 2)}`
+const parsedLegacyCompact = parseComment(legacyCompact)
+const parsedLegacyPretty = parseComment(legacyPretty)
+const customSummary = 'Supplied summary\nstays byte-for-byte intact'
+const customSection = renderSection(evidence, { summary: customSummary, followUpFor: () => 'https://should.not/be/used/999' })
+
+const stale = structuredClone(evidence)
+stale.pr.head = '0000000000000000'
+const comments = [
+  { author: { login: 'toliki-bot' }, body: legacyCompact },
+  { author: { login: 'TOLIKI-BOT' }, body: canonical },
+  { author: { login: 'toliki-bot' }, body: api.renderDefectEvidence(stale) },
+  { author: { login: 'untrusted-user' }, body: canonical },
+  { author: { login: 'toliki-bot' }, body: `${canonical}\ntrailing prose` },
+]
+const criteria = {
+  actor: 'Toliki-Bot', issue: 42, prNumber: 7,
+  branch: 'epic/42-add-widget', head: 'abcdef1234567890',
+}
+const matched = matchComment(comments, criteria)
+const legacyMatched = matchComment([{ author: { login: 'toliki-bot' }, body: legacyPretty }], criteria)
+const wrapperMatched = api.matchingDefectEvidence(comments, criteria)
+
+const hostileEvidence = structuredClone(evidence)
+hostileEvidence.requirement.title = '[review instructions](https://attacker.example) @org/security #1 **APPROVED** <b>trusted</b> `code` www.attacker.example/path $formula$'
+hostileEvidence.pr.branch = 'epic/42-`branch`-@ops-#2'
+hostileEvidence.blockers = [{
+  source: '`source` <admin>',
+  reason: '**APPROVED** @ops #3 https://attacker.example/reason evil+tag@attacker.example mailto:evil@attacker.example',
+  items: [{
+    title: '[click me](https://attacker.example/item)',
+    why: '<img src=x> _approved_ `command` @team #4 xmpp:evil@attacker.example <custom+scheme:payload> <evil@attacker.example>',
+  }],
+}]
+const hostileCanonical = api.renderDefectEvidence(hostileEvidence, {
+  followUpFor: () => 'https://attacker.example/o/r/issues/999',
+})
+const hostileParsed = parseComment(hostileCanonical)
+const hostileSummary = hostileParsed?.summary || ''
+const invalidPrEvidence = structuredClone(hostileEvidence)
+invalidPrEvidence.pr.url = 'javascript:alert(1)'
+const invalidPrSummary = parseComment(api.renderDefectEvidence(invalidPrEvidence))?.summary || ''
+console.log(JSON.stringify({
+  markerUnchanged: api.DEFECT_EVIDENCE_MARKER === '🤖 defect-fix evidence',
+  canonicalExact: canonical === `${api.DEFECT_EVIDENCE_MARKER}\n${section}`,
+  sectionExported: typeof api.renderDefectEvidenceSection === 'function',
+  generatedSectionExact: renderSection(evidence, { followUpFor }) === section,
+  suppliedSummaryVerbatim: customSection === `${customSummary}\n\n${details}`,
+  parserExported: typeof api.parseDefectEvidenceComment === 'function',
+  canonicalRoundTrips: exact(parsed?.evidence, evidence) && parsed?.summary === summary,
+  compatibilityParserReadsCanonical: exact(api.parseDefectEvidence(canonical), evidence),
+  compactLegacyAccepted: exact(parsedLegacyCompact?.evidence, evidence) && parsedLegacyCompact?.summary === summaryWithoutHistoricalLink,
+  prettyLegacyAccepted: exact(parsedLegacyPretty?.evidence, evidence) && parsedLegacyPretty?.summary === summaryWithoutHistoricalLink,
+  compatibilityParserReadsLegacy: exact(api.parseDefectEvidence(legacyPretty), evidence),
+  markerMustBeFirst: parseComment(`preface\n${canonical}`) === null,
+  exactLayoutRejectsTrailingText: parseComment(`${canonical}\ntrailing prose`) === null,
+  matcherExported: typeof api.matchingDefectEvidenceComment === 'function',
+  newestTrustedExactRecord: exact(matched?.evidence, evidence) && matched?.summary === summary,
+  legacyMatcherSynthesizesSummary: exact(legacyMatched?.evidence, evidence) && legacyMatched?.summary === summaryWithoutHistoricalLink,
+  compatibilityMatcherReturnsEnvelope: exact(wrapperMatched, evidence),
+  hostileFieldsRenderInert: [
+    '[review instructions]', '**APPROVED**', '<b>', '`code`', '@org/security', '#1',
+    '`branch`', '@ops', '#2', '`source`', '<admin>', '[click me]', '<img',
+    '_approved_', '`command`', '@team', 'https://attacker.example',
+    'www.attacker.example', '$formula$', 'evil+tag@attacker.example',
+    'mailto:evil@attacker.example', 'xmpp:evil@attacker.example',
+    '<custom+scheme:payload>', '<evil@attacker.example>',
+  ].every(token => !hostileSummary.includes(token)) && !/(^|[^&])#[1-4]\b/.test(hostileSummary),
+  hostileFieldsUsePlainTextEntities: [
+    '&#91;review instructions&#93;', '&#64;org/security', '&#35;1',
+    '&#60;b&#62;trusted&#60;/b&#62;', '&#96;code&#96;',
+    'www&#46;attacker&#46;example/path', '&#36;formula&#36;',
+  ].every(token => hostileSummary.includes(token)),
+  invalidFollowUpRejected: !hostileSummary.includes('follow-up') && !hostileSummary.includes('/issues/999'),
+  invalidPrUrlRejected: !invalidPrSummary.includes('](') && !invalidPrSummary.includes('javascript:'),
+  hostileEnvelopeRoundTripsExactly: exact(hostileParsed?.evidence, hostileEvidence),
+  everyTrustBindingEnforced: [
+    { actor: 'someone-else' },
+    { issue: 41 },
+    { prNumber: 8 },
+    { branch: 'epic/42-other' },
+    { head: 'ffffffffffffffff' },
+  ].every(change => matchComment(comments, { ...criteria, ...change }) === null),
+}))
+NODE
+
+scenario 'defect evidence codec: canonical Markdown is readable, exact, and lossless'
+EVIDENCE_CONTRACT="$(DEFECT_EVIDENCE_MODULE="$ROOT/workflows/lib/defect-evidence.mjs" node "$TMP/defect-evidence-contract.mjs")"
+assert_eq "the marker remains the exact first-line selection key" true "$(jq -r .markerUnchanged <<<"$EVIDENCE_CONTRACT")"
+assert_eq "the complete canonical comment matches the public Markdown contract" true "$(jq -r .canonicalExact <<<"$EVIDENCE_CONTRACT")"
+assert_eq "the reusable evidence-section renderer is exported" true "$(jq -r .sectionExported <<<"$EVIDENCE_CONTRACT")"
+assert_eq "generated summaries collapse display fields and honor every title/why fallback" true "$(jq -r .generatedSectionExact <<<"$EVIDENCE_CONTRACT")"
+assert_eq "a caller-supplied summary is reproduced verbatim above the same envelope" true "$(jq -r .suppliedSummaryVerbatim <<<"$EVIDENCE_CONTRACT")"
+assert_eq "the comment-level parser is exported" true "$(jq -r .parserExported <<<"$EVIDENCE_CONTRACT")"
+assert_eq "the canonical document parses to its exact envelope and rendered summary" true "$(jq -r .canonicalRoundTrips <<<"$EVIDENCE_CONTRACT")"
+assert_eq "the envelope-only compatibility parser accepts canonical comments" true "$(jq -r .compatibilityParserReadsCanonical <<<"$EVIDENCE_CONTRACT")"
+
+scenario 'defect evidence codec: legacy comments stay actionable and trust-bound'
+assert_eq "compact legacy JSON parses and synthesizes its readable summary" true "$(jq -r .compactLegacyAccepted <<<"$EVIDENCE_CONTRACT")"
+assert_eq "pretty legacy JSON parses and synthesizes its readable summary" true "$(jq -r .prettyLegacyAccepted <<<"$EVIDENCE_CONTRACT")"
+assert_eq "the compatibility parser still returns the exact legacy envelope" true "$(jq -r .compatibilityParserReadsLegacy <<<"$EVIDENCE_CONTRACT")"
+assert_eq "text before the marker is refused" true "$(jq -r .markerMustBeFirst <<<"$EVIDENCE_CONTRACT")"
+assert_eq "text outside the exact canonical layout is refused" true "$(jq -r .exactLayoutRejectsTrailingText <<<"$EVIDENCE_CONTRACT")"
+assert_eq "the comment-level trusted matcher is exported" true "$(jq -r .matcherExported <<<"$EVIDENCE_CONTRACT")"
+assert_eq "newest-first matching skips forged, stale, and malformed later comments" true "$(jq -r .newestTrustedExactRecord <<<"$EVIDENCE_CONTRACT")"
+assert_eq "matching a legacy comment returns its synthesized report summary" true "$(jq -r .legacyMatcherSynthesizesSummary <<<"$EVIDENCE_CONTRACT")"
+assert_eq "the compatibility matcher still returns only the exact envelope" true "$(jq -r .compatibilityMatcherReturnsEnvelope <<<"$EVIDENCE_CONTRACT")"
+assert_eq "author, issue, PR, branch, and head remain mandatory trust bindings" true "$(jq -r .everyTrustBindingEnforced <<<"$EVIDENCE_CONTRACT")"
+
+scenario 'defect evidence codec: untrusted display fields cannot create active Markdown'
+assert_eq "Markdown, HTML, mentions, references, and bare URLs render inert" true "$(jq -r .hostileFieldsRenderInert <<<"$EVIDENCE_CONTRACT")"
+assert_eq "the summary uses plain-text entities for dangerous display characters" true "$(jq -r .hostileFieldsUsePlainTextEntities <<<"$EVIDENCE_CONTRACT")"
+assert_eq "a follow-up URL outside the evidence PR repository is never linked" true "$(jq -r .invalidFollowUpRejected <<<"$EVIDENCE_CONTRACT")"
+assert_eq "an invalid PR URL is never placed in a Markdown destination" true "$(jq -r .invalidPrUrlRejected <<<"$EVIDENCE_CONTRACT")"
+assert_eq "escaping the summary does not alter the authoritative evidence envelope" true "$(jq -r .hostileEnvelopeRoundTripsExactly <<<"$EVIDENCE_CONTRACT")"
 
 # ───────────────────────── epic-run ─────────────────────────
 scenario 'epic-run: happy path ships and queues for merge'
@@ -1345,6 +1547,7 @@ HELD="$TMP/fixtures-held"; cp -R "$BASE" "$HELD"
 fixture "$HELD" triage '{"status":"Left one for a human.","assessments":[{"index":1,"action":"deferred","reason":"The fix needs a product decision."}]}'
 fixture_sh "$HELD" triage 'true'
 fixture "$HELD" fixcheck '{"verdicts":[{"index":1,"verdict":"defect","confidence":94,"reasoning":"The empty-list access is still reachable and throws; no guard was added."}],"regressions":[]}'
+fixture "$HELD" ship '{"title":"Add widget","body":"Adds a widget.","commitBody":"","deferred":[{"blockerId":"blocker-1","title":"Null deref on empty list","why":"The fix needs a product decision.","kind":"defect","file":false}]}'
 run_pipeline "$EPIC_RUN" "$HELD" --issue 42
 assert_rc "exits 0 (the PR is real, just held)" 0 "$RUN_RC"
 assert_contains "RESULT records why the gate held" "$RUN_OUT" '"mergeSkipped"'
@@ -1354,6 +1557,15 @@ assert_contains "RESULT marks an exclusively defect-class hold repairable" "$RUN
 assert_eq "the issue stays reviewable and enters the defect-fixer queue" "needs-defect-fix,ready-to-review," "$(gh_labels)"
 assert_eq "a deliberate deferral still gets an independent check" 1 "$(calls fixcheck)"
 assert_eq "a deliberate deferral spends no second repair round" 0 "$(calls triage2)"
+EVIDENCE_COMMENT="$(gh_evidence_comment)"
+assert_eq "the evidence selection marker is the comment's first line" "🤖 defect-fix evidence" "$(head -n 1 <<<"$EVIDENCE_COMMENT")"
+SHORT_HEAD="$(origin_ref epic/42-add-widget | cut -c1-7)"
+assert_contains "the evidence summary links the PR, short head, and branch" "$EVIDENCE_COMMENT" "PR: [#7](https://github.com/o/r/pull/7) — \`$SHORT_HEAD\` on \`epic/42-add-widget\`"
+assert_contains "the evidence summary names the pinned requirement" "$EVIDENCE_COMMENT" "Pinned requirement: Add widget"
+assert_contains "the evidence summary shows blocker source and reason" "$EVIDENCE_COMMENT" '- `post-review-defect` — 1 independently confirmed review defect(s) left unfixed'
+assert_contains "the evidence summary gives each blocker item a readable title and why" "$EVIDENCE_COMMENT" '  - Null deref on empty list — The empty-list access is still reachable and throws; no guard was added.'
+assert_contains "the complete envelope is hidden in an unopened details block" "$EVIDENCE_COMMENT" $'<details>\n<summary>machine-readable evidence</summary>\n\n```json'
+assert_contains "the evidence envelope is pretty-printed rather than raw one-line JSON" "$EVIDENCE_COMMENT" $'```json\n{\n  "version": 1,'
 
 scenario 'review assessment: a deferred allegation is not a confirmed defect'
 UNCERTAIN_DEFER="$TMP/fixtures-uncertain-defer"; cp -R "$HELD" "$UNCERTAIN_DEFER"
@@ -1485,7 +1697,7 @@ assert_eq "and no vendor process was started" 0 "$(wc -l < "$POST_TERMINAL_LOG" 
 # reports, all inside the one window that write opened.
 scenario "epic-run: ship's own ready-to-review write is bounded and the gate still decides after it"
 CLEARDEFER="$TMP/fixtures-cleardefer"; cp -R "$BASE" "$CLEARDEFER"
-fixture "$CLEARDEFER" ship '{"title":"Add widget","body":"Adds a widget.","commitBody":"","deferred":[{"title":"Refactor the helpers","why":"Nice to have.","kind":"other","file":false}]}'
+fixture "$CLEARDEFER" ship '{"title":"Add widget","body":"Adds a widget.","commitBody":"","deferred":[{"blockerId":"new","title":"Refactor the helpers","why":"Nice to have.","kind":"other","file":false}]}'
 fixture "$CLEARDEFER" defercheck '{"verdicts":[{"index":1,"defect":false,"confidence":90,"reasoning":"A refactor idea; nothing breaks."}]}'
 SHIP_WRITE_START="$(date +%s)"
 EPIC_TERMINAL_REPORT_MS=3000 GH_SLOW_LABEL=ready-to-review:20 run_pipeline "$EPIC_RUN" "$CLEARDEFER" --issue 42
@@ -1575,11 +1787,11 @@ assert_contains "which records the blocked run" "$RUN_OUT" '"blocked":true'
 scenario 'epic-run: ship classifies deferrals; the script counts, files and records them'
 DEFER="$TMP/fixtures-defer"; cp -R "$BASE" "$DEFER"
 fixture "$DEFER" ship '{"title":"Add widget","body":"Adds a widget.","commitBody":"","legalMarker":"LEGAL-REVIEW: required","deferred":[
-  {"title":"Widget crashes on empty list","why":"Needs a product decision.","kind":"defect","file":true,"issueTitle":"Widget crashes on empty list","issueBody":"Still on main after the merge."},
-  {"title":"Second defect","why":"Same.","kind":"defect","file":true},
-  {"title":"Third defect","why":"Same.","kind":"defect","file":true},
-  {"title":"Fourth defect","why":"Same.","kind":"defect","file":true},
-  {"title":"Refactor the helpers","why":"Nice to have.","kind":"other","file":true}]}'
+  {"blockerId":"new","title":"Widget crashes on empty list","why":"Needs a product decision.","kind":"defect","file":true,"issueTitle":"Widget crashes on empty list","issueBody":"Still on main after the merge."},
+  {"blockerId":"new","title":"Second defect","why":"Same.","kind":"defect","file":true},
+  {"blockerId":"new","title":"Third defect","why":"Same.","kind":"defect","file":true},
+  {"blockerId":"new","title":"Fourth defect","why":"Same.","kind":"defect","file":true},
+  {"blockerId":"new","title":"Refactor the helpers","why":"Nice to have.","kind":"other","file":true}]}'
 fixture "$DEFER" defercheck '{"verdicts":[{"index":1,"defect":false,"confidence":90,"reasoning":"A refactor idea; nothing breaks."}]}'
 run_pipeline "$EPIC_RUN" "$DEFER" --issue 42
 assert_rc "exits 0" 0 "$RUN_RC"
@@ -1595,6 +1807,9 @@ assert_contains "it lists every item, kind and why" "$(gh_comments)" "- Refactor
 assert_eq "at most three follow-ups were filed, defects first" 3 "$(grep -c '^TITLE: ' "$STATE_DIR/gh/issues-created")"
 assert_not_contains "an 'other' item is never filed even when asked" "$(gh_issues_created)" "Refactor the helpers"
 assert_contains "a follow-up links back with the Follow-up line" "$(gh_issues_created)" "Follow-up to #42"
+assert_contains "the evidence summary links a filed item to its follow-up" "$(gh_evidence_comment)" '  - Widget crashes on empty list — Needs a product decision. — [follow-up #101](https://github.com/o/r/issues/101)'
+assert_contains "the evidence summary links every filed item by its returned URL" "$(gh_evidence_comment)" '  - Third defect — Same. — [follow-up #103](https://github.com/o/r/issues/103)'
+assert_not_contains "an item beyond the filing cap gets no invented follow-up" "$(gh_evidence_comment)" '[follow-up #104]'
 assert_contains "the record says how many qualified versus filed" "$(gh_comments)" "4 items qualified for a follow-up issue and 3 were filed"
 assert_contains "the PR body points at the record" "$(cat "$WT/.epics/42-add-widget/summary.md")" "Deferred items recorded on #42."
 assert_contains "the legal marker reaches the PR body" "$(cat "$WT/.epics/42-add-widget/summary.md")" "LEGAL-REVIEW: required"
@@ -2147,7 +2362,7 @@ assert_contains "the run ships" "$RUN_OUT" '"readyToMerge":true'
 
 scenario 'deferral check: an item ship called other but the skeptic calls a defect holds the PR'
 DOWNGRADED="$TMP/fixtures-downgraded"; cp -R "$BASE" "$DOWNGRADED"
-fixture "$DOWNGRADED" ship '{"title":"Add widget","body":"Adds a widget.","commitBody":"","deferred":[{"title":"Empty list still crashes on submit","why":"Out of scope for this slice.","kind":"other","file":false}]}'
+fixture "$DOWNGRADED" ship '{"title":"Add widget","body":"Adds a widget.","commitBody":"","deferred":[{"blockerId":"new","title":"Empty list still crashes on submit","why":"Out of scope for this slice.","kind":"other","file":false}]}'
 fixture "$DOWNGRADED" defercheck '{"verdicts":[{"index":1,"defect":true,"confidence":92,"reasoning":"Submit with an empty list throws on main after this merge; the requirement covers it."}]}'
 run_pipeline "$EPIC_RUN" "$DOWNGRADED" --issue 42
 assert_rc "exits 0" 0 "$RUN_RC"
@@ -2182,7 +2397,7 @@ assert_not_contains "the soft check does not become a blocker comment" "$(gh_com
 
 scenario 'merge gate: one uncertain blocker keeps concrete defects out of autonomous repair'
 MIXED="$TMP/fixtures-mixed-gate"; cp -R "$HELD" "$MIXED"
-fixture "$MIXED" ship '{"title":"Add widget","body":"Adds a widget.","commitBody":"","deferred":[{"title":"Maybe update the docs","why":"Classification needs review.","kind":"other","file":false}]}'
+fixture "$MIXED" ship '{"title":"Add widget","body":"Adds a widget.","commitBody":"","deferred":[{"blockerId":"blocker-1","title":"Null deref on empty list","why":"The fix needs a product decision.","kind":"defect","file":false},{"blockerId":"new","title":"Maybe update the docs","why":"Classification needs review.","kind":"other","file":false}]}'
 printf '1' > "$MIXED/defercheck.0.rc"; printf '1' > "$MIXED/defercheck.1.rc"
 run_pipeline "$EPIC_RUN" "$MIXED" --issue 42
 assert_rc "exits 0 with a reviewable PR" 0 "$RUN_RC"
@@ -2883,6 +3098,15 @@ make_defect_evidence() { # head [blocker title] [requirement body]
     blockers: [{source: "ship-deferral", reason: $title, items: [{title: $title, severity: "Important", why: "firstItem dereferences items[0] without a guard."}]}]
   }'
 }
+make_canonical_defect_evidence() { # head summary
+  local head="$1" summary="$2" legacy json
+  legacy="$(make_defect_evidence "$head")"
+  json="${legacy#*$'\n'}"
+  printf '🤖 defect-fix evidence\n%s\n\n' "$summary"
+  printf '<details>\n<summary>machine-readable evidence</summary>\n\n```json\n'
+  jq . <<<"$json"
+  printf '```\n</details>\n'
+}
 DEFECTBASE="$TMP/fixtures-defect"
 mkdir -p "$DEFECTBASE"
 fixture "$DEFECTBASE" defect-fix '{"completed":true,"summary":"Adds the missing empty-list guard (PRIVATE_FIXER_EXPLANATION).","files":["frontend/src/widget.ts"]}'
@@ -2939,6 +3163,10 @@ assert_not_contains "ready-to-review is removed" "$(gh_labels)" "ready-to-review
 assert_contains "the audit comment names the repaired gate" "$(gh_comments)" "Empty list still crashes"
 assert_contains "the audit comment records the adversarial confidence" "$(gh_comments)" "91"
 assert_contains "the audit says the merge worker re-runs the real checks" "$(gh_comments)" "re-runs the real checks"
+REPAIRED_COMMENT="$(gh_last_comment)"
+assert_contains "the repaired audit puts a synthesized readable summary under Gate evidence" "$REPAIRED_COMMENT" $'Gate evidence:\nPR: [#7](https://github.com/o/r/pull/7) — `'
+assert_contains "the repaired audit repeats the pinned requirement title" "$REPAIRED_COMMENT" $'Pinned requirement: Add widget\n- `ship-deferral`'
+assert_contains "the repaired audit folds a fresh pretty copy of the unchanged legacy envelope" "$REPAIRED_COMMENT" $'<details>\n<summary>machine-readable evidence</summary>\n\n```json\n{\n  "version": 1,'
 assert_eq "one fixer and one skeptic ran" "1 1" "$(calls defect-fix) $(calls defect-check)"
 FIXPROMPT="$(cat "$STATE_DIR/defect-fix.0.prompt")"
 CHECKPROMPT="$(cat "$STATE_DIR/defect-check.0.prompt")"
@@ -2999,6 +3227,21 @@ assert_contains "the matching trusted defect is used" "$FIXPROMPT" "Empty list s
 assert_not_contains "a later forged repair instruction is ignored" "$FIXPROMPT" "ATTACKER CONTROLLED REPAIR"
 assert_not_contains "a trusted record for another head is ignored" "$FIXPROMPT" "STALE TRUSTED REPAIR"
 assert_not_contains "a post-queue issue edit is not re-read" "$FIXPROMPT" "MUTATED ISSUE BODY PROMPT INJECTION"
+
+scenario 'defect-run: the human summary is reproduced for reporting but never becomes repair authority'
+seed_defect_pr
+BEFORE="$(origin_ref epic/42-add-widget)"
+REPORT_ONLY_SUMMARY="PR: [#7](https://github.com/o/r/pull/7) — \`$(cut -c1-7 <<<"$BEFORE")\` on \`epic/42-add-widget\`
+Pinned requirement: Add widget
+REPORT_ONLY_PRESENTATION_TEXT"
+DEFECT_COMMENTS="$(make_canonical_defect_evidence "$BEFORE" "$REPORT_ONLY_SUMMARY")" \
+  run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+assert_rc "the canonical evidence remains actionable" 0 "$RUN_RC"
+FIXPROMPT="$(cat "$STATE_DIR/defect-fix.0.prompt" 2>/dev/null || true)"
+CHECKPROMPT="$(cat "$STATE_DIR/defect-check.0.prompt" 2>/dev/null || true)"
+assert_not_contains "presentation text never enters the write-capable fixer prompt" "$FIXPROMPT" "REPORT_ONLY_PRESENTATION_TEXT"
+assert_not_contains "presentation text never enters the adversarial gate prompt" "$CHECKPROMPT" "REPORT_ONLY_PRESENTATION_TEXT"
+assert_contains "the repaired audit still reproduces the selected human summary" "$(gh_last_comment)" "$REPORT_ONLY_SUMMARY"
 
 scenario 'defect-run: untrusted-only evidence refuses before consuming an attempt'
 seed_defect_pr
@@ -3561,16 +3804,51 @@ assert_eq "post-terminal reporting finishes well inside that floor" "fits" \
 # The queue label and its canonical evidence are one invariant. Carry the real
 # comments and labels produced by epic-run into a fresh defect-run process;
 # never seed a hand-written replacement brief for these handoff scenarios.
-assert_defect_handoff() { # name epic-fixtures expected blocker text
-  local name="$1" epic_fixtures="$2" expected="$3" comments labels
+assert_defect_handoff() { # name epic-fixtures expected blocker text [expected linked copies] [linked item 1] [linked item 2]
+  local name="$1" epic_fixtures="$2" expected="$3" linked_copies="${4:-0}" linked_item1="${5:-$3}" linked_item2="${6:-${5:-$3}}" comments labels evidence_summary repaired original_json repaired_json link non_ship_items ship_items
   scenario "epic-run -> defect-run: $name carries its complete durable repair brief"
   run_pipeline "$EPIC_RUN" "$epic_fixtures" --issue 42
   assert_rc "$name epic finishes held" 0 "$RUN_RC"
   assert_contains "$name enters the bounded repair queue" "$(gh_labels)" "needs-defect-fix"
   comments="$(gh_comments)"; labels="$(gh_labels)"; labels="${labels%,}"
+  evidence_summary="$(printf '%s\n' "$comments" | awk '
+    $0 == "🤖 defect-fix evidence" { found = 1; next }
+    found && $0 == "<details>" { exit }
+    found { print }
+  ')"
+  evidence_summary="${evidence_summary%$'\n'}"
+  assert_contains "$name posts the canonical collapsed evidence document" "$comments" $'<details>\n<summary>machine-readable evidence</summary>\n\n```json'
+  assert_contains "$name evidence summary names the pinned requirement" "$evidence_summary" 'Pinned requirement: Add widget'
+  assert_contains "$name evidence summary includes the durable blocker" "$evidence_summary" "$expected"
+  assert_contains "$name evidence summary formats its blocker as a readable bullet" "$evidence_summary" $'\n- `'
+  if (( linked_copies > 0 )); then
+    link=" — [follow-up #101](https://github.com/o/r/issues/101)"
+    if [[ "$linked_item1" == "$linked_item2" ]]; then
+      assert_eq "$name links every independently-created blocker copy to the filed follow-up" "$linked_copies" "$(grep -F -c "$linked_item1$link" <<<"$evidence_summary")"
+    else
+      assert_contains "$name links the original blocker text" "$evidence_summary" "$linked_item1$link"
+      assert_contains "$name links the rephrased ship copy" "$evidence_summary" "$linked_item2$link"
+    fi
+    non_ship_items="$(awk '/^- `post-review-defect`/{found=1; next} found && /^- `/{exit} found' <<<"$evidence_summary")"
+    ship_items="$(awk '/^- `ship-deferral`/{found=1; next} found && /^- `/{exit} found' <<<"$evidence_summary")"
+    assert_contains "$name links the non-ship blocker copy" "$non_ship_items" "$linked_item1$link"
+    assert_contains "$name links the ship blocker copy" "$ship_items" "$linked_item2$link"
+  fi
+  original_json="$(printf '%s\n' "$comments" | awk '$0 == "```json" { found = 1; next } found && $0 == "```" { exit } found { print }')"
+  assert_contains "$name evidence details retain the complete pretty envelope" "$original_json" '"version": 1'
+  assert_not_contains "$name internal blocker IDs never enter the v1 envelope" "$original_json" "blockerId"
   DEFECT_LABELS="$labels" DEFECT_COMMENTS="$comments" run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
   assert_rc "$name evidence is accepted without synthetic comments" 0 "$RUN_RC"
   assert_contains "$name blocker reaches the fixer" "$(cat "$STATE_DIR/defect-fix.0.prompt")" "$expected"
+  repaired="$(gh_last_comment)"
+  assert_contains "$name repaired audit reuses the selected evidence summary verbatim" "$repaired" "$evidence_summary"
+  if (( linked_copies > 0 )); then
+    assert_eq "$name repaired audit retains every correlated follow-up link" "$linked_copies" "$(grep -F -c "$link" <<<"$repaired")"
+  fi
+  assert_contains "$name repaired audit folds the same authoritative envelope" "$repaired" $'Gate evidence:\n'
+  assert_contains "$name repaired audit labels the machine copy exactly" "$repaired" '<summary>machine-readable evidence</summary>'
+  repaired_json="$(printf '%s\n' "$repaired" | awk '$0 == "```json" { found = 1; next } found && $0 == "```" { exit } found { print }')"
+  assert_eq "$name repaired audit preserves the authoritative JSON byte-for-byte" "$original_json" "$repaired_json"
 }
 # An unconfirmed fix is deliberately absent: it is uncertainty, not a named
 # defect, so it holds the PR for a human and never reaches this handoff.
@@ -3580,6 +3858,52 @@ assert_defect_handoff "regression round 2 left unfixed" "$HELD2" "Guard breaks t
 assert_defect_handoff "independently refuted rejection" "$REJECTREALHELD" "Null deref on empty list"
 assert_defect_handoff "independently proven no-delta defect" "$NODIFFDEFECT" "still reachable and still crashes"
 assert_defect_handoff "ship deferral" "$DEFER" "Second defect"
+COPIED_BLOCKER="$TMP/fixtures-copied-blocker"; cp -R "$HELD" "$COPIED_BLOCKER"
+fixture "$COPIED_BLOCKER" ship '{"title":"Add widget","body":"Adds a widget.","commitBody":"","deferred":[{"blockerId":"blocker-1","title":"Empty collections still throw","why":"The remaining path reaches an unsafe access.","kind":"defect","file":true}]}'
+assert_defect_handoff "copied blocker follow-up" "$COPIED_BLOCKER" "Null deref on empty list" 2 "Null deref on empty list — The empty-list access is still reachable and throws; no guard was added." "Empty collections still throw — The remaining path reaches an unsafe access."
+
+IDENTICAL="$TMP/fixtures-identical-blockers"; cp -R "$BASE" "$IDENTICAL"
+fixture "$IDENTICAL" review-general '{"findings":[{"title":"Same displayed blocker","severity":"Important","confidence":90,"location":"src/widget.ts:12","problem":"Same displayed reason.","fix":"Fix the first path.","gate":"first focused test"},{"title":"Same displayed blocker","severity":"Important","confidence":90,"location":"src/widget.ts:24","problem":"Same displayed reason.","fix":"Fix the second path.","gate":"second focused test"}]}'
+fixture "$IDENTICAL" verify '{"verdicts":[{"index":1,"real":true,"confidence":90,"reasoning":"The first path is broken."},{"index":2,"real":true,"confidence":90,"reasoning":"The second path is independently broken."}]}'
+fixture "$IDENTICAL" triage '{"status":"Left both identical-looking blockers for a human.","assessments":[{"index":2,"action":"deferred","reason":"Same displayed reason."},{"index":1,"action":"deferred","reason":"Same displayed reason."}]}'
+fixture_sh "$IDENTICAL" triage 'true'
+fixture "$IDENTICAL" fixcheck '{"verdicts":[{"index":2,"verdict":"defect","confidence":92,"reasoning":"Same displayed reason."},{"index":1,"verdict":"defect","confidence":92,"reasoning":"Same displayed reason."}],"regressions":[]}'
+fixture "$IDENTICAL" ship '{"title":"Add widget","body":"Adds a widget.","commitBody":"","deferred":[{"blockerId":"blocker-2","title":"Same displayed blocker","why":"Same displayed reason.","kind":"defect","file":true},{"blockerId":"blocker-1","title":"Same displayed blocker","why":"Same displayed reason.","kind":"defect","file":false}]}'
+scenario 'ship identity: duplicate display text stays correlated when ship reverses the blockers'
+run_pipeline "$EPIC_RUN" "$IDENTICAL" --issue 42
+assert_rc "reversed identical blockers ship safely" 0 "$RUN_RC"
+assert_contains "ship maps the first opaque ID to its finding location" "$(cat "$STATE_DIR/ship.0.prompt")" "- blocker-1: Same displayed blocker [src/widget.ts:12] — Same displayed reason."
+assert_contains "ship maps the second opaque ID to its finding location" "$(cat "$STATE_DIR/ship.0.prompt")" "- blocker-2: Same displayed blocker [src/widget.ts:24] — Same displayed reason."
+assert_eq "only the selected blocker files a follow-up" 1 "$(grep -c '^TITLE: ' "$STATE_DIR/gh/issues-created")"
+IDENTICAL_SUMMARY="$(gh_evidence_comment)"
+assert_eq "the one filed identity links both of its evidence copies" 2 "$(grep -F -c 'Same displayed blocker — Same displayed reason. — [follow-up #101](https://github.com/o/r/issues/101)' <<<"$IDENTICAL_SUMMARY")"
+assert_eq "the other identical identity never steals that link" 4 "$(grep -F -c 'Same displayed blocker — Same displayed reason.' <<<"$IDENTICAL_SUMMARY")"
+assert_not_contains "no second follow-up is invented for the unfiled identity" "$IDENTICAL_SUMMARY" "follow-up #102"
+
+SUBSET="$TMP/fixtures-blocker-id-subset"; cp -R "$IDENTICAL" "$SUBSET"
+fixture "$SUBSET" ship '{"title":"Add widget","body":"Adds a widget.","commitBody":"","deferred":[{"blockerId":"blocker-2","title":"Same displayed blocker","why":"Same displayed reason.","kind":"defect","file":true}]}'
+scenario 'ship identity: a non-empty subset of known blocker IDs fails closed before transport'
+run_pipeline "$EPIC_RUN" "$SUBSET" --issue 42
+assert_rc "a missing known blocker ID blocks the run" 3 "$RUN_RC"
+assert_contains "the missing ID refusal names blocker identity" "$RUN_OUT" "blocker ID"
+assert_eq "a partial blocker ledger creates no PR" "" "$(gh_pr_created)"
+
+for blocker_id_case in unknown duplicate known-as-new; do
+  BAD_BLOCKER_ID="$TMP/fixtures-blocker-id-$blocker_id_case"; cp -R "$HELD" "$BAD_BLOCKER_ID"
+  if [[ "$blocker_id_case" == unknown ]]; then
+    deferred='[{"blockerId":"blocker-999","title":"Unknown copy","why":"No registered source.","kind":"defect","file":true}]'
+  elif [[ "$blocker_id_case" == duplicate ]]; then
+    deferred='[{"blockerId":"blocker-1","title":"First copy","why":"Same source.","kind":"defect","file":true},{"blockerId":"blocker-1","title":"Second copy","why":"Same source again.","kind":"defect","file":true}]'
+  else
+    deferred='[{"blockerId":"new","title":"Known blocker called new","why":"Would sever its evidence link.","kind":"defect","file":true}]'
+  fi
+  fixture "$BAD_BLOCKER_ID" ship "{\"title\":\"Add widget\",\"body\":\"Adds a widget.\",\"commitBody\":\"\",\"deferred\":$deferred}"
+  scenario "ship identity: $blocker_id_case blocker IDs fail closed before transport"
+  run_pipeline "$EPIC_RUN" "$BAD_BLOCKER_ID" --issue 42
+  assert_rc "$blocker_id_case blocker IDs block the run" 3 "$RUN_RC"
+  assert_contains "$blocker_id_case blocker IDs name the identity refusal" "$RUN_OUT" "blocker ID"
+  assert_eq "$blocker_id_case blocker IDs create no PR" "" "$(gh_pr_created)"
+done
 
 # ───────────────────── exact deduplication without semantic grouping ─────────────────────
 # Related reports still need individual dispositions and independent evidence.

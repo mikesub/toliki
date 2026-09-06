@@ -1,12 +1,53 @@
 // Canonical handoff between epic-run's deterministic merge gate and the
-// bounded defect fixer. The marker is human-readable; the JSON is the authority.
-// Selection requires the authenticated author plus the exact issue, PR, branch
-// and head captured by the consumer, so mutable or forgeable issue prose never
-// becomes an unattended write instruction.
+// bounded defect fixer. The readable summary is reporting only; the complete
+// JSON in the collapsed details block remains the authority. Legacy comments
+// with raw JSON after the marker stay actionable. Selection requires the
+// authenticated author plus the exact issue, PR, branch and head captured by
+// the consumer, so mutable or forgeable issue prose never becomes an
+// unattended write instruction. Human-facing fields are rendered as inert
+// GitHub Markdown; only validated PR and follow-up URLs become links.
 
 export const DEFECT_EVIDENCE_MARKER = '🤖 defect-fix evidence'
 
 const isObject = value => value !== null && typeof value === 'object' && !Array.isArray(value)
+const DETAILS_OPEN = '<details>\n<summary>machine-readable evidence</summary>\n\n```json\n'
+const DETAILS_CLOSE = '\n```\n</details>'
+
+const oneLine = value => String(value ?? '').replace(/\s+/g, ' ').trim()
+const plainText = value => oneLine(value)
+  .replace(/[&\\`*_\[\]{}<>#+!|@~:$]/gu, character => `&#${character.codePointAt(0)};`)
+  .replace(/\bwww\.[^\s]*/giu, token => token.replaceAll('.', '&#46;'))
+
+function firstLineValue(...values) {
+  for (const value of values) {
+    const text = oneLine(value)
+    if (text) return text
+  }
+  return ''
+}
+
+function itemTitle(item) {
+  return firstLineValue(item?.title, item?.finding?.title)
+}
+
+function artifactUrl(value, kind, expectedNumber) {
+  let url
+  try {
+    url = new URL(oneLine(value))
+  } catch {
+    return null
+  }
+  if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash) return null
+  const match = url.pathname.match(/^\/([^/]+)\/([^/]+)\/(pull|issues)\/([1-9]\d*)\/?$/)
+  if (!match || match[3] !== kind) return null
+  const number = Number(match[4])
+  if (expectedNumber !== undefined && number !== expectedNumber) return null
+  return {
+    href: url.href,
+    number,
+    repository: `${url.origin}/${match[1]}/${match[2]}`.toLocaleLowerCase('en-US'),
+  }
+}
 
 export function validDefectEvidence(value) {
   if (!isObject(value) || value.version !== 1 || !Number.isInteger(value.issue)) return false
@@ -17,35 +58,99 @@ export function validDefectEvidence(value) {
     typeof blocker.reason === 'string' && Array.isArray(blocker.items) && blocker.items.length > 0)
 }
 
-export function renderDefectEvidence(evidence) {
-  if (!validDefectEvidence(evidence)) throw new Error('refusing to render malformed defect-fix evidence')
-  return `${DEFECT_EVIDENCE_MARKER}\n${JSON.stringify(evidence)}`
+function renderSummary(evidence, followUpFor) {
+  const pr = artifactUrl(evidence.pr.url, 'pull', evidence.pr.number)
+  const prLabel = pr ? `[#${evidence.pr.number}](${pr.href})` : `PR ${evidence.pr.number}`
+  const lines = [
+    `PR: ${prLabel} — \`${plainText(evidence.pr.head).slice(0, 7)}\` on \`${plainText(evidence.pr.branch)}\``,
+    `Pinned requirement: ${plainText(evidence.requirement.title)}`,
+  ]
+  for (const blocker of evidence.blockers) {
+    const reason = plainText(blocker.reason)
+    lines.push(`- \`${plainText(blocker.source)}\` — ${reason}`)
+    for (const item of blocker.items) {
+      const title = plainText(itemTitle(item))
+      const why = plainText(firstLineValue(
+        item?.why,
+        item?.verdict?.reasoning,
+        item?.problem,
+        item?.finding?.problem,
+        blocker.reason,
+      ))
+      let line = `  - ${title} — ${why}`
+      const followUp = followUpFor?.(item)
+      const link = pr && followUp ? artifactUrl(followUp, 'issues') : null
+      if (link && link.repository === pr.repository) {
+        line += ` — [follow-up #${link.number}](${link.href})`
+      }
+      lines.push(line)
+    }
+  }
+  return lines.join('\n')
 }
 
-export function parseDefectEvidence(body) {
+export function renderDefectEvidenceSection(evidence, { summary, followUpFor } = {}) {
+  if (!validDefectEvidence(evidence)) throw new Error('refusing to render malformed defect-fix evidence')
+  const readable = summary === undefined ? renderSummary(evidence, followUpFor) : String(summary)
+  return `${readable}\n\n${DETAILS_OPEN}${JSON.stringify(evidence, null, 2)}${DETAILS_CLOSE}`
+}
+
+export function renderDefectEvidence(evidence, options = {}) {
+  return `${DEFECT_EVIDENCE_MARKER}\n${renderDefectEvidenceSection(evidence, options)}`
+}
+
+export function parseDefectEvidenceComment(body) {
   const text = String(body || '')
   if (!text.startsWith(`${DEFECT_EVIDENCE_MARKER}\n`)) return null
+  const content = text.slice(DEFECT_EVIDENCE_MARKER.length + 1)
+
+  // The old representation was just the marker and a compact or pretty JSON
+  // object. Parsing it first keeps every already-posted repair brief valid.
   try {
-    const value = JSON.parse(text.slice(DEFECT_EVIDENCE_MARKER.length).trim())
-    return validDefectEvidence(value) ? value : null
+    const evidence = JSON.parse(content.trim())
+    if (validDefectEvidence(evidence)) return { evidence, summary: renderSummary(evidence) }
+  } catch {}
+
+  const details = `\n\n${DETAILS_OPEN}`
+  const detailsAt = content.indexOf(details)
+  if (detailsAt < 0 || !content.endsWith(DETAILS_CLOSE)) return null
+  const summary = content.slice(0, detailsAt)
+  const jsonStart = detailsAt + details.length
+  const jsonText = content.slice(jsonStart, -DETAILS_CLOSE.length)
+  try {
+    const evidence = JSON.parse(jsonText)
+    if (!validDefectEvidence(evidence)) return null
+    // The canonical layout owns a byte-stable machine block. Refuse prose or
+    // alternate serialization outside that exact document shape.
+    if (jsonText !== JSON.stringify(evidence, null, 2)) return null
+    return { evidence, summary }
   } catch {
     return null
   }
 }
 
-export function matchingDefectEvidence(comments, { actor, issue, prNumber, branch, head }) {
+export function parseDefectEvidence(body) {
+  return parseDefectEvidenceComment(body)?.evidence || null
+}
+
+export function matchingDefectEvidenceComment(comments, { actor, issue, prNumber, branch, head }) {
   const login = String(actor || '').toLowerCase()
   if (!login || !Array.isArray(comments)) return null
   for (let i = comments.length - 1; i >= 0; i--) {
     const comment = comments[i]
     if (String(comment?.author?.login || '').toLowerCase() !== login) continue
-    const evidence = parseDefectEvidence(comment?.body)
-    if (!evidence) continue
+    const record = parseDefectEvidenceComment(comment?.body)
+    if (!record) continue
+    const { evidence } = record
     if (evidence.issue !== Number(issue) || evidence.pr.number !== Number(prNumber)) continue
     if (evidence.pr.branch !== branch || evidence.pr.head !== head) continue
-    return evidence
+    return record
   }
   return null
+}
+
+export function matchingDefectEvidence(comments, criteria) {
+  return matchingDefectEvidenceComment(comments, criteria)?.evidence || null
 }
 
 // ───────────────────────── the landing record ─────────────────────────
