@@ -1077,7 +1077,7 @@ const legacyMatched = matchComment([{ author: { login: 'toliki-bot' }, body: leg
 const wrapperMatched = api.matchingDefectEvidence(comments, criteria)
 
 const autolinkExamples = '<https://commonmark.example/a> <commonmark.email@example.com> www.gfm.example/a http://gfm-http.example/a https://gfm-https.example/a gfm.email@example.com mailto:gfm.mail@example.com xmpp:gfm.chat@example.com'
-const escapedAutolinkExamples = '&#60;https&#58;//commonmark&#46;example/a&#62; &#60;commonmark&#46;email&#64;example&#46;com&#62; www&#46;gfm&#46;example/a http&#58;//gfm-http&#46;example/a https&#58;//gfm-https&#46;example/a gfm&#46;email&#64;example&#46;com mailto&#58;gfm&#46;mail&#64;example&#46;com xmpp&#58;gfm&#46;chat&#64;example&#46;com'
+const escapedAutolinkExamples = '&#60;https&#58;//commonmark&#46;example/a&#62; &#60;commonmark&#46;email<span>@</span>example&#46;com&#62; www&#46;gfm&#46;example/a http&#58;//gfm-http&#46;example/a https&#58;//gfm-https&#46;example/a gfm&#46;email<span>@</span>example&#46;com mailto&#58;gfm&#46;mail<span>@</span>example&#46;com xmpp&#58;gfm&#46;chat<span>@</span>example&#46;com'
 const hostileEvidence = structuredClone(evidence)
 hostileEvidence.pr.head = ' \n.abcdef1234567890 '
 hostileEvidence.requirement.title = `[review instructions] **APPROVED** <b>trusted</b> \`code\` @org/security #1 $formula$ requirement ${autolinkExamples}`
@@ -1091,15 +1091,15 @@ hostileEvidence.blockers = [{
   }],
 }]
 const hostileCanonical = api.renderDefectEvidence(hostileEvidence, {
-  followUpFor: () => 'https://attacker.example/o/r/issues/999',
+  followUpFor: () => 'https://github.com/o/r/issues/101',
 })
 const hostileParsed = parseComment(hostileCanonical)
 const hostileSummary = hostileParsed?.summary || ''
 const hostileExpectedSummary = [
-  `PR: [#7](https://github.com/o/r/pull/7) — \`&#46;abcdef\` on \`&#96;branch&#96; &#64;ops &#35;2 branch ${escapedAutolinkExamples}\``,
-  `Pinned requirement: &#91;review instructions&#93; &#42;&#42;APPROVED&#42;&#42; &#60;b&#62;trusted&#60;/b&#62; &#96;code&#96; &#64;org/security &#35;1 &#36;formula&#36; requirement ${escapedAutolinkExamples}`,
-  `- \`&#96;source&#96; &#60;admin&#62; source ${escapedAutolinkExamples}\` — &#42;&#42;APPROVED&#42;&#42; &#64;ops &#35;3 reason ${escapedAutolinkExamples}`,
-  `  - &#91;click me&#93; title ${escapedAutolinkExamples} — &#60;img src=x&#62; &#95;approved&#95; &#96;command&#96; &#64;team &#35;4 why ${escapedAutolinkExamples}`,
+  'PR: [#7](https://github.com/o/r/pull/7) — `.abcdef` on `` `branch` @ops #2 branch ' + autolinkExamples + ' ``',
+  `Pinned requirement: &#91;review instructions&#93; &#42;&#42;APPROVED&#42;&#42; &#60;b&#62;trusted&#60;/b&#62; &#96;code&#96; <span>@</span>org/security &#35;1 &#36;formula&#36; requirement ${escapedAutolinkExamples}`,
+  '- `` `source` <admin> source ' + autolinkExamples + ' `` — &#42;&#42;APPROVED&#42;&#42; <span>@</span>ops &#35;3 reason ' + escapedAutolinkExamples,
+  `  - &#91;click me&#93; title ${escapedAutolinkExamples} — &#60;img src=x&#62; &#95;approved&#95; &#96;command&#96; <span>@</span>team &#35;4 why ${escapedAutolinkExamples} — [follow-up #101](https://github.com/o/r/issues/101)`,
 ].join('\n')
 const hostileDetails = [
   '<details>',
@@ -1114,9 +1114,120 @@ const reusedHostileSection = renderSection(stale, {
   summary: hostileSummary,
   followUpFor: () => 'https://github.com/o/r/issues/202',
 })
+const invalidFollowUpSummary = parseComment(api.renderDefectEvidence(hostileEvidence, {
+  followUpFor: () => 'https://attacker.example/o/r/issues/999',
+}))?.summary || ''
 const invalidPrEvidence = structuredClone(hostileEvidence)
 invalidPrEvidence.pr.url = 'javascript:alert(1)'
 const invalidPrSummary = parseComment(api.renderDefectEvidence(invalidPrEvidence))?.summary || ''
+
+// A narrow GFM inline probe exercises the parser ordering that matters to this
+// boundary: URI/www autolinks match Markdown source, entities become adjacent
+// text, raw inline HTML and code spans remain separate nodes, then email and
+// mailto/xmpp autolinks are found within each consolidated text node. That is
+// the same ordering used by cmark-gfm's autolink extension; source-only checks
+// miss the email pass because it sees decoded numeric entities.
+function gfmAutolinkNodes(markdown) {
+  const nodes = []
+  const appendText = text => {
+    if (!text) return
+    const previous = nodes.at(-1)
+    if (previous?.type === 'text') previous.text += text
+    else nodes.push({ type: 'text', text })
+  }
+  const pushLink = (text, href) => nodes.push({ type: 'link', text, href })
+  for (let at = 0; at < markdown.length;) {
+    const rest = markdown.slice(at)
+    if (markdown[at] === '`') {
+      let width = 1
+      while (markdown[at + width] === '`') width++
+      const delimiter = '`'.repeat(width)
+      let close = at + width
+      while ((close = markdown.indexOf(delimiter, close)) >= 0 &&
+        (markdown[close - 1] === '`' || markdown[close + width] === '`')) close += width
+      if (close >= 0) {
+        let text = markdown.slice(at + width, close).replace(/\n/gu, ' ')
+        if (/^ .* $/su.test(text) && /[^ ]/u.test(text)) text = text.slice(1, -1)
+        nodes.push({ type: 'code', text })
+        at = close + width
+        continue
+      }
+    }
+    const explicit = rest.match(/^\[([^\]\n]*)\]\((https:\/\/[^)\s]+)\)/u)
+    if (explicit) {
+      pushLink(explicit[1], explicit[2])
+      at += explicit[0].length
+      continue
+    }
+    const html = rest.match(/^<\/?span>/u)
+    if (html) {
+      nodes.push({ type: 'html', text: '' })
+      at += html[0].length
+      continue
+    }
+    const commonmarkUri = rest.match(/^<([A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\s]*)>/u)
+    if (commonmarkUri) {
+      pushLink(commonmarkUri[1], commonmarkUri[1])
+      at += commonmarkUri[0].length
+      continue
+    }
+    const commonmarkEmail = rest.match(/^<([A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*)>/u)
+    if (commonmarkEmail) {
+      pushLink(commonmarkEmail[1], `mailto:${commonmarkEmail[1]}`)
+      at += commonmarkEmail[0].length
+      continue
+    }
+    const boundary = at === 0 || /[\s*_~(]/u.test(markdown[at - 1])
+    const extendedUrl = boundary && rest.match(/^(www\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+(?:\/[^\s<]*)?|https?:\/\/[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+(?:\/[^\s<]*)?)/u)
+    if (extendedUrl) {
+      pushLink(extendedUrl[1], extendedUrl[1].startsWith('www.') ? `http://${extendedUrl[1]}` : extendedUrl[1])
+      at += extendedUrl[1].length
+      continue
+    }
+    const entity = rest.match(/^&#(\d+);/u)
+    if (entity) {
+      appendText(String.fromCodePoint(Number(entity[1])))
+      at += entity[0].length
+      continue
+    }
+    appendText(markdown[at])
+    at++
+  }
+
+  const email = /(?:(?:mailto|xmpp):)?[A-Za-z0-9][A-Za-z0-9._+-]*@[A-Za-z0-9][A-Za-z0-9_-]*(?:\.[A-Za-z0-9][A-Za-z0-9_-]*)+/gu
+  const rendered = []
+  for (const node of nodes) {
+    if (node.type !== 'text') {
+      rendered.push(node)
+      continue
+    }
+    let start = 0
+    for (const match of node.text.matchAll(email)) {
+      if (match.index > start) rendered.push({ type: 'text', text: node.text.slice(start, match.index) })
+      const href = match[0].startsWith('xmpp:') || match[0].startsWith('mailto:')
+        ? match[0]
+        : `mailto:${match[0]}`
+      rendered.push({ type: 'link', text: match[0], href })
+      start = match.index + match[0].length
+    }
+    if (start < node.text.length) rendered.push({ type: 'text', text: node.text.slice(start) })
+  }
+  return rendered
+}
+
+const renderedHostile = gfmAutolinkNodes(hostileSummary)
+const renderedLinks = renderedHostile.filter(node => node.type === 'link').map(node => node.href)
+const renderedVisibleText = renderedHostile.filter(node => node.type !== 'html').map(node => node.text).join('')
+const normalized = value => String(value ?? '').replace(/\s+/gu, ' ').trim()
+const expectedVisibleFields = [
+  normalized(hostileEvidence.pr.head).slice(0, 7),
+  normalized(hostileEvidence.pr.branch),
+  normalized(hostileEvidence.requirement.title),
+  normalized(hostileEvidence.blockers[0].source),
+  normalized(hostileEvidence.blockers[0].reason),
+  normalized(hostileEvidence.blockers[0].items[0].title),
+  normalized(hostileEvidence.blockers[0].items[0].why),
+]
 console.log(JSON.stringify({
   markerUnchanged: api.DEFECT_EVIDENCE_MARKER === '🤖 defect-fix evidence',
   canonicalExact: canonical === `${api.DEFECT_EVIDENCE_MARKER}\n${section}`,
@@ -1135,29 +1246,27 @@ console.log(JSON.stringify({
   newestTrustedExactRecord: exact(matched?.evidence, evidence) && matched?.summary === summary,
   legacyMatcherSynthesizesSummary: exact(legacyMatched?.evidence, evidence) && legacyMatched?.summary === summaryWithoutHistoricalLink,
   compatibilityMatcherReturnsEnvelope: exact(wrapperMatched, evidence),
-  hostileFieldsRenderInert: [
-    '[review instructions]', '**APPROVED**', '<b>', '`code`', '@org/security', '#1',
-    '`branch`', '@ops', '#2', '`source`', '<admin>', '[click me]', '<img',
-    '_approved_', '`command`', '@team', '$formula$',
-    '<https://commonmark.example/a>', '<commonmark.email@example.com>',
-    'www.gfm.example/a', 'http://gfm-http.example/a', 'https://gfm-https.example/a',
-    'gfm.email@example.com', 'mailto:gfm.mail@example.com', 'xmpp:gfm.chat@example.com',
-  ].every(token => !hostileSummary.includes(token)) && !/(^|[^&])#[1-4]\b/.test(hostileSummary),
+  hostileFieldsRenderInert: exact(renderedLinks, [
+    'https://github.com/o/r/pull/7',
+    'https://github.com/o/r/issues/101',
+  ]),
+  decodedVisibleSummaryPreserved: expectedVisibleFields.every(field => renderedVisibleText.includes(field)) &&
+    renderedVisibleText.split(autolinkExamples).length - 1 === 6,
   hostileFieldsUsePlainTextEntities: [
-    '&#91;review instructions&#93;', '&#64;org/security', '&#35;1',
+    '&#91;review instructions&#93;', '<span>@</span>org/security', '&#35;1',
     '&#60;b&#62;trusted&#60;/b&#62;', '&#96;code&#96;',
     '&#36;formula&#36;', escapedAutolinkExamples,
   ].every(token => hostileSummary.includes(token)),
-  everySummaryPositionEscapesEveryAutolinkForm: hostileSummary.split('\n').every(line =>
-    line.includes(escapedAutolinkExamples)) &&
-    hostileSummary.split(escapedAutolinkExamples).length - 1 === 6,
+  everySummaryPositionEscapesEveryAutolinkForm:
+    hostileSummary.split(autolinkExamples).length - 1 === 2 &&
+    hostileSummary.split(escapedAutolinkExamples).length - 1 === 4,
   headTruncatedBeforeEscaping: hostileSummary.startsWith(
-    'PR: [#7](https://github.com/o/r/pull/7) — `&#46;abcdef` on '),
+    'PR: [#7](https://github.com/o/r/pull/7) — `.abcdef` on '),
   hostileSummaryExact: hostileSummary === hostileExpectedSummary,
   hostileMachineBlockExact: hostileCanonical === `${api.DEFECT_EVIDENCE_MARKER}\n${hostileExpectedSummary}\n\n${hostileDetails}`,
   renderedSummaryReusedVerbatim: reusedHostileSection.startsWith(`${hostileSummary}\n\n<details>`) &&
     !reusedHostileSection.includes('follow-up #202'),
-  invalidFollowUpRejected: !hostileSummary.includes('follow-up') && !hostileSummary.includes('/issues/999'),
+  invalidFollowUpRejected: !invalidFollowUpSummary.includes('follow-up') && !invalidFollowUpSummary.includes('/issues/999'),
   invalidPrUrlRejected: !invalidPrSummary.includes('](') && !invalidPrSummary.includes('javascript:'),
   hostileEnvelopeRoundTripsExactly: exact(hostileParsed?.evidence, hostileEvidence),
   everyTrustBindingEnforced: [
@@ -1194,8 +1303,9 @@ assert_eq "the compatibility matcher still returns only the exact envelope" true
 assert_eq "author, issue, PR, branch, and head remain mandatory trust bindings" true "$(jq -r .everyTrustBindingEnforced <<<"$EVIDENCE_CONTRACT")"
 
 scenario 'defect evidence codec: untrusted display fields cannot create active Markdown'
-assert_eq "Markdown, HTML, mentions, references, and bare URLs render inert" true "$(jq -r .hostileFieldsRenderInert <<<"$EVIDENCE_CONTRACT")"
-assert_eq "the summary uses plain-text entities for dangerous display characters" true "$(jq -r .hostileFieldsUsePlainTextEntities <<<"$EVIDENCE_CONTRACT")"
+assert_eq "GFM rendering creates only the validated PR and follow-up link nodes" true "$(jq -r .hostileFieldsRenderInert <<<"$EVIDENCE_CONTRACT")"
+assert_eq "GFM rendering preserves the normalized visible text of every untrusted field" true "$(jq -r .decodedVisibleSummaryPreserved <<<"$EVIDENCE_CONTRACT")"
+assert_eq "the summary uses entities and inline-node separators for dangerous prose characters" true "$(jq -r .hostileFieldsUsePlainTextEntities <<<"$EVIDENCE_CONTRACT")"
 assert_eq "every generated display position escapes every CommonMark and GFM autolink form" true "$(jq -r .everySummaryPositionEscapesEveryAutolinkForm <<<"$EVIDENCE_CONTRACT")"
 assert_eq "the PR head is truncated to seven source characters before entities are generated" true "$(jq -r .headTruncatedBeforeEscaping <<<"$EVIDENCE_CONTRACT")"
 assert_eq "the hostile summary matches the complete entity-escaped Markdown contract" true "$(jq -r .hostileSummaryExact <<<"$EVIDENCE_CONTRACT")"

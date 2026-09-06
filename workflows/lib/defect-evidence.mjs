@@ -16,8 +16,25 @@ const DETAILS_OPEN = '<details>\n<summary>machine-readable evidence</summary>\n\
 const DETAILS_CLOSE = '\n```\n</details>'
 
 const oneLine = value => String(value ?? '').replace(/\s+/g, ' ').trim()
-const plainText = value => oneLine(value)
-  .replace(/[&\\`*_\[\]{}<>#+!|@~:$.]/gu, character => `&#${character.codePointAt(0)};`)
+const proseText = value => oneLine(value)
+  .replace(/[&\\`*_\[\]{}<>#+!|@~:$.]/gu, character => character === '@'
+    // GFM finds email autolinks after resolving entities and consolidating
+    // adjacent text. Trusted inline HTML keeps the visible @ but makes it its
+    // own text node, so the address cannot be reconstructed by that pass.
+    ? '<span>@</span>'
+    : `&#${character.codePointAt(0)};`)
+
+function codeSpan(value) {
+  const text = oneLine(value)
+  if (!text) return '<code></code>'
+  const longestRun = Math.max(0, ...(text.match(/`+/gu) || []).map(run => run.length))
+  const delimiter = '`'.repeat(longestRun + 1)
+  // A separating space prevents a leading or trailing content backtick from
+  // joining the delimiter. CommonMark removes this matching padding when it
+  // renders the code span, preserving the normalized visible value.
+  const content = text.startsWith('`') || text.endsWith('`') ? ` ${text} ` : text
+  return `${delimiter}${content}${delimiter}`
+}
 
 function firstLineValue(...values) {
   for (const value of values) {
@@ -63,15 +80,15 @@ function renderSummary(evidence, followUpFor) {
   const pr = artifactUrl(evidence.pr.url, 'pull', evidence.pr.number)
   const prLabel = pr ? `[#${evidence.pr.number}](${pr.href})` : `PR ${evidence.pr.number}`
   const lines = [
-    `PR: ${prLabel} — \`${plainText(oneLine(evidence.pr.head).slice(0, 7))}\` on \`${plainText(evidence.pr.branch)}\``,
-    `Pinned requirement: ${plainText(evidence.requirement.title)}`,
+    `PR: ${prLabel} — ${codeSpan(oneLine(evidence.pr.head).slice(0, 7))} on ${codeSpan(evidence.pr.branch)}`,
+    `Pinned requirement: ${proseText(evidence.requirement.title)}`,
   ]
   for (const blocker of evidence.blockers) {
-    const reason = plainText(blocker.reason)
-    lines.push(`- \`${plainText(blocker.source)}\` — ${reason}`)
+    const reason = proseText(blocker.reason)
+    lines.push(`- ${codeSpan(blocker.source)} — ${reason}`)
     for (const item of blocker.items) {
-      const title = plainText(itemTitle(item))
-      const why = plainText(firstLineValue(
+      const title = proseText(itemTitle(item))
+      const why = proseText(firstLineValue(
         item?.why,
         item?.verdict?.reasoning,
         item?.problem,
