@@ -42,7 +42,7 @@ import { HARNESS_DIR } from './lib/engine.mjs'
 import { parseArgs, finish, UsageError, EXIT } from './lib/cli.mjs'
 import { initStatus, statusPhase, statusNote, statusFinish } from './lib/status.mjs'
 import { sh, must, failureReason } from './lib/proc.mjs'
-import { authenticatedLogin, ensureLabels, editLabels, issueLabels, issueView, comment, openPrs, readBack, terminalBudget, terminalTimeout, terminalTransition, verifyIssueEngine } from './lib/github.mjs'
+import { authenticatedLogin, ensureLabels, editLabels, issueLabels, issueView, comment, openPrs, readBack, terminalBudget, terminalSpend, terminalTimeout, terminalTransition, verifyIssueEngine } from './lib/github.mjs'
 import { git, gitOut, discoverPackages, pkgList, ensureDeps, runVerify, rebaseInProgress, pushRejected, intentToAdd } from './lib/repo.mjs'
 import { finalizeFixerIssue, finalizeFixerQuotaHold } from './lib/fixer-finalize.mjs'
 import { recordQuotaHold } from './quota-hold.mjs'
@@ -260,7 +260,10 @@ initRuntime({ scriptName: 'fix-run', sessionName: ARGS.session, defaultEngine: A
 // got to.
 initStatus({ issue: ARGS.issue, script: 'fix-run', session: ARGS.session, phases: ['Prepare', 'Resolve', 'Verify', 'Check', 'Ship'] })
 onPhase(statusPhase)
-onLog(statusNote)
+// Once a terminal label opens reap's clock, the awaited, budgeted final edit is
+// the only status write still worth queueing. A throttled note here would run
+// ahead of statusFinish on status.mjs's promise chain with the default timeout.
+onLog(message => { if (!terminalSpend()) statusNote(message) })
 const issue = ARGS.issue
 
 // ───────────────────────── Transport ─────────────────────────

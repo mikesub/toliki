@@ -25,7 +25,9 @@ import { humanTimestamp, humanizeTimestamps } from './time.mjs'
 const GH_TIMEOUT_MS = 20_000
 // Long enough that a chatty phase cannot turn into an API burst, short enough
 // that "last updated" stays a believable liveness signal.
-const MIN_INTERVAL_MS = 90_000
+// The override lets the hermetic terminal-window regression expire the
+// throttle without making the suite wait a production-sized 90 seconds.
+const MIN_INTERVAL_MS = Number(process.env.EPIC_STATUS_INTERVAL_MS) || 90_000
 
 let issue = null
 let script = 'epic-run'
