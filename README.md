@@ -116,8 +116,10 @@ agent CLIs. Route the next unassigned epic with
 `-r <repo>` to restrict selection. An engine is a named table in
 `etc/engines.json` saying which vendor, model and effort runs each pipeline
 step, so one engine can code on Claude and review on Codex. Unlabeled issues
-run on the host's `EPIC_ENGINE` default, set in `etc/dispatch.cron` (claude
-when unset). From the laptop, `./default-engine.sh` prints the VM's installed
+run on the host's `EPIC_ENGINE` default, read from the installed copy of
+`etc/dispatch.cron` (claude when that file is absent, and a file whose value
+disagrees with the environment refuses to launch anything rather than guess).
+From the laptop, `./default-engine.sh` prints the VM's installed
 default and available engines; pass an engine name to change the VM default
 for future unpinned claims. An unlabeled issue consults that default only for
 its first claim. Once the claim succeeds, the run snapshots its selection as
@@ -127,9 +129,19 @@ same exact pin rather than falling back to a later host default, and missing,
 mismatched, or conflicting pins stop for an operator without being rewritten.
 Turning the box autonomous is a deliberate last step: install the cron file
 per the comment at the top of `etc/dispatch.cron`.
+`--engine` is optional on every manual `./remote-control.sh epic|fix|ci|defect`
+launch. Given, it is persisted as the issue's durable `engine:<name>` label and
+verified before the run starts, so the choice survives resumes and fixer
+retries. Omitted, the host resolves it and writes nothing: the issue's own
+`engine:<name>` label, else the host default above, else claude — and the
+launch reports which of the three chose it. Inheriting never creates, replaces
+or removes a label, which is what keeps a host-wide fallback distinguishable
+from a per-issue decision; a closed or unreadable issue, an unknown or
+conflicting routing label, or an unreadable host default refuses without
+launching.
 Defect repair is empty-by-default: add selected registered repo names to
 `DEFECT_FIX_REPOS=(...)` in the host's `etc/repos.conf`, or launch a marked
-issue explicitly with `./remote-control.sh defect N --engine <engine> -r <repo>`.
+issue explicitly with `./remote-control.sh defect N -r <repo>`.
 All explicit `remote-control.sh epic|fix|ci|defect` launches bypass an active
 provider hold as a deliberate operator override. A mixed engine waits if any
 vendor it uses is held; admission never reroutes an issue to a different engine.

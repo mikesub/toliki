@@ -36,17 +36,18 @@ Commands:
                            ~/epic-usage.jsonl (read-only): which steps an average
                            run spends its tokens on. Optional window in days and
                            engine name, e.g. "usage 7 codex".
-  epic <ref> --engine <e>  Run the epic pipeline on an issue, as session
+  epic <ref> [--engine <e>]
+                           Run the epic pipeline on an issue, as session
                            <repo>-epic-<ref>. The manual override for dispatch's
                            ready queue. A ref starting with # isn't doubled.
-  fix <ref> --engine <e>   Run the conflict fixer on a needs-judgment issue —
+  fix <ref> [--engine <e>] Run the conflict fixer on a needs-judgment issue —
                            the manual override for dispatch's fixer walk. Same
                            session name as dispatch would use, which is what
                            keeps it visible to reap and to the next tick.
-  ci <ref> --engine <e>    Run the CI fixer on a needs-ci-fix issue (checks red
+  ci <ref> [--engine <e>]  Run the CI fixer on a needs-ci-fix issue (checks red
                            on the rebased head) — the manual override for the
                            other fixer walk. Same session name again.
-  defect <ref> --engine <e>
+  defect <ref> [--engine <e>]
                            Run the ship-gate defect fixer on a needs-defect-fix
                            issue, even when its repo is not autonomously opted in.
   next <engine>            Route the first unrouted, unblocked ready issue to
@@ -68,9 +69,14 @@ Commands:
                            are host-wide. Every session is named <repo>-<name>, so
                            "epic 63 -r otherapp" -> otherapp-epic-63. Names are given
                            short (epic-63) or full (otherapp-epic-63) interchangeably.
-  --engine <engine>        Required for manual epic/fix/ci/defect launches; a name from
-                           etc/engines.json ($(engine_names | tr '\n' ' ')). Queue-driven
-                           launches get the engine from the issue label instead.
+  --engine <engine>        Optional for manual epic/fix/ci/defect launches; a name from
+                           etc/engines.json ($(engine_names | tr '\n' ' ')). Given, it is
+                           persisted as the issue's durable engine:<name> label before
+                           the launch. Omitted, the engine is resolved on the host —
+                           the issue's own engine:<name> label, else the host's
+                           EPIC_ENGINE default, else claude — and nothing is written:
+                           an inherited default stays a default. Queue-driven launches
+                           get the engine from the issue label the same way.
 EOF
 }
 
@@ -220,10 +226,6 @@ if [[ $HAVE_ENGINE -eq 1 ]] && ! engine_known "$ENGINE"; then
   echo "[control] --engine must name an engine in etc/engines.json ($(engine_names | tr '\n' ' ')), got '$ENGINE'" >&2
   exit 1
 fi
-if [[ -n "$PIPELINE" && $HAVE_ENGINE -eq 0 ]]; then
-  echo "[control] manual $PIPELINE requires --engine <name from etc/engines.json>; queue launches inherit the issue's engine label" >&2
-  exit 1
-fi
 if [[ -z "$PIPELINE" && $HAVE_ENGINE -eq 1 ]]; then
   echo "[control] --engine only applies to manual epic/fix/ci/defect launches" >&2
   exit 1
@@ -298,6 +300,41 @@ case "$ACTION" in
     ssh "$HOST" "$REMOTE"
     ;;
   start)
+    if [[ -n "$PIPELINE" && $HAVE_ENGINE -eq 0 ]]; then
+      # No engine named: the host decides, in two steps that write nothing.
+      # dispatch.sh --resolve-issue reads the issue once and prints
+      # "<engine> <source>"; launch.sh is then given that engine explicitly, so
+      # every phase of the run takes the resolved route. Deliberately NOT a
+      # --route-issue: persisting an inherited label would turn a host-wide
+      # fallback into a per-issue decision nobody made.
+      #
+      # A heredoc rather than a command string because the answer has to be
+      # read between the two calls. `read` takes a here-string, never stdin —
+      # stdin here IS this script, and reading from it would eat the rest of it.
+      ssh "$HOST" bash -s -- "$HOST_CONTROL_DIR" "$PIPELINE" "$REF" "$REPO" <<'REMOTE_INHERIT'
+set -euo pipefail
+control="$1"
+kind="$2"
+ref="$3"
+repo="$4"
+
+if ! answer="$("$control/bin/dispatch.sh" --resolve-issue "$ref" --repo "$repo")"; then
+  exit 1
+fi
+read -r engine source <<<"$answer"
+case "$source" in
+  label)        why="the issue's engine:$engine label" ;;
+  host-default) why="the host's EPIC_ENGINE default" ;;
+  builtin)      why="the built-in claude default" ;;
+  *)
+    echo "[remote] #$ref ($repo): unrecognised engine source '$source' — not launching" >&2
+    exit 1 ;;
+esac
+echo "[remote] #$ref ($repo): engine $engine selected by $why — no label written"
+exec "$control/bin/launch.sh" "--$kind" "$ref" --repo "$repo" --engine "$engine"
+REMOTE_INHERIT
+      exit 0
+    fi
     # Each arg is shell-quoted with sq() since ssh mashes the remote command
     # into one string and hands it to the remote shell.
     REMOTE="$LAUNCH --repo $(sq "$REPO")"
@@ -341,10 +378,10 @@ EOF
     if [[ $HAVE_MESSAGE -eq 0 && "$SESSION" =~ -epic-([0-9]+)$ ]]; then
       N="${BASH_REMATCH[1]}"
       echo "[control] '$SESSION' is a pipeline session — 'restart' can't tell an epic from a fixer." >&2
-      echo "[control] Relaunch it explicitly:  $0 stop $SESSION && $0 epic $N --engine <engine>" >&2
-      echo "[control] Or use: $0 fix $N --engine <engine>" >&2
-      echo "[control] Or use: $0 ci $N --engine <engine>" >&2
-      echo "[control] Or use: $0 defect $N --engine <engine>" >&2
+      echo "[control] Relaunch it explicitly:  $0 stop $SESSION && $0 epic $N [--engine <engine>]" >&2
+      echo "[control] Or use: $0 fix $N [--engine <engine>]" >&2
+      echo "[control] Or use: $0 ci $N [--engine <engine>]" >&2
+      echo "[control] Or use: $0 defect $N [--engine <engine>]" >&2
       echo "[control] Or just stop it: dispatch relaunches an unfinished issue on its next tick." >&2
       exit 1
     fi

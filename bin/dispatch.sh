@@ -51,6 +51,7 @@ usage() {
 Usage: $0 [-r <repo>] [-n|--dry-run]
        $0 --route-next <engine> [-r <repo>]
        $0 --route-issue <N> <engine> -r <repo>
+       $0 --resolve-issue <N> -r <repo>
 
 <engine> is a name from etc/engines.json (a vendor/model/effort table per
 pipeline step): currently $(engine_names | tr '\n' ' ').
@@ -76,6 +77,12 @@ until the host hits MAX_PARALLEL_EPICS ($MAX_PARALLEL_EPICS).
   --route-issue <N> <name>
                       Persist an explicit manual epic/fix engine choice on one
                       issue. Requires -r; labels only and launches nothing.
+  --resolve-issue <N> Report which engine one issue would run on, and what
+                      chose it, as a single line "<engine> <source>" on stdout
+                      (source: label, host-default, builtin). Requires -r.
+                      Read-only: no label is written, nothing is launched.
+                      remote-control.sh uses it for a manual launch that named
+                      no engine, so an inherited default never becomes a label.
 
 An active host provider-quota hold skips ordinary and dry-run candidates whose
 engine uses that vendor; other engines keep walking. Routing-only modes and
@@ -90,6 +97,8 @@ HAVE_ROUTE_NEXT=0
 ROUTE_ISSUE=""
 ROUTE_ISSUE_ENGINE=""
 HAVE_ROUTE_ISSUE=0
+RESOLVE_ISSUE=""
+HAVE_RESOLVE_ISSUE=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
@@ -118,6 +127,19 @@ while [[ $# -gt 0 ]]; do
       ROUTE_ISSUE="${2#\#}"
       ROUTE_ISSUE_ENGINE="$3"
       shift 3 ;;
+    --resolve-issue)
+      if [[ $# -lt 2 ]]; then
+        warn "$1 requires an issue number"
+        exit 1
+      fi
+      HAVE_RESOLVE_ISSUE=1
+      RESOLVE_ISSUE="${2#\#}"
+      shift 2 ;;
+    --resolve-issue=*)
+      HAVE_RESOLVE_ISSUE=1
+      RESOLVE_ISSUE="${1#*=}"
+      RESOLVE_ISSUE="${RESOLVE_ISSUE#\#}"
+      shift ;;
     *)
       warn "unknown argument '$1'"
       usage >&2
@@ -125,11 +147,16 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Fail on a bad engine name before the lock, the queue, or any label write.
-if ! engine_known "$DEFAULT_ENGINE"; then
-  warn "EPIC_ENGINE must name an engine in etc/engines.json ($(engine_names | tr '\n' ' ')), got '$DEFAULT_ENGINE'"
+# Fail on a bad or inconsistent host default before the lock, the queue, or any
+# label write. This is the same resolver launch.sh uses (etc/lib.sh), reading
+# the installed cron file rather than this process's environment, so a tick and
+# a manual launch a second later cannot disagree about what an unlabeled issue
+# runs on.
+if ! resolve_host_default_engine; then
+  warn "$HOST_DEFAULT_ENGINE_ERROR"
   exit 1
 fi
+DEFAULT_ENGINE="$HOST_DEFAULT_ENGINE"
 if (( HAVE_ROUTE_NEXT )); then
   if ! engine_known "$ROUTE_NEXT"; then
     warn "--route-next must name an engine in etc/engines.json ($(engine_names | tr '\n' ' ')), got '$ROUTE_NEXT'"
@@ -151,6 +178,21 @@ if (( HAVE_ROUTE_ISSUE )); then
   fi
   if [[ -z "$ONLY_REPO" ]]; then
     warn "--route-issue requires --repo because issue numbers are per repository"
+    exit 1
+  fi
+fi
+
+if (( HAVE_RESOLVE_ISSUE )); then
+  if (( HAVE_ROUTE_NEXT || HAVE_ROUTE_ISSUE || DRY_RUN )); then
+    warn "--resolve-issue cannot be combined with --route-next/--route-issue/--dry-run"
+    exit 1
+  fi
+  if [[ ! "$RESOLVE_ISSUE" =~ ^[0-9]+$ ]]; then
+    warn "--resolve-issue takes an issue number, got '$RESOLVE_ISSUE'"
+    exit 1
+  fi
+  if [[ -z "$ONLY_REPO" ]]; then
+    warn "--resolve-issue requires --repo because issue numbers are per repository"
     exit 1
   fi
 fi
@@ -195,8 +237,8 @@ done
 # open.
 exec 9>"${TMPDIR:-/tmp}/harness-dispatch.lock"
 if ! flock -n 9; then
-  if (( HAVE_ROUTE_NEXT || HAVE_ROUTE_ISSUE )); then
-    warn "dispatch lock is busy — routing was not changed"
+  if (( HAVE_ROUTE_NEXT || HAVE_ROUTE_ISSUE || HAVE_RESOLVE_ISSUE )); then
+    warn "dispatch lock is busy — routing was not read or changed"
     exit 1
   fi
   say "previous tick still running — skipping"
@@ -207,8 +249,10 @@ LAUNCHED=0
 FAILED=0
 
 # Strong-read an issue and resolve its routing label. No engine label means
-# the host default (EPIC_ENGINE via etc/lib.sh, claude when unset). Any unknown or conflicting engine label
-# is an error: silently guessing here would send work to the wrong vendor.
+# the host default (resolve_host_default_engine in etc/lib.sh: the installed
+# cron file's EPIC_ENGINE, claude when absent). Any unknown or conflicting
+# engine label is an error: silently guessing here would send work to the
+# wrong vendor.
 ISSUE_STATE=""
 ISSUE_LABELS=""
 ISSUE_LABEL_LIST=""
@@ -287,7 +331,47 @@ if (( HAVE_ROUTE_ISSUE )); then
     warn "#$ROUTE_ISSUE ($ONLY_REPO): could not persist and verify engine:$ROUTE_ISSUE_ENGINE"
     exit 1
   fi
-  say "#$ROUTE_ISSUE ($ONLY_REPO): routed manual run to $ROUTE_ISSUE_ENGINE"
+  say "#$ROUTE_ISSUE ($ONLY_REPO): routed manual run to $ROUTE_ISSUE_ENGINE (explicit --engine, persisted as engine:$ROUTE_ISSUE_ENGINE)"
+  exit 0
+fi
+
+# The read-only twin of --route-issue: report the engine one issue would run on
+# and what chose it, writing nothing at all. remote-control.sh calls this for a
+# manual launch that named no engine and passes the answer straight into
+# launch.sh, so an inherited label or host default stays inherited — the
+# distinction between an explicit per-issue route and a host-wide fallback is
+# exactly what a label written here would erase.
+#
+# It sits with the routing-only modes, before the hold snapshot and the
+# capacity probe: this answers a question, it does not admit work. Every
+# uncertainty refuses without printing a line, because the caller one step
+# later turns whatever this prints into a launch.
+if (( HAVE_RESOLVE_ISSUE )); then
+  resolve_path="$(repo_path "$ONLY_REPO")"
+  resolve_rc=0
+  read_issue_engine "$resolve_path" "$RESOLVE_ISSUE" || resolve_rc=$?
+  case "$resolve_rc" in
+    0) ;;
+    2)
+      warn "#$RESOLVE_ISSUE ($ONLY_REPO): engine routing label is unknown or conflicting — not resolving an engine"
+      exit 1 ;;
+    *)
+      warn "#$RESOLVE_ISSUE ($ONLY_REPO): issue or its labels could not be read — not resolving an engine"
+      exit 1 ;;
+  esac
+  if [[ "$ISSUE_STATE" != "OPEN" ]]; then
+    warn "#$RESOLVE_ISSUE ($ONLY_REPO): issue is ${ISSUE_STATE:-unknown}, not OPEN — not resolving an engine"
+    exit 1
+  fi
+  if (( ISSUE_ENGINE_EXPLICIT )); then
+    resolve_source="label"
+  else
+    resolve_source="$HOST_DEFAULT_ENGINE_SOURCE"
+  fi
+  # Exactly one line, on stdout, and nothing else: the caller reads it with a
+  # single `read`. Everything this script says goes to stderr (warn), so the
+  # two streams cannot mix here.
+  printf '%s %s\n' "$ISSUE_ENGINE" "$resolve_source"
   exit 0
 fi
 

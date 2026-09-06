@@ -63,14 +63,6 @@ export TZ
 # The first registry entry is the default when -r/--repo isn't given.
 DEFAULT_REPO="${REPOS[0]%%=*}"
 
-# The engine a run gets when nothing names one: no engine:* label on the issue,
-# no --engine on launch.sh. EPIC_ENGINE is the one knob (the Node side reads the
-# same name), and unset means claude, so a host without it behaves as before.
-# Checked with engine_known by the scripts that launch (dispatch, launch,
-# remote-control), not here: reap, merge and update never route anything and
-# should not read the engines file to do their job.
-DEFAULT_ENGINE="${EPIC_ENGINE:-claude}"
-
 # The engines a run can be routed to are the top-level keys of etc/engines.json,
 # tracked beside this file (a label must mean the same on every machine). The
 # full table — vendor/model/effort per step — is primarily the orchestrator's
@@ -94,6 +86,80 @@ engine_vendors() { # engine name; one unique vendor per line
       else error("unknown or empty engine")
     end
   ' "$ENGINES_FILE" 2>/dev/null
+}
+
+# The engine a run gets when nothing names one: no engine:* label on the issue,
+# no --engine on launch.sh. EPIC_ENGINE is still the one knob (the Node side
+# reads the same name), but it is read from the INSTALLED cron file — the
+# deployed copy of etc/dispatch.cron, which is what default-engine.sh already
+# treats as the source of truth — and never from this process's own
+# environment. The two callers that must agree do not share an environment: cron
+# exports the file's value into every dispatch tick, while a manual
+# `remote-control.sh epic N` arrives over ssh with an environment that has
+# never seen it. Reading the file is what makes a tick and a manual launch a
+# second later resolve an unlabeled issue the same way.
+#
+# The process environment never SELECTS the default, it only has to agree with
+# the file: taking EPIC_ENGINE when the file is absent would reintroduce the
+# split it exists to close, since the cron tick has the variable and the ssh
+# command does not. An absent file means nothing is configured, and both
+# callers then get claude.
+#
+# Every uncertainty refuses instead of picking a side. A file with anything but
+# one EPIC_ENGINE line is ambiguous (cron itself would take the last one), and
+# an environment value that disagrees with the file means one of the two is
+# stale — either guess routes work to a vendor nobody chose, which is worse
+# than a loud tick. The refusal is left in HOST_DEFAULT_ENGINE_ERROR rather
+# than printed, so each caller reports it in its own voice (dispatch's
+# timestamped warn, launch's [launch] prefix).
+#
+# Sets HOST_DEFAULT_ENGINE and HOST_DEFAULT_ENGINE_SOURCE: `host-default` when
+# the file named it, `builtin` when no file did and it fell back to claude. Called only by the scripts that launch (dispatch, launch),
+# never at source time: reap, merge and update route nothing and must not
+# acquire an opinion about engine config to do their job.
+HOST_DEFAULT_ENGINE=""
+HOST_DEFAULT_ENGINE_SOURCE=""
+HOST_DEFAULT_ENGINE_ERROR=""
+resolve_host_default_engine() {
+  # Overridden only by hermetic tests; real hosts always read the installed file.
+  local cron_file="${DEFAULT_ENGINE_CRON:-/etc/cron.d/harness-dispatch}"
+  local env_value="${EPIC_ENGINE:-}" file_value="" have_file=0 count
+  HOST_DEFAULT_ENGINE=""
+  HOST_DEFAULT_ENGINE_SOURCE=""
+  HOST_DEFAULT_ENGINE_ERROR=""
+  if [[ -e "$cron_file" ]]; then
+    if [[ ! -r "$cron_file" ]]; then
+      HOST_DEFAULT_ENGINE_ERROR="engine configuration cannot be read consistently: $cron_file is not readable"
+      return 1
+    fi
+    # Same rule as default-engine.sh's read_default: exactly one line, or the
+    # file does not state one default and nothing may act on it.
+    count="$(awk '/^EPIC_ENGINE=/{n++} END{print n+0}' "$cron_file")"
+    if [[ "$count" != "1" ]]; then
+      HOST_DEFAULT_ENGINE_ERROR="engine configuration cannot be read consistently: $cron_file must contain exactly one EPIC_ENGINE line, found $count"
+      return 1
+    fi
+    file_value="$(awk '/^EPIC_ENGINE=/{sub(/^EPIC_ENGINE=/, ""); print}' "$cron_file")"
+    have_file=1
+  fi
+  if (( have_file )) && [[ -n "$env_value" && "$env_value" != "$file_value" ]]; then
+    HOST_DEFAULT_ENGINE_ERROR="EPIC_ENGINE is '$env_value' in this environment but '$file_value' in $cron_file — refusing to guess which one is stale"
+    return 1
+  fi
+  if (( have_file )); then
+    HOST_DEFAULT_ENGINE="$file_value"
+    HOST_DEFAULT_ENGINE_SOURCE="host-default"
+  else
+    HOST_DEFAULT_ENGINE="claude"
+    HOST_DEFAULT_ENGINE_SOURCE="builtin"
+  fi
+  if ! engine_known "$HOST_DEFAULT_ENGINE"; then
+    HOST_DEFAULT_ENGINE_ERROR="EPIC_ENGINE must name an engine in etc/engines.json ($(engine_names | tr '\n' ' ')), got '$HOST_DEFAULT_ENGINE'"
+    HOST_DEFAULT_ENGINE=""
+    HOST_DEFAULT_ENGINE_SOURCE=""
+    return 1
+  fi
+  return 0
 }
 
 repo_names() {

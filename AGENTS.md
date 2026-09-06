@@ -53,10 +53,14 @@ in the same change.
   `needs-defect-fix` issue. All reuse the epic's session name on purpose so
   every guard covers them.
 - **Engine**: a top-level key of `etc/engines.json`, selected per issue by the
-  `engine:<name>` label. An unlabeled issue uses `EPIC_ENGINE` from
-  `etc/dispatch.cron` (claude when unset) only until its first successful claim,
-  which snapshots that selection before model work. Resumes and fixers require
-  the exact persisted singleton; the label survives fixer retries.
+  `engine:<name>` label. An unlabeled issue uses `EPIC_ENGINE` from the
+  INSTALLED `etc/dispatch.cron` (claude when that file is absent) only until its
+  first successful claim, which snapshots that selection before model work.
+  Dispatch ticks and manual launches read that one file rather than their own
+  environments, because cron and an ssh command do not share one. Resumes and
+  fixers require the exact persisted singleton; the label survives fixer
+  retries. A manual launch may omit `--engine`, and then inherits — issue label,
+  else host default, else claude — without writing any label.
 - **Step**: one of the seven pipeline steps in `STEPS` in
   `workflows/lib/engine.mjs`, each a judgment call. Pipelines name steps; the
   engine file says who runs them; `STEPS` fixes each step's charter and tool
@@ -402,8 +406,12 @@ than made launchable against a main without the code it describes.
 - Install `etc/dispatch.cron` by hand, all three pipeline lines or none. Its
   `PATH=` must reach `node`, `claude` and `codex`, plus `bun` for any
   registered repo whose `scripts.verify` shells out to it.
-- `EPIC_ENGINE` must be a key of `etc/engines.json`, or `etc/lib.sh` refuses to
-  load on every tick.
+- `EPIC_ENGINE` must be a key of `etc/engines.json`, or every tick and every
+  launch refuses. It is read from the installed cron file, not the process
+  environment: the file must hold exactly one `EPIC_ENGINE=` line, and if the
+  environment also names one it must agree — a malformed file or a disagreement
+  refuses to launch (`default-engine.sh` edits that file, so the minute after
+  an edit can log one loud tick).
 - Every name in `DEFECT_FIX_REPOS` must be registered in `REPOS`; empty or
   unset disables autonomous defect repair without disabling manual launches.
 - Changing `HOST_TIMEZONE` in the host registry requires a `bin/provision.sh`
