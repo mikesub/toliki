@@ -296,9 +296,18 @@ than made launchable against a main without the code it describes.
   required.
 - Mechanical conflict resolution stays containment-gated. If both sides' intent
   cannot be proven to survive, escalate instead of guessing.
-- The conflict fixer never merges, but it does restore unattended eligibility:
-  it lands `ready-to-merge`, and its push is the last step after verify and the
-  adversarial check. That landing is safe for the same reason the CI fixer's is
+- The conflict fixer never merges. A complete repair restores unattended
+  eligibility at `ready-to-merge`; a verified partial repair preserves every
+  repaired hunk but rests only at `ready-to-review`, with `needs-judgment`
+  removed and each declined hunk retaining the exact PR-side text. Before that
+  push it publishes and reads back an authenticated record bound to the amended
+  head, containing only the declined hunk identities and original diff3 sides.
+  A matching record with either ladder label refuses without a model even if
+  `needs-judgment` was retained; clearing both ladder labels explicitly grants
+  one bounded round over only those declines, and a moved main holds for a
+  human instead of reconstructing stale intent. Its push is
+  the last step after verify and an adversarial check of every indexed repaired
+  and declined claim. A complete landing is safe for the same reason the CI fixer's is
   — the merge worker rebases and RE-RUNS the real checks before anything
   merges, so a resolution that broke something cannot land on a red check. What
   that cannot catch is a resolution that is green and wrong, which is what the
@@ -306,7 +315,10 @@ than made launchable against a main without the code it describes.
   outside a marker block too, since the resolver may make one only where that
   is what carries a side's intent to lines the other side moved. Gated by
   `tests/epic-run.test.sh`.
-- The CI fixer lands `ready-to-merge` too, and that is only safe because the
+- The CI fixer likewise lands a complete repair at `ready-to-merge`, while a
+  verified partial repair is pushed only to `ready-to-review` with
+  `needs-ci-fix` removed. Its checker receives every indexed repaired/declined
+  claim and refutes a changed decline. Unattended promotion is only safe because the
   merge worker rebases and RE-RUNS the real checks before anything merges, so a
   fix that is still red cannot land. What that cannot catch is a fix that is
   green and wrong, which is why the fixer is forbidden to weaken a test and its
@@ -316,9 +328,12 @@ than made launchable against a main without the code it describes.
   but repairs only defects already named by the durable ship-gate evidence. It
   is a separate two-attempt session, and epic-run queues it only when no mixed
   or missing blocker evidence exists. It cannot weaken a test or reclassify a
-  defect, and rejoins `ready-to-merge` only after orchestrator-run verify plus
-  a blind adversarial check of the complete delta, including intent-added new
-  files. Every blocker/refusal restores and verifies its terminal labels even
+  defect. A complete repair rejoins `ready-to-merge` only after
+  orchestrator-run verify plus a blind adversarial check of the complete delta,
+  including intent-added new files. A verified partial repair is pushed to
+  `ready-to-review`, removes `needs-defect-fix`, publishes and reads back a new
+  authenticated envelope on the amended head containing only declined items,
+  and emits no complete-repair landing record. Every blocker/refusal restores and verifies its terminal labels even
   when its reporting comment fails, and any guidance that names a label is
   composed from that readback per label — an operator is asked to set what is
   missing and remove what is stuck, never to repair state that is already
@@ -346,8 +361,11 @@ than made launchable against a main without the code it describes.
   never a hand-written remove list: a fallback that adds `failed` beside the
   landing label GitHub already applied leaves a blocked run in
   `bin/merge-worker.sh`'s queue, where the failure path becomes a merge. A
-  fixer's blocker also restores the queue label its own landing swap stripped,
-  so an unverified landing costs a retry, not the issue. The verdict on a
+  fixer's blocker also restores the queue label its own complete landing swap
+  stripped, so an unverified complete landing costs a retry, not the issue. A
+  partial push is the exception: later evidence, audit or label trouble removes
+  the fixer queue and leaves a human-only terminal state, because rerunning it
+  could overwrite or promote repairs already on the branch. The verdict on a
   terminal write is the readback, never the write's exit code: GitHub can apply
   the label while the client still waits, so the readback runs whatever the
   write returned, and a run reports only the state it read back. `ready-to-merge`

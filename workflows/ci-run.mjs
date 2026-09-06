@@ -6,8 +6,9 @@
 // they came back RED. That is the one decline class where the code is
 // genuinely wrong and there is something to act on. This run reads the failing
 // checks' logs, fixes the cause, re-verifies, has a blind adversarial agent
-// try to refute the fix, amends the branch's single commit, force-pushes, and
-// lands the issue ready-to-merge — back in the unattended queue, where the
+// try to refute the fix, amends the branch's single commit, and force-pushes.
+// A complete repair lands ready-to-merge; a verified partial repair keeps its
+// safe work but rests at ready-to-review with the CI-fixer queue removed. The
 // merge worker rebases it again and RE-RUNS THE REAL CHECKS before anything
 // lands. That last re-run is what makes this landing safe: a fix that is still
 // red cannot merge. What it cannot catch is a fix that is green and wrong,
@@ -30,7 +31,7 @@ import { parseArgs, finish, UsageError, EXIT } from './lib/cli.mjs'
 import { initStatus, statusPhase, statusNote, statusFinish } from './lib/status.mjs'
 import { failureReason } from './lib/proc.mjs'
 import { gh, ensureLabels, editLabels, issueLabels, issueView, comment, openPrs, withBodyFile, readBack, terminalBudget, terminalTimeout, terminalTransition, verifyIssueEngine } from './lib/github.mjs'
-import { git, gitOut, discoverPackages, pkgList, ensureDeps, runVerify, pushRejected } from './lib/repo.mjs'
+import { git, gitOut, discoverPackages, pkgList, ensureDeps, runVerify, pushRejected, intentToAdd } from './lib/repo.mjs'
 import { finalizeFixerIssue, finalizeFixerQuotaHold } from './lib/fixer-finalize.mjs'
 import { recordQuotaHold } from './quota-hold.mjs'
 
@@ -58,6 +59,8 @@ const PROMPTS = {
 `Fix the failing checks on a finished PR. The change on branch ${prep.branch} (issue #${issue}) was built, reviewed and verified, then the merge worker rebased it onto current origin/main and re-ran its checks — and they came back RED. HEAD is that rebased commit. Your job is exactly the failure below: make those checks pass without changing what the PR set out to do.
 
 Checks that failed: ${prep.failedChecks.join(', ')}.
+Numbered for the disposition record:
+${prep.failedChecks.map((name, index) => `${index + 1}. ${name}`).join('\n')}.
 
 ${prep.localVerify.green
   ? `\`npm run verify\` is GREEN locally on this exact tree (${prep.localVerify.detail}). The failure is therefore something the local gate does not run — a job configured only in CI, a platform or version difference, a missing fixture, a check against the merged result — so read the logs below rather than expecting to reproduce it, and be explicit in your summary about why it fails there and not here.`
@@ -72,25 +75,29 @@ Rules:
 2. Stay inside the PR's intent. You are repairing a finished change, not extending it: no refactors, no drive-by improvements, no new features. The smallest diff that makes the checks pass is the right one.
 3. Do NOT commit, amend, push, or touch any label or comment — the pipeline does all of that after it has verified and checked your work. Leave your fix in the working tree.
 4. Do NOT open anything under \`.epics/\`: it carries the builder's framing and would anchor you.
-5. **Escalate instead of guessing.** If the failure is not something a code change here can fix — an infrastructure or runner problem, a missing secret or credential, a flaky external dependency, a workflow misconfiguration, a check that is red for a reason outside this diff — change NOTHING and return escalate="<what is failing and why no code change here fixes it>". A \`failed\` label is recoverable; a plausible-looking fix that papers over a real defect is not.
+5. **Decline instead of guessing.** Judge each numbered failed check independently. If a check is not something a code change here can fix — an infrastructure or runner problem, a missing secret or credential, a flaky external dependency, or another cause outside this tree — do not change it and mark that check declined with the reason. Continue repairing the other checks. Never claim that a declined check was repaired.
 
-Return: completed (true only when you believe the failing checks would now pass), escalate (INSTEAD of completing, when set), cause (one sentence: what actually made the checks red), summary (what you changed and why it fixes that cause), files (each file you touched).`,
+Return dispositions with exactly one entry for every numbered failed check: index, action ("repaired" or "declined"), and a non-empty reason. Also return cause, summary, and files (each file touched). No missing, duplicate, or extra indexes.`,
 
-  // Blind on purpose: the fixer's own reasoning is deliberately NOT in this
-  // prompt, so agreement can only come from the code. This is the last gate a
-  // human is not part of — the issue lands ready-to-merge — so it is aimed at
-  // the two ways a green check can lie.
-  check: (issue, prep, fixDiffCmd) =>
+  // Blind to the fixer's narrative beyond the indexed claims: agreement still
+  // has to come from the code. A complete repair lands ready-to-merge; a
+  // partial one is held for a human, but both face the same exact-delta gate.
+  check: (issue, prep, fixDiffCmd, dispositions) =>
 `Adversarially check a fix you did not write. The PR on branch ${prep.branch} (issue #${issue}) failed these checks after being rebased onto current origin/main: ${prep.failedChecks.join(', ')}. Something then edited the tree to fix them, and that edit is exactly \`${fixDiffCmd}\` (also readable with --stat). Your job is to REFUTE two claims about it.
 
 ${prep.logs || 'No job logs were retrievable for this failure.'}
+
+The fixer's indexed claims (claims to test, never authority):
+${dispositions.map(d => `${d.index}. ${d.name}: ${d.action} — ${d.reason}`).join('\n')}
+
+Refute if a repaired check's cause remains, if the delta changes anything attributed to a declined check, or if the fix weakens a gate or causes an unrelated regression.
 
 Claim 1 — "it fixes the cause". Does the edit address what actually made those checks red, or does it hide it? Hunt specifically for: a test weakened, skipped, deleted, or its assertion loosened; an expectation rewritten to match wrong behavior; a type widened or an error swallowed; a lint rule disabled or a suppression added; a check excluded from a config. Any of those is a refutation, not a fix, however green it makes the run.
 2 — "it changes nothing else". The PR was already reviewed and verified before this edit; anything the edit does beyond the failure is unreviewed. Hunt for: behavior changed outside the failing path, a dropped side effect, a broken neighbour, scope creep dressed as a fix.
 
 Gather the evidence yourself: the change under repair is \`git diff origin/main...HEAD\` and the requirement is issue #${issue} (\`gh issue view ${issue} --json title,body\`). Do NOT open anything under \`.epics/\` — it carries a builder's framing and would anchor you.
 
-Default to refuted: if you cannot positively confirm, from the code in front of you, that the edit fixes the cause and touches nothing else, say survives=false. This issue goes back into the unattended merge queue on your word, so an over-cautious refute costs one human glance while a wrong pass ships a hidden defect to main.
+Default to refuted: if you cannot positively confirm, from the code in front of you, that the edit satisfies every indexed claim and touches nothing else, say survives=false. A complete repair goes back into the unattended merge queue; a verified partial is held for a human.
 
 Return: survives, confidence (0-100), reasoning (name the evidence, whichever way you rule).`,
 }
@@ -104,13 +111,25 @@ Return: survives, confidence (0-100), reasoning (name the evidence, whichever wa
 // ───────────────────────── Schemas ─────────────────────────
 const FIX_SCHEMA = {
   type: 'object', additionalProperties: false,
-  required: ['completed'],
+  required: [],
   properties: {
     completed: { type: 'boolean', description: 'true only when the failing checks should now pass' },
     escalate: { type: 'string', description: 'set INSTEAD of completing when no code change here can fix the failure — what is failing and why' },
     cause: { type: 'string', description: 'one sentence: what actually made the checks red' },
     summary: { type: 'string', description: 'what changed and why it fixes that cause' },
     files: { type: 'array', items: { type: 'string' }, description: 'each file touched' },
+    dispositions: {
+      type: 'array',
+      description: 'one repaired or declined disposition per numbered failed check',
+      items: {
+        type: 'object', additionalProperties: false, required: ['index', 'action', 'reason'],
+        properties: {
+          index: { type: 'number' },
+          action: { enum: ['repaired', 'declined'] },
+          reason: { type: 'string' },
+        },
+      },
+    },
   },
 }
 const CHECK_SCHEMA = {
@@ -154,6 +173,41 @@ function failedChecks(rollup) {
     }
   }
   return out
+}
+
+const nonblank = value => typeof value === 'string' && value.trim().length > 0
+
+function normalizedDispositions(result, checks) {
+  if (result?.escalate) return { problem: `escalated rather than guessed: ${result.escalate}` }
+  let dispositions
+  if (Array.isArray(result?.dispositions)) {
+    dispositions = result.dispositions
+  } else if (result?.completed === true) {
+    // Compatibility for complete repairs emitted before indexed dispositions
+    // were introduced. The generic reason avoids leaking the fixer's private
+    // narrative into the blind checker.
+    dispositions = checks.map((_name, index) => ({ index: index + 1, action: 'repaired', reason: 'reported repaired' }))
+  } else if (result?.completed === false) {
+    return { problem: 'the fixer did not complete' }
+  } else {
+    return { problem: 'the fixer returned no indexed failed-check dispositions' }
+  }
+  if (dispositions.length !== checks.length) {
+    return { problem: `the fixer returned ${dispositions.length} disposition(s) for ${checks.length} failed check(s)` }
+  }
+  const byIndex = new Map()
+  for (const disposition of dispositions) {
+    const index = Number(disposition?.index)
+    if (!Number.isInteger(index) || index < 1 || index > checks.length || byIndex.has(index)) {
+      return { problem: 'the fixer returned duplicate, missing, or out-of-range disposition indexes' }
+    }
+    if (!['repaired', 'declined'].includes(disposition.action) || !nonblank(disposition.reason)) {
+      return { problem: `failed-check disposition ${index} needs a repaired/declined action and non-empty reason` }
+    }
+    byIndex.set(index, disposition)
+  }
+  if (byIndex.size !== checks.length) return { problem: 'the fixer did not cover every failed check exactly once' }
+  return { dispositions: checks.map((name, index) => ({ ...byIndex.get(index + 1), index: index + 1, name })) }
 }
 
 // The failing jobs' logs, which is the evidence a human would open first.
@@ -257,7 +311,7 @@ async function prepare(issue) {
 
 // Amend the branch's single commit, keeping its message (and so its Closes
 // line), then push under a lease pinned to the head this run inspected.
-async function ship(issue, prep, body) {
+async function ship(issue, prep, body, { partial = false } = {}) {
   await gitOut(['add', '-A'], 'git add -A')
   if ((await git(['diff', '--cached', '--quiet'])).code === 0) return { pushed: false, labelled: false, note: 'nothing staged to amend' }
   await gitOut(['commit', '-q', '--amend', '--no-edit'], 'git commit --amend')
@@ -266,6 +320,19 @@ async function ship(issue, prep, body) {
 
   const push = await git(['push', `--force-with-lease=refs/heads/${prep.branch}:${prep.prHead}`, 'origin', `HEAD:refs/heads/${prep.branch}`])
   if (!push.ok) return { pushed: false, labelled: false, note: pushRejected(push) ? `rejected — ${prep.branch} moved on origin under this run` : failureReason(push) }
+  if (partial) {
+    const settled = await finalizeFixerIssue({
+      issue,
+      body,
+      ...terminalTransition({ rest: 'ready-to-review', drop: ['needs-ci-fix'] }),
+    })
+    terminalWindow = settled.budget
+    const notes = [
+      ...(!settled.settled ? [`terminal label transition failed: ${settled.stateError}`] : []),
+      ...(!settled.reported ? [`audit comment failed: ${settled.reportError}`] : []),
+    ]
+    return { pushed: true, labelled: settled.settled, reported: settled.reported, note: notes.join('; ') }
+  }
   await comment(issue, body)
   // ready-to-merge: back into the unattended queue, where the merge worker
   // rebases and RE-RUNS the real checks before anything lands. The ladder
@@ -328,15 +395,39 @@ async function postBlocker({ issue, phase, reason, prUrl, attempt }, budget) {
   if (!settled.settled) log(`blocked: terminal label restoration failed (${settled.stateError})`)
 }
 
+async function blockPushedPartial(reason, { reviewSettled }) {
+  blockerPosted = true
+  if (reviewSettled) {
+    log(`blocked after partial push: ${reason}`)
+  } else {
+    const settled = await finalizeFixerIssue({
+      issue,
+      body: state => blockerBody({ phase: 'ship', reason, prUrl, attempt }, state),
+      ...terminalTransition({ rest: 'failed', drop: ['needs-ci-fix'] }),
+      budget: terminalWindow || terminalBudget(),
+    })
+    terminalWindow = settled.budget
+    if (!settled.reported) log(`blocked: GitHub report failed (${settled.reportError})`)
+    if (!settled.settled) log(`blocked: terminal label quarantine failed (${settled.stateError})`)
+  }
+  return { blocked: true, issue, phase: 'ship', reason, prUrl: prUrl || undefined, attempt, partialPushed: true }
+}
+
 // ───────────────────────── Blocker path ─────────────────────────
 let currentPhase = 'prepare'
 let blockerPosted = false
 let prUrl = null
 let attempt = 0
 let terminalWindow = null
+async function cleanUnpushedEdits(options) {
+  const opts = () => typeof options === 'function' ? options() : options
+  await git(['reset', '--mixed', 'HEAD'], opts())
+  await git(['checkout', '-f', '--', '.'], opts())
+  await git(['clean', '-fd'], opts())
+}
 async function holdForQuota(phase, failure, reason) {
   try {
-    await git(['checkout', '-f', '--', '.'])
+    await cleanUnpushedEdits()
     const { hostHold, trigger } = await recordQuotaHold({ vendor: failure.vendor, reason: failure.reason })
     const rung = attemptRung(attempt)
     const finalized = await finalizeFixerQuotaHold({
@@ -384,7 +475,7 @@ async function fail(phase, reason) {
       // terminal window has left when ship's landing swap is what failed: past that write reap's
       // settle clock is running, and a stalled local git call costs the blocker report just as an
       // unbounded gh call would. Before any terminal write there is no clock and git's own timeout stands.
-      await git(['checkout', '-f', '--', '.'], terminalTimeout())
+      await cleanUnpushedEdits(terminalTimeout)
       await postBlocker({ issue, phase, reason, prUrl, attempt })
     } catch (e) {
       log(`blocked: could not report on GitHub (${e && e.message || e})`)
@@ -394,26 +485,33 @@ async function fail(phase, reason) {
 }
 
 // ───────────────────────── The audit comment ─────────────────────────
-// Composed here from structured pieces. The fix edited a reviewed change and
-// the issue goes straight back to the merge queue, so the record names the
-// cause, the files, and every gate that ran.
-const buildComment = (prep, fix, verifyDetail, check) => [
-  '🤖 fix-ci repaired a red check',
+// Composed here from structured pieces. The fix edited a reviewed change, so
+// the record names every disposition, the files, and every gate that ran.
+const buildComment = (prep, fix, dispositions, verifyDetail, check) => {
+  const declined = dispositions.filter(d => d.action === 'declined')
+  return [
+  declined.length ? '🤖 fix-ci landed a partial red-check repair' : '🤖 fix-ci repaired a red check',
   `- pr: ${prep.prUrl}`,
   `- attempt: ${prep.attempt}`,
   `- checks that were red: ${prep.failedChecks.join(', ')}`,
+  '',
+  'Check dispositions:',
+  ...dispositions.map(d => `- ${d.name}: ${d.action} — ${d.reason}`),
   '',
   `Cause: ${fix.cause || 'not stated'}`,
   '',
   `Fix: ${fix.summary || 'not stated'}`,
   ...(Array.isArray(fix.files) && fix.files.length ? ['', `Files: ${fix.files.join(', ')}`] : []),
   '',
-  `An adversarial check, blind to this session's reasoning, tried to refute "it fixes the cause and changes nothing else" and failed to (confidence ${check.confidence}/100).`,
+  `An adversarial check tested every repaired claim, every declined check, and the complete delta (confidence ${check.confidence}/100).`,
   '',
   `verify: ${verifyDetail}`,
   '',
-  'The branch is amended and force-pushed; the issue is back to ready-to-merge. The merge worker rebases it onto current main and re-runs the real checks before anything lands, so a fix that is still red cannot merge.',
+  declined.length
+    ? 'The branch now carries the repairs and is force-pushed; the issue is held at ready-to-review with the CI-fixer queue removed. A human decides the declined checks.'
+    : 'The branch is amended and force-pushed; the issue is back to ready-to-merge. The merge worker rebases it onto current main and re-runs the real checks before anything lands, so a fix that is still red cannot merge.',
 ].join('\n')
+}
 
 // ───────────────────────── Pipeline ─────────────────────────
 async function main() {
@@ -435,8 +533,14 @@ try {
   const fix = await agent(PROMPTS.fix(issue, prep),
     { label: 'fix-ci', phase: 'Fix', step: 'fix-ci', schema: FIX_SCHEMA })
   if (!fix) return await fail('fix', 'the fixer produced no result — nothing was pushed and the PR branch is untouched.')
-  if (fix.escalate) return await fail('fix', `escalated rather than guessed: ${fix.escalate}`)
-  if (!fix.completed) return await fail('fix', 'the fixer did not complete.')
+  const normalized = normalizedDispositions(fix, prep.failedChecks)
+  if (normalized.problem) return await fail('fix', normalized.problem)
+  const dispositions = normalized.dispositions
+  const declined = dispositions.filter(d => d.action === 'declined')
+  const repaired = dispositions.filter(d => d.action === 'repaired')
+  if (!repaired.length) {
+    return await fail('fix', `the fixer declined every failed check: ${declined.map(d => `${d.name}: ${d.reason}`).join('; ')}`)
+  }
   // A fix that changed nothing cannot have fixed anything.
   if (!(await gitOut(['status', '--porcelain'], 'git status'))) {
     return await fail('fix', 'the fixer reported a fix but changed no file — the checks would come back red exactly as they are.')
@@ -455,10 +559,15 @@ try {
   if (!v.green) return await fail('verify', `npm run verify is red after the fix (${v.detail}) — nothing was pushed and the PR branch is untouched.`)
 
   // ───────────────────────── Adversarial check ─────────────────────────
-  // The last gate before this rejoins the unattended merge queue.
+  // The last gate before a complete repair rejoins the unattended merge queue
+  // or a partial repair is preserved for a human.
   currentPhase = 'check'
   phase('Check')
-  const check = await agent(PROMPTS.check(issue, prep, `git diff ${prep.prHead}`),
+  // A repair may legitimately add a file. Give it an intent-to-add entry so
+  // the exact git diff named in the prompt includes every byte ship() will
+  // later stage with `git add -A`.
+  await intentToAdd()
+  const check = await agent(PROMPTS.check(issue, prep, `git diff ${prep.prHead}`, dispositions),
     { label: 'ci-check', phase: 'Check', step: 'confirm-review', schema: CHECK_SCHEMA })
   if (!check) return await fail('check', 'the adversarial checker produced no result — an unchecked fix must not rejoin the merge queue.')
   if (!check.survives || check.confidence < 75) {
@@ -469,14 +578,24 @@ try {
   // ───────────────────────── Ship ─────────────────────────
   currentPhase = 'ship'
   phase('Ship')
-  const shipped = await ship(issue, prep, buildComment(prep, fix, v.detail, check))
+  const partial = declined.length > 0
+  const shipped = await ship(issue, prep, buildComment(prep, fix, dispositions, v.detail, check), { partial })
   if (!shipped.pushed) {
     return await fail('ship', `the force-with-lease push did not land${shipped.note ? ` (${shipped.note})` : ''} — the branch on origin is untouched.`)
+  }
+  if (partial && (!shipped.labelled || !shipped.reported)) {
+    return await blockPushedPartial(
+      `the partial repair was pushed, but its human-held landing could not be fully verified${shipped.note ? ` (${shipped.note})` : ''}`,
+      { reviewSettled: shipped.labelled })
   }
   if (!shipped.labelled) {
     return await fail('ship', `pushed, but the ready-to-merge label swap could not be verified${shipped.note ? ` (${shipped.note})` : ''} — a human finishes the labels; the PR itself is fixed.`)
   }
-  log(`Ship: pushed and labelled ready-to-merge — ${prep.prUrl}`)
+  if (partial) {
+    log(`Ship: partial repair pushed and held for review — ${declined.map(d => `${d.name}: ${d.reason}`).join('; ')}`)
+  } else {
+    log(`Ship: pushed and labelled ready-to-merge — ${prep.prUrl}`)
+  }
 
   return {
     issue,
@@ -485,9 +604,10 @@ try {
     attempt,
     failedChecks: prep.failedChecks,
     cause: fix.cause,
+    declinedChecks: declined.map(d => ({ name: d.name, reason: d.reason })),
     checkConfidence: check.confidence,
     verify: v.detail,
-    readyToMerge: true,
+    ...(partial ? { readyToReview: true } : { readyToMerge: true }),
   }
 } catch (e) {
   return await fail(currentPhase, (e && e.message) || String(e))
@@ -495,5 +615,5 @@ try {
 }
 
 const RESULT = await main()
-await statusFinish(RESULT?.held ? `**held**: provider quota exhausted, resumes after ${RESULT.holdUntil} — vendor: ${RESULT.vendor}; provider reason: "${RESULT.reason}"` : RESULT?.blocked ? `**blocked** at ${RESULT.phase}: ${RESULT.reason}` : RESULT?.skipped ? `**skipped**: ${RESULT.reason}` : RESULT?.readyToMerge ? `**done** — ${RESULT.prUrl} is back to ready-to-merge` : '**finished**', { budget: terminalWindow || undefined })
+await statusFinish(RESULT?.held ? `**held**: provider quota exhausted, resumes after ${RESULT.holdUntil} — vendor: ${RESULT.vendor}; provider reason: "${RESULT.reason}"` : RESULT?.blocked ? `**blocked** at ${RESULT.phase}: ${RESULT.reason}` : RESULT?.skipped ? `**skipped**: ${RESULT.reason}` : RESULT?.readyToMerge ? `**done** — ${RESULT.prUrl} is back to ready-to-merge` : RESULT?.readyToReview ? `**done, held for review** — ${RESULT.prUrl}; declined: ${RESULT.declinedChecks.map(d => `${d.name}: ${d.reason}`).join('; ')}` : '**finished**', { budget: terminalWindow || undefined })
 process.exit(finish(RESULT))

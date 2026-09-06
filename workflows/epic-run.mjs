@@ -65,9 +65,9 @@ import { validate } from './lib/schema.mjs'
 import {
   ensureLabels, editLabels, issueLabels, issueView, openBlockers, comment, assignSelf,
   openPrs, searchOpenPrs, prCreate, issueCreate, withBodyFile, hasDeferredRecord, issueId, addBlockedBy,
-  authenticatedLogin, readBack, terminalBudget, terminalSpend, terminalTransition, verifyIssueEngine,
+  readBack, terminalBudget, terminalSpend, terminalTransition, verifyIssueEngine,
 } from './lib/github.mjs'
-import { matchingDefectEvidence, renderDefectEvidence } from './lib/defect-evidence.mjs'
+import { publishDefectEvidence } from './lib/defect-evidence.mjs'
 import {
   git, gitOut, discoverPackages, pkgList, ensureDeps, runVerify, ensureEpicsIgnored, checkpoint, intentToAdd,
   pushRejected, rebaseInProgress, slugify, epicDir, writeRequirements, readRequirements, initEpicMd, updateEpicMd,
@@ -1539,7 +1539,6 @@ try {
     if (mergeBlockers.every(b => b.defectClass)) {
       try {
         if (!Number.isInteger(shipped.prNumber)) throw new Error(`could not derive a PR number from ${shipped.prUrl}`)
-        const actor = await authenticatedLogin(spend())
         const evidence = {
           version: 1,
           issue,
@@ -1547,20 +1546,12 @@ try {
           requirement: { title: requirementTitle, body: requirementBody },
           blockers: mergeBlockers.map(({ source, reason, items }) => ({ source, reason, items })),
         }
-        await comment(issue, renderDefectEvidence(evidence, {
-          followUpFor: item => shipped.followUps.get(blockerIdFor(item)),
-        }), spend())
-        // Read back until the comment GitHub accepted is visible on the issue, or
-        // the window ends: a fresh comment can lag its own write by seconds, and a
-        // single immediate read leaves a repairable PR with a human for nothing.
-        // The waiting is charged to the same terminal window as the write.
-        const seen = await readBack(
-          () => issueView(issue, 'comments', spend()),
-          v => !!matchingDefectEvidence(v.comments, {
-            actor, issue, prNumber: shipped.prNumber, branch: `epic/${slug}`, head: shipped.prHead,
-          }),
-          spend())
-        if (!seen.matched) throw new Error('canonical defect-fix evidence was not observed after posting')
+        await publishDefectEvidence({
+          issue,
+          evidence,
+          renderOptions: { followUpFor: item => shipped.followUps.get(blockerIdFor(item)) },
+          options: spend,
+        })
         await ensureLabels(['ready-to-review', 'needs-defect-fix'], spend())
         const queued = await editLabels(issue, { add: ['ready-to-review', 'needs-defect-fix'] }, spend())
         if (queued.ok) {
