@@ -534,7 +534,9 @@ until mkdir "$lock_dir" 2>/dev/null; do
   (( attempt < 200 )) || exit 1
   sleep 0.05
 done
-trap 'rmdir "$lock_dir"' EXIT
+# Cleanup must not replace the protected command's status when this test-only
+# directory is already absent; releasing a real flock is idempotent too.
+trap 'rmdir "$lock_dir" 2>/dev/null || true' EXIT
 "$@"
 STUB
 chmod +x "$TMP/bin/flock"
@@ -861,6 +863,7 @@ run_pipeline() { # script fixtures-dir args...   (scenario knobs via GH_* env)
     GH_LABEL_STALE_READ_AT="${GH_LABEL_STALE_READ_AT:-}" \
     GH_EVIDENCE_STALE_READS="${GH_EVIDENCE_STALE_READS:-}" \
     EPIC_READBACK_INTERVAL_MS="${EPIC_READBACK_INTERVAL_MS:-5}" \
+    EPIC_STATUS_INTERVAL_MS="${EPIC_STATUS_INTERVAL_MS:-}" \
     GH_FORK_PR="${GH_FORK_PR:-}" \
     GH_ONLY_FORK_PR="${GH_ONLY_FORK_PR:-}" \
     GH_DROP_LABEL="${GH_DROP_LABEL:-}" \
@@ -3065,10 +3068,11 @@ scenario 'fix-run: unreadable conflict evidence is a human-only final refusal'
 seed_conflict
 BEFORE="$(origin_ref epic/42-add-widget)"
 EVIDENCE_REFUSAL_START="$(date +%s)"
-EPIC_TERMINAL_REPORT_MS=1200 GH_SLOW_PATCH=5 GH_AUTH_READ_FAIL=1 run_fix "$FIXBASE" --issue 42
+EPIC_STATUS_INTERVAL_MS=1 EPIC_TERMINAL_REPORT_MS=1200 GH_SLOW_PATCH=5 GH_AUTH_READ_FAIL=1 run_fix "$FIXBASE" --issue 42
 EVIDENCE_REFUSAL_ELAPSED=$(( $(date +%s) - EVIDENCE_REFUSAL_START ))
 assert_rc "exits 2 (skipped/refused before work)" 2 "$RUN_RC"
-assert_eq "the final status edit stays inside the refusal's existing terminal window" "bounded" "$( (( EVIDENCE_REFUSAL_ELAPSED < 4 )) && echo bounded || echo "waited ${EVIDENCE_REFUSAL_ELAPSED}s for a 5s status stall" )"
+assert_eq "the elapsed status throttle cannot enqueue a default-timeout refusal note" "1" "$(grep -c 'api --method PATCH' "$GH_LOG" || true)"
+assert_eq "the sole final status edit stays inside the refusal's existing terminal window" "bounded" "$( (( EVIDENCE_REFUSAL_ELAPSED < 4 )) && echo bounded || echo "waited ${EVIDENCE_REFUSAL_ELAPSED}s for a 5s status stall" )"
 assert_contains "the refusal names the unreadable trusted evidence" "$RUN_OUT" "trusted partial-conflict evidence could not be read"
 assert_eq "no resolver or adversarial checker ran" "0 0" "$(calls fix-resolve) $(calls fix-check)"
 assert_not_contains "no first attempt rung was consumed" "$(gh_labels)" "fix-attempted"
@@ -3082,6 +3086,25 @@ FINAL_FIX_LABELS="$(gh_labels)"; FINAL_FIX_LABELS="${FINAL_FIX_LABELS%,}"
 FIX_LABELS="$FINAL_FIX_LABELS" run_fix "$FIXBASE" --issue 42
 assert_contains "a subsequent launch sees the issue is no longer in the dispatch queue" "$RUN_OUT" "not labelled needs-judgment"
 assert_eq "the removed queue cannot start resolver or checker work" "0 0" "$(calls fix-resolve) $(calls fix-check)"
+
+scenario 'fix-run: a spent partial-record refusal cannot enqueue an unbudgeted status note'
+seed_conflict_three
+run_fix "$GRANTBASE" --issue 42
+SPENT_PARTIAL_COMMENTS="$(gh_comments)"
+SPENT_PARTIAL_HEAD="$(origin_ref epic/42-add-widget)"
+SPENT_PARTIAL_START="$(date +%s)"
+EPIC_STATUS_INTERVAL_MS=1 EPIC_TERMINAL_REPORT_MS=1200 GH_SLOW_PATCH=5 \
+  FIX_LABELS="failed,needs-judgment,fix-attempted" SEED_COMMENTS="$SPENT_PARTIAL_COMMENTS" \
+  run_fix "$PARTIALFIX" --issue 42
+SPENT_PARTIAL_ELAPSED=$(( $(date +%s) - SPENT_PARTIAL_START ))
+assert_rc "the spent partial head is refused without work" 2 "$RUN_RC"
+assert_contains "the direct refusal is final" "$RUN_OUT" '"refusalFinal":true'
+assert_contains "the direct refusal names the spent partial head" "$RUN_OUT" "verified partial conflict repair with a spent ladder rung"
+assert_eq "the elapsed status throttle still leaves only the budgeted final edit" "1" "$(grep -c 'api --method PATCH' "$GH_LOG" || true)"
+assert_eq "the spent-partial final edit stays inside the original terminal window" "bounded" "$( (( SPENT_PARTIAL_ELAPSED < 4 )) && echo bounded || echo "waited ${SPENT_PARTIAL_ELAPSED}s for a 5s status stall" )"
+assert_eq "the direct refusal starts no resolver or checker" "0 0" "$(calls fix-resolve) $(calls fix-check)"
+assert_eq "the spent partial head remains unchanged" "$SPENT_PARTIAL_HEAD" "$(origin_ref epic/42-add-widget)"
+assert_eq "the spent partial head remains human-held" "fix-attempted,ready-to-review," "$(gh_labels)"
 
 scenario 'fix-run: no open PR is a final refusal'
 seed_conflict
