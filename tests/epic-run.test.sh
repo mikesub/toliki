@@ -1076,15 +1076,18 @@ const matched = matchComment(comments, criteria)
 const legacyMatched = matchComment([{ author: { login: 'toliki-bot' }, body: legacyPretty }], criteria)
 const wrapperMatched = api.matchingDefectEvidence(comments, criteria)
 
+const autolinkExamples = '<https://commonmark.example/a> <commonmark.email@example.com> www.gfm.example/a http://gfm-http.example/a https://gfm-https.example/a gfm.email@example.com mailto:gfm.mail@example.com xmpp:gfm.chat@example.com'
+const escapedAutolinkExamples = '&#60;https&#58;//commonmark&#46;example/a&#62; &#60;commonmark&#46;email&#64;example&#46;com&#62; www&#46;gfm&#46;example/a http&#58;//gfm-http&#46;example/a https&#58;//gfm-https&#46;example/a gfm&#46;email&#64;example&#46;com mailto&#58;gfm&#46;mail&#64;example&#46;com xmpp&#58;gfm&#46;chat&#64;example&#46;com'
 const hostileEvidence = structuredClone(evidence)
-hostileEvidence.requirement.title = '[review instructions](https://attacker.example) @org/security #1 **APPROVED** <b>trusted</b> `code` www.attacker.example/path $formula$'
-hostileEvidence.pr.branch = 'epic/42-`branch`-@ops-#2'
+hostileEvidence.pr.head = ' \n.abcdef1234567890 '
+hostileEvidence.requirement.title = `[review instructions] **APPROVED** <b>trusted</b> \`code\` @org/security #1 $formula$ requirement ${autolinkExamples}`
+hostileEvidence.pr.branch = `\`branch\` @ops #2 branch ${autolinkExamples}`
 hostileEvidence.blockers = [{
-  source: '`source` <admin>',
-  reason: '**APPROVED** @ops #3 https://attacker.example/reason evil+tag@attacker.example mailto:evil@attacker.example',
+  source: `\`source\` <admin> source ${autolinkExamples}`,
+  reason: `**APPROVED** @ops #3 reason ${autolinkExamples}`,
   items: [{
-    title: '[click me](https://attacker.example/item)',
-    why: '<img src=x> _approved_ `command` @team #4 xmpp:evil@attacker.example <custom+scheme:payload> <evil@attacker.example>',
+    title: `[click me] title ${autolinkExamples}`,
+    why: `<img src=x> _approved_ \`command\` @team #4 why ${autolinkExamples}`,
   }],
 }]
 const hostileCanonical = api.renderDefectEvidence(hostileEvidence, {
@@ -1092,6 +1095,25 @@ const hostileCanonical = api.renderDefectEvidence(hostileEvidence, {
 })
 const hostileParsed = parseComment(hostileCanonical)
 const hostileSummary = hostileParsed?.summary || ''
+const hostileExpectedSummary = [
+  `PR: [#7](https://github.com/o/r/pull/7) — \`&#46;abcdef\` on \`&#96;branch&#96; &#64;ops &#35;2 branch ${escapedAutolinkExamples}\``,
+  `Pinned requirement: &#91;review instructions&#93; &#42;&#42;APPROVED&#42;&#42; &#60;b&#62;trusted&#60;/b&#62; &#96;code&#96; &#64;org/security &#35;1 &#36;formula&#36; requirement ${escapedAutolinkExamples}`,
+  `- \`&#96;source&#96; &#60;admin&#62; source ${escapedAutolinkExamples}\` — &#42;&#42;APPROVED&#42;&#42; &#64;ops &#35;3 reason ${escapedAutolinkExamples}`,
+  `  - &#91;click me&#93; title ${escapedAutolinkExamples} — &#60;img src=x&#62; &#95;approved&#95; &#96;command&#96; &#64;team &#35;4 why ${escapedAutolinkExamples}`,
+].join('\n')
+const hostileDetails = [
+  '<details>',
+  '<summary>machine-readable evidence</summary>',
+  '',
+  '```json',
+  JSON.stringify(hostileEvidence, null, 2),
+  '```',
+  '</details>',
+].join('\n')
+const reusedHostileSection = renderSection(stale, {
+  summary: hostileSummary,
+  followUpFor: () => 'https://github.com/o/r/issues/202',
+})
 const invalidPrEvidence = structuredClone(hostileEvidence)
 invalidPrEvidence.pr.url = 'javascript:alert(1)'
 const invalidPrSummary = parseComment(api.renderDefectEvidence(invalidPrEvidence))?.summary || ''
@@ -1116,16 +1138,25 @@ console.log(JSON.stringify({
   hostileFieldsRenderInert: [
     '[review instructions]', '**APPROVED**', '<b>', '`code`', '@org/security', '#1',
     '`branch`', '@ops', '#2', '`source`', '<admin>', '[click me]', '<img',
-    '_approved_', '`command`', '@team', 'https://attacker.example',
-    'www.attacker.example', '$formula$', 'evil+tag@attacker.example',
-    'mailto:evil@attacker.example', 'xmpp:evil@attacker.example',
-    '<custom+scheme:payload>', '<evil@attacker.example>',
+    '_approved_', '`command`', '@team', '$formula$',
+    '<https://commonmark.example/a>', '<commonmark.email@example.com>',
+    'www.gfm.example/a', 'http://gfm-http.example/a', 'https://gfm-https.example/a',
+    'gfm.email@example.com', 'mailto:gfm.mail@example.com', 'xmpp:gfm.chat@example.com',
   ].every(token => !hostileSummary.includes(token)) && !/(^|[^&])#[1-4]\b/.test(hostileSummary),
   hostileFieldsUsePlainTextEntities: [
     '&#91;review instructions&#93;', '&#64;org/security', '&#35;1',
     '&#60;b&#62;trusted&#60;/b&#62;', '&#96;code&#96;',
-    'www&#46;attacker&#46;example/path', '&#36;formula&#36;',
+    '&#36;formula&#36;', escapedAutolinkExamples,
   ].every(token => hostileSummary.includes(token)),
+  everySummaryPositionEscapesEveryAutolinkForm: hostileSummary.split('\n').every(line =>
+    line.includes(escapedAutolinkExamples)) &&
+    hostileSummary.split(escapedAutolinkExamples).length - 1 === 6,
+  headTruncatedBeforeEscaping: hostileSummary.startsWith(
+    'PR: [#7](https://github.com/o/r/pull/7) — `&#46;abcdef` on '),
+  hostileSummaryExact: hostileSummary === hostileExpectedSummary,
+  hostileMachineBlockExact: hostileCanonical === `${api.DEFECT_EVIDENCE_MARKER}\n${hostileExpectedSummary}\n\n${hostileDetails}`,
+  renderedSummaryReusedVerbatim: reusedHostileSection.startsWith(`${hostileSummary}\n\n<details>`) &&
+    !reusedHostileSection.includes('follow-up #202'),
   invalidFollowUpRejected: !hostileSummary.includes('follow-up') && !hostileSummary.includes('/issues/999'),
   invalidPrUrlRejected: !invalidPrSummary.includes('](') && !invalidPrSummary.includes('javascript:'),
   hostileEnvelopeRoundTripsExactly: exact(hostileParsed?.evidence, hostileEvidence),
@@ -1165,6 +1196,11 @@ assert_eq "author, issue, PR, branch, and head remain mandatory trust bindings" 
 scenario 'defect evidence codec: untrusted display fields cannot create active Markdown'
 assert_eq "Markdown, HTML, mentions, references, and bare URLs render inert" true "$(jq -r .hostileFieldsRenderInert <<<"$EVIDENCE_CONTRACT")"
 assert_eq "the summary uses plain-text entities for dangerous display characters" true "$(jq -r .hostileFieldsUsePlainTextEntities <<<"$EVIDENCE_CONTRACT")"
+assert_eq "every generated display position escapes every CommonMark and GFM autolink form" true "$(jq -r .everySummaryPositionEscapesEveryAutolinkForm <<<"$EVIDENCE_CONTRACT")"
+assert_eq "the PR head is truncated to seven source characters before entities are generated" true "$(jq -r .headTruncatedBeforeEscaping <<<"$EVIDENCE_CONTRACT")"
+assert_eq "the hostile summary matches the complete entity-escaped Markdown contract" true "$(jq -r .hostileSummaryExact <<<"$EVIDENCE_CONTRACT")"
+assert_eq "the hostile machine block remains an exact pretty-printed copy of the input envelope" true "$(jq -r .hostileMachineBlockExact <<<"$EVIDENCE_CONTRACT")"
+assert_eq "a previously rendered summary is reused verbatim without regenerating links" true "$(jq -r .renderedSummaryReusedVerbatim <<<"$EVIDENCE_CONTRACT")"
 assert_eq "a follow-up URL outside the evidence PR repository is never linked" true "$(jq -r .invalidFollowUpRejected <<<"$EVIDENCE_CONTRACT")"
 assert_eq "an invalid PR URL is never placed in a Markdown destination" true "$(jq -r .invalidPrUrlRejected <<<"$EVIDENCE_CONTRACT")"
 assert_eq "escaping the summary does not alter the authoritative evidence envelope" true "$(jq -r .hostileEnvelopeRoundTripsExactly <<<"$EVIDENCE_CONTRACT")"
@@ -1651,7 +1687,7 @@ SHORT_HEAD="$(origin_ref epic/42-add-widget | cut -c1-7)"
 assert_contains "the evidence summary links the PR, short head, and branch" "$EVIDENCE_COMMENT" "PR: [#7](https://github.com/o/r/pull/7) — \`$SHORT_HEAD\` on \`epic/42-add-widget\`"
 assert_contains "the evidence summary names the pinned requirement" "$EVIDENCE_COMMENT" "Pinned requirement: Add widget"
 assert_contains "the evidence summary shows blocker source and reason" "$EVIDENCE_COMMENT" '- `post-review-defect` — 1 independently confirmed review defect(s) left unfixed'
-assert_contains "the evidence summary gives each blocker item a readable title and why" "$EVIDENCE_COMMENT" '  - Null deref on empty list — The empty-list access is still reachable and throws; no guard was added.'
+assert_contains "the evidence summary gives each blocker item a readable title and why" "$EVIDENCE_COMMENT" '  - Null deref on empty list — The empty-list access is still reachable and throws; no guard was added&#46;'
 assert_contains "the complete envelope is hidden in an unopened details block" "$EVIDENCE_COMMENT" $'<details>\n<summary>machine-readable evidence</summary>\n\n```json'
 assert_contains "the evidence envelope is pretty-printed rather than raw one-line JSON" "$EVIDENCE_COMMENT" $'```json\n{\n  "version": 1,'
 
@@ -1895,8 +1931,8 @@ assert_contains "it lists every item, kind and why" "$(gh_comments)" "- Refactor
 assert_eq "at most three follow-ups were filed, defects first" 3 "$(grep -c '^TITLE: ' "$STATE_DIR/gh/issues-created")"
 assert_not_contains "an 'other' item is never filed even when asked" "$(gh_issues_created)" "Refactor the helpers"
 assert_contains "a follow-up links back with the Follow-up line" "$(gh_issues_created)" "Follow-up to #42"
-assert_contains "the evidence summary links a filed item to its follow-up" "$(gh_evidence_comment)" '  - Widget crashes on empty list — Needs a product decision. — [follow-up #101](https://github.com/o/r/issues/101)'
-assert_contains "the evidence summary links every filed item by its returned URL" "$(gh_evidence_comment)" '  - Third defect — Same. — [follow-up #103](https://github.com/o/r/issues/103)'
+assert_contains "the evidence summary links a filed item to its follow-up" "$(gh_evidence_comment)" '  - Widget crashes on empty list — Needs a product decision&#46; — [follow-up #101](https://github.com/o/r/issues/101)'
+assert_contains "the evidence summary links every filed item by its returned URL" "$(gh_evidence_comment)" '  - Third defect — Same&#46; — [follow-up #103](https://github.com/o/r/issues/103)'
 assert_not_contains "an item beyond the filing cap gets no invented follow-up" "$(gh_evidence_comment)" '[follow-up #104]'
 assert_contains "the record says how many qualified versus filed" "$(gh_comments)" "4 items qualified for a follow-up issue and 3 were filed"
 assert_contains "the PR body points at the record" "$(cat "$WT/.epics/42-add-widget/summary.md")" "Deferred items recorded on #42."
@@ -4389,7 +4425,7 @@ assert_defect_handoff "independently proven no-delta defect" "$NODIFFDEFECT" "st
 assert_defect_handoff "ship deferral" "$DEFER" "Second defect"
 COPIED_BLOCKER="$TMP/fixtures-copied-blocker"; cp -R "$HELD" "$COPIED_BLOCKER"
 fixture "$COPIED_BLOCKER" ship '{"title":"Add widget","body":"Adds a widget.","commitBody":"","deferred":[{"blockerId":"blocker-1","title":"Empty collections still throw","why":"The remaining path reaches an unsafe access.","kind":"defect","file":true}]}'
-assert_defect_handoff "copied blocker follow-up" "$COPIED_BLOCKER" "Null deref on empty list" 2 "Null deref on empty list — The empty-list access is still reachable and throws; no guard was added." "Empty collections still throw — The remaining path reaches an unsafe access."
+assert_defect_handoff "copied blocker follow-up" "$COPIED_BLOCKER" "Null deref on empty list" 2 "Null deref on empty list — The empty-list access is still reachable and throws; no guard was added&#46;" "Empty collections still throw — The remaining path reaches an unsafe access&#46;"
 
 # Counting linked lines cannot tell a correct correlation from a first-occurrence
 # one when several items display identical text: both produce the same totals.
@@ -4417,8 +4453,8 @@ assert_contains "ship maps the first opaque ID to its finding location" "$(cat "
 assert_contains "ship maps the second opaque ID to its finding location" "$(cat "$STATE_DIR/ship.0.prompt")" "- blocker-2: Same displayed blocker [src/widget.ts:24] — Same displayed reason."
 assert_eq "only the selected blocker files a follow-up" 1 "$(grep -c '^TITLE: ' "$STATE_DIR/gh/issues-created")"
 IDENTICAL_SUMMARY="$(gh_evidence_comment)"
-assert_eq "the one filed identity links both of its evidence copies" 2 "$(grep -F -c 'Same displayed blocker — Same displayed reason. — [follow-up #101](https://github.com/o/r/issues/101)' <<<"$IDENTICAL_SUMMARY")"
-assert_eq "the other identical identity never steals that link" 4 "$(grep -F -c 'Same displayed blocker — Same displayed reason.' <<<"$IDENTICAL_SUMMARY")"
+assert_eq "the one filed identity links both of its evidence copies" 2 "$(grep -F -c 'Same displayed blocker — Same displayed reason&#46; — [follow-up #101](https://github.com/o/r/issues/101)' <<<"$IDENTICAL_SUMMARY")"
+assert_eq "the other identical identity never steals that link" 4 "$(grep -F -c 'Same displayed blocker — Same displayed reason&#46;' <<<"$IDENTICAL_SUMMARY")"
 assert_not_contains "no second follow-up is invented for the unfiled identity" "$IDENTICAL_SUMMARY" "follow-up #102"
 IDENTICAL_LINK=' — [follow-up #101](https://github.com/o/r/issues/101)'
 assert_eq "the link sits on ship's own first ledger line, its reversed position" "  - Same displayed blocker — Same displayed reason.$IDENTICAL_LINK" "$(evidence_group_line "$IDENTICAL_SUMMARY" ship-deferral 1)"

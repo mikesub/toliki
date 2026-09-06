@@ -17,8 +17,7 @@ const DETAILS_CLOSE = '\n```\n</details>'
 
 const oneLine = value => String(value ?? '').replace(/\s+/g, ' ').trim()
 const plainText = value => oneLine(value)
-  .replace(/[&\\`*_\[\]{}<>#+!|@~:$]/gu, character => `&#${character.codePointAt(0)};`)
-  .replace(/\bwww\.[^\s]*/giu, token => token.replaceAll('.', '&#46;'))
+  .replace(/[&\\`*_\[\]{}<>#+!|@~:$.]/gu, character => `&#${character.codePointAt(0)};`)
 
 function firstLineValue(...values) {
   for (const value of values) {
@@ -64,7 +63,7 @@ function renderSummary(evidence, followUpFor) {
   const pr = artifactUrl(evidence.pr.url, 'pull', evidence.pr.number)
   const prLabel = pr ? `[#${evidence.pr.number}](${pr.href})` : `PR ${evidence.pr.number}`
   const lines = [
-    `PR: ${prLabel} — \`${plainText(evidence.pr.head).slice(0, 7)}\` on \`${plainText(evidence.pr.branch)}\``,
+    `PR: ${prLabel} — \`${plainText(oneLine(evidence.pr.head).slice(0, 7))}\` on \`${plainText(evidence.pr.branch)}\``,
     `Pinned requirement: ${plainText(evidence.requirement.title)}`,
   ]
   for (const blocker of evidence.blockers) {
