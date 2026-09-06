@@ -756,9 +756,10 @@ const blockerBody = ({ phase, reason, prUrl, attempt }, state) =>
   `🤖 fix-conflict blocked\n- phase: ${phase}\n- reason: ${reason}\n- pr: ${prUrl || 'not resolved'}\n- next: ${attemptGuidance(attempt, state)}\n`
 
 async function postBlocker({ issue, phase, reason, prUrl, attempt }, budget) {
-  // The worktree must not be left mid-rebase for the next run to trip over. Bounded by what the
-  // terminal window has left when it is ship's landing swap that failed: past that write reap's
-  // settle clock is running, and a stalled local git call costs the blocker report just as an
+  // The worktree must not be left mid-rebase for the next run to trip over. The probe is bounded
+  // as well as the abort, because its own `rev-parse` subprocesses can stall just as long. Bounded
+  // by what the terminal window has left when it is ship's landing swap that failed: past that write
+  // reap's settle clock is running, and a stalled local git call costs the blocker report just as an
   // unbounded gh call would. Before any terminal write there is no clock and git's own timeout stands.
   await cleanConflictWorktree(terminalTimeout)
   // needs-judgment keeps the issue in the fixer queue and the ladder labels bound the retries; both
@@ -811,7 +812,7 @@ let attempt = 0
 let terminalWindow = null
 async function cleanConflictWorktree(options) {
   const opts = () => typeof options === 'function' ? options() : options
-  if (await rebaseInProgress()) await git(['rebase', '--abort'], opts())
+  if (await rebaseInProgress(opts())) await git(['rebase', '--abort'], opts())
   await git(['reset', '--mixed', 'HEAD'], opts())
   await git(['checkout', '-f', '--', '.'], opts())
   await git(['clean', '-fd'], opts())
