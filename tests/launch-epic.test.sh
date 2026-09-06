@@ -330,5 +330,102 @@ run_launch --check-idle
 assert_rc "a dead pane at a shell prompt is idle" 0 "$RUN_RC"
 unset STUB_SESSIONS STUB_PANE_CMD
 
+
+printf '\nlaunch --over-capacity: the one deliberate bypass of the host cap\n'
+# The cap is the host's only overload guard, so both halves are pinned here:
+# what it still refuses, and that the bypass is reachable ONLY through an
+# explicit flag on a named pipeline launch. A leak into a probe, an
+# interactive session or the environment is silent until the box is overloaded.
+set_max_parallel() {
+  grep -v '^MAX_PARALLEL_EPICS=' "$HARNESS/etc/repos.conf" > "$HARNESS/etc/repos.conf.next"
+  printf 'MAX_PARALLEL_EPICS=%s\n' "$1" >> "$HARNESS/etc/repos.conf.next"
+  mv "$HARNESS/etc/repos.conf.next" "$HARNESS/etc/repos.conf"
+}
+# Two live panes running node against MAX_PARALLEL_EPICS=2: the host is full.
+export STUB_SESSIONS="testrepo-epic-80 testrepo-epic-81" STUB_PANE_CMD="node"
+
+run_launch --epic 70 --repo testrepo
+assert_rc "at the cap a plain launch is still refused with exit 3" 3 "$RUN_RC"
+assert_contains "and names the count against the limit" "$RUN_OUT" "at capacity (2/2 running)"
+assert_not_contains "no session is created" "$(tmux_log)" "new-session"
+assert_not_contains "and the repo is not pulled" "$RUN_OUT" "pulling latest main"
+
+export OVER_CAPACITY=1
+run_launch --epic 70 --repo testrepo
+unset OVER_CAPACITY
+assert_rc "an environment variable never grants the override" 3 "$RUN_RC"
+assert_contains "the refusal is the ordinary one" "$RUN_OUT" "at capacity (2/2 running)"
+assert_not_contains "and still creates nothing" "$(tmux_log)" "new-session"
+
+run_launch --epic 70 --repo testrepo --over-capacity
+assert_rc "the explicit flag admits the launch" 0 "$RUN_RC"
+assert_contains "the admission is conspicuous" "$RUN_OUT" "OVER CAPACITY"
+assert_contains "and carries the running count against the limit" "$RUN_OUT" "2/2"
+assert_contains "the exact-name check still precedes admission" \
+  "$(grep -E '^(has-session|flock 8$)' "$TMUX_LOG_FILE" | head -n 1)" "has-session -t =testrepo-epic-70"
+assert_contains "the count still happens under the admission lock" \
+  "$(grep -E '^(flock 8$|new-session)' "$TMUX_LOG_FILE" | head -n 1)" "flock 8"
+assert_contains "the session is created" "$(tmux_log)" "new-session -d -s testrepo-epic-70"
+assert_contains "and the lock is released once it exists" "$(tmux_log)" "flock -u 8"
+assert_contains "the engine tag is the ordinary one" "$(tmux_log)" "set-option -t testrepo-epic-70 @engine claude"
+assert_contains "and the pane line is an ordinary epic run" "$(tmux_log)" "workflows/epic-run.mjs' --issue 70"
+
+run_launch --fix 72 --repo testrepo --over-capacity --engine codex
+assert_rc "a fixer may carry the override too" 0 "$RUN_RC"
+assert_contains "it is admitted over the cap" "$RUN_OUT" "OVER CAPACITY"
+assert_contains "with the ordinary fixer pane line" "$(tmux_log)" "workflows/fix-run.mjs' --issue 72"
+
+unset STUB_SESSIONS STUB_PANE_CMD
+run_launch --epic 71 --repo testrepo --over-capacity
+assert_rc "below the cap the flag is a no-op" 0 "$RUN_RC"
+assert_contains "the ordinary capacity line is printed" "$RUN_OUT" "capacity 0/2"
+assert_not_contains "and no override warning is emitted" "$RUN_OUT" "OVER CAPACITY"
+export STUB_SESSIONS="testrepo-epic-80 testrepo-epic-81" STUB_PANE_CMD="node"
+
+printf '\nlaunch --over-capacity: it bypasses the cap and nothing else\n'
+STUB_LIVE_SESSIONS="testrepo-epic-70" run_launch --epic 70 --repo testrepo --over-capacity
+assert_rc "an exactly-named live session is still just reported" 0 "$RUN_RC"
+assert_contains "it says the session is already there" "$RUN_OUT" "already running"
+assert_not_contains "and creates nothing" "$(tmux_log)" "new-session"
+assert_not_contains "no override warning for a launch that starts nothing" "$RUN_OUT" "OVER CAPACITY"
+unset STUB_LIVE_SESSIONS
+
+run_launch --epic 70 --repo testrepo --over-capacity --engine unknown
+assert_rc "an unknown engine still exits 1" 1 "$RUN_RC"
+assert_contains "and names the allowed engines" "$RUN_OUT" "must name an engine"
+assert_not_contains "before any session is created" "$(tmux_log)" "new-session"
+
+set_max_parallel abc
+run_launch --epic 70 --repo testrepo --over-capacity
+assert_rc "a malformed cap still exits 1 rather than being overridden" 1 "$RUN_RC"
+assert_contains "and says what the config must hold" "$RUN_OUT" "must be a positive integer"
+assert_not_contains "before any session is created" "$(tmux_log)" "new-session"
+set_max_parallel 2
+
+printf '\nlaunch --over-capacity: probes and non-pipeline launches refuse it\n'
+run_launch --check-capacity --over-capacity
+assert_rc "the capacity probe refuses the override (exit 1)" 1 "$RUN_RC"
+assert_contains "and says probes stay strict" "$RUN_OUT" "probes stay strict"
+assert_not_contains "it starts nothing" "$(tmux_log)" "new-session"
+
+run_launch --check-idle --over-capacity
+assert_rc "the idle probe refuses it too" 1 "$RUN_RC"
+assert_contains "for the same reason" "$RUN_OUT" "probes stay strict"
+
+run_launch --check-capacity
+assert_rc "the capacity probe alone is still strict at the cap" 3 "$RUN_RC"
+assert_contains "and reports the count" "$RUN_OUT" "at capacity (2/2 running)"
+
+run_launch --repo testrepo -m "hello" --over-capacity
+assert_rc "an interactive session cannot carry the override" 1 "$RUN_RC"
+assert_contains "and it says where the flag applies" "$RUN_OUT" "only applies to --epic/--fix/--ci/--defect"
+assert_not_contains "no session is created" "$(tmux_log)" "new-session"
+
+run_launch --repo testrepo --over-capacity
+assert_rc "nor a bare pool-name launch" 1 "$RUN_RC"
+assert_contains "and it says where the flag applies" "$RUN_OUT" "only applies to --epic/--fix/--ci/--defect"
+assert_not_contains "no session is created" "$(tmux_log)" "new-session"
+unset STUB_SESSIONS STUB_PANE_CMD
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

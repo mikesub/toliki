@@ -31,7 +31,9 @@ set -euo pipefail
 # at its capacity check). Before asking, an automatic tick snapshots the
 # vendor-keyed provider holds under this script's lock; each candidate is then
 # admitted from the vendors used by its resolved engine. Routing-only modes
-# bypass admission.
+# bypass admission. This script never passes launch.sh's --over-capacity: that
+# bypass belongs to an operator typing it, and an over-capacity session counts
+# like any other, so ticks stay paused until usage drops below the cap.
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/../etc/lib.sh"
