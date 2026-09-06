@@ -68,6 +68,7 @@ import {
   readBack, terminalBudget, terminalSpend, terminalTransition, verifyIssueEngine,
 } from './lib/github.mjs'
 import { publishDefectEvidence } from './lib/defect-evidence.mjs'
+import { createBlockerIdentityRegistry } from './lib/blocker-identity.mjs'
 import {
   git, gitOut, discoverPackages, pkgList, ensureDeps, runVerify, ensureEpicsIgnored, checkpoint, intentToAdd,
   pushRejected, rebaseInProgress, slugify, epicDir, writeRequirements, readRequirements, initEpicMd, updateEpicMd,
@@ -464,85 +465,6 @@ const SUMMARY_SCHEMA = {
   properties: { summary: { type: 'string', description: 'the run summary, markdown' } },
 }
 
-// A blocker can cross several independent model records before ship turns one
-// of them into a follow-up issue. Text is presentation and can be duplicated or
-// rephrased, so it is never an identity key. These IDs live only for this
-// process: WeakMap keeps them out of the versioned defect-evidence envelope,
-// while the reverse map validates the IDs ship copies from its prompt.
-const blockerIds = new WeakMap()
-const blockersById = new Map()
-let blockerIdSerial = 0
-const objectLike = value => value !== null && typeof value === 'object'
-
-function blockerIdFor(item) {
-  if (!objectLike(item)) return null
-  return blockerIds.get(item) || blockerIdFor(item.finding)
-}
-
-function ensureBlockerId(item) {
-  if (!objectLike(item)) throw new Error('cannot assign a blocker ID to a non-object item')
-  const existing = blockerIdFor(item)
-  if (existing) {
-    blockerIds.set(item, existing)
-    return existing
-  }
-  const identity = objectLike(item.finding) ? item.finding : item
-  const id = `blocker-${++blockerIdSerial}`
-  blockerIds.set(identity, id)
-  blockerIds.set(item, id)
-  blockersById.set(id, identity)
-  return id
-}
-
-function blockerCatalog(items) {
-  const seen = new Set()
-  const entries = []
-  for (const item of items) {
-    if (!objectLike(item)) continue
-    const blockerId = ensureBlockerId(item)
-    if (seen.has(blockerId)) continue
-    seen.add(blockerId)
-    entries.push({ blockerId, item })
-  }
-  const text = entries.map(({ blockerId, item }) => {
-    const source = objectLike(item.finding) ? item.finding : item
-    const title = String(source.title || item.title || '').replace(/\s+/g, ' ').trim()
-    const location = String(source.location || item.location || '').replace(/\s+/g, ' ').trim()
-    const reason = String(item.why || item.verdict?.reasoning || source.problem || source.why || '').replace(/\s+/g, ' ').trim()
-    return `- ${blockerId}: ${title}${location ? ` [${location}]` : ''}${reason ? ` — ${reason}` : ''}`
-  }).join('\n') || '(none)'
-  return { text, ids: new Set(entries.map(entry => entry.blockerId)) }
-}
-
-function registerShipDeferrals(decision, expectedIds) {
-  const used = new Set()
-  const deferred = Array.isArray(decision.deferred) ? decision.deferred : []
-  decision.deferred = deferred.map(raw => {
-    const requested = String(raw?.blockerId || '').trim()
-    if (!requested) throw new Error('Ship returned a deferred item without a blocker ID')
-    if (requested !== 'new' && !blockersById.has(requested)) {
-      throw new Error(`Ship returned unknown blocker ID ${requested}`)
-    }
-    if (requested !== 'new' && used.has(requested)) {
-      throw new Error(`Ship reused blocker ID ${requested} for more than one deferred item`)
-    }
-    const { blockerId: _blockerId, ...item } = raw
-    const id = requested === 'new' ? ensureBlockerId(item) : requested
-    blockerIds.set(item, id)
-    used.add(id)
-    return item
-  })
-  const missing = [...expectedIds].filter(id => !used.has(id))
-  // An empty ship ledger creates no follow-up link and the deterministic
-  // merge blockers below still hold the PR. Once ship returns any item, its
-  // ledger must cover every known blocker so a known item cannot masquerade
-  // as "new" or disappear beside an unrelated filed follow-up.
-  if (deferred.length && missing.length) {
-    throw new Error(`Ship omitted known blocker ID${missing.length === 1 ? '' : 's'} ${missing.join(', ')}`)
-  }
-  return decision
-}
-
 // ───────────────────────── Args & mode ─────────────────────────
 // Issue mode (--issue N): self-contained — branch, build, ship a PR, or post a blocker comment.
 // Slug mode (--slug S): manual — build on the current tree from an existing requirements.md, no git.
@@ -725,7 +647,7 @@ async function prepare(issue) {
 const spend = terminalSpend
 
 // Squash, push, open the PR, record deferrals, label — from ship's JSON.
-async function shipTransport({ issue, slug, dir, decision }) {
+async function shipTransport({ issue, slug, dir, decision, blockerIdentity }) {
   const branch = `epic/${slug}`
   const deferred = Array.isArray(decision.deferred) ? decision.deferred : []
   // The merge gate's input, counted here from the classification, never taken as a number a model
@@ -792,7 +714,7 @@ async function shipTransport({ issue, slug, dir, decision }) {
       if (issueNodeId) await ensureLabels(['ready'])
       for (const d of eligible.slice(0, 3)) {
         const url = await issueCreate({ title: d.issueTitle || d.title, body: `${String(d.issueBody || d.why).trim()}\n\nFollow-up to #${issue}` })
-        followUps.set(blockerIdFor(d), url)
+        followUps.set(blockerIdentity.idFor(d), url)
         filed++
         // Order first, queue second: a follow-up that got `ready` without its dependency would be
         // launchable immediately, against a main that does not yet carry the code it describes.
@@ -805,7 +727,7 @@ async function shipTransport({ issue, slug, dir, decision }) {
       }
       const lines = ['🤖 deferred / not done', '']
       for (const d of deferred) {
-        const followUp = followUps.get(blockerIdFor(d))
+        const followUp = followUps.get(blockerIdentity.idFor(d))
         lines.push(`- ${d.title} (${d.kind}): ${d.why}${d.checkNote ? ` — ${d.checkNote}` : ''}${followUp ? ` — filed as ${followUp}` : ''}`)
       }
       if (eligible.length > filed) lines.push('', `${eligible.length} items qualified for a follow-up issue and ${filed} were filed (the cap is 3): needing more means this issue was under-scoped.`)
@@ -1023,6 +945,7 @@ const applyDiscovery = (pkgs) => {
 }
 
 async function main() {
+  const blockerIdentity = createBlockerIdentityRegistry()
 try {
   // ───────────────────────── Phase 0: Prepare (issue mode only) ─────────────────────────
   if (gitMode) {
@@ -1442,7 +1365,7 @@ try {
     }
   }
 
-  const knownBlockers = blockerCatalog([
+  const knownBlockers = blockerIdentity.catalog([
     ...fixBlockers.flatMap(blocker => Array.isArray(blocker.items) ? blocker.items : []),
   ])
   const decision = await agent(PROMPTS.ship(dir, issue, design, triageStatus, reviewTally, knownBlockers.text),
@@ -1450,7 +1373,7 @@ try {
   )
   if (!decision) return await fail('ship', 'Ship produced no PR description — nothing was pushed; the change is on epic/' + slug + ' (checkpoint commits + working tree).')
   try {
-    registerShipDeferrals(decision, knownBlockers.ids)
+    blockerIdentity.registerShipDeferrals(decision, knownBlockers.ids)
   } catch (e) {
     return await fail('ship', `${e && e.message || e} — refusing to file or link follow-ups from ambiguous identity.`)
   }
@@ -1492,7 +1415,7 @@ try {
     }
   }
 
-  const shipped = await shipTransport({ issue, slug, dir, decision })
+  const shipped = await shipTransport({ issue, slug, dir, decision, blockerIdentity })
   openPr = shipped.prUrl
   log(`Ship: PR opened — ${shipped.prUrl} (${shipped.deferredCount} deferred item(s), ${shipped.filed} filed as follow-ups)`)
 
@@ -1549,7 +1472,7 @@ try {
         await publishDefectEvidence({
           issue,
           evidence,
-          renderOptions: { followUpFor: item => shipped.followUps.get(blockerIdFor(item)) },
+          renderOptions: { followUpFor: item => shipped.followUps.get(blockerIdentity.idFor(item)) },
           options: spend,
         })
         await ensureLabels(['ready-to-review', 'needs-defect-fix'], spend())

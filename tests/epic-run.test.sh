@@ -974,6 +974,86 @@ assert_merge_label_agrees() {
   assert_eq "invariant: ready-to-merge is on the issue iff RESULT claims the merge queue" "$labelled" "$claimed"
 }
 
+# ───────────────────────── blocker identity registry ─────────────────────────
+# Direct coverage for the run-local registry: the end-to-end cases below prove
+# the same IDs survive model handoffs and transport, while this matrix pins the
+# no-text-fallback boundary and every malformed-ledger refusal independently.
+cat > "$TMP/blocker-identity-contract.mjs" <<'NODE'
+const api = await import(process.env.BLOCKER_IDENTITY_MODULE)
+const registry = api.createBlockerIdentityRegistry()
+const first = {
+  title: 'Same displayed blocker', location: 'src/widget.ts:12',
+  problem: 'Same displayed reason.',
+}
+const later = {
+  title: 'Same displayed blocker', location: 'src/widget.ts:24',
+  problem: 'Same displayed reason.',
+}
+const known = registry.catalog([first, later])
+const reversedCatalog = registry.catalog([later, first])
+const reversedDecision = {
+  deferred: [
+    { blockerId: 'blocker-2', title: first.title, why: first.problem, kind: 'defect', file: true },
+    { blockerId: 'blocker-1', title: first.title, why: first.problem, kind: 'defect', file: false },
+  ],
+}
+registry.registerShipDeferrals(reversedDecision, known.ids)
+const filedUrl = 'https://github.com/o/r/issues/101'
+const followUps = new Map([[registry.idFor(reversedDecision.deferred[0]), filedUrl]])
+
+function refusal(kind) {
+  const isolated = api.createBlockerIdentityRegistry()
+  const one = { title: 'Duplicate title', why: 'Duplicate reason' }
+  const two = { title: 'Duplicate title', why: 'Duplicate reason' }
+  const catalog = isolated.catalog([one, two])
+  let deferred
+  if (kind === 'incomplete') {
+    deferred = [{ blockerId: 'blocker-2', title: two.title, why: two.why, kind: 'defect', file: true }]
+  } else if (kind === 'unknown') {
+    deferred = [{ blockerId: 'blocker-999', title: one.title, why: one.why, kind: 'defect', file: true }]
+  } else {
+    deferred = [
+      { blockerId: 'blocker-1', title: one.title, why: one.why, kind: 'defect', file: true },
+      { blockerId: 'blocker-1', title: two.title, why: two.why, kind: 'defect', file: false },
+    ]
+  }
+  try {
+    isolated.registerShipDeferrals({ deferred }, catalog.ids)
+    return 'accepted'
+  } catch (error) {
+    return error.message
+  }
+}
+
+console.log(JSON.stringify({
+  factoryExported: typeof api.createBlockerIdentityRegistry === 'function',
+  distinctIds: registry.idFor(first) === 'blocker-1' && registry.idFor(later) === 'blocker-2',
+  reversedCatalogIds: [...reversedCatalog.ids].join(','),
+  reversedShipIds: reversedDecision.deferred.map(item => registry.idFor(item)).join(','),
+  blockerIdsRemoved: reversedDecision.deferred.every(item => !Object.hasOwn(item, 'blockerId')),
+  unregisteredCopy: registry.idFor({ title: first.title, location: first.location, problem: first.problem }),
+  filedLaterLink: followUps.get(registry.idFor(later)) || null,
+  siblingLink: followUps.get(registry.idFor(first)) || null,
+  incomplete: refusal('incomplete'),
+  unknown: refusal('unknown'),
+  repeated: refusal('repeated'),
+}))
+NODE
+
+scenario 'blocker identity registry: exact object identity survives reorder without display-text fallback'
+BLOCKER_IDENTITY_CONTRACT="$(BLOCKER_IDENTITY_MODULE="$ROOT/workflows/lib/blocker-identity.mjs" node "$TMP/blocker-identity-contract.mjs")"
+assert_eq "the factory-backed registry is exported" true "$(jq -r .factoryExported <<<"$BLOCKER_IDENTITY_CONTRACT")"
+assert_eq "same-title blocker objects receive distinct opaque IDs" true "$(jq -r .distinctIds <<<"$BLOCKER_IDENTITY_CONTRACT")"
+assert_eq "reversing known objects retains their original IDs" "blocker-2,blocker-1" "$(jq -r .reversedCatalogIds <<<"$BLOCKER_IDENTITY_CONTRACT")"
+assert_eq "reversed ship copies register against their requested exact IDs" "blocker-2,blocker-1" "$(jq -r .reversedShipIds <<<"$BLOCKER_IDENTITY_CONTRACT")"
+assert_eq "internal blocker IDs stay off registered ship records" true "$(jq -r .blockerIdsRemoved <<<"$BLOCKER_IDENTITY_CONTRACT")"
+assert_eq "an unregistered same-text copy has no identity" null "$(jq -r .unregisteredCopy <<<"$BLOCKER_IDENTITY_CONTRACT")"
+assert_eq "filing the later duplicate resolves its exact follow-up" "https://github.com/o/r/issues/101" "$(jq -r .filedLaterLink <<<"$BLOCKER_IDENTITY_CONTRACT")"
+assert_eq "the earlier same-text sibling cannot inherit that follow-up" null "$(jq -r .siblingLink <<<"$BLOCKER_IDENTITY_CONTRACT")"
+assert_contains "an incomplete non-empty ledger is refused" "$(jq -r .incomplete <<<"$BLOCKER_IDENTITY_CONTRACT")" "omitted known blocker ID"
+assert_contains "an unknown blocker ID is refused" "$(jq -r .unknown <<<"$BLOCKER_IDENTITY_CONTRACT")" "unknown blocker ID"
+assert_contains "a repeated blocker ID is refused" "$(jq -r .repeated <<<"$BLOCKER_IDENTITY_CONTRACT")" "reused blocker ID"
+
 # ───────────────────────── defect evidence document codec ─────────────────────────
 # Unit-level coverage for the public comment codec. The integration scenarios
 # below prove the same document survives GitHub posting/readback and becomes the
@@ -4417,8 +4497,14 @@ assert_contains "ship maps the first opaque ID to its finding location" "$(cat "
 assert_contains "ship maps the second opaque ID to its finding location" "$(cat "$STATE_DIR/ship.0.prompt")" "- blocker-2: Same displayed blocker [src/widget.ts:24] — Same displayed reason."
 assert_eq "only the selected blocker files a follow-up" 1 "$(grep -c '^TITLE: ' "$STATE_DIR/gh/issues-created")"
 IDENTICAL_SUMMARY="$(gh_evidence_comment)"
-assert_eq "the one filed identity links both of its evidence copies" 2 "$(grep -F -c 'Same displayed blocker — Same displayed reason. — [follow-up #101](https://github.com/o/r/issues/101)' <<<"$IDENTICAL_SUMMARY")"
-assert_eq "the other identical identity never steals that link" 4 "$(grep -F -c 'Same displayed blocker — Same displayed reason.' <<<"$IDENTICAL_SUMMARY")"
+IDENTICAL_POST_REVIEW="$(awk '/^- `post-review-defect`/{found=1; next} found && /^- `/{exit} found && /^  - /' <<<"$IDENTICAL_SUMMARY")"
+IDENTICAL_SHIP="$(awk '/^- `ship-deferral`/{found=1; next} found && /^- `/{exit} found && /^  - /' <<<"$IDENTICAL_SUMMARY")"
+IDENTICAL_BARE='  - Same displayed blocker — Same displayed reason.'
+IDENTICAL_LINKED="$IDENTICAL_BARE — [follow-up #101](https://github.com/o/r/issues/101)"
+assert_eq "the earlier review blocker stays unlinked at its exact position" "$IDENTICAL_BARE" "$(sed -n '1p' <<<"$IDENTICAL_POST_REVIEW")"
+assert_eq "the later filed review blocker carries its link at its exact position" "$IDENTICAL_LINKED" "$(sed -n '2p' <<<"$IDENTICAL_POST_REVIEW")"
+assert_eq "the reversed filed ship copy carries the same identity link" "$IDENTICAL_LINKED" "$(sed -n '1p' <<<"$IDENTICAL_SHIP")"
+assert_eq "the reversed unfiled ship sibling stays bare" "$IDENTICAL_BARE" "$(sed -n '2p' <<<"$IDENTICAL_SHIP")"
 assert_not_contains "no second follow-up is invented for the unfiled identity" "$IDENTICAL_SUMMARY" "follow-up #102"
 IDENTICAL_LINK=' — [follow-up #101](https://github.com/o/r/issues/101)'
 assert_eq "the link sits on ship's own first ledger line, its reversed position" "  - Same displayed blocker — Same displayed reason.$IDENTICAL_LINK" "$(evidence_group_line "$IDENTICAL_SUMMARY" ship-deferral 1)"
@@ -4453,6 +4539,7 @@ run_pipeline "$EPIC_RUN" "$SUBSET" --issue 42
 assert_rc "a missing known blocker ID blocks the run" 3 "$RUN_RC"
 assert_contains "the missing ID refusal names blocker identity" "$RUN_OUT" "blocker ID"
 assert_eq "a partial blocker ledger creates no PR" "" "$(gh_pr_created)"
+assert_eq "a partial blocker ledger files no follow-up" 0 "$(grep -c '^TITLE: ' "$STATE_DIR/gh/issues-created" 2>/dev/null || echo 0)"
 
 for blocker_id_case in unknown duplicate known-as-new; do
   BAD_BLOCKER_ID="$TMP/fixtures-blocker-id-$blocker_id_case"; cp -R "$HELD" "$BAD_BLOCKER_ID"
