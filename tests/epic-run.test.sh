@@ -4391,6 +4391,18 @@ COPIED_BLOCKER="$TMP/fixtures-copied-blocker"; cp -R "$HELD" "$COPIED_BLOCKER"
 fixture "$COPIED_BLOCKER" ship '{"title":"Add widget","body":"Adds a widget.","commitBody":"","deferred":[{"blockerId":"blocker-1","title":"Empty collections still throw","why":"The remaining path reaches an unsafe access.","kind":"defect","file":true}]}'
 assert_defect_handoff "copied blocker follow-up" "$COPIED_BLOCKER" "Null deref on empty list" 2 "Null deref on empty list — The empty-list access is still reachable and throws; no guard was added." "Empty collections still throw — The remaining path reaches an unsafe access."
 
+# Counting linked lines cannot tell a correct correlation from a first-occurrence
+# one when several items display identical text: both produce the same totals.
+# Read the Nth item line of a named blocker group instead, so an assertion names
+# the exact copy whose own blocker ID must have filed the link it carries.
+evidence_group_line() { # summary group position
+  awk -v head="- \`$2\` — " -v want="$3" '
+    index($0, head) == 1 { found = 1; next }
+    found && /^- `/ { exit }
+    found { if (++n == want) { print; exit } }
+  ' <<<"$1"
+}
+
 IDENTICAL="$TMP/fixtures-identical-blockers"; cp -R "$BASE" "$IDENTICAL"
 fixture "$IDENTICAL" review-general '{"findings":[{"title":"Same displayed blocker","severity":"Important","confidence":90,"location":"src/widget.ts:12","problem":"Same displayed reason.","fix":"Fix the first path.","gate":"first focused test"},{"title":"Same displayed blocker","severity":"Important","confidence":90,"location":"src/widget.ts:24","problem":"Same displayed reason.","fix":"Fix the second path.","gate":"second focused test"}]}'
 fixture "$IDENTICAL" verify '{"verdicts":[{"index":1,"real":true,"confidence":90,"reasoning":"The first path is broken."},{"index":2,"real":true,"confidence":90,"reasoning":"The second path is independently broken."}]}'
@@ -4408,6 +4420,31 @@ IDENTICAL_SUMMARY="$(gh_evidence_comment)"
 assert_eq "the one filed identity links both of its evidence copies" 2 "$(grep -F -c 'Same displayed blocker — Same displayed reason. — [follow-up #101](https://github.com/o/r/issues/101)' <<<"$IDENTICAL_SUMMARY")"
 assert_eq "the other identical identity never steals that link" 4 "$(grep -F -c 'Same displayed blocker — Same displayed reason.' <<<"$IDENTICAL_SUMMARY")"
 assert_not_contains "no second follow-up is invented for the unfiled identity" "$IDENTICAL_SUMMARY" "follow-up #102"
+IDENTICAL_LINK=' — [follow-up #101](https://github.com/o/r/issues/101)'
+assert_eq "the link sits on ship's own first ledger line, its reversed position" "  - Same displayed blocker — Same displayed reason.$IDENTICAL_LINK" "$(evidence_group_line "$IDENTICAL_SUMMARY" ship-deferral 1)"
+assert_eq "and on the review copy at the second position, the one ship filed" "  - Same displayed blocker — Same displayed reason.$IDENTICAL_LINK" "$(evidence_group_line "$IDENTICAL_SUMMARY" post-review-defect 2)"
+assert_eq "the first review copy, which ship did not file, stays bare" "  - Same displayed blocker — Same displayed reason." "$(evidence_group_line "$IDENTICAL_SUMMARY" post-review-defect 1)"
+
+# Both copies filed: the two follow-up URLs are distinguishable, and ship listed
+# the blockers in the reverse of review order, so a correlation that resolved by
+# display text or by first occurrence would cross the links. Each line's own
+# identity is the only thing that can put #101 and #102 where they belong.
+BOTH_FILED="$TMP/fixtures-both-filed-blockers"; cp -R "$IDENTICAL" "$BOTH_FILED"
+fixture "$BOTH_FILED" ship '{"title":"Add widget","body":"Adds a widget.","commitBody":"","deferred":[{"blockerId":"blocker-2","title":"Same displayed blocker","why":"Same displayed reason.","kind":"defect","file":true,"issueTitle":"Second path still throws","issueBody":"The second path still reaches the unsafe access."},{"blockerId":"blocker-1","title":"Same displayed blocker","why":"Same displayed reason.","kind":"defect","file":true,"issueTitle":"First path still throws","issueBody":"The first path still reaches the unsafe access."}]}'
+scenario 'ship identity: two identical blockers each keep their own follow-up across a reversal'
+run_pipeline "$EPIC_RUN" "$BOTH_FILED" --issue 42
+assert_rc "both identical blockers ship safely" 0 "$RUN_RC"
+assert_eq "the issue stays reviewable and enters the defect-fixer queue" "needs-defect-fix,ready-to-review," "$(gh_labels)"
+assert_eq "both identities file their own follow-up" 2 "$(grep -c '^TITLE: ' "$STATE_DIR/gh/issues-created")"
+assert_eq "filed in ship's ledger order, so #101 is the second finding's" "$(printf 'TITLE: Second path still throws\nTITLE: First path still throws')" "$(grep '^TITLE: ' "$STATE_DIR/gh/issues-created")"
+BOTH_SUMMARY="$(gh_evidence_comment)"
+BOTH_LINE='  - Same displayed blocker — Same displayed reason. — [follow-up #'
+assert_eq "ship's first ledger line carries the follow-up ship filed first" "${BOTH_LINE}101](https://github.com/o/r/issues/101)" "$(evidence_group_line "$BOTH_SUMMARY" ship-deferral 1)"
+assert_eq "ship's second ledger line carries the other" "${BOTH_LINE}102](https://github.com/o/r/issues/102)" "$(evidence_group_line "$BOTH_SUMMARY" ship-deferral 2)"
+assert_eq "the first review copy links what its own identity filed, not what its position did" "${BOTH_LINE}102](https://github.com/o/r/issues/102)" "$(evidence_group_line "$BOTH_SUMMARY" post-review-defect 1)"
+assert_eq "the second review copy links the other, crossed against ship's order" "${BOTH_LINE}101](https://github.com/o/r/issues/101)" "$(evidence_group_line "$BOTH_SUMMARY" post-review-defect 2)"
+assert_eq "the deferred record credits each item with the URL its own identity filed" "$(printf 'https://github.com/o/r/issues/101\nhttps://github.com/o/r/issues/102')" "$(grep -o 'filed as https://github.com/o/r/issues/[0-9]*' <<<"$(gh_comments)" | sed 's/^filed as //')"
+assert_not_contains "internal blocker IDs still never enter the v1 envelope" "$(printf '%s\n' "$BOTH_SUMMARY" | evidence_json)" "blockerId"
 
 SUBSET="$TMP/fixtures-blocker-id-subset"; cp -R "$IDENTICAL" "$SUBSET"
 fixture "$SUBSET" ship '{"title":"Add widget","body":"Adds a widget.","commitBody":"","deferred":[{"blockerId":"blocker-2","title":"Same displayed blocker","why":"Same displayed reason.","kind":"defect","file":true}]}'
