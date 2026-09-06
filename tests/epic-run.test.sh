@@ -4,7 +4,7 @@ set -uo pipefail
 # Exercises workflows/epic-run.mjs and its three fixer orchestrators end to end. The
 # orchestrator's own git runs for real against a throwaway bare origin under
 # mktemp; `gh` and `npm` are stubs on PATH; the model steps are a stub engine
-# that answers each prompt with a fixture keyed by a marker in the prompt and
+# that answers each prompt with a fixture keyed by EPIC_STEP_LABEL and
 # can run a side-effect script (what the real step would have written to the
 # tree). Nothing here touches the network, a real clone, or a live tmux server.
 #
@@ -474,6 +474,27 @@ exit 0
 STUB
 chmod +x "$TMP/bin/npm"
 
+# macOS has no flock. The quota writer's command-form lock must still serialize
+# competing children here; a no-op stub would invalidate the concurrent-writer
+# regression. mkdir gives this test-only adapter an atomic, bounded lock under
+# the caller's throwaway TMPDIR and preserves the child's exit status.
+cat > "$TMP/bin/flock" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "$#" -ge 3 && "$1" == -x ]] || exit 2
+lock_dir="$2.test-lock"
+shift 2
+attempt=0
+until mkdir "$lock_dir" 2>/dev/null; do
+  attempt=$((attempt + 1))
+  (( attempt < 200 )) || exit 1
+  sleep 0.05
+done
+trap 'rmdir "$lock_dir"' EXIT
+"$@"
+STUB
+chmod +x "$TMP/bin/flock"
+
 # ───────────────────────── ensureDeps: no lockfile means nothing to install ─────────────────────────
 # Unit-level, not a full pipeline run: repo.mjs's own contract, exercised
 # directly against throwaway directories rather than the shared seed project.
@@ -549,7 +570,7 @@ if (op === 'derive') {
 NODE
 
 quota_probe() {
-  QUOTA_HOLD_MODULE="$ROOT/workflows/quota-hold.mjs" node "$TMP/quota-hold-probe.mjs" "$@"
+  PATH="$TMP/bin:$PATH" QUOTA_HOLD_MODULE="$ROOT/workflows/quota-hold.mjs" node "$TMP/quota-hold-probe.mjs" "$@"
 }
 
 printf '\nquota hold parser: UTC and IANA reset times use the next future occurrence\n'
@@ -714,10 +735,9 @@ fixture_sh "$BASE" red 'printf "test(\"widget\", () => {})\n" > frontend/src/wid
 fixture_text "$BASE" green "frontend verified green"
 fixture_sh "$BASE" green 'printf "export const createWidget = () => ({})\n" > frontend/src/widget.ts'
 fixture "$BASE" review-general '{"findings":[{"title":"Null deref on empty list","severity":"Critical","confidence":90,"location":"src/widget.ts:12","problem":"Crashes when items is empty.","fix":"Guard the access.","gate":"unit test for the empty case"}]}'
-fixture "$BASE" verify '{"verdicts":[{"index":1,"real":true,"confidence":90,"reasoning":"Confirmed against the code."}]}'
-fixture "$BASE" triage '{"status":"Fixed the null deref, verify green.","deferred":[]}'
+fixture "$BASE" triage '{"status":"Fixed the null deref, verify green.","assessments":[{"index":1,"action":"fixed","reason":"Added the empty-list guard and regression coverage."}]}'
 fixture_sh "$BASE" triage 'printf "export const createWidget = () => ({ items: [] })\n" > frontend/src/widget.ts'
-fixture "$BASE" fixcheck '{"verdicts":[{"index":1,"resolved":true,"confidence":92,"reasoning":"The guard is in place and the empty case is tested."}],"regressions":[]}'
+fixture "$BASE" fixcheck '{"verdicts":[{"index":1,"verdict":"fixed","confidence":92,"reasoning":"The guard is in place and the empty case is tested."}],"regressions":[]}'
 fixture "$BASE" ship '{"title":"Add widget","body":"Adds a widget.\n\n## Review\n\nOne finding fixed.","commitBody":"Thin module, no caching.","deferred":[]}'
 
 # ───────────────────────── the runner ─────────────────────────
@@ -855,15 +875,16 @@ assert_rc "exits 0" 0 "$RUN_RC"
 assert_contains "RESULT says readyToMerge" "$RUN_OUT" '"readyToMerge":true'
 assert_not_contains "a clear gate never advertises defect repair" "$RUN_OUT" '"needsDefectFix":true'
 assert_contains "RESULT carries the PR url" "$RUN_OUT" '"prUrl":"https://github.com/o/r/pull/7"'
-assert_contains "review tally reported" "$RUN_OUT" '1 confirmed by adversarial verification, 0 refuted'
-assert_eq "exactly the eight model steps ran" 8 "$(wc -l < "$RUN_LOG" | tr -d ' ')"
+assert_contains "the review finding remains in the review artifact" "$(cat "$WT/.epics/42-add-widget/review.md")" 'Null deref on empty list'
+assert_eq "exactly seven model steps ran" 7 "$(wc -l < "$RUN_LOG" | tr -d ' ')"
+assert_eq "no separate pre-repair confirmation ran" 0 "$(calls verify)"
 assert_eq "the fixes were checked once" 1 "$(calls fixcheck)"
 assert_eq "a clean check starts no second fix round" 0 "$(calls triage2)"
 assert_eq "and no second check" 0 "$(calls fixcheck2)"
 assert_eq "no deferrals, no deferral check" 0 "$(calls defercheck)"
-assert_contains "the tally records the fix check" "$RUN_OUT" "fix check: 1/1 fixes confirmed, 0 regression(s)"
+assert_contains "the tally records the independent check" "$RUN_OUT" "fix check:"
 assert_contains "the fix check was handed the exact delta" "$(cat "$STATE_DIR/fixcheck.0.prompt")" "git diff "
-assert_contains "the skeptic receives the pinned requirement" "$(cat "$STATE_DIR/verify.0.prompt")" "Build a widget."
+assert_contains "the assessor is directed to the pinned requirement" "$(cat "$STATE_DIR/triage.0.prompt")" "Read .epics/42-add-widget/requirements.md"
 assert_contains "the fix check receives the pinned requirement" "$(cat "$STATE_DIR/fixcheck.0.prompt")" "Build a widget."
 assert_contains "the fixer is asked for the smallest correct repair" "$(cat "$STATE_DIR/triage.0.prompt")" "smallest correct repair"
 assert_not_contains "the fixer is not forced into class-wide hardening" "$(cat "$STATE_DIR/triage.0.prompt")" "Every review finding is a missing gate"
@@ -871,17 +892,17 @@ assert_contains "follow-up filing treats the cap as a ceiling" "$(cat "$STATE_DI
 assert_contains "follow-ups retain dependency-first queueing" "$(cat "$STATE_DIR/ship.0.prompt")" 'records the dependency on this issue, and then queues the follow-up with `ready`'
 assert_contains "review.md carries the post-fix section" "$(cat "$WT/.epics/42-add-widget/review.md")" "## Post-fix check"
 # The usage log: one line per spawn, keyed by the engines.json step, never on GitHub.
-assert_eq "one usage record per spawn" 8 "$(usage_log | wc -l | tr -d ' ')"
-assert_eq "records name the engines.json steps" "architect:1 code:3 confirm-review:2 fixes-after-review:1 review:1" "$(usage_log | jq -r .step | sort | uniq -c | awk '{print $2":"$1}' | tr '\n' ' ' | sed 's/ $//')"
+assert_eq "one usage record per spawn" 7 "$(usage_log | wc -l | tr -d ' ')"
+assert_eq "records name the engines.json steps" "architect:1 code:3 confirm-review:1 fixes-after-review:1 review:1" "$(usage_log | jq -r .step | sort | uniq -c | awk '{print $2":"$1}' | tr '\n' ' ' | sed 's/ $//')"
 assert_eq "tokens are what the CLI reported, all four kinds summed" "1600" "$(usage_log | jq -r 'select(.label=="architect:design") | .tokens.total')"
 assert_eq "cost and turns ride along" "0.05 3" "$(usage_log | jq -r 'select(.label=="architect:design") | "\(.costUsd) \(.turns)"')"
-assert_eq "every record carries the run, issue and engine" "8" "$(usage_log | jq -r 'select(.issue==42 and .engine=="claude" and (.runId|length)>0) | .step' | wc -l | tr -d ' ')"
-assert_eq "every usage timestamp stays canonical UTC ISO" "8" "$(usage_log | jq -r 'select(.ts | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$")) | .ts' | wc -l | tr -d ' ')"
+assert_eq "every record carries the run, issue and engine" "7" "$(usage_log | jq -r 'select(.issue==42 and .engine=="claude" and (.runId|length)>0) | .step' | wc -l | tr -d ' ')"
+assert_eq "every usage timestamp stays canonical UTC ISO" "7" "$(usage_log | jq -r 'select(.ts | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$")) | .ts' | wc -l | tr -d ' ')"
 assert_not_contains "no usage went to GitHub" "$(cat "$GH_LOG")" "tokens"
 REPORT="$(node "$ROOT/workflows/usage-report.mjs" --log "$STATE_DIR/usage.jsonl")"
 assert_contains "the report groups by script" "$REPORT" "epic-run — 1 run(s): claude 1"
 assert_contains "and shows independent review usage" "$REPORT" "review"
-assert_contains "with percentages" "$REPORT" "37.5"
+assert_contains "with percentages" "$REPORT" "42.9"
 assert_eq "the mandatory general reviewer ran once" 1 "$(calls review-general)"
 assert_eq "an empty review question does not add a focused reviewer" 0 "$(calls review-focus)"
 # What the orchestrator did to the repo and the issue.
@@ -986,7 +1007,7 @@ run_pipeline "$EPIC_RUN" "$BASE" --issue 42 --engine codex+claude
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_contains "the run ships" "$RUN_OUT" '"readyToMerge":true'
 assert_contains "review went to Codex" "$(cat "$CODEX_LOG")" 'model_reasoning_effort="xhigh"'
-assert_eq "the reviewer, confirm batches and fix check ran on Codex" "$(( 1 + $(calls verify) + $(calls fixcheck) ))" "$(grep -c -- '--model gpt-5.6-sol' "$CODEX_LOG" || true)"
+assert_eq "the reviewer and independent fix check ran on Codex" "$(( 1 + $(calls fixcheck) ))" "$(grep -c -- '--model gpt-5.6-sol' "$CODEX_LOG" || true)"
 assert_contains "coding stayed on Claude" "$(cat "$RUN_LOG")" "--model opus"
 assert_contains "the architect stayed on Claude" "$(cat "$RUN_LOG")" "--model fable"
 assert_contains "the pane names the vendor and model per step" "$RUN_OUT" "[codex gpt-5.6-sol/xhigh]"
@@ -1169,26 +1190,68 @@ assert_rc "a dead selected reviewer blocks" 3 "$RUN_RC"
 assert_contains "the missing focused reviewer is named" "$RUN_OUT" "review:focus"
 assert_eq "nothing ships without requested focused review" "" "$(gh_pr_created)"
 
-scenario 'review skeptic: dead evidence cannot become a refutation'
-DEADVERIFY="$TMP/fixtures-deadverify"; cp -R "$BASE" "$DEADVERIFY"
-printf '1' > "$DEADVERIFY/verify.0.rc"; printf '1' > "$DEADVERIFY/verify.1.rc"
-run_pipeline "$EPIC_RUN" "$DEADVERIFY" --issue 42
-assert_rc "a dead skeptic blocks before shipping" 3 "$RUN_RC"
-assert_contains "unknown evidence is not called refuted" "$RUN_OUT" "refusing to treat unknown evidence as refuted"
-assert_eq "no PR opens on a dead skeptic" "" "$(gh_pr_created)"
+scenario 'review assessment: a rejected false positive needs independent agreement even without edits'
+REJECTED="$TMP/fixtures-rejected"; cp -R "$BASE" "$REJECTED"
+fixture "$REJECTED" triage '{"status":"The report is a false positive.","assessments":[{"index":1,"action":"rejected","reason":"The caller normalizes missing lists before the access."}]}'
+fixture_sh "$REJECTED" triage 'true'
+fixture "$REJECTED" fixcheck '{"verdicts":[{"index":1,"verdict":"rejected","confidence":91,"reasoning":"The only caller initializes items before invoking createWidget; the reported path cannot occur."}],"regressions":[]}'
+run_pipeline "$EPIC_RUN" "$REJECTED" --issue 42
+assert_rc "an independently rejected false positive ships" 0 "$RUN_RC"
+assert_contains "the accepted rejection clears the gate" "$RUN_OUT" '"readyToMerge":true'
+assert_eq "the assessor ran once" 1 "$(calls triage)"
+assert_eq "no pre-repair confirmation ran" 0 "$(calls verify)"
+assert_eq "the checker ran despite no repair delta" 1 "$(calls fixcheck)"
+assert_eq "agreement starts no extra repair round" 0 "$(calls triage2)"
+assert_contains "the checker receives the reported rejection" "$(cat "$STATE_DIR/fixcheck.0.prompt")" "Reported action: rejected"
+assert_not_contains "the independent checker stays blind to the assessor explanation" "$(cat "$STATE_DIR/fixcheck.0.prompt")" "The caller normalizes missing lists"
+assert_contains "the original finding survives in the artifact" "$(cat "$WT/.epics/42-add-widget/review.md")" "Null deref on empty list"
+assert_eq "the rejection makes no implementation edit" "export const createWidget = () => ({})" "$(git -C "$ORIGIN" show epic/42-add-widget:frontend/src/widget.ts)"
 
-scenario 'review skeptic: duplicate verdict indices cannot hide missing evidence'
-DUPVERIFY="$TMP/fixtures-dupverify"; cp -R "$BASE" "$DUPVERIFY"
-fixture "$DUPVERIFY" review-general '{"findings":[{"title":"First fault","severity":"Important","confidence":85,"location":"src/widget.ts:1","problem":"First behavior breaks.","fix":"Fix first.","gate":"focused test"},{"title":"Second fault","severity":"Important","confidence":85,"location":"src/widget.ts:2","problem":"Second behavior breaks.","fix":"Fix second.","gate":"focused test"}]}'
-fixture "$DUPVERIFY" verify '{"verdicts":[{"index":1,"real":false,"confidence":90,"reasoning":"Refuted."},{"index":1,"real":false,"confidence":90,"reasoning":"Duplicate."}]}'
-run_pipeline "$EPIC_RUN" "$DUPVERIFY" --issue 42
-assert_rc "duplicate skeptic coverage blocks" 3 "$RUN_RC"
-assert_contains "duplicate coverage stays unknown" "$RUN_OUT" "no unique verdict"
-assert_eq "no PR opens on malformed skeptic coverage" "" "$(gh_pr_created)"
+# Coverage belongs to the orchestrator, including errors a JSON schema cannot
+# distinguish (duplicate and out-of-range indices with otherwise valid shape).
+for assessment_case in missing duplicate out-of-range fractional empty-reason; do
+  scenario "review assessment: $assessment_case disposition cannot silently drop a finding"
+  BADASSESS="$TMP/fixtures-assessment-$assessment_case"; cp -R "$BASE" "$BADASSESS"
+  case "$assessment_case" in
+    missing) assessments='[]' ;;
+    duplicate) assessments='[{"index":1,"action":"rejected","reason":"Caller guards it."},{"index":1,"action":"rejected","reason":"Same claim twice."}]' ;;
+    out-of-range) assessments='[{"index":2,"action":"rejected","reason":"Caller guards it."}]' ;;
+    fractional) assessments='[{"index":1.5,"action":"rejected","reason":"Caller guards it."}]' ;;
+    empty-reason) assessments='[{"index":1,"action":"rejected","reason":"   "}]' ;;
+  esac
+  fixture "$BADASSESS" triage "{\"status\":\"Assessed.\",\"assessments\":$assessments}"
+  run_pipeline "$EPIC_RUN" "$BADASSESS" --issue 42
+  assert_rc "$assessment_case assessment fails closed" 3 "$RUN_RC"
+  assert_eq "$assessment_case assessment creates no PR" "" "$(gh_pr_created)"
+  assert_eq "$assessment_case assessment leaves failed" "failed," "$(gh_labels)"
+  assert_eq "$assessment_case assessment starts no second repair round" 0 "$(calls triage2)"
+done
+
+for verdict_case in missing duplicate out-of-range fractional empty-evidence missing-confidence excessive-confidence; do
+  scenario "independent check: $verdict_case evidence cannot clear a finding"
+  BADVERDICT="$TMP/fixtures-verdict-$verdict_case"; cp -R "$REJECTED" "$BADVERDICT"
+  case "$verdict_case" in
+    missing) verdicts='[]' ;;
+    duplicate) verdicts='[{"index":1,"verdict":"rejected","confidence":90,"reasoning":"Caller guards it."},{"index":1,"verdict":"rejected","confidence":90,"reasoning":"Duplicate."}]' ;;
+    out-of-range) verdicts='[{"index":2,"verdict":"rejected","confidence":90,"reasoning":"Caller guards it."}]' ;;
+    fractional) verdicts='[{"index":1.5,"verdict":"rejected","confidence":90,"reasoning":"Caller guards it."}]' ;;
+    empty-evidence) verdicts='[{"index":1,"verdict":"rejected","confidence":90,"reasoning":"   "}]' ;;
+    missing-confidence) verdicts='[{"index":1,"verdict":"rejected","reasoning":"Caller guards it."}]' ;;
+    excessive-confidence) verdicts='[{"index":1,"verdict":"rejected","confidence":101,"reasoning":"Caller guards it."}]' ;;
+  esac
+  fixture "$BADVERDICT" fixcheck "{\"verdicts\":$verdicts,\"regressions\":[]}"
+  run_pipeline "$EPIC_RUN" "$BADVERDICT" --issue 42
+  assert_rc "$verdict_case evidence holds a reviewable PR" 0 "$RUN_RC"
+  assert_eq "$verdict_case evidence remains human-only" "ready-to-review," "$(gh_labels)"
+  assert_not_contains "$verdict_case evidence cannot queue defect repair" "$RUN_OUT" '"needsDefectFix":true'
+  assert_eq "$verdict_case evidence starts no second round" 0 "$(calls triage2)"
+done
 
 scenario 'epic-run: a deferred finding holds the merge gate'
 HELD="$TMP/fixtures-held"; cp -R "$BASE" "$HELD"
-fixture "$HELD" triage '{"status":"Left one for a human.","deferred":[{"title":"Null deref on empty list","severity":"Critical","why":"The fix needs a product decision."}]}'
+fixture "$HELD" triage '{"status":"Left one for a human.","assessments":[{"index":1,"action":"deferred","reason":"The fix needs a product decision."}]}'
+fixture_sh "$HELD" triage 'true'
+fixture "$HELD" fixcheck '{"verdicts":[{"index":1,"verdict":"defect","confidence":94,"reasoning":"The empty-list access is still reachable and throws; no guard was added."}],"regressions":[]}'
 run_pipeline "$EPIC_RUN" "$HELD" --issue 42
 assert_rc "exits 0 (the PR is real, just held)" 0 "$RUN_RC"
 assert_contains "RESULT records why the gate held" "$RUN_OUT" '"mergeSkipped"'
@@ -1196,6 +1259,29 @@ assert_contains "the held reason names the finding" "$RUN_OUT" 'Critical: Null d
 assert_not_contains "it is not queued for merge" "$RUN_OUT" '"readyToMerge":true'
 assert_contains "RESULT marks an exclusively defect-class hold repairable" "$RUN_OUT" '"needsDefectFix":true'
 assert_eq "the issue stays reviewable and enters the defect-fixer queue" "needs-defect-fix,ready-to-review," "$(gh_labels)"
+assert_eq "a deliberate deferral still gets an independent check" 1 "$(calls fixcheck)"
+assert_eq "a deliberate deferral spends no second repair round" 0 "$(calls triage2)"
+
+scenario 'review assessment: a deferred allegation is not a confirmed defect'
+UNCERTAIN_DEFER="$TMP/fixtures-uncertain-defer"; cp -R "$HELD" "$UNCERTAIN_DEFER"
+fixture "$UNCERTAIN_DEFER" fixcheck '{"verdicts":[{"index":1,"verdict":"uncertain","confidence":90,"reasoning":"The external caller contract is unavailable, so reachability cannot be established."}],"regressions":[]}'
+run_pipeline "$EPIC_RUN" "$UNCERTAIN_DEFER" --issue 42
+assert_rc "the uncertain deferral remains reviewable" 0 "$RUN_RC"
+assert_eq "uncertainty cannot enter the defect queue" "ready-to-review," "$(gh_labels)"
+assert_eq "the deliberate deferral starts no second round" 0 "$(calls triage2)"
+
+scenario 'review assessment: mixed outcomes use indices even when finding titles are identical'
+MIXED_ASSESS="$TMP/fixtures-mixed-assessments"; cp -R "$BASE" "$MIXED_ASSESS"
+fixture "$MIXED_ASSESS" review-general '{"findings":[{"title":"Missing guard","severity":"Critical","confidence":90,"location":"src/widget.ts:10","problem":"The first caller crashes.","fix":"Guard the first caller.","gate":"first caller regression"},{"title":"Missing guard","severity":"Important","confidence":85,"location":"src/widget.ts:20","problem":"The second caller allegedly crashes.","fix":"Guard the second caller.","gate":"second caller regression"},{"title":"Missing guard","severity":"Important","confidence":85,"location":"src/widget.ts:30","problem":"The third caller crashes.","fix":"Guard the third caller.","gate":"third caller regression"}]}'
+fixture "$MIXED_ASSESS" triage '{"status":"Fixed one, rejected one, deferred one.","assessments":[{"index":3,"action":"deferred","reason":"The third caller needs a product decision."},{"index":1,"action":"fixed","reason":"Guarded the first caller and tested it."},{"index":2,"action":"rejected","reason":"The second caller already normalizes its input."}]}'
+fixture "$MIXED_ASSESS" fixcheck '{"verdicts":[{"index":2,"verdict":"rejected","confidence":90,"reasoning":"Normalization precedes the second caller on every path."},{"index":3,"verdict":"defect","confidence":91,"reasoning":"The third caller still dereferences an empty list."},{"index":1,"verdict":"fixed","confidence":92,"reasoning":"The first caller has a guard and its regression exercises the crash."}],"regressions":[]}'
+run_pipeline "$EPIC_RUN" "$MIXED_ASSESS" --issue 42
+assert_rc "the mixed assessment leaves a reviewable PR" 0 "$RUN_RC"
+assert_eq "only the independently confirmed deferral blocks" "needs-defect-fix,ready-to-review," "$(gh_labels)"
+assert_eq "accepted outcomes plus a deliberate deferral start no retry" 0 "$(calls triage2)"
+assert_contains "the artifact keeps the first report location" "$(cat "$WT/.epics/42-add-widget/review.md")" "src/widget.ts:10"
+assert_contains "the artifact keeps the rejected report location" "$(cat "$WT/.epics/42-add-widget/review.md")" "src/widget.ts:20"
+assert_contains "the artifact keeps the deferred report location" "$(cat "$WT/.epics/42-add-widget/review.md")" "src/widget.ts:30"
 
 scenario 'epic-run: repairability is reported only after the queue label is observed'
 GH_DROP_LABEL=needs-defect-fix run_pipeline "$EPIC_RUN" "$HELD" --issue 42
@@ -1719,79 +1805,160 @@ assert_not_contains "no respawn on a timeout" "$RUN_OUT" "respawning once (trans
 # dead check, a claimed fix with no diff) start no round at all.
 scenario 'post-fix check: an unconfirmed fix gets one more round, and a confirmed round 2 ships'
 ROUND2="$TMP/fixtures-round2"; cp -R "$BASE" "$ROUND2"
-fixture "$ROUND2" fixcheck '{"verdicts":[{"index":1,"resolved":false,"confidence":90,"reasoning":"The guard checks null, not empty."}],"regressions":[]}'
-fixture "$ROUND2" triage2 '{"status":"Made the empty-list guard explicit and covered it with a regression test.","deferred":[]}'
+fixture "$ROUND2" fixcheck '{"verdicts":[{"index":1,"verdict":"uncertain","confidence":90,"reasoning":"The guard checks null, not empty."}],"regressions":[]}'
+fixture "$ROUND2" triage2 '{"status":"Made the empty-list guard explicit and covered it with a regression test.","assessments":[{"index":1,"action":"fixed","reason":"Added an explicit empty-list guard and a failing-before test."}]}'
 fixture_sh "$ROUND2" triage2 'printf "export const createWidget = (items = []) => ({ items })\n" > frontend/src/widget.ts'
-fixture "$ROUND2" fixcheck2 '{"verdicts":[{"index":1,"resolved":true,"confidence":95,"reasoning":"A test now fails without the guard."}],"regressions":[]}'
+fixture "$ROUND2" fixcheck2 '{"verdicts":[{"index":1,"verdict":"fixed","confidence":95,"reasoning":"A test now fails without the guard."}],"regressions":[]}'
 run_pipeline "$EPIC_RUN" "$ROUND2" --issue 42
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_eq "exactly one second fix round ran" 1 "$(calls triage2)"
 assert_contains "the round-2 prompt names the unconfirmed finding" "$(cat "$STATE_DIR/triage2.0.prompt")" "Title: Null deref on empty list"
-assert_contains "and carries why the check could not confirm it" "$(cat "$STATE_DIR/triage2.0.prompt")" "Why the check could not confirm it: The guard checks null, not empty."
+assert_contains "and carries why the check could not confirm it" "$(cat "$STATE_DIR/triage2.0.prompt")" "The guard checks null, not empty."
 assert_contains "and says it is the last round" "$(cat "$STATE_DIR/triage2.0.prompt")" "SECOND and final round"
-assert_contains "it asks for the smallest correct change" "$(cat "$STATE_DIR/triage2.0.prompt")" "smallest correct change"
+assert_contains "it asks for the smallest correct repair" "$(cat "$STATE_DIR/triage2.0.prompt")" "smallest correct repair"
 assert_contains "and for evidence a reader who cannot run code can follow" "$(cat "$STATE_DIR/triage2.0.prompt")" "fails without the fix and passes with it"
 assert_eq "the second round was checked once" 1 "$(calls fixcheck2)"
 assert_contains "the second check was handed the round-2 delta" "$(cat "$STATE_DIR/fixcheck2.0.prompt")" "git diff "
 assert_contains "and the pinned requirement" "$(cat "$STATE_DIR/fixcheck2.0.prompt")" "Build a widget."
-assert_contains "the tally records both checks" "$RUN_OUT" "fix check: 0/1 fixes confirmed, 0 regression(s); fix check 2: 1/1 confirmed, 0 regression(s)"
+assert_contains "the tally records the second check" "$RUN_OUT" "fix check 2:"
 assert_contains "review.md reports the state after round 2" "$(cat "$WT/.epics/42-add-widget/review.md")" "A second and final fix round ran"
 assert_contains "the run ships" "$RUN_OUT" '"readyToMerge":true'
 assert_eq "the issue ends ready-to-merge" "ready-to-merge," "$(gh_labels)"
 
+scenario 'independent check: rejecting a real defect triggers the one repair round'
+REJECTREAL="$TMP/fixtures-rejected-real"; cp -R "$REJECTED" "$REJECTREAL"
+fixture "$REJECTREAL" fixcheck '{"verdicts":[{"index":1,"verdict":"defect","confidence":94,"reasoning":"A direct caller supplies an empty list; the claimed normalization does not run on that path."}],"regressions":[]}'
+fixture "$REJECTREAL" triage2 '{"status":"Repaired the independently confirmed caller path.","assessments":[{"index":1,"action":"fixed","reason":"Guarded the direct caller path and added regression coverage."}]}'
+fixture_sh "$REJECTREAL" triage2 'printf "export const createWidget = (items = []) => ({ items })\n" > frontend/src/widget.ts'
+fixture "$REJECTREAL" fixcheck2 '{"verdicts":[{"index":1,"verdict":"fixed","confidence":93,"reasoning":"The direct caller now reaches the guard and the regression reproduces the original crash without it."}],"regressions":[]}'
+run_pipeline "$EPIC_RUN" "$REJECTREAL" --issue 42
+assert_rc "the rejected bug is repaired before shipping" 0 "$RUN_RC"
+assert_eq "exactly one second repair round ran" 1 "$(calls triage2)"
+assert_contains "the correction carries independent counterevidence" "$(cat "$STATE_DIR/triage2.0.prompt")" "A direct caller supplies an empty list"
+assert_contains "the final independent repair verdict clears the gate" "$RUN_OUT" '"readyToMerge":true'
+
+scenario 'independent check: a rejected real defect left deferred remains a concrete blocker'
+REJECTREALHELD="$TMP/fixtures-rejected-real-held"; cp -R "$REJECTREAL" "$REJECTREALHELD"
+fixture "$REJECTREALHELD" triage2 '{"status":"Cannot repair the caller contract safely.","assessments":[{"index":1,"action":"deferred","reason":"The caller contract needs a product decision."}]}'
+fixture_sh "$REJECTREALHELD" triage2 'true'
+fixture "$REJECTREALHELD" fixcheck2 '{"verdicts":[{"index":1,"verdict":"defect","confidence":94,"reasoning":"The reachable direct caller still crashes on an empty list."}],"regressions":[]}'
+run_pipeline "$EPIC_RUN" "$REJECTREALHELD" --issue 42
+assert_rc "the deferred bug leaves a reviewable PR" 0 "$RUN_RC"
+assert_eq "the independent defect enters bounded repair" "needs-defect-fix,ready-to-review," "$(gh_labels)"
+assert_eq "two rounds is the limit" "1 1" "$(calls triage) $(calls triage2)"
+
+for rejection_case in low-confidence mismatched-verdict uncertain; do
+  scenario "independent check: $rejection_case cannot accept a rejection in either round"
+  UNPROVEN_REJECTION="$TMP/fixtures-rejection-$rejection_case"; cp -R "$REJECTED" "$UNPROVEN_REJECTION"
+  case "$rejection_case" in
+    low-confidence) verdict='{"index":1,"verdict":"rejected","confidence":74,"reasoning":"The caller seems to normalize the input but its contract is incomplete."}' ;;
+    mismatched-verdict) verdict='{"index":1,"verdict":"fixed","confidence":95,"reasoning":"The checker claims a fix although the assessor explicitly rejected the finding."}' ;;
+    uncertain) verdict='{"index":1,"verdict":"uncertain","confidence":95,"reasoning":"The caller contract cannot be established from the repository."}' ;;
+  esac
+  fixture "$UNPROVEN_REJECTION" fixcheck "{\"verdicts\":[$verdict],\"regressions\":[]}"
+  cp "$UNPROVEN_REJECTION/triage.json" "$UNPROVEN_REJECTION/triage2.json"
+  cp "$UNPROVEN_REJECTION/triage.sh" "$UNPROVEN_REJECTION/triage2.sh"
+  cp "$UNPROVEN_REJECTION/fixcheck.json" "$UNPROVEN_REJECTION/fixcheck2.json"
+  run_pipeline "$EPIC_RUN" "$UNPROVEN_REJECTION" --issue 42
+  assert_rc "$rejection_case leaves a reviewable result" 0 "$RUN_RC"
+  assert_eq "$rejection_case gets one bounded second assessment" 1 "$(calls triage2)"
+  assert_eq "$rejection_case stays human-only" "ready-to-review," "$(gh_labels)"
+  assert_not_contains "$rejection_case cannot become defect evidence" "$RUN_OUT" '"needsDefectFix":true'
+done
+
+scenario 'independent check: confidence 75 accepts an evidenced matching rejection'
+REJECTION75="$TMP/fixtures-rejection-75"; cp -R "$REJECTED" "$REJECTION75"
+fixture "$REJECTION75" fixcheck '{"verdicts":[{"index":1,"verdict":"rejected","confidence":75,"reasoning":"The only caller initializes the input before the access; the reported path is impossible."}],"regressions":[]}'
+run_pipeline "$EPIC_RUN" "$REJECTION75" --issue 42
+assert_rc "the threshold is inclusive" 0 "$RUN_RC"
+assert_contains "matching evidence at 75 clears the gate" "$RUN_OUT" '"readyToMerge":true'
+assert_eq "the accepted rejection spends no second round" 0 "$(calls triage2)"
+
 scenario 'post-fix check: a fix the second check still cannot confirm holds the PR for a human'
 UNCONF2="$TMP/fixtures-unconfirmed2"; cp -R "$ROUND2" "$UNCONF2"
-fixture "$UNCONF2" fixcheck2 '{"verdicts":[{"index":1,"resolved":false,"confidence":85,"reasoning":"Still cannot tell the empty case is covered."}],"regressions":[]}'
+fixture "$UNCONF2" fixcheck2 '{"verdicts":[{"index":1,"verdict":"uncertain","confidence":85,"reasoning":"Still cannot tell the empty case is covered."}],"regressions":[]}'
 run_pipeline "$EPIC_RUN" "$UNCONF2" --issue 42
 assert_rc "exits 0 (the PR is real, just held)" 0 "$RUN_RC"
-assert_contains "the held reason says a human decides" "$RUN_OUT" '1 fix(es) not confirmed by the post-fix check — a human decides (Null deref on empty list)'
+assert_contains "the held reason names the unresolved finding" "$RUN_OUT" 'Null deref on empty list'
 assert_not_contains "it is not queued for merge" "$RUN_OUT" '"readyToMerge":true'
 assert_not_contains "uncertainty is never a defect the fixer may repair" "$RUN_OUT" '"needsDefectFix":true'
 assert_eq "the issue rests at ready-to-review for a human" "ready-to-review," "$(gh_labels)"
 assert_not_contains "and no repair envelope is posted" "$(gh_comments)" "🤖 defect-fix evidence"
-assert_contains "review.md records the verdict" "$(cat "$WT/.epics/42-add-widget/review.md")" "NOT confirmed"
+assert_contains "review.md records the evidence" "$(cat "$WT/.epics/42-add-widget/review.md")" "Still cannot tell the empty case is covered."
 assert_eq "exactly two fix rounds, never a third" "1 1" "$(calls triage) $(calls triage2)"
 assert_eq "and exactly two post-fix checks" "1 1" "$(calls fixcheck) $(calls fixcheck2)"
 
 scenario 'post-fix check: a regression the second check finds is a defect the fixer may repair'
 REGRESS2="$TMP/fixtures-regress2"; cp -R "$ROUND2" "$REGRESS2"
-fixture "$REGRESS2" fixcheck2 '{"verdicts":[{"index":1,"resolved":true,"confidence":95,"reasoning":"Confirmed against the code."}],"regressions":[{"title":"Guard breaks the non-empty path","severity":"Important","confidence":85,"location":"src/widget.ts:14","problem":"Returns early for every list.","fix":"Check length, not truthiness.","gate":"unit test for a non-empty list"}]}'
+fixture "$REGRESS2" fixcheck2 '{"verdicts":[{"index":1,"verdict":"fixed","confidence":95,"reasoning":"Confirmed against the code."}],"regressions":[{"title":"Guard breaks the non-empty path","severity":"Important","confidence":85,"location":"src/widget.ts:14","problem":"Returns early for every list.","fix":"Check length, not truthiness.","gate":"unit test for a non-empty list"}]}'
 run_pipeline "$EPIC_RUN" "$REGRESS2" --issue 42
 assert_rc "exits 0" 0 "$RUN_RC"
-assert_contains "the gate names the regression" "$RUN_OUT" 'regression(s) introduced by the fixes (Important: Guard breaks the non-empty path)'
+assert_contains "the gate names the regression" "$RUN_OUT" 'Guard breaks the non-empty path'
 assert_not_contains "it is not queued for merge" "$RUN_OUT" '"readyToMerge":true'
 assert_contains "RESULT marks the concrete regression repairable" "$RUN_OUT" '"needsDefectFix":true'
 assert_eq "the issue stays reviewable and enters the defect-fixer queue" "needs-defect-fix,ready-to-review," "$(gh_labels)"
 assert_contains "the repair envelope names the regression" "$(gh_comments)" "Guard breaks the non-empty path"
-assert_contains "review.md lists it as a deferred defect" "$(cat "$WT/.epics/42-add-widget/review.md")" "Regressions introduced by the fixes"
+assert_contains "review.md retains the regression evidence" "$(cat "$WT/.epics/42-add-widget/review.md")" "Returns early for every list."
 
 scenario 'post-fix check: a regression the first check found is the second round job'
 REGRESS1="$TMP/fixtures-regress1"; cp -R "$BASE" "$REGRESS1"
-fixture "$REGRESS1" fixcheck '{"verdicts":[{"index":1,"resolved":true,"confidence":90,"reasoning":"Fixed."}],"regressions":[{"title":"Guard breaks the non-empty path","severity":"Important","confidence":85,"location":"src/widget.ts:14","problem":"Returns early for every list.","fix":"Check length, not truthiness.","gate":"unit test for a non-empty list"}]}'
-fixture "$REGRESS1" triage2 '{"status":"Checked length instead of truthiness.","deferred":[]}'
+fixture "$REGRESS1" fixcheck '{"verdicts":[{"index":1,"verdict":"fixed","confidence":90,"reasoning":"Fixed."}],"regressions":[{"title":"Guard breaks the non-empty path","severity":"Important","confidence":85,"location":"src/widget.ts:14","problem":"Returns early for every list.","fix":"Check length, not truthiness.","gate":"unit test for a non-empty list"}]}'
+fixture "$REGRESS1" triage2 '{"status":"Checked length instead of truthiness.","assessments":[{"index":1,"action":"fixed","reason":"Restored the non-empty path with a length check and test."}]}'
 fixture_sh "$REGRESS1" triage2 'printf "export const createWidget = (items = []) => ({ items, empty: items.length === 0 })\n" > frontend/src/widget.ts'
-fixture "$REGRESS1" fixcheck2 '{"verdicts":[{"index":1,"resolved":true,"confidence":92,"reasoning":"The non-empty path is back."}],"regressions":[]}'
+fixture "$REGRESS1" fixcheck2 '{"verdicts":[{"index":1,"verdict":"fixed","confidence":92,"reasoning":"The empty-list guard still holds after the second repair."},{"index":2,"verdict":"fixed","confidence":92,"reasoning":"The non-empty path is back."}],"regressions":[]}'
 run_pipeline "$EPIC_RUN" "$REGRESS1" --issue 42
 assert_rc "exits 0" 0 "$RUN_RC"
-assert_contains "the regression is put to the second round as a finding" "$(cat "$STATE_DIR/triage2.0.prompt")" "Regression the fixes introduced 1"
+assert_contains "the regression is put to the second round as a finding" "$(cat "$STATE_DIR/triage2.0.prompt")" "Guard breaks the non-empty path"
 assert_contains "with the regression evidence the check suggested" "$(cat "$STATE_DIR/triage2.0.prompt")" "unit test for a non-empty list"
 assert_not_contains "a fix the check confirmed is never re-opened" "$(cat "$STATE_DIR/triage2.0.prompt")" "Null deref on empty list"
 assert_contains "the second check judged the repaired regression" "$(cat "$STATE_DIR/fixcheck2.0.prompt")" "Guard breaks the non-empty path"
+assert_contains "the second check rechecks the earlier repair too" "$(cat "$STATE_DIR/fixcheck2.0.prompt")" "Null deref on empty list"
 assert_contains "the run ships once it is confirmed" "$RUN_OUT" '"readyToMerge":true'
 assert_eq "the issue ends ready-to-merge" "ready-to-merge," "$(gh_labels)"
 
 scenario 'post-fix check: what round 2 leaves unfixed is classed by where it came from'
 HELD2="$TMP/fixtures-held2"; cp -R "$REGRESS1" "$HELD2"
-fixture "$HELD2" fixcheck '{"verdicts":[{"index":1,"resolved":false,"confidence":90,"reasoning":"The guard checks null, not empty."}],"regressions":[{"title":"Guard breaks the non-empty path","severity":"Important","confidence":85,"location":"src/widget.ts:14","problem":"Returns early for every list.","fix":"Check length, not truthiness.","gate":"unit test for a non-empty list"}]}'
-fixture "$HELD2" triage2 '{"status":"Made the guard evident; left the regression for a human.","deferred":[{"title":"Guard breaks the non-empty path","severity":"Important","why":"The behavior wanted for a non-empty list needs a product decision."}]}'
-fixture "$HELD2" fixcheck2 '{"verdicts":[{"index":1,"resolved":true,"confidence":95,"reasoning":"A test now fails without the guard."}],"regressions":[]}'
+fixture "$HELD2" fixcheck '{"verdicts":[{"index":1,"verdict":"uncertain","confidence":90,"reasoning":"The guard checks null, not empty."}],"regressions":[{"title":"Guard breaks the non-empty path","severity":"Important","confidence":85,"location":"src/widget.ts:14","problem":"Returns early for every list.","fix":"Check length, not truthiness.","gate":"unit test for a non-empty list"}]}'
+fixture "$HELD2" triage2 '{"status":"Made the guard evident; left the regression for a human.","assessments":[{"index":1,"action":"fixed","reason":"Made the guard explicit and tested the empty case."},{"index":2,"action":"deferred","reason":"The behavior wanted for a non-empty list needs a product decision."}]}'
+fixture "$HELD2" fixcheck2 '{"verdicts":[{"index":1,"verdict":"fixed","confidence":95,"reasoning":"A test now fails without the guard."},{"index":2,"verdict":"defect","confidence":90,"reasoning":"The non-empty branch still returns before processing items."}],"regressions":[]}'
 run_pipeline "$EPIC_RUN" "$HELD2" --issue 42
 assert_rc "exits 0" 0 "$RUN_RC"
-assert_contains "only what round 2 repaired went to the second check" "$(cat "$STATE_DIR/fixcheck2.0.prompt")" "Null deref on empty list"
-assert_not_contains "what it deferred did not" "$(cat "$STATE_DIR/fixcheck2.0.prompt")" "Guard breaks the non-empty path"
-assert_contains "the gate names the regression round 2 left" "$RUN_OUT" 'regression(s) the second fix round left unfixed (Important: Guard breaks the non-empty path)'
+assert_contains "what round 2 repaired went to the second check" "$(cat "$STATE_DIR/fixcheck2.0.prompt")" "Null deref on empty list"
+assert_contains "its deferral is independently checked too" "$(cat "$STATE_DIR/fixcheck2.0.prompt")" "Guard breaks the non-empty path"
+assert_contains "the gate names the regression round 2 left" "$RUN_OUT" 'Guard breaks the non-empty path'
 assert_contains "a named regression stays repairable" "$RUN_OUT" '"needsDefectFix":true'
 assert_eq "the issue stays reviewable and enters the defect-fixer queue" "needs-defect-fix,ready-to-review," "$(gh_labels)"
+
+scenario 'independent check: old defect evidence cannot override an uncertain final check'
+UNCERTAIN_FINAL="$TMP/fixtures-uncertain-final"; cp -R "$HELD2" "$UNCERTAIN_FINAL"
+fixture "$UNCERTAIN_FINAL" fixcheck2 '{"verdicts":[{"index":1,"verdict":"fixed","confidence":95,"reasoning":"The empty case now has a tested guard."},{"index":2,"verdict":"uncertain","confidence":90,"reasoning":"The changed control flow prevents establishing whether the previously found regression remains."}],"regressions":[]}'
+run_pipeline "$EPIC_RUN" "$UNCERTAIN_FINAL" --issue 42
+assert_rc "the final uncertainty is reviewable" 0 "$RUN_RC"
+assert_eq "earlier regression evidence cannot queue an uncertain current head" "ready-to-review," "$(gh_labels)"
+assert_not_contains "no repair envelope claims the older verdict is current" "$(gh_comments)" "🤖 defect-fix evidence"
+
+scenario 'independent check: round 2 cannot rely on a fix accepted before its edits'
+REOPEN_FIXED="$TMP/fixtures-reopen-fixed"; cp -R "$REGRESS1" "$REOPEN_FIXED"
+fixture "$REOPEN_FIXED" fixcheck2 '{"verdicts":[{"index":1,"verdict":"defect","confidence":94,"reasoning":"The second repair removed the earlier empty-list guard."},{"index":2,"verdict":"fixed","confidence":92,"reasoning":"The non-empty path is now correct."}],"regressions":[]}'
+run_pipeline "$EPIC_RUN" "$REOPEN_FIXED" --issue 42
+assert_rc "the newly broken original finding leaves a reviewable PR" 0 "$RUN_RC"
+assert_not_contains "the round-2 coder is not tasked with the earlier cleared repair" "$(cat "$STATE_DIR/triage2.0.prompt")" "Null deref on empty list"
+assert_contains "the checker still examines the original finding" "$(cat "$STATE_DIR/fixcheck2.0.prompt")" "Null deref on empty list"
+assert_eq "the stale first-round acceptance cannot merge" "needs-defect-fix,ready-to-review," "$(gh_labels)"
+assert_eq "there is no third round after reopening a finding" 1 "$(calls triage2)"
+
+scenario 'independent check: round 2 rechecks an earlier accepted rejection against its edits'
+REOPEN_REJECTED="$TMP/fixtures-reopen-rejected"; cp -R "$ROUND2" "$REOPEN_REJECTED"
+fixture "$REOPEN_REJECTED" review-general '{"findings":[{"title":"Caller input lacks normalization","severity":"Important","confidence":85,"location":"src/widget.ts:4","problem":"Direct callers may pass missing input.","fix":"Normalize input.","gate":"direct caller test"},{"title":"Null deref on empty list","severity":"Critical","confidence":90,"location":"src/widget.ts:12","problem":"Crashes when items is empty.","fix":"Guard the access.","gate":"unit test for the empty case"}]}'
+fixture "$REOPEN_REJECTED" triage '{"status":"Rejected the caller claim and fixed the empty-list access.","assessments":[{"index":1,"action":"rejected","reason":"The outer caller already normalizes input."},{"index":2,"action":"fixed","reason":"Added an empty-list guard."}]}'
+fixture "$REOPEN_REJECTED" fixcheck '{"verdicts":[{"index":1,"verdict":"rejected","confidence":90,"reasoning":"The current outer caller does normalize input."},{"index":2,"verdict":"uncertain","confidence":90,"reasoning":"The empty-list branch is not covered by the test."}],"regressions":[]}'
+fixture "$REOPEN_REJECTED" fixcheck2 '{"verdicts":[{"index":1,"verdict":"defect","confidence":94,"reasoning":"The second repair bypasses the normalization wrapper, making the formerly rejected caller path real."},{"index":2,"verdict":"fixed","confidence":92,"reasoning":"The empty-list branch is now explicitly guarded and tested."}],"regressions":[]}'
+run_pipeline "$EPIC_RUN" "$REOPEN_REJECTED" --issue 42
+assert_rc "the reintroduced rejected report is reviewable" 0 "$RUN_RC"
+assert_not_contains "the round-2 coder only receives the unresolved second report" "$(cat "$STATE_DIR/triage2.0.prompt")" "Caller input lacks normalization"
+assert_contains "the round-2 checker revisits the original rejection" "$(cat "$STATE_DIR/fixcheck2.0.prompt")" "Caller input lacks normalization"
+assert_eq "stale rejection evidence cannot clear the changed head" "needs-defect-fix,ready-to-review," "$(gh_labels)"
+assert_contains "the durable defect evidence explains the changed path" "$(gh_comments)" "bypasses the normalization wrapper"
 
 scenario 'verify gate: a second fix round that leaves verify red twice blocks the run'
 BROKEN2="$TMP/fixtures-broken2"; cp -R "$ROUND2" "$BROKEN2"
@@ -1799,22 +1966,56 @@ fixture_sh "$BROKEN2" triage2 'rm -f frontend/src/widget.ts'   # the second roun
 run_pipeline "$EPIC_RUN" "$BROKEN2" --issue 42
 assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
 assert_contains "it blocks in the fixes phase" "$RUN_OUT" '"phase":"triage"'
-assert_contains "the reason names the red verify" "$RUN_OUT" 'red after the second fix round and its retry'
+assert_contains "the reason names the red verify" "$RUN_OUT" 'npm run verify is red after the fixes and their retry'
 assert_eq "the second round was spawned twice, never a third time" 2 "$(calls triage2)"
 assert_contains "the retry carried the verify output" "$(cat "$STATE_DIR/triage2.1.prompt")" "missing export createWidget"
 assert_eq "no second check ran on an unverified tree" 0 "$(calls fixcheck2)"
 assert_eq "nothing shipped a PR" "" "$(gh_pr_created)"
 
-scenario 'post-fix check: a claimed fix with no diff holds the PR without a model'
+scenario 'review assessment: round 2 must assess every open item exactly once'
+BADASSESS2="$TMP/fixtures-assessment2-missing"; cp -R "$ROUND2" "$BADASSESS2"
+fixture "$BADASSESS2" triage2 '{"status":"Claimed completion without an assessment.","assessments":[]}'
+run_pipeline "$EPIC_RUN" "$BADASSESS2" --issue 42
+assert_rc "missing round-2 coverage blocks" 3 "$RUN_RC"
+assert_eq "invalid round-2 coverage creates no PR" "" "$(gh_pr_created)"
+assert_eq "invalid round-2 coverage never reaches the checker" 0 "$(calls fixcheck2)"
+
+scenario 'independent check: round 2 must cover earlier cleared items too'
+BADCHECK2="$TMP/fixtures-check2-missing-original"; cp -R "$REGRESS1" "$BADCHECK2"
+fixture "$BADCHECK2" fixcheck2 '{"verdicts":[{"index":2,"verdict":"fixed","confidence":92,"reasoning":"The regression is repaired, but the original finding was omitted."}],"regressions":[]}'
+run_pipeline "$EPIC_RUN" "$BADCHECK2" --issue 42
+assert_rc "incomplete round-2 evidence leaves a reviewable PR" 0 "$RUN_RC"
+assert_eq "the missing original verdict holds for a human" "ready-to-review," "$(gh_labels)"
+assert_eq "incomplete evidence never starts a third repair round" 1 "$(calls triage2)"
+
+scenario 'post-fix check: a second-round fixed claim with no new delta cannot clear'
+NODIFF2="$TMP/fixtures-no-diff2"; cp -R "$ROUND2" "$NODIFF2"
+fixture_sh "$NODIFF2" triage2 'true'
+run_pipeline "$EPIC_RUN" "$NODIFF2" --issue 42
+assert_rc "the second no-delta claim remains reviewable" 0 "$RUN_RC"
+assert_eq "the second checker still runs" 1 "$(calls fixcheck2)"
+assert_eq "its positive claim cannot replace an actual repair delta" "ready-to-review," "$(gh_labels)"
+assert_eq "two rounds remains the complete budget" 1 "$(calls triage2)"
+
+scenario 'post-fix check: a claimed fix with no diff cannot clear even with checker agreement'
 NODIFF="$TMP/fixtures-nodiff"; cp -R "$BASE" "$NODIFF"
 fixture_sh "$NODIFF" triage 'true'      # claims a fix, changes nothing
 run_pipeline "$EPIC_RUN" "$NODIFF" --issue 42
 assert_rc "exits 0" 0 "$RUN_RC"
-assert_contains "the gate says so" "$RUN_OUT" 'reported fixed but the fixes step changed nothing'
-assert_eq "no skeptic was spawned for an empty delta" 0 "$(calls fixcheck)"
+assert_contains "the artifact explains why the positive check did not clear" "$(cat "$WT/.epics/42-add-widget/review.md")" 'The fixes step reported fixes but produced no diff'
+assert_eq "the checker still judges the report" 1 "$(calls fixcheck)"
 assert_eq "and an empty delta starts no second round" 0 "$(calls triage2)"
-assert_contains "RESULT marks a claimed no-delta fix repairable" "$RUN_OUT" '"needsDefectFix":true'
-assert_eq "the issue stays reviewable and enters the defect-fixer queue" "needs-defect-fix,ready-to-review," "$(gh_labels)"
+assert_not_contains "a no-delta claim is not proof of a concrete defect" "$RUN_OUT" '"needsDefectFix":true'
+assert_eq "the issue stays reviewable for a human" "ready-to-review," "$(gh_labels)"
+
+scenario 'post-fix check: a no-delta claim is repairable only when the checker finds a concrete defect'
+NODIFFDEFECT="$TMP/fixtures-no-diff-defect"; cp -R "$NODIFF" "$NODIFFDEFECT"
+fixture "$NODIFFDEFECT" fixcheck '{"verdicts":[{"index":1,"verdict":"defect","confidence":94,"reasoning":"The original empty-list dereference is still reachable and still crashes."}],"regressions":[]}'
+run_pipeline "$EPIC_RUN" "$NODIFFDEFECT" --issue 42
+assert_rc "the independently proven defect leaves a reviewable PR" 0 "$RUN_RC"
+assert_eq "concrete current evidence permits the defect queue" "needs-defect-fix,ready-to-review," "$(gh_labels)"
+assert_eq "a no-delta claim still starts no second round" 0 "$(calls triage2)"
+assert_contains "the repair envelope names the actual failing behavior" "$(gh_comments)" "still reachable and still crashes"
 
 scenario 'post-fix check: a dead check holds the PR, not the run'
 DEADCHECK="$TMP/fixtures-deadcheck"; cp -R "$BASE" "$DEADCHECK"
@@ -1840,7 +2041,7 @@ assert_eq "the hold is durable before ready is exposed" "" "$(hold_order_error)"
 assert_eq "ship never opens a PR after the quota" "" "$(gh_pr_created)"
 assert_not_contains "the soft check does not become a blocker comment" "$(gh_comments)" "🤖 epic-run blocked"
 
-scenario 'post-fix check: nothing confirmed means nothing to check'
+scenario 'post-fix check: no review findings means no assessment or check'
 CLEANREV="$TMP/fixtures-cleanrev"; cp -R "$BASE" "$CLEANREV"
 fixture "$CLEANREV" review-general '{"findings":[]}'
 run_pipeline "$EPIC_RUN" "$CLEANREV" --issue 42
@@ -1890,7 +2091,7 @@ fixture "$MIXED" ship '{"title":"Add widget","body":"Adds a widget.","commitBody
 printf '1' > "$MIXED/defercheck.0.rc"; printf '1' > "$MIXED/defercheck.1.rc"
 run_pipeline "$EPIC_RUN" "$MIXED" --issue 42
 assert_rc "exits 0 with a reviewable PR" 0 "$RUN_RC"
-assert_contains "the concrete unfixed finding still holds the gate" "$RUN_OUT" 'confirmed review finding(s) left unfixed'
+assert_contains "the concrete unfixed finding still holds the gate" "$RUN_OUT" 'Null deref on empty list'
 assert_contains "the uncertain deferral also holds it" "$RUN_OUT" 'the deferral check produced no result'
 assert_not_contains "mixed evidence cannot enter autonomous repair" "$RUN_OUT" '"needsDefectFix":true'
 assert_eq "the issue remains only ready-to-review" "ready-to-review," "$(gh_labels)"
@@ -1918,7 +2119,7 @@ assert_eq "the verify gate ran once more, on the rebased tree" 5 "$(grep -c '^ru
 assert_contains "and that run is the post-rebase gate" "$RUN_OUT" "Ship: verify gate after rebase: verify green"
 assert_contains "the gate outcome is what it is without the move" "$RUN_OUT" '"readyToMerge":true'
 assert_eq "the issue still ends ready-to-merge and nothing else" "ready-to-merge," "$(gh_labels)"
-assert_eq "the rebase costs no model step" 8 "$(wc -l < "$RUN_LOG" | tr -d ' ')"
+assert_eq "the rebase costs no model step" 7 "$(wc -l < "$RUN_LOG" | tr -d ' ')"
 assert_contains "the dep check still runs and finds nothing to do" "$RUN_OUT" "Ship: deps checked after rebase (frontend: deps present)"
 assert_eq "a base with no lockfile move installs nothing extra" 1 "$(grep -c '^ci$' "$NPM_LOG")"
 
@@ -2042,22 +2243,47 @@ assert_eq "the issue ends failed" "failed," "$(gh_labels)"
 scenario 'epic-run: manual slug mode touches no git phase and no issue'
 MANUAL="$TMP/fixtures-manual"; cp -R "$BASE" "$MANUAL"
 fixture "$MANUAL" summary '{"summary":"summary.md written"}'
-MANUAL_WT="$(fresh_clone)"
-mkdir -p "$MANUAL_WT/.epics/42-add-widget"
-printf 'Build a widget.\n' > "$MANUAL_WT/.epics/42-add-widget/requirements.md"
-# run in that prepared clone rather than a fresh one
-fresh_clone() { printf '%s' "$MANUAL_WT"; }
-run_pipeline "$EPIC_RUN" "$MANUAL" --slug 42-add-widget
-unset -f fresh_clone
-fresh_clone() { local dir="$TMP/run-$RANDOM$RANDOM"; git clone -q "$ORIGIN" "$dir"; git -C "$dir" checkout -q --detach main; printf '%s' "$dir"; }
+run_manual() {
+  MANUAL_WT="$(fresh_clone)"
+  mkdir -p "$MANUAL_WT/.epics/42-add-widget"
+  printf 'Build a widget.\n' > "$MANUAL_WT/.epics/42-add-widget/requirements.md"
+  # Run in the prepared clone while preserving the normal runner's insulation.
+  fresh_clone() { printf '%s' "$MANUAL_WT"; }
+  run_pipeline "$EPIC_RUN" "$1" --slug 42-add-widget
+  unset -f fresh_clone
+  fresh_clone() { local dir="$TMP/run-$RANDOM$RANDOM"; git clone -q "$ORIGIN" "$dir"; git -C "$dir" checkout -q --detach main; printf '%s' "$dir"; }
+}
+run_manual "$MANUAL"
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_contains "the summary came back" "$RUN_OUT" 'summary.md written'
 assert_contains "summary.md was written to the tree" "$(cat "$MANUAL_WT/.epics/42-add-widget/summary.md")" 'summary.md written'
 assert_eq "no gh calls at all" "0" "$(wc -l < "$GH_LOG" | tr -d ' ')"
 assert_eq "no branch was created on origin" "" "$(origin_ref epic/42-add-widget)"
-assert_eq "no fix check in manual mode" 0 "$(calls fixcheck)"
+assert_eq "manual assessments get one independent check" 1 "$(calls fixcheck)"
+assert_eq "manual mode starts no second repair round" 0 "$(calls triage2)"
 assert_eq "no commit was made on the user's tree" "$MAIN_INITIAL" "$(git -C "$MANUAL_WT" rev-parse HEAD)"
 assert_contains "new files were intent-added for the blind review" "$(git -C "$MANUAL_WT" status --porcelain)" "frontend/src/widget.ts"
+
+scenario 'epic-run: manual no-edit rejection is independently accepted'
+MANUAL_REJECTED="$TMP/fixtures-manual-rejected"; cp -R "$REJECTED" "$MANUAL_REJECTED"
+fixture "$MANUAL_REJECTED" summary '{"summary":"The reported path is already handled; no repair was needed."}'
+run_manual "$MANUAL_REJECTED"
+assert_rc "manual rejection completes" 0 "$RUN_RC"
+assert_eq "the independent checker runs even without edits" 1 "$(calls fixcheck)"
+assert_eq "the result counts the independently accepted rejection" "1|0" "$(result_json | jq -r '[.findingsRejected,.findingsPending] | join("|")')"
+assert_eq "manual rejection makes no commit" "$MAIN_INITIAL" "$(git -C "$MANUAL_WT" rev-parse HEAD)"
+assert_eq "manual rejection makes no GitHub call" 0 "$(wc -l < "$GH_LOG" | tr -d ' ')"
+
+scenario 'epic-run: manual unsupported rejection remains explicitly unresolved'
+MANUAL_UNCERTAIN="$TMP/fixtures-manual-uncertain"; cp -R "$MANUAL_REJECTED" "$MANUAL_UNCERTAIN"
+fixture "$MANUAL_UNCERTAIN" fixcheck '{"verdicts":[{"index":1,"verdict":"uncertain","confidence":95,"reasoning":"The caller contract is unavailable, so the dismissal cannot be confirmed."}],"regressions":[]}'
+run_manual "$MANUAL_UNCERTAIN"
+assert_rc "manual uncertainty returns a summary" 0 "$RUN_RC"
+assert_eq "the result cannot accept an unsupported rejection" "0|1" "$(result_json | jq -r '[.findingsRejected,.findingsPending] | join("|")')"
+assert_eq "manual mode still has only one assessment round" 0 "$(calls triage2)"
+assert_contains "the review artifact preserves the uncertainty" "$(cat "$MANUAL_WT/.epics/42-add-widget/review.md")" "the dismissal cannot be confirmed"
+assert_eq "manual uncertainty makes no commit" "$MAIN_INITIAL" "$(git -C "$MANUAL_WT" rev-parse HEAD)"
+assert_eq "manual uncertainty makes no GitHub call" 0 "$(wc -l < "$GH_LOG" | tr -d ' ')"
 
 # ───────────────────────── fix-run ─────────────────────────
 # A finished epic PR (one commit, Closes #42) whose line conflicts with a
@@ -3183,51 +3409,53 @@ assert_defect_handoff() { # name epic-fixtures expected blocker text
 assert_defect_handoff "triage deferral" "$HELD" "Null deref on empty list"
 assert_defect_handoff "fix regression" "$REGRESS2" "Guard breaks the non-empty path"
 assert_defect_handoff "regression round 2 left unfixed" "$HELD2" "Guard breaks the non-empty path"
-assert_defect_handoff "claimed no-delta fix" "$NODIFF" "fixes step changed nothing"
+assert_defect_handoff "independently refuted rejection" "$REJECTREALHELD" "Null deref on empty list"
+assert_defect_handoff "independently proven no-delta defect" "$NODIFFDEFECT" "still reachable and still crashes"
 assert_defect_handoff "ship deferral" "$DEFER" "Second defect"
 
-# ───────────────────── defect grouping (restatements across files) ─────────────────────
-# Independent reviewers reporting one fault is useful convergence, but the fixer must not
-# then fix and gate that fault repeatedly. The skeptic links restatements with sameDefectAs; the script unions them into
-# defects and tells the fixer, WITHOUT dropping any finding.
-scenario 'grouping: restatements across files become one defect for the fixer'
+# ───────────────────── exact deduplication without semantic grouping ─────────────────────
+# Related reports still need individual dispositions and independent evidence.
+# Only identical normalized title+location reports can share a finding index.
+scenario 'review coverage: three related reports are all assessed and checked'
 GROUP="$TMP/fixtures-group"
 cp -R "$BASE" "$GROUP"
 fixture "$GROUP" design '{"approach":"Thin widget module","rationale":"Fits the existing shape.","steps":["one","two"],"files":["src/widget.ts — new"],"contract":"createWidget(): Widget","tradeoffs":"No caching.","verification":{"mode":"test-first","rationale":"The public export can be asserted before implementation.","evidence":["widget test passes"]},"review":{"question":"Can an unusable schedule still permit submit?","rationale":"The validation crosses several modules."}}'
 fixture "$GROUP" review-general '{"findings":[{"title":"Unusable schedule does not block submit","severity":"Critical","confidence":90,"location":"src/dialog.tsx:40","problem":"Submit stays enabled.","fix":"Block it.","gate":"unit test"},{"title":"Block gate tests the wrong condition","severity":"Important","confidence":85,"location":"src/gate.ts:12","problem":"Checks null, not empty.","fix":"Check emptiness.","gate":"unit test"}]}'
 fixture "$GROUP" review-focus '{"findings":[{"title":"Test asserts the wrong guard","severity":"Important","confidence":80,"location":"src/gate.test.ts:8","problem":"Encodes the wrong rule.","fix":"Assert emptiness.","gate":"unit test"}]}'
-# One skeptic sees all three (one batch) and links 2 and 3 back to 1.
-fixture "$GROUP" verify '{"verdicts":[
-  {"index":1,"real":true,"confidence":90,"reasoning":"Confirmed."},
-  {"index":2,"real":true,"confidence":88,"reasoning":"Same fault as 1.","sameDefectAs":1},
-  {"index":3,"real":true,"confidence":85,"reasoning":"Same fault as 1.","sameDefectAs":1}]}'
-# All three fixes confirmed: this scenario is about the grouping, not the rounds.
+fixture "$GROUP" triage '{"status":"Repaired all three reports.","assessments":[
+  {"index":1,"action":"fixed","reason":"Submit now blocks an unusable schedule."},
+  {"index":2,"action":"fixed","reason":"The gate now tests emptiness."},
+  {"index":3,"action":"fixed","reason":"The test asserts the required guard."}]}'
 fixture "$GROUP" fixcheck '{"verdicts":[
-  {"index":1,"resolved":true,"confidence":92,"reasoning":"Fixed."},
-  {"index":2,"resolved":true,"confidence":92,"reasoning":"Fixed."},
-  {"index":3,"resolved":true,"confidence":92,"reasoning":"Fixed."}],"regressions":[]}'
+  {"index":1,"verdict":"fixed","confidence":92,"reasoning":"The submit path now blocks unusable schedules."},
+  {"index":2,"verdict":"fixed","confidence":92,"reasoning":"The gate tests the required empty condition."},
+  {"index":3,"verdict":"fixed","confidence":92,"reasoning":"The test fails without that guard."}],"regressions":[]}'
 run_pipeline "$EPIC_RUN" "$GROUP" --issue 42
 assert_rc "exits 0" 0 "$RUN_RC"
-assert_contains "one batch, not one per file" "$RUN_OUT" "in 1 batch(es)"
-assert_contains "the tally keeps BOTH counts" "$RUN_OUT" "3 confirmed by adversarial verification, which are 1 distinct defect(s)"
+assert_contains "all reports were independently cleared" "$RUN_OUT" '"readyToMerge":true'
+assert_eq "no semantic grouping model runs" 0 "$(calls verify)"
 TRIAGE_PROMPT="$(cat "$STATE_DIR/triage.0.prompt")"
-assert_contains "the fixer is told they are one defect" "$TRIAGE_PROMPT" "SAME underlying defect"
-assert_contains "grouping lists every finding, losing none" "$TRIAGE_PROMPT" "Block gate tests the wrong condition"
+assert_contains "the first report is retained" "$TRIAGE_PROMPT" "Unusable schedule does not block submit"
+assert_contains "the second report is retained" "$TRIAGE_PROMPT" "Block gate tests the wrong condition"
 assert_contains "...including the third" "$TRIAGE_PROMPT" "Test asserts the wrong guard"
-assert_contains "the grouping is advisory, not an order" "$TRIAGE_PROMPT" "hint, not an instruction"
+assert_contains "the checker receives all three indices" "$(cat "$STATE_DIR/fixcheck.0.prompt")" "Test asserts the wrong guard"
+assert_not_contains "no semantic grouping assertion reaches the fixer" "$TRIAGE_PROMPT" "SAME underlying defect"
 
-scenario 'grouping: distinct defects stay distinct'
-DISTINCT="$TMP/fixtures-distinct"
-cp -R "$GROUP" "$DISTINCT"
-fixture "$DISTINCT" verify '{"verdicts":[
-  {"index":1,"real":true,"confidence":90,"reasoning":"Confirmed."},
-  {"index":2,"real":true,"confidence":88,"reasoning":"Distinct fault."},
-  {"index":3,"real":true,"confidence":85,"reasoning":"Distinct fault."}]}'
-run_pipeline "$EPIC_RUN" "$DISTINCT" --issue 42
-assert_rc "exits 0" 0 "$RUN_RC"
-assert_not_contains "no defect collapsing is claimed" "$RUN_OUT" "distinct defect(s)"
-TRIAGE_PROMPT="$(cat "$STATE_DIR/triage.0.prompt")"
-assert_not_contains "and the fixer is told nothing about groups" "$TRIAGE_PROMPT" "SAME underlying defect"
+scenario 'review coverage: duplicate dispositions cannot conceal another report'
+DUPASSESS="$TMP/fixtures-duplicate-coverage"; cp -R "$GROUP" "$DUPASSESS"
+fixture "$DUPASSESS" triage '{"status":"Claimed three assessments.","assessments":[{"index":1,"action":"fixed","reason":"First fixed."},{"index":2,"action":"fixed","reason":"Second fixed."},{"index":2,"action":"fixed","reason":"Second repeated while third is missing."}]}'
+run_pipeline "$EPIC_RUN" "$DUPASSESS" --issue 42
+assert_rc "equal counts with a missing index fail closed" 3 "$RUN_RC"
+assert_eq "duplicate coverage cannot open a PR" "" "$(gh_pr_created)"
+
+scenario 'review coverage: exact duplicate title and location shares one disposition'
+EXACTDUP="$TMP/fixtures-exact-duplicate"; cp -R "$FOCUSED" "$EXACTDUP"
+rm -f "$EXACTDUP/review-focus.0.rc" "$EXACTDUP/review-focus.1.rc"
+fixture "$EXACTDUP" review-focus '{"findings":[{"title":"  NULL DEREF ON EMPTY LIST  ","severity":"Critical","confidence":88,"location":" src/widget.ts:12 ","problem":"Same reported crash.","fix":"Guard access.","gate":"empty-list test"}]}'
+run_pipeline "$EPIC_RUN" "$EXACTDUP" --issue 42
+assert_rc "an exact normalized duplicate is assessed once" 0 "$RUN_RC"
+assert_contains "one complete assessment and check can ship" "$RUN_OUT" '"readyToMerge":true'
+assert_eq "the independent checker runs once" 1 "$(calls fixcheck)"
 
 # ───────────────────── the issue's live status comment ─────────────────────
 # The label says WHICH state an issue is in; this says whether the run is alive

@@ -29,7 +29,10 @@ only where a judgment is needed. Claude Code and Codex are both supported.
    test-first red/green or a direct coding step. Both paths pass the project's
    verify gate run by the orchestrator. One general reviewer always runs; the
    plan may request one additional review for a concrete risk question.
-   Findings go through an independent skeptic and bounded repairs. Ship then
+   The fixer assesses findings and repairs, rejects or defers each one. An
+   independent checker judges every disposition, including no-edit rejections,
+   and the complete repair delta. Open items get at most one final repair round;
+   missing evidence holds the PR for a human. Ship then
    rebases the run's checkpoint chain onto current `main` and re-runs verify
    before squashing, so a base that moved during the run is met here rather
    than by the merge worker; a conflict or a failed fetch ships on the run's

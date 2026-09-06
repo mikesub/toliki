@@ -266,45 +266,40 @@ ${d.review.rationale}
   writeFileSync(path.join(dir, 'architecture.json'), `${JSON.stringify(d, null, 2)}\n`)
   return text
 }
-
-// review.md, rendered from the verdicts. Confirmed findings first, highest
-// severity first; refuted ones under a section fixes-after-review and ship
-// are told never to act on — recorded so a human can double-check the discard.
-export function renderReview(dir, confirmed, unconfirmed, postFix = null) {
-  const order = { Critical: 0, Important: 1 }
-  const sorted = [...confirmed].sort((a, b) => (order[a.severity] ?? 9) - (order[b.severity] ?? 9))
-  const finding = (f, i) => `### Finding ${i + 1}: ${f.title}
+// The assessment ledger preserves every finding and its index. A coder's
+// rejection is only a claim; only the independent check can mark it cleared.
+// Ship reads final states, including uncertainty, without reconstructing them
+// from builder prose or matching potentially duplicate titles.
+export function renderReview(dir, items, { rounds = 0, note = null } = {}) {
+  let text = '# Review\n\n'
+  if (rounds) {
+    text += '## Post-fix check\n\n'
+    if (rounds > 1) text += 'A second and final fix round ran over open items; every finding was rechecked against the final tree.\n\n'
+    if (note) text += `${note}.\n\n`
+    text += `${items.filter(item => item.cleared && item.verdict?.verdict === 'fixed').length} fixes confirmed; ${items.filter(item => item.cleared && item.verdict?.verdict === 'rejected').length} rejections confirmed; ${items.filter(item => !item.cleared).length} open.\n\n`
+  }
+  text += '## Findings\n\n'
+  if (!items.length) text += 'No review findings.\n'
+  items.forEach((item, i) => {
+    const { finding: f, assessment, verdict } = item
+    const state = item.cleared
+      ? `independently ${verdict.verdict}${verdict.verdict === 'rejected' ? ' — not deferred work' : ''}`
+      : verdict?.verdict === 'defect' && verdict.confidence >= 75
+        ? 'OPEN — independently confirmed defect'
+        : 'OPEN — NOT confirmed; requires independent evidence or a human'
+    text += `### Finding ${i + 1}: ${f.title}
 - severity: ${f.severity}
 - confidence: ${f.confidence}
 - location: ${f.location}
 - problem: ${f.problem}
 - fix: ${f.fix}
 - gate: ${f.gate}
+- assessment: ${assessment ? `${assessment.action} — ${assessment.reason}` : 'pending'}
+- independent verdict: ${verdict ? `${verdict.verdict} (confidence ${verdict.confidence}) — ${verdict.reasoning}` : 'pending'}
+- state: ${state}
+
 `
-  let text = `# Review\n\n## Confirmed findings\n\n`
-  text += sorted.length ? sorted.map(finding).join('\n') : 'No finding survived adversarial verification.\n'
-  if (unconfirmed.length) {
-    text += `\n## Unconfirmed — not fixed\n\nFixes-after-review and ship MUST NOT act on these. Adversarial verification refuted them or could not confirm them; they are recorded only so a human can double-check the discard.\n\n`
-    text += unconfirmed.map(f => `- ${f.title} (${f.location}; ${f.severity}): ${f.verdict?.reasoning || 'no reasoning recorded'}`).join('\n') + '\n'
-  }
-  // The skeptic's pass — or both passes — over the fixes-after-review delta,
-  // rendered as the END state: what the rounds together confirmed, and what is
-  // still open after the last check. Ship records each open item on the issue.
-  // A regression is a defect; a fix nobody could confirm is a human's call
-  // rather than a named bug.
-  if (postFix) {
-    const total = postFix.confirmed.length + postFix.unresolved.length
-    text += `\n## Post-fix check\n\n`
-    if (postFix.rounds > 1) text += 'A second and final fix round ran over what the first check left open; this is the state after it.\n\n'
-    if (postFix.note) text += `${postFix.note}.\n\n`
-    text += `Fixes confirmed: ${postFix.confirmed.length} of ${total}.\n`
-    for (const c of postFix.confirmed) text += `- ${c.finding.title}: confirmed (confidence ${c.verdict.confidence}) — ${c.verdict.reasoning}\n`
-    for (const u of postFix.unresolved) text += `- ${u.finding.title}: NOT confirmed (confidence ${u.verdict.confidence}) — ${u.verdict.reasoning}\n`
-    if (postFix.regressions.length) {
-      text += `\nRegressions introduced by the fixes (each is a deferred DEFECT until a human decides):\n`
-      for (const r of postFix.regressions) text += `- ${r.severity}: ${r.title} (${r.location}): ${r.problem} Fix: ${r.fix} Gate: ${r.gate}\n`
-    }
-  }
+  })
   mkdirSync(dir, { recursive: true })
   writeFileSync(path.join(dir, 'review.md'), text)
   return text

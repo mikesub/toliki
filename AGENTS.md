@@ -230,8 +230,8 @@ than made launchable against a main without the code it describes.
   Gated by `tests/epic-run.test.sh`.
 - One general reviewer always judges the actual diff against the requirement.
   Architecture can request at most one additional reviewer for a concrete risk
-  question. Reviewers stay blind to builder notes; the skeptic and fix checker
-  receive the original requirement too. Every finding needs a complete verdict:
+  question. Reviewers stay blind to builder notes; the independent checker
+  receives the original requirement too. Every finding needs a complete verdict:
   missing or ambiguous evidence cannot become a refutation or merge clearance.
   A resumed code checkpoint keeps its review plan, or reconstructs that plan
   read-only when the local artifact is missing, without replaying code.
@@ -240,17 +240,24 @@ than made launchable against a main without the code it describes.
   not mandated for every finding. Follow-up issues are still filed and queued
   for concrete material work with a standalone definition of done; the cap is
   a ceiling, not a target, and filing never clears the current PR's blockers.
-- The fixes-after-review delta gets a skeptic pass (fix-check), and an epic runs
-  at most two fix rounds. What the first check leaves open — a fix it could not
-  confirm, a regression it found — gets one more fix round over exactly those
-  items and one more pass of the same check. There is never a third, and a dead
-  check or a claimed fix with no diff holds the PR at `ready-to-review` with no
-  second round at all. After the last check, a fix nobody could confirm holds
-  the PR for a human and never enters the defect-fixer queue: it is uncertainty,
-  not a named bug. A regression, or a confirmed finding left unfixed, is
-  defect-class and may enter it. If and only if every blocker is defect-class, the
-  completed run may mark it for the separate bounded defect-fixer queue. Gated
-  by `tests/epic-run.test.sh`.
+- Fixes-after-review assesses each finding and reports an indexed disposition:
+  fixed, rejected with evidence, or deferred. There is no separate confirmation
+  before repairs. Fix-check independently judges EVERY disposition and the full
+  repair delta, including rejections and deferrals when no code changed. Only a
+  matching, evidenced fixed/rejected verdict clears an item; missing, duplicate,
+  extra or ambiguous evidence never does. Titles are not identities.
+  An epic runs at most two repair rounds. Open non-deferred items and new
+  regressions get the second round; its checker revisits every original finding
+  and earlier regression against the final tree, so earlier clearances cannot
+  survive a later regression unchecked. A dead or malformed check, or a claimed
+  repair with no diff, holds at `ready-to-review` without a second round.
+  Uncertainty always needs a human. Only current independent evidence of an
+  actual remaining defect can authorize the separate defect-fixer queue, and
+  only when every blocker has that evidence. A coder's deferral or no-diff repair
+  claim is not such proof. Manual slug mode checks one assessment/repair round
+  against an in-memory reviewed patch and immutable base, without committing
+  or queueing a merge; open items remain explicit in its summary. Gated by
+  `tests/epic-run.test.sh`.
 - Ship's deferral kinds feed the merge gate only after the skeptic re-judges
   every item ship did not call a defect; the skeptic can only escalate, and a
   dead check holds the PR. Gated by `tests/epic-run.test.sh`.

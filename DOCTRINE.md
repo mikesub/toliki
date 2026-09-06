@@ -38,18 +38,23 @@ don't get re-litigated from memory.
   request one additional reviewer for a concrete risk question, such as whether
   a migration preserves existing records; it cannot disable the general review
   or request an unbounded fan-out. Both review actual behavior and evidence,
-  without the builder's conclusions. Every finding goes to a
-  skeptic instructed to refute it; survivors are auto-fixed, refuted ones
-  recorded as unconfirmed rather than deleted; missing verdicts block rather
-  than count as refutations. The skeptic and fix checker also receive the
-  original requirement. The fixes get a pass from the same skeptic, and what it
-  leaves open gets one more fix round and one more pass — two rounds inside an
-  epic, never a third, because a third round is a round that is not converging.
-  A fix still unconfirmed after the last pass holds the PR for a human: nobody
-  established a bug, only that the fix could not be confirmed, so it never
-  enters a repair queue. A hold made entirely of concrete defects — a named
-  regression, a confirmed finding left in the tree — may enter a separate,
-  label-bounded defect-fixer session in repositories that explicitly opt in;
+  without the builder's conclusions. The fixer assesses each finding and
+  either repairs it, rejects it with evidence, or defers it. One independent
+  checker then judges every disposition against the original requirement and
+  code, including no-edit rejections. Assessment and repair share one pass to
+  avoid reading the same bug twice before any edit; the trade-off is that a
+  mistaken finding can cause unnecessary edits, so the independent checker
+  examines the before/after code for both false-positive repairs and regressions.
+  A builder's dismissal never clears itself. Every finding keeps an indexed
+  disposition and verdict; rejected findings remain in the audit record.
+  Open non-deferred items get one final repair round. Its checker revisits all
+  findings and the complete repair delta, because the second repair can break
+  something the first check cleared. Missing evidence or a claimed repair with
+  no diff holds immediately. Two rounds inside an epic, never a third, because
+  a third round is a round that is not converging. An unsupported repair or
+  rejection still needs a human; uncertainty never enters a repair queue.
+  A hold made entirely of independently confirmed remaining defects may enter
+  a separate, label-bounded defect-fixer session in repositories that explicitly opt in;
   uncertainty still goes directly to a human. The strong model goes to design
   and adjudication, where being wrong is expensive; implementation runs on a
   cheaper model under the test gate.

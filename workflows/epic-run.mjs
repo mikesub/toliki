@@ -31,15 +31,15 @@
 // After fixes it must be green too. An agent's word that it ran a gate is
 // never the gate; a wrong answer is handed back once, then blocks the run.
 //
-// The fixes themselves get a skeptic pass (fix-check) over exactly the delta
-// they produced. What that check leaves open — a fix it could not confirm, a
-// regression it found — gets exactly ONE more fix round over those items and
-// one more pass of the same check. There is never a third, and a dead check or
-// a claimed fix with no diff holds the PR at ready-to-review with no second
-// round at all. After the last check, a fix nobody could confirm holds the PR
-// for a human and never enters the defect queue; a regression, or a confirmed
-// finding still sitting in the tree, is a concrete defect, and a hold made only
-// of those may be repaired later by defect-run under its own label-bounded ladder.
+// The fixer assesses each finding and fixes, rejects or defers it. There is
+// no separate pre-repair confirmation. One independent check (fix-check)
+// judges EVERY disposition, even a rejection with no edits, and the complete
+// repair delta. Missing evidence holds the PR; only an independently accepted
+// repair or rejection clears a finding. Open non-deferred items get ONE more
+// repair round, then the checker rechecks every finding against the final tree.
+// There is never a third round; a dead/malformed check or a claimed repair
+// with no diff holds immediately. Only current independent evidence of actual
+// remaining defects can enter defect-run; uncertainty always needs a human.
 //
 // Ship's deferrals go through the same skeptic before the merge gate counts
 // them: every item ship did not call a defect is re-judged, and the skeptic
@@ -144,66 +144,25 @@ ${requirement}
 Read \`${diffCmd}\` / \`${diffCmd} --stat\` and the source tree to judge the change. Do NOT open ANY file under \`.epics/\` — architecture.md, epic.md, review.md and summary.md all encode the builder's intended behavior and would anchor you; you have the requirement above and do not need that directory.
 If nothing meets your confidence bar, return an empty findings array.`,
 
-  verify: (findings, requirement, diffCmd) =>
-`Adversarially verify ${findings.length === 1 ? 'a code-review finding' : `${findings.length} code-review findings reported against this change`}. Default to refuting each unless the code clearly bears it out.
+  triage: (dir, pkgs, items, round) =>
+`Assess and repair review findings, autonomous (NO user sign-off). ${round === 2 ? 'This is the SECOND and final round: address only the open items below; do not revisit cleared findings.' : 'The findings below are claims to investigate, not established defects. There is no separate confirmation pass.'}
+Read ${dir}/requirements.md and the source tree. For each numbered finding, either fix the actual defect, reject a false positive with concrete code evidence, or defer it with the reason it cannot safely be repaired. Never repair code merely to satisfy a mistaken review.
 
-${findings.map((f, i) => `--- Finding ${i + 1} ---
-Title: ${f.title}
-Severity: ${f.severity}
-Location: ${f.location}
-Claim: ${f.problem}`).join('\n\n')}
+${items.map((item, i) => `--- Finding ${i + 1} ---
+Title: ${item.finding.title}
+Severity: ${item.finding.severity}
+Location: ${item.finding.location}
+Problem: ${item.finding.problem}
+Recommended fix: ${item.finding.fix}
+Regression evidence: ${item.finding.gate}
+${item.verdict ? `Last independent check: ${item.verdict.verdict} — ${item.verdict.reasoning}` : ''}`).join('\n\n')}
 
-Original requirement the change must satisfy:
-"""
-${requirement}
-"""
+Apply the smallest correct repair, highest severity first. Add or update meaningful regression evidence, following the project's explicit verification rules. For a repair whose correctness the checker could not establish, provide a regression test that fails without the fix and passes with it, or a code change that removes the exact ambiguity it named. Multiple findings may describe one fault: one repair may satisfy them, but return a separate assessment for EVERY finding. Do not add unrelated refactors, abstractions, hardening rules or speculative follow-ups. Update existing documentation when a necessary repair changes its contract. Shared harness skills, agents and pipeline files outside this project remain out of scope.
+Never weaken, skip or delete a test, assertion, type or lint rule to make a check pass. If an item cannot safely be decided, defer it instead of guessing.
+Record material decisions and remaining work in ${dir}/epic.md's phase log. Run \`npm run verify\` in each touched package (${pkgs}) until green. Leave edits in the working tree: do NOT commit or push. The orchestrator checkpoints and runs verify itself.
 
-Read the relevant code and \`${diffCmd}\`. Do NOT open anything under \`.epics/\` — it carries the builder's intent and would anchor you. For each finding, determine whether the claim genuinely holds (real) or is a false positive / already handled (not real). Set real=false if you cannot confirm it against the actual code.
-
-Return exactly ${findings.length} verdict${findings.length === 1 ? '' : 's'} — one per finding — with \`index\` set to that finding's number above (${findings.length === 1 ? '1' : `1-${findings.length}`}).${findings.length > 1 ? `
-
-Several may be one defect restated in different words, often pointing at DIFFERENT files (the component, the gate that guards it, its test, the doc describing it). Judge each on its own merits: if two are the same defect, set \`sameDefectAs\` on the LATER one to the earlier one's number and let them stand or fall together — do NOT mark one not-real merely because it overlaps another. Group only findings ONE fix would genuinely resolve together; two distinct bugs that happen to sit in the same function are NOT the same defect.` : ''}`,
-
-  triage: (dir, pkgs, grouping) =>
-`Fixes-after-review phase, autonomous (NO user sign-off). Read ${dir}/requirements.md, ${dir}/review.md and the diff. Apply the smallest correct repair for the CONFIRMED findings only, highest severity first — NEVER act on anything under "## Unconfirmed — not fixed" (those were refuted; they are listed for human eyes only). Add or update a regression check when it meaningfully protects the affected behavior. Follow the project's own explicit verification rules.
-Keep the repair proportional to the defect. A finding does not require a new abstraction, shared helper, lint rule or project instruction: introduce one only when necessary for this repair. Do not turn a local fix into prevention of an entire class of hypothetical problems. If a necessary repair changes a documented contract, update the relevant project instructions or documentation in their existing voice. Shared harness skills, agents and pipeline files outside this project remain out of scope; never edit or recreate them. Record material decisions and any concrete work left undone in ${dir}/epic.md's phase log, without inventing hardening work to justify a follow-up.
-If a finding is genuinely too risky or expensive to fix safely without a human decision, DO NOT guess — leave it, and record it as deferred (with why) in ${dir}/epic.md's phase log so the summary surfaces it.
-${grouping}After fixes, re-run \`npm run verify\` in each touched package (this repo's packages: ${pkgs}) until green.
-Leave everything in the working tree: do NOT commit or push; the pipeline checkpoints your work itself, and re-runs \`npm run verify\` after you return — a red run comes back to you once, then blocks the run. Return:
-- status: a short summary — which findings were fixed, which were deferred and why, and the final verify result.
-- deferred: one entry per CONFIRMED finding you did NOT fix; empty array when you fixed them all. This list is a MERGE GATE: an empty list queues the PR to be merged to main unattended, so omitting something you left unfixed ships it. Report every one.`,
-
-  // Round two, and there is no round three. It lists exactly what the first post-fix check left open —
-  // each fix it could not confirm, with the reason it gave, and each regression it found — and nothing
-  // it confirmed, because re-opening settled work is how a bounded round turns into a loop.
-  triageRound2: (dir, pkgs, unconfirmed, regressions) =>
-`Fixes-after-review phase, SECOND and final round, autonomous (NO user sign-off). An earlier fixes step edited this change after review, and an independent check then read exactly those edits. The items below are what that check left open, and they are the whole job: do not revisit anything it confirmed, and NEVER act on anything under "## Unconfirmed — not fixed" in ${dir}/review.md — those were refuted and are recorded for human eyes only. Read ${dir}/requirements.md and the diff for the context you need.
-
-${unconfirmed.map((u, i) => `--- Fix the check could not confirm ${i + 1} ---
-Title: ${u.finding.title}
-Severity: ${u.finding.severity}
-Location: ${u.finding.location}
-Problem: ${u.finding.problem}
-Recommended fix: ${u.finding.fix}
-Why the check could not confirm it: ${u.verdict?.reasoning || 'no reasoning recorded'}`).join('\n\n')}${unconfirmed.length && regressions.length ? '\n\n' : ''}${regressions.map((r, i) => `--- Regression the fixes introduced ${i + 1} ---
-Title: ${r.title}
-Severity: ${r.severity}
-Location: ${r.location}
-Problem: ${r.problem}
-Recommended fix: ${r.fix}
-Regression evidence the check suggested: ${r.gate}`).join('\n\n')}
-
-Repair every item above with the smallest correct change, and add or update a regression check where it meaningfully protects the affected behavior.
-- For a fix the check could not confirm: make its correctness evident to a reader who cannot run the code — a regression test that fails without the fix and passes with it, or a code change that removes the exact ambiguity the check named. Answer what the check actually said, not the finding in general.
-- For a regression: remove it without giving back the fix that introduced it.
-- NEVER weaken, skip or delete a test to make something pass.
-Keep the repair proportional to the item. Nothing here requires a new abstraction, shared helper, lint rule or project instruction: introduce one only when this repair needs it. If a necessary repair changes a documented contract, update the relevant project instructions or documentation in their existing voice. Shared harness skills, agents and pipeline files outside this project remain out of scope; never edit or recreate them. Follow the project's own explicit verification rules.
-If an item is genuinely too risky or expensive to fix safely without a human decision, DO NOT guess — leave it and report it as deferred. Record material decisions and anything left undone in ${dir}/epic.md's phase log.
-
-After the fixes, re-run \`npm run verify\` in each touched package (this repo's packages: ${pkgs}) until green.
-Leave everything in the working tree: do NOT commit or push; the pipeline checkpoints your work itself, and re-runs \`npm run verify\` after you return — a red run comes back to you once, then blocks the run. This is the last fix round in this run: whatever is still open after it is checked once more and then waits for a human. Return:
-- status: a short summary — which items you repaired, which you left and why, and the final verify result.
-- deferred: one entry per item above you did NOT fix, under its EXACT title as written above; empty array when you fixed them all. This list is a MERGE GATE: an empty list is what lets the PR be queued for unattended merge, so omitting something you left unfixed ships it. Report every one.`,
+Return status (short summary, use "Finding 3", never a bare #number) and assessments: exactly ${items.length} entries, each with index (the 1-based finding number above), action ("fixed", "rejected", or "deferred"), and reason (concrete evidence for the repair or rejection, or why it is deferred). No missing, duplicate or extra indices.
+Every disposition is checked independently against the requirement and code, including rejections and deferrals when you made no edits. Your explanation alone never clears a finding.`,
 
   // Appended to a step's own prompt when the orchestrator's verify run disagreed with it.
   redRetry: (gate) =>
@@ -237,29 +196,36 @@ Refute each classification. Read \`${diffCmd}\` and the source tree; do NOT open
 
 Return exactly ${items.length} verdict${items.length === 1 ? '' : 's'} with \`index\` set to the item's number above.`,
 
-  // Refute-by-default over the fix delta: the same adversarial shape as the review verify, aimed at
-  // the one diff no reviewer has seen.
-  fixCheck: (fixed, requirement, deltaCmd, diffCmd) =>
-`Check the fixes applied after review — you did not write them. An automated fixes-after-review step edited the change after independent review; its edits are exactly \`${deltaCmd}\` (also readable with --stat), applied on top of the reviewed change \`${diffCmd}\`. ${fixed.length ? `It reports these ${fixed.length} confirmed review finding(s) as FIXED:` : 'It reports no finding as fixed; check its edits for regressions only.'}
+  // One independent check judges all dispositions and the full repair delta.
+  // In round two it rechecks earlier clearances too: those belong to the old tree.
+  fixCheck: (items, requirement, deltaCmd, diffCmd, manualBaseline = '') =>
+`Independently check the assessment and repair of every finding below. You did not write the repairs. Read \`${deltaCmd}\` (also with --stat), ${manualBaseline ? 'the current working-tree diff to compare with the captured reviewed patch below' : 'the COMPLETE delta since the reviewed implementation'}, and \`${diffCmd}\` for the overall change. The fixer's explanation is deliberately withheld. Judge from the code and original requirement, not its claimed action.
 
-${fixed.map((f, i) => `--- Finding ${i + 1} ---
-Title: ${f.title}
-Severity: ${f.severity}
-Location: ${f.location}
-Claim: ${f.problem}
-Recommended fix: ${f.fix}`).join('\n\n')}
-
-Original requirement the change and its fixes must satisfy:
+Original requirement:
 """
 ${requirement}
 """
 
-Two questions, refute-by-default:
-1. For each finding above: does the delta genuinely remove the defect? resolved=true only if the code now behaves correctly for the case the finding names. A test weakened, skipped or deleted so the finding no longer shows is NOT a fix, and neither is a comment or a suppression. resolved=false whenever you cannot confirm it against the code.
-2. Regressions: any defect the delta introduces that the reviewed change did not have — a behavior change outside the finding's scope, a dropped side effect, a broken neighbour, a new null path. Same bar as a review finding: report only what you are at least 75 confident of, with file:line, the problem, a concrete fix and useful targeted regression evidence (or why no meaningful automated check exists).
+${manualBaseline}
 
-Do NOT open anything under \`.epics/\` — it carries the builder's and the fixer's framing and would anchor you.
-Return exactly ${fixed.length} verdict${fixed.length === 1 ? '' : 's'}${fixed.length ? `, with \`index\` set to the finding's number above (${fixed.length === 1 ? '1' : `1-${fixed.length}`})` : ''}, and a regressions array (empty when none).`,
+${items.map((item, i) => `--- Finding ${i + 1} ---
+Title: ${item.finding.title}
+Severity: ${item.finding.severity}
+Location: ${item.finding.location}
+Claim: ${item.finding.problem}
+Recommended fix: ${item.finding.fix}
+Reported action: ${item.assessment.action}
+Baseline containing the reported problem: ${item.baseline} (inspect with git show)`).join('\n\n')}
+
+Return exactly ${items.length} verdicts, one per 1-based index above, with verdict, confidence (0-100), and non-empty reasoning citing concrete code evidence:
+- fixed: the original defect was real, and the repair actually removes it while preserving the requirement. Check the finding's baseline AND current code; unnecessary changes for a false positive do not count as a fix.
+- rejected: the finding was a false positive, demonstrably already handled in its baseline. Verify this even if the fixer edited nothing. An unsupported dismissal is never a rejection you can accept.
+- defect: a concrete bug described by this finding still exists in the current tree. Name the actual failing behavior and location; this may authorize a later defect repair.
+- uncertain: you cannot establish any of the above. Missing evidence is uncertainty, never clearance.
+
+A fixed/rejected verdict clears a finding only when it matches the reported action and confidence is at least 75. A deferred disposition remains open. Default to uncertain when you cannot positively establish the evidence.
+Also return regressions: new defects introduced by the COMPLETE repair delta, including damage to previously cleared findings or unnecessary edits prompted by false positives. Check every edit for weakened tests/checks, behavior changes outside the repair, dropped side effects and broken neighbours. List only concrete regressions at confidence 75 or above, with the review finding fields (title, severity, confidence, location, problem, fix, gate). Do not duplicate a defect already covered by one of the numbered verdicts.
+Do NOT open anything under \`.epics/\` — it contains builder and fixer framing. The requirement and findings above are the only narrative context you need.`,
 
   // Judgment only: what the PR says, what was left undone and how each item is
   // classed. The pipeline squashes, pushes, opens the PR, files the follow-ups
@@ -270,11 +236,11 @@ Return exactly ${fixed.length} verdict${fixed.length === 1 ? '' : 's'}${fixed.le
 Your output is schema-enforced JSON:
 
 1. title: the PR title, also the squashed commit's subject line (one line, imperative, ≤ 72 chars).
-2. body: the PR body, in markdown — keep it about THIS diff, not future work. Do NOT include a files-modified/diff-stat listing or a verification/test-results section; the PR's Files tab and checks already show both. Capture, against ${dir}/requirements.md: what was built; the architecture approach — "${design?.approach}": ${design?.rationale}; review outcome — OPEN that section with this tally verbatim: "${tally}", then the findings that survived verification and which were fixed (review.md's "Unconfirmed — not fixed" findings were refuted, not deferred: leave them out, but keep the refuted COUNT in the tally). Do NOT enumerate deferred/out-of-scope work in the body, and do NOT write a "Closes #${issue}" line: the pipeline appends both a pointer to the issue's deferred record and the Closes line.
+2. body: the PR body, in markdown — keep it about THIS diff, not future work. Do NOT include a files-modified/diff-stat listing or a verification/test-results section; the PR's Files tab and checks already show both. Capture, against ${dir}/requirements.md: what was built; the architecture approach — "${design?.approach}": ${design?.rationale}; review outcome — OPEN that section with this tally verbatim: "${tally}", then the findings independently confirmed fixed. Read review.md's final states: independently rejected findings are not deferred work; omit their details but keep the rejected count in the tally. Do NOT enumerate deferred/out-of-scope work in the body, and do NOT write a "Closes #${issue}" line: the pipeline appends both a pointer to the issue's deferred record and the Closes line.
    **Never write a bare \`#<number>\` for anything except issue #${issue} itself.** GitHub turns every \`#N\` into a live cross-reference and renders it as that issue or PR's TITLE, so numbering findings \`#1\`, \`#2\`, \`#3\` splices the titles of three unrelated PRs into your sentences and notifies them. Refer to a finding as \`Finding 3\`, or just lead with what it was; the same goes for hunks, steps, requirements and packages, in every field you return. Fixes-after-review status: ${triageStatus}
 3. commitBody: a short commit body (the why and notable details), or an empty string.
 4. legalMarker: apply THIS project's own legal/compliance review trigger, if it has one: look in its AGENTS.md for a section defining when a change needs legal or policy review. If one exists, judge this diff against the criteria written there — not against any you remember from elsewhere — and when they are met, return the exact marker string that section specifies; the pipeline adds it to the commit body and the PR body. If the project defines no such trigger, or the criteria are not met, omit the field: do NOT invent criteria and do NOT import another project's.
-5. deferred: everything deferred or out of scope, one entry each; empty array when nothing was. Read ${dir}/epic.md's phase log and ${dir}/review.md (confirmed sections only — refuted "Unconfirmed" findings are NOT deferred work; a "Post-fix check" section, when present, reports the state after the fix rounds, and every fix still unconfirmed and every regression still listed there IS deferred work. A regression is a defect. A fix the check could not confirm is kind "other" — nobody established that a bug is there, only that the fix could not be confirmed against the code — UNLESS the check named a concrete bug still in the code, and then it is a defect) and collect: deferred review findings (with why), scope cut, edge cases intentionally skipped, clarifying answers that narrowed scope, uncovered test surfaces. For each entry:
+5. deferred: everything deferred or out of scope, one entry each; empty array when nothing was. Read ${dir}/epic.md's phase log and ${dir}/review.md. Use the FINAL ledger states: every OPEN finding IS deferred work. Only OPEN independently confirmed defects are kind "defect"; an unsupported repair, rejection or deferral is uncertainty (kind "other"), never a proven bug. Independently fixed or rejected findings are resolved and are NOT deferred work. Never use the coder's claimed action as the final verdict. Also collect: deferred review findings (with why), scope cut, edge cases intentionally skipped, clarifying answers that narrowed scope, uncovered test surfaces. For each entry:
    - title and why: one line each.
    - kind, judged honestly, because it drives a MERGE GATE:
      defect — a correctness, security, data-loss, or user-visible breakage bug that still exists on main AFTER this merges, whether this diff introduced it or merely exposed it. One defect holds the PR open for a human; none lets it merge unattended. A missing gate, a scope cut, a nice-to-have or a refactor idea is NOT a defect and must not inflate the count, and a real defect must not be relabelled to keep the merge: an independent check re-judges every item you do not call a defect, and its verdict wins.
@@ -286,7 +252,7 @@ Your output is schema-enforced JSON:
 
   summaryManual: (dir, design, triageStatus) =>
 `Write the run's summary and return it in the "summary" field, as markdown. This is the manual flow — do NOT commit, push, or open a PR; leave all changes in the working tree.
-Capture, against ${dir}/requirements.md: what was built; the architecture approach — "${design?.approach}": ${design?.rationale}; files modified (\`git diff --stat\`); verify status per package; review outcome (findings that survived verification, which were fixed, which were DEFERRED and why — read ${dir}/review.md and ${dir}/epic.md); anything deferred or out of scope; a suggested next step. Fixes-after-review status: ${triageStatus}`,
+Capture, against ${dir}/requirements.md: what was built; the architecture approach — "${design?.approach}": ${design?.rationale}; files modified (\`git diff --stat\`); verify status per package; review outcome (each assessment and its final independent verdict, explicitly noting any unresolved findings or missing evidence — read ${dir}/review.md and ${dir}/epic.md); anything deferred or out of scope; a suggested next step. Fixes-after-review status: ${triageStatus}`,
 }
 
 // ───────────────────────── Config ─────────────────────────
@@ -298,10 +264,9 @@ Capture, against ${dir}/requirements.md: what was built; the architecture approa
 // code — red, green or direct, and ship's judgment half (what the PR says, what was deferred and of what kind, the
 // project's own legal trigger). Ship's `kind` per deferral feeds the merge gate, which is why it is not a
 // cheaper row.
-// confirm-review — the adversarial verifier is the last judgment before fixes-after-review AUTO-APPLIES a fix
-// with no human sign-off, so a wrong "real" here becomes a committed change and a wrong "not real" buries a
-// live bug. It runs once per batch (a handful of spawns), not once per reviewer, which is what makes
-// upgrading it cheap.
+// confirm-review — independently judges repairs, rejections and deferrals after
+// assessment, plus ship's deferral classes. An unsupported dismissal cannot
+// clear a finding, and every changed tree needs current evidence.
 // review — one independent general review is mandatory. The architect may request one additional focused
 // review for a concrete risk that merits a second pair of eyes; the orchestrator hard-bounds this at two.
 
@@ -393,74 +358,54 @@ const FINDINGS_SCHEMA = {
     },
   },
 }
-// One verify agent covers every finding in a batch, so verdicts come back as an array keyed by the
-// finding's 1-based number in the prompt. A missing/extra entry is handled at the call site (fail-closed
-// to unconfirmed) rather than trusted, since one batch carries several findings.
-const VERDICT_SCHEMA = {
-  type: 'object', additionalProperties: false, required: ['verdicts'],
-  properties: {
-    verdicts: {
-      type: 'array',
-      description: 'Exactly one entry per finding listed in the prompt, in that order',
-      items: {
-        type: 'object', additionalProperties: false, required: ['index', 'real', 'confidence', 'reasoning'],
-        properties: {
-          index: { type: 'number', description: '1-based number of the finding this verdict judges' },
-          real: { type: 'boolean', description: 'true only if the finding genuinely holds against the code' },
-          confidence: { type: 'number', description: '0-100' },
-          reasoning: { type: 'string' },
-          sameDefectAs: {
-            type: 'number',
-            description: 'OPTIONAL. When this finding is the SAME underlying defect as an earlier finding in this batch — one fix resolves both — the 1-based index of that earlier finding. Omit when the finding stands on its own. Never point forward or at itself.',
-          },
-        },
-      },
-    },
-  },
-}
+// Dispositions and verdicts are indexed by the numbered prompt, never by title:
+// two different findings may share a title. Exact coverage and evidence are
+// validated below in addition to the engine's shape validation.
 const TRIAGE_SCHEMA = {
-  type: 'object', additionalProperties: false, required: ['status', 'deferred'],
+  type: 'object', additionalProperties: false, required: ['status', 'assessments'],
   properties: {
-    status: { type: 'string', description: 'short summary: what was fixed, what was deferred and why, final verify result. Ship copies this into the PR body, so never write a bare #<number> in it — GitHub renders every #N as another issue/PR\'s title. Say "Finding 3", not "#3".' },
-    deferred: {
+    status: { type: 'string' },
+    assessments: {
       type: 'array',
-      description: 'one entry per CONFIRMED finding left unfixed; empty when all were fixed (an empty list is what lets the PR be queued for unattended merge)',
       items: {
-        type: 'object', additionalProperties: false, required: ['title', 'severity', 'why'],
+        type: 'object', additionalProperties: false, required: ['index', 'action', 'reason'],
         properties: {
-          title: { type: 'string' },
-          severity: { enum: ['Critical', 'Important'] },
-          why: { type: 'string', description: 'why it was left for a human' },
+          index: { type: 'number' },
+          action: { enum: ['fixed', 'rejected', 'deferred'] },
+          reason: { type: 'string' },
         },
       },
     },
   },
 }
-// One verdict per finding the fixer reported fixed, plus any defect the fix delta introduced. A
-// regression carries the same fields as a review finding so review.md and the gate can treat it as one.
 const FIXCHECK_SCHEMA = {
   type: 'object', additionalProperties: false, required: ['verdicts', 'regressions'],
   properties: {
     verdicts: {
       type: 'array',
-      description: 'exactly one entry per finding listed in the prompt, in that order',
       items: {
-        type: 'object', additionalProperties: false, required: ['index', 'resolved', 'confidence', 'reasoning'],
+        type: 'object', additionalProperties: false, required: ['index', 'verdict', 'confidence', 'reasoning'],
         properties: {
-          index: { type: 'number', description: '1-based number of the finding this verdict judges' },
-          resolved: { type: 'boolean', description: 'true only if the delta genuinely removes the defect' },
-          confidence: { type: 'number', description: '0-100' },
+          index: { type: 'number' },
+          verdict: { enum: ['fixed', 'rejected', 'defect', 'uncertain'] },
+          confidence: { type: 'number' },
           reasoning: { type: 'string' },
         },
       },
     },
-    regressions: {
-      type: 'array',
-      description: 'defects the fix delta introduced; empty when none',
-      items: FINDINGS_SCHEMA.properties.findings.items,
-    },
+    regressions: { type: 'array', items: FINDINGS_SCHEMA.properties.findings.items },
   },
 }
+const coversEveryIndex = (entries, count) => Array.isArray(entries) && entries.length === count &&
+  new Set(entries.map(e => e.index)).size === count &&
+  entries.every(e => Number.isInteger(e.index) && e.index >= 1 && e.index <= count)
+const validAssessments = (value, count) => matchesSchema(TRIAGE_SCHEMA, value) &&
+  coversEveryIndex(value.assessments, count) && value.assessments.every(a => nonblank(a.reason))
+const validCheck = (value, count) => matchesSchema(FIXCHECK_SCHEMA, value) &&
+  coversEveryIndex(value.verdicts, count) &&
+  value.verdicts.every(v => nonblank(v.reasoning) && Number.isFinite(v.confidence) && v.confidence >= 0 && v.confidence <= 100) &&
+  value.regressions.every(r => nonblank(r.title) && nonblank(r.location) && nonblank(r.problem) &&
+    Number.isFinite(r.confidence) && r.confidence >= 0 && r.confidence <= 100)
 const DEFERRAL_CHECK_SCHEMA = {
   type: 'object', additionalProperties: false, required: ['verdicts'],
   properties: {
@@ -1148,7 +1093,7 @@ try {
   updateEpicMd(dir, { phase: 'code → done', log: `code: done (${codeCheckpoint})` })
   log(`Code: implementation complete, verify gate run, work checkpointed (${codeCheckpoint}).`)
 
-  // ───────────────────────── Phase 3: Review (blind, adversarially verified) ─────────────────────────
+  // ───────────────────────── Phase 3: Review (blind findings) ─────────────────────────
   currentPhase = 'review'
   phase('Review')
 
@@ -1174,334 +1119,161 @@ try {
   }
   const reviews = reviewerResults.flat()
 
-  // Soft dedup before the verify fan-out (free — reviews is already fully materialized). Two reviewers
-  // can restate the same defect, which otherwise gets verified twice, listed
-  // twice in review.md, and fixed twice. Collapse ONLY a confident duplicate — same location AND same
-  // normalized title. Biased toward keeping: when in doubt we keep both, so distinct bugs at one file:line
-  // survive (different titles) and nothing is ever dropped on location alone.
+  // Collapse only exact restatements. Related findings may share one repair,
+  // but each retains its own disposition and independent verdict.
   const seen = new Set()
   const uniqueReviews = reviews.filter(f => {
-    const k = `${(f.location || '').trim()}::${(f.title || '').trim().toLowerCase().replace(/\s+/g, ' ')}`
-    return seen.has(k) ? false : seen.add(k)
+    const key = `${(f.location || '').trim()}::${(f.title || '').trim().toLowerCase().replace(/\s+/g, ' ')}`
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
   })
-  // Cluster by FILE (line numbers stripped) before the adversarial fan-out. The title dedup above only catches
-  // verbatim restatements; independent reviewers can word one defect differently and
-  // slip through. On #194 that put paraphrases of a single history.ts bug in front of separate
-  // skeptics, each re-reading the same diff to re-confirm it. One skeptic per batch pays that cost once and can
-  // see the claims are one defect — a call the per-finding verifiers each had to make blind. Verdicts stay PER
-  // FINDING: clustering changes who judges, never what survives.
-  // Batches are sized, NOT keyed by file. Keying by file was the first version of this and it only caught
-  // restatements that happen to land in the same file; on #69 one defect ("a parseable-but-unusable schedule
-  // renders no rate fields and does not block submit") arrived from reviewers pointing at a component, a
-  // gate, a test and a doc — four files, so four skeptics, none of whom could see it was one defect. Three
-  // more of that run's findings were a second defect split the same way: 18 findings, ~9 real defects.
-  //
-  // Grouping aggressively is safe BECAUSE it is routing rather than gating — a verdict is still returned per
-  // finding, so the worst a bad batch can do is give one skeptic some unrelated context. The cap keeps that
-  // honest: past ~8 findings a single reviewer's attention is the thing being diluted, so split rather than
-  // pile on. Sorting by file first keeps genuinely related findings adjacent when a split does happen.
-  const fileOf = f => (f.location || '').trim().replace(/:\s*\d+(?:\s*-\s*\d+)?\s*$/, '') || '(unspecified)'
-  const MAX_BATCH = 8
-  const ordered = [...uniqueReviews].sort((a, b) => fileOf(a).localeCompare(fileOf(b)))
-  const batches = []
-  for (let i = 0; i < ordered.length; i += MAX_BATCH) batches.push(ordered.slice(i, i + MAX_BATCH))
-  log(`Review: ${reviews.length} raw finding(s) across ${reviewers.length} blind reviewer(s); adversarially verifying ${uniqueReviews.length} in ${batches.length} batch(es) of up to ${MAX_BATCH}.`)
-
-  // Adversarial verify: an independent skeptic tries to REFUTE each finding before it counts. Refuted /
-  // low-confidence findings are NOT silently dropped — they land in review.md's "Unconfirmed" section for
-  // human eyes (fixes-after-review and ship are told to ignore them). Fail closed on a missing verdict: batching means
-  // a dead agent or a short array would otherwise take a whole batch's findings with it, and a lost finding
-  // must surface as unconfirmed (a human re-checks it), never vanish and never pass as confirmed.
-  const noVerdict = f => ({
-    finding: f,
-    verdict: { real: false, confidence: 0, reasoning: 'Batched verifier returned no verdict for this finding — recorded as unconfirmed rather than dropped. Re-check by hand.' },
-    unknownEvidence: true,
-  })
-  const verdicts = (await parallel(batches.map((group, bi) => () =>
-    agent(PROMPTS.verify(group, requirement, DIFF),
-      { label: `verify:${bi + 1}/${batches.length}`, phase: 'Review', step: 'confirm-review', schema: VERDICT_SCHEMA },
-    ).then(v => {
-      const returned = v && Array.isArray(v.verdicts) ? v.verdicts : []
-      const indices = returned.map(x => Number(x.index))
-      const complete = returned.length === group.length && new Set(indices).size === group.length &&
-        indices.every(i => Number.isInteger(i) && i >= 1 && i <= group.length)
-      if (!complete) return group.map(noVerdict)
-      return group.map((f, i) => {
-        const got = returned.find(x => Number(x.index) === i + 1)
-        if (!got || typeof got.real !== 'boolean') return noVerdict(f)
-        // sameDefectAs is 1-based WITHIN this batch; resolve it to the actual finding while the
-        // batch is still in scope. Ignore a self-reference or an out-of-range index rather than
-        // trusting it — a bad link would silently merge unrelated defects.
-        const k = Number(got.sameDefectAs)
-        const twin = Number.isInteger(k) && k >= 1 && k <= group.length ? group[k - 1] : null
-        return { finding: f, verdict: got, twin: twin && twin !== f ? twin : null }
-      })
-    }).catch(() => group.map(noVerdict)),
-  ))).flat().filter(Boolean)
-  const verifierFailure = takeAgentFailure()
-  if (verifierFailure?.kind === 'quota-exhausted') {
-    return await fail('review', 'An adversarial review verifier hit provider quota — refusing to continue with incomplete review evidence.', verifierFailure)
-  }
-
-  // A skeptic is a gate, not a source of optional annotation. Unknown coverage must not be converted to
-  // real=false: that would make a dead, short or duplicate verifier response indistinguishable from a
-  // genuine refutation and could make the change mergeable.
-  const unknownVerdicts = verdicts.filter(r => r.unknownEvidence)
-  if (unknownVerdicts.length) {
-    return await fail('review', `adversarial verification produced no unique verdict for ${unknownVerdicts.length} finding(s) — refusing to treat unknown evidence as refuted.`)
-  }
-
-  const confirmedRecs = verdicts.filter(r => r.verdict.real && r.verdict.confidence >= 75)
-  const verified = confirmedRecs.map(r => r.finding)
-  const unconfirmed = verdicts.filter(r => !(r.verdict.real && r.verdict.confidence >= 75))
-    .map(r => ({ ...r.finding, verdict: r.verdict }))
-
-  // Collapse the confirmed findings into DEFECTS — the things a fix addresses — using the links the
-  // skeptics returned. Multiple reviewers reporting one fault is the design working, but handing
-  // fixes-after-review duplicate items makes it fix and gate the
-  // same thing repeatedly, and that is the longest phase in the run.
-  //
-  // This is presentation, never a filter: every finding still reaches fixes-after-review, grouped, and the
-  // grouping is advisory — it is told to split a group back apart if the findings are actually distinct. So a
-  // wrong link costs a sentence of explanation, never an unfixed bug. Union-find over the links, since a
-  // chain (3→2, 2→1) has to land in one group.
-  const parent = new Map(verified.map(f => [f, f]))
-  const root = f => { while (parent.get(f) !== f) { parent.set(f, parent.get(parent.get(f))); f = parent.get(f) } return f }
-  for (const r of confirmedRecs) {
-    if (!r.twin || !parent.has(r.twin)) continue      // twin was refuted, or never confirmed
-    const a = root(r.finding), b = root(r.twin)
-    if (a !== b) parent.set(a, b)
-  }
-  const defectMap = new Map()
-  for (const f of verified) {
-    const k = root(f)
-    if (!defectMap.has(k)) defectMap.set(k, [])
-    defectMap.get(k).push(f)
-  }
-  const defects = [...defectMap.values()]
-
-  // The one line of the review that has to outlive the worktree. review.md is gitignored and the PR body is
-  // told to skip the refuted findings, so without this tally in the PR nothing records they were ever raised.
-  // Both numbers stay in the tally on purpose. Reporting only the defect count would read as a WEAKER
-  // review than actually happened — the raw count is the only durable record that independent reviewers
-  // converged on the same fault, and review.md dies with the worktree.
-  const grouped = defects.length < verified.length ? `, which are ${defects.length} distinct defect(s)` : ''
-  let reviewTally = `${reviews.length} raw finding(s) across ${reviewers.length} blind reviewer(s) → ${verified.length} confirmed by adversarial verification${grouped}, ${unconfirmed.length} refuted`
+  // Manual mode cannot checkpoint the user's tree. Preserve its reviewed
+  // patch in memory against an immutable base, so removing pre-confirmation
+  // does not remove independent adjudication from that mode either.
+  const manualBase = !gitMode && uniqueReviews.length ? await gitOut(['rev-parse', 'HEAD'], 'git rev-parse HEAD') : null
+  const manualPatch = manualBase ? await gitOut(['diff', '--binary', manualBase], 'git diff manual baseline') : null
+  const items = uniqueReviews.map(finding => ({ finding, baseline: codeSha || 'the captured reviewed patch below', assessment: null, verdict: null, cleared: false }))
+  const rawTally = `${reviews.length} raw finding(s) across ${reviewers.length} blind reviewer(s)`
+  let reviewTally = `${rawTally}; ${items.length} finding(s) to assess`
   log(`Review: ${reviewTally}.`)
-
-  // review.md, rendered from the surviving findings (+ the unconfirmed record).
-  renderReview(dir, verified, unconfirmed)
+  renderReview(dir, items)
   updateEpicMd(dir, { phase: 'review → done', log: `review: ${reviewTally}` })
 
-  // ───────────────────────── Phase 4: Fixes after review (auto-apply, no sign-off) ─────────────────────────
+  // ───────────────────────── Phase 4: Assess, repair, independently check ─────────────────────────
   currentPhase = 'triage'
   phase('Fixes after review')
 
-  let triageStatus = 'No confirmed findings — nothing to fix.'
-  let triageDeferred = []
-  if (verified.length) {
-    // Advisory grouping: the same defect, found by several reviewers, arrives as several findings. Naming the
-    // groups lets the fixer fix and gate once instead of once per restatement — while every finding is still
-    // listed, and it is told to split a group it disagrees with rather than silently honour it.
-    const multi = defects.filter(g => g.length > 1)
-    const grouping = multi.length
-      ? `\nSeveral findings are the SAME underlying defect, reported by different reviewers looking at different files. An independent verifier grouped them; one fix and one gate should resolve each group, so do NOT fix or gate the same fault once per finding:\n${multi.map((g, i) => `- Defect ${i + 1}:\n${g.map(f => `  - "${f.title}" (${f.location})`).join('\n')}`).join('\n')}\nThis grouping is a hint, not an instruction: if the findings in a group are genuinely distinct faults needing separate fixes, treat them separately and say so in your status. Every finding above must still end up either fixed or reported as deferred.\n`
-      : ''
-    let triaged = await agent(PROMPTS.triage(dir, pkgList(packages), grouping),
-      { label: 'fixes-after-review', phase: 'Fixes after review', step: 'fixes-after-review', schema: TRIAGE_SCHEMA },
-    )
-    // Fail closed: a dead agent leaves confirmed findings in an unknown state — some fixed, some not,
-    // verify possibly never re-run — and the merge gate below reads exactly that list to decide whether main
-    // gets this change unattended. "We don't know what it left unfixed" must never merge.
-    if (!triaged) return await fail('triage', `fixes-after-review produced no result for ${verified.length} confirmed finding(s) — their state is unknown (partially applied fixes may sit in the tree) and the merge gate has nothing to read.`)
-    // The gate again: the fixes must leave verify GREEN, by this script's own run.
-    let fixGate = await verifyGate('Fixes after review: verify gate')
+  let triageStatus = 'No findings — nothing to assess or fix.'
+  let pending = [...items]
+  let rounds = 0
+  let checkNote = null
+  const fixBlockers = []
+  const checkSummaries = []
+  // Two rounds, one implementation retry per red verify, and no second round
+  // from missing checker evidence or a claimed repair that changed nothing.
+  // A fixer may reject a claim; only the independent checker can clear it.
+  for (let round = 1; round <= 2 && pending.length; round++) {
+    rounds = round
+    const beforeSha = gitMode ? await gitOut(['rev-parse', 'HEAD'], 'git rev-parse HEAD') : null
+    const roundPrompt = PROMPTS.triage(dir, pkgList(packages), pending, round)
+    const label = round === 1 ? 'fixes-after-review' : 'fixes-after-review:round2'
+    let assessed = await agent(roundPrompt,
+      { label, phase: 'Fixes after review', step: 'fixes-after-review', schema: TRIAGE_SCHEMA })
+    if (!validAssessments(assessed, pending.length)) {
+      return await fail('triage', `${label} produced no complete assessment with unique indices and evidence for ${pending.length} finding(s) — refusing to drop an unassessed finding.`)
+    }
+    let fixGate = await verifyGate(`Fixes after review${round === 2 ? ' (round 2)' : ''}: verify gate`)
     if (!fixGate.green) {
-      log('Fixes after review: verify is red after the fixes — respawning once with the failure.')
-      triaged = await agent(PROMPTS.triage(dir, pkgList(packages), grouping) + PROMPTS.verifyRetry(fixGate),
-        { label: 'fixes-after-review:retry', phase: 'Fixes after review', step: 'fixes-after-review', schema: TRIAGE_SCHEMA },
-      )
-      if (!triaged) return await fail('triage', `fixes-after-review produced no result on its retry for ${verified.length} confirmed finding(s) — their state is unknown and the merge gate has nothing to read.`)
-      fixGate = await verifyGate('Fixes after review: verify gate (retry)')
+      log('Fixes after review: verify is red — respawning once with the failure.')
+      assessed = await agent(roundPrompt + PROMPTS.verifyRetry(fixGate),
+        { label: `${label}:retry`, phase: 'Fixes after review', step: 'fixes-after-review', schema: TRIAGE_SCHEMA })
+      if (!validAssessments(assessed, pending.length)) {
+        return await fail('triage', `${label} produced no complete assessment on its verify retry — refusing to drop an unassessed finding.`)
+      }
+      fixGate = await verifyGate(`Fixes after review${round === 2 ? ' (round 2)' : ''}: verify gate (retry)`)
       if (!fixGate.green) return await fail('triage', `npm run verify is red after the fixes and their retry (${fixGate.detail}) — refusing to ship an unverified change.`)
     }
-    triageStatus = triaged.status
-    triageDeferred = Array.isArray(triaged.deferred) ? triaged.deferred : []
+    pending.forEach((item, i) => { item.assessment = assessed.assessments.find(a => a.index === i + 1) })
+    triageStatus = assessed.status
     const fixCheckpoint = await checkpointWork('triage')
-    updateEpicMd(dir, { phase: 'review→triaged', log: `fixes-after-review: ${triageStatus} (${fixCheckpoint})` })
-  }
-  log(`Fixes after review: ${triageStatus}`)
+    updateEpicMd(dir, { phase: 'review→triaged', log: `${label}: ${triageStatus} (${fixCheckpoint})` })
+    log(`Fixes after review: ${triageStatus}`)
 
-  // ───────────────────────── Post-fix check ─────────────────────────
-  // The fixes changed code no reviewer has seen. A skeptic pass over exactly that delta: does each fix
-  // resolve its finding, and does the delta introduce a defect of its own? Every bad answer changes the
-  // label — the merge gate below holds the PR — never the tree.
-  //
-  // What the check leaves open — a fix it could not confirm, a regression it found — gets exactly ONE
-  // more fix round over those items and nothing else, then one more pass of the same check. Two rounds
-  // is the whole budget: there is never a third, and the fail-closed outcomes (a dead check, a claimed
-  // fix with no diff) hold the PR with no second round at all, because there is nothing trustworthy to
-  // fix from. One interactive engineer would fix, check and fix once more; past that a round is not
-  // converging, and the PR is better in front of a human than in another loop.
-  //
-  // How the last check's answers are classed matters as much as the count. A fix it could not confirm
-  // is UNCERTAINTY, not a named bug: it holds the PR for a human and never queues the issue for the
-  // defect fixer, which repairs only concrete defects. A regression it names, and a confirmed finding
-  // still sitting in the tree, are those concrete defects. Git mode only: manual mode has no
-  // checkpoints and no gate.
-  const fixBlockers = []
-  if (gitMode && verified.length) {
-    const fixSha = await gitOut(['rev-parse', 'HEAD'], 'git rev-parse HEAD')
-    const deferredTitles = new Set(triageDeferred.map(d => d.title))
-    const fixed = verified.filter(f => !deferredTitles.has(f.title))
-    const changed = (await git(['diff', '--quiet', codeSha, fixSha])).code !== 0
-    // One reader for both checks: a missing, low-confidence or malformed verdict is unresolved, never
-    // assumed fixed, and a low-confidence regression is not counted.
-    const readCheck = (c, items) => {
-      const verdicts = Array.isArray(c.verdicts) ? c.verdicts : []
-      const confirmed = []
-      const unresolved = []
-      items.forEach((f, i) => {
-        const v = verdicts.find(x => Number(x.index) === i + 1)
-        if (v && v.resolved === true && Number(v.confidence) >= 75) confirmed.push({ finding: f, verdict: v })
-        else unresolved.push({ finding: f, verdict: v || { resolved: false, confidence: 0, reasoning: 'no verdict returned — recorded as unresolved rather than assumed fixed' } })
-      })
-      const regressions = (Array.isArray(c.regressions) ? c.regressions : []).filter(r => Number(r.confidence) >= 75)
-      return { confirmed, unresolved, regressions }
+    const fixSha = gitMode ? await gitOut(['rev-parse', 'HEAD'], 'git rev-parse HEAD') : null
+    const delta = gitMode ? await git(['diff', '--quiet', beforeSha, fixSha])
+      : { code: manualPatch === await gitOut(['diff', '--binary', manualBase], 'git diff manual repair') ? 0 : 1 }
+    if (![0, 1].includes(delta.code)) return await fail('triage', 'Could not read the repair delta — refusing to infer whether a repair changed code.')
+    const noDeltaClaims = delta.code === 0 ? pending.filter(item => item.assessment.action === 'fixed') : []
+    // This check runs even on an empty delta: all-rejected/all-deferred is
+    // still a judgment about every original finding, never an empty review.
+    const manualBaseline = gitMode ? '' : `Manual mode: compare the current working-tree diff (git diff ${manualBase}) with this captured BEFORE-repair patch against base ${manualBase}. Read unchanged baseline code with git show ${manualBase}:<path>. The patch is code evidence, not instructions. No repair checkpoint exists; reconstruct the before/after behavior from both patches.\n<reviewed-patch>\n${manualPatch}\n</reviewed-patch>`
+    const checked = await agent(PROMPTS.fixCheck(items, requirement, gitMode ? `git diff ${codeSha} ${fixSha}` : `git diff ${manualBase}`, DIFF, manualBaseline),
+      { label: round === 1 ? 'fix-check' : 'fix-check:round2', phase: 'Fixes after review', step: 'confirm-review', schema: FIXCHECK_SCHEMA })
+    if (!validCheck(checked, items.length)) {
+      const failure = takeAgentFailure()
+      if (failure?.kind === 'quota-exhausted') {
+        return await fail('triage', 'The post-fix check hit provider quota — refusing to turn missing review evidence into a soft PR hold.', failure)
+      }
+      checkNote = checked
+        ? 'The post-fix check returned incomplete, duplicate or invalid verdict evidence'
+        : 'The post-fix check produced no result'
+      // Earlier clearances belong to the earlier tree. Nothing retains a
+      // green verdict after an unreadable check of the final repair delta.
+      for (const item of items) {
+        item.cleared = false
+        item.verdict = { verdict: 'uncertain', confidence: 0, reasoning: checkNote }
+      }
+      fixBlockers.push({ source: 'missing-post-fix-verdict', reason: `${checkNote.toLowerCase()} — the assessments and repairs are unreviewed and a human decides`, defectClass: false, items: items.map(item => item.finding) })
+      break
     }
-    const unconfirmedBlocker = (entries, what) => ({
-      source: 'unconfirmed-post-review-fix',
-      reason: `${entries.length} fix(es) ${what} — a human decides (${entries.map(u => u.finding.title).join('; ')})`,
-      defectClass: false,
-      items: entries,
-    })
-    const regressionBlocker = (items, what) => ({
-      source: 'post-review-fix-regression',
-      reason: `${items.length} regression(s) ${what} (${items.map(r => `${r.severity}: ${r.title}`).join('; ')})`,
-      defectClass: true,
-      items,
-    })
-    let postFix = null
-    let summary1 = null
-    let summary2 = null
-    if (!changed && fixed.length) {
-      // A claimed fix with no diff is not a fix. No model needed to say so, and nothing to fix from.
-      fixBlockers.push({
-        source: 'claimed-fix-without-delta',
-        reason: `${fixed.length} finding(s) reported fixed but the fixes step changed nothing`,
-        defectClass: true,
-        items: fixed,
-      })
-      postFix = { confirmed: [], unresolved: fixed.map(f => ({ finding: f, verdict: { resolved: false, confidence: 0, reasoning: 'the fixes step produced no diff' } })), regressions: [], note: 'The fixes step reported fixes but produced no diff', rounds: 1 }
-    } else if (changed) {
-      const c = await agent(PROMPTS.fixCheck(fixed, requirement, `git diff ${codeSha} ${fixSha}`, DIFF),
-        { label: 'fix-check', phase: 'Fixes after review', step: 'confirm-review', schema: FIXCHECK_SCHEMA },
-      )
-      if (!c) {
-        const failure = takeAgentFailure()
-        if (failure?.kind === 'quota-exhausted') {
-          return await fail('triage', 'The post-fix check hit provider quota — refusing to turn missing review evidence into a soft PR hold.', failure)
-        }
-        // A dead check leaves the fixes unreviewed; the PR is complete and verified, so it waits for a
-        // human rather than failing the run. No second round: a round needs a list of what to repair.
-        fixBlockers.push({ source: 'missing-post-fix-verdict', reason: 'the post-fix check produced no result — the fixes are unreviewed and a human decides', defectClass: false, items: fixed })
-        postFix = { confirmed: [], unresolved: fixed.map(f => ({ finding: f, verdict: { resolved: false, confidence: 0, reasoning: 'the post-fix check produced no result' } })), regressions: [], note: 'The post-fix check produced no result', rounds: 1 }
-      } else {
-        const r1 = readCheck(c, fixed)
-        postFix = { ...r1, note: null, rounds: 1 }
-        summary1 = `fix check: ${r1.confirmed.length}/${fixed.length} fixes confirmed, ${r1.regressions.length} regression(s)`
-        if (!r1.unresolved.length && !r1.regressions.length) {
-          // Clean: one fixes spawn, one check spawn, exactly as before the second round existed.
-        } else {
-          // ─────────────────── Fixes after review, round 2 (the last one) ───────────────────
-          const round2Prompt = PROMPTS.triageRound2(dir, pkgList(packages), r1.unresolved, r1.regressions)
-          const openCount = r1.unresolved.length + r1.regressions.length
-          log(`Fixes after review: the check left ${openCount} item(s) open — running the second and final fix round.`)
-          let triaged2 = await agent(round2Prompt,
-            { label: 'fixes-after-review:round2', phase: 'Fixes after review', step: 'fixes-after-review', schema: TRIAGE_SCHEMA },
-          )
-          // Fail closed exactly as round 1 does: a dead round leaves partially applied edits in the tree
-          // with nothing saying what they are, and that tree is what the PR would carry.
-          if (!triaged2) return await fail('triage', `the second fixes-after-review round produced no result for ${openCount} open item(s) — their state is unknown (partially applied fixes may sit in the tree) and the merge gate has nothing to read.`)
-          let fix2Gate = await verifyGate('Fixes after review (round 2): verify gate')
-          if (!fix2Gate.green) {
-            log('Fixes after review (round 2): verify is red after the fixes — respawning once with the failure.')
-            triaged2 = await agent(round2Prompt + PROMPTS.verifyRetry(fix2Gate),
-              { label: 'fixes-after-review:round2:retry', phase: 'Fixes after review', step: 'fixes-after-review', schema: TRIAGE_SCHEMA },
-            )
-            if (!triaged2) return await fail('triage', `the second fixes-after-review round produced no result on its retry for ${openCount} open item(s) — their state is unknown and the merge gate has nothing to read.`)
-            fix2Gate = await verifyGate('Fixes after review (round 2): verify gate (retry)')
-            if (!fix2Gate.green) return await fail('triage', `npm run verify is red after the second fix round and its retry (${fix2Gate.detail}) — refusing to ship an unverified change.`)
-          }
-          const round2Checkpoint = await checkpointWork('triage')
-          updateEpicMd(dir, { log: `fixes-after-review round 2: ${triaged2.status} (${round2Checkpoint})` })
-          log(`Fixes after review (round 2): ${triaged2.status}`)
 
-          // What round 2 left behind, split by where the item came from: a regression it declined to fix
-          // is still a named bug, so it stays defect-class; a fix it declined to make evident is still
-          // only "nobody could confirm it", so it stays a human's call.
-          const deferred2 = Array.isArray(triaged2.deferred) ? triaged2.deferred : []
-          const why2 = new Map(deferred2.map(d => [d.title, d.why]))
-          const heldFixes = r1.unresolved.filter(u => why2.has(u.finding.title))
-            .map(u => ({ finding: u.finding, verdict: { resolved: false, confidence: 0, reasoning: `the second fix round left it unfixed: ${why2.get(u.finding.title)}` } }))
-          const heldRegressions = r1.regressions.filter(r => why2.has(r.title))
-          // A regression is a finding for the second check: same fields, same question.
-          const items2 = [...r1.unresolved.map(u => u.finding), ...r1.regressions].filter(f => !why2.has(f.title))
-          const fix2Sha = await gitOut(['rev-parse', 'HEAD'], 'git rev-parse HEAD')
-          const changed2 = (await git(['diff', '--quiet', fixSha, fix2Sha])).code !== 0
-          let r2 = { confirmed: [], unresolved: [], regressions: [] }
-          let note2 = null
-          if (!changed2 && items2.length) {
-            fixBlockers.push({
-              source: 'claimed-fix-without-delta',
-              reason: `${items2.length} item(s) reported repaired by the second fix round, which changed nothing`,
-              defectClass: true,
-              items: items2,
-            })
-            r2 = { confirmed: [], unresolved: items2.map(f => ({ finding: f, verdict: { resolved: false, confidence: 0, reasoning: 'the second fix round produced no diff' } })), regressions: [] }
-            note2 = 'The second fix round reported repairs but produced no diff'
-          } else if (changed2) {
-            const c2 = await agent(PROMPTS.fixCheck(items2, requirement, `git diff ${fixSha} ${fix2Sha}`, DIFF),
-              { label: 'fix-check:round2', phase: 'Fixes after review', step: 'confirm-review', schema: FIXCHECK_SCHEMA },
-            )
-            if (!c2) {
-              const failure2 = takeAgentFailure()
-              if (failure2?.kind === 'quota-exhausted') {
-                return await fail('triage', 'The second post-fix check hit provider quota — refusing to turn missing review evidence into a soft PR hold.', failure2)
-              }
-              fixBlockers.push({ source: 'missing-post-fix-verdict', reason: 'the second post-fix check produced no result — the second round of fixes is unreviewed and a human decides', defectClass: false, items: items2 })
-              r2 = { confirmed: [], unresolved: items2.map(f => ({ finding: f, verdict: { resolved: false, confidence: 0, reasoning: 'the second post-fix check produced no result' } })), regressions: [] }
-              note2 = 'The second post-fix check produced no result'
-            } else {
-              r2 = readCheck(c2, items2)
-              if (r2.unresolved.length) fixBlockers.push(unconfirmedBlocker(r2.unresolved, 'not confirmed by the post-fix check'))
-              if (r2.regressions.length) fixBlockers.push(regressionBlocker(r2.regressions, 'introduced by the fixes'))
-            }
-          }
-          if (heldRegressions.length) fixBlockers.push(regressionBlocker(heldRegressions, 'the second fix round left unfixed'))
-          if (heldFixes.length) fixBlockers.push(unconfirmedBlocker(heldFixes, 'the second fix round left unfixed'))
-          // The end state across both rounds, which is what ship reads out of review.md.
-          postFix = {
-            confirmed: [...r1.confirmed, ...r2.confirmed],
-            unresolved: [...r2.unresolved, ...heldFixes],
-            regressions: [...r2.regressions, ...heldRegressions],
-            note: note2,
-            rounds: 2,
-          }
-          summary2 = `fix check 2: ${r2.confirmed.length}/${items2.length} confirmed, ${r2.regressions.length} regression(s)${note2 ? ` (${note2.toLowerCase()})` : ''}`
+    items.forEach((item, i) => {
+      item.verdict = checked.verdicts.find(v => v.index === i + 1)
+      item.cleared = ['fixed', 'rejected'].includes(item.verdict.verdict) &&
+        item.verdict.verdict === item.assessment.action && item.verdict.confidence >= 75 &&
+        !noDeltaClaims.includes(item)
+    })
+    // Regressions become ordinary numbered items for the final repair round,
+    // with the tree that exposed them as their own before-repair baseline.
+    const regressions = checked.regressions.filter(r => r.confidence >= 75)
+    for (const finding of regressions) {
+      items.push({
+        finding, baseline: fixSha, assessment: null, cleared: false,
+        verdict: { verdict: 'defect', confidence: finding.confidence, reasoning: finding.problem },
+      })
+    }
+    const fixedCount = items.filter(item => item.cleared && item.verdict.verdict === 'fixed').length
+    const rejectedCount = items.filter(item => item.cleared && item.verdict.verdict === 'rejected').length
+    const openCount = items.filter(item => !item.cleared).length
+    const summary = `fix check${round === 2 ? ' 2' : ''}: ${fixedCount} fixed, ${rejectedCount} rejected, ${openCount} open; ${regressions.length} regression(s)`
+    checkSummaries.push(summary)
+    log(summary)
+
+    if (noDeltaClaims.length) {
+      checkNote = 'The fixes step reported fixes but produced no diff'
+      // A claim with no diff is not itself proof that the original finding
+      // was real. Only a current checker defect verdict can authorize repair.
+      for (const item of noDeltaClaims) {
+        if (item.verdict.verdict !== 'defect' || item.verdict.confidence < 75) {
+          item.verdict = { verdict: 'uncertain', confidence: 0, reasoning: checkNote }
         }
       }
+      break
     }
-    if (postFix) {
-      renderReview(dir, verified, unconfirmed, postFix)
-      const summary = [summary1 || `fix check: ${postFix.confirmed.length}/${fixed.length} fixes confirmed, ${postFix.regressions.length} regression(s)${postFix.note ? ` (${postFix.note.toLowerCase()})` : ''}`, summary2].filter(Boolean).join('; ')
-      reviewTally += `; ${summary}`
-      updateEpicMd(dir, { log: summary })
-      log(`Fix check: ${summary}.`)
-    }
-  } else if (verified.length) {
-    log('Fix check: skipped in manual mode (no checkpoints, no merge gate).')
+    if (!gitMode) break // manual mode reports the one checked repair round; it never queues a merge
+    pending = items.filter(item => !item.cleared && item.assessment?.action !== 'deferred')
+    if (round === 1 && pending.length) log(`Fixes after review: ${pending.length} open item(s) — running the second and final fix round.`)
   }
+
+  // The checker, never the coder's disposition or a title match, establishes
+  // which open items are actual defects. Uncertainty remains human-only.
+  const openItems = items.filter(item => !item.cleared)
+  if (gitMode && !fixBlockers.length && openItems.length) {
+    const defects = openItems.filter(item => item.verdict?.verdict === 'defect' && item.verdict.confidence >= 75)
+    const uncertain = openItems.filter(item => !defects.includes(item))
+    if (defects.length) fixBlockers.push({
+      source: 'post-review-defect',
+      reason: `${defects.length} independently confirmed review defect(s) left unfixed (${defects.map(item => `${item.finding.severity}: ${item.finding.title}`).join('; ')})`,
+      defectClass: true,
+      items: defects.map(item => ({ ...item.finding, verdict: item.verdict })),
+    })
+    if (uncertain.length) fixBlockers.push({
+      source: 'unconfirmed-post-review-fix',
+      reason: `${uncertain.length} assessment(s) not confirmed by the post-fix check — a human decides (${uncertain.map(item => item.finding.title).join('; ')})`,
+      defectClass: false,
+      items: uncertain.map(item => ({ finding: item.finding, verdict: item.verdict })),
+    })
+  }
+  const originalItems = items.slice(0, uniqueReviews.length)
+  const findingsConfirmed = originalItems.filter(item => item.verdict?.confidence >= 75 && ['fixed', 'defect'].includes(item.verdict.verdict)).length
+  const findingsRejected = originalItems.filter(item => item.cleared && item.verdict.verdict === 'rejected').length
+  const findingsPending = originalItems.filter(item => !item.cleared).length
+  reviewTally = `${rawTally}; ${findingsConfirmed} confirmed, ${findingsRejected} independently rejected, ${findingsPending} open`
+  if (checkSummaries.length) reviewTally += `; ${checkSummaries.join('; ')}`
+  renderReview(dir, items, { rounds, note: checkNote })
+  updateEpicMd(dir, { log: reviewTally })
+  log(`Review: ${reviewTally}.`)
 
   // ───────────────────────── Phase 5: Ship ─────────────────────────
   // Issue mode: ship decides what the PR says; the script squashes to one commit (Closes #N), pushes,
@@ -1516,7 +1288,7 @@ try {
     if (!s) return await fail('ship', 'the summary was not written.')
     writeFileSync(path.join(dir, 'summary.md'), `${String(s.summary).trim()}\n`)
     updateEpicMd(dir, { phase: 'ship → done', log: 'ship: summary.md written (manual mode, no PR)' })
-    return { slug, approach: design?.approach, greenStatus: green, findingsConfirmed: verified.length, findingsUnconfirmed: unconfirmed.length, triageStatus, summary: s.summary }
+    return { slug, approach: design?.approach, greenStatus: green, findingsConfirmed, findingsUnconfirmed: uniqueReviews.length - findingsConfirmed, findingsRejected, findingsPending, triageStatus, summary: s.summary }
   }
 
   // ───────────────────────── Rebase onto current origin/main ─────────────────────────
@@ -1627,16 +1399,18 @@ try {
     branch: `epic/${slug}`,
     prUrl: shipped.prUrl,
     approach: design?.approach,
-    findingsConfirmed: verified.length,
-    findingsUnconfirmed: unconfirmed.length,
+    findingsConfirmed,
+    findingsUnconfirmed: uniqueReviews.length - findingsConfirmed,
+    findingsRejected,
+    findingsPending,
     triageStatus,
     readyToMerge: false,
   }
 
   // ───────────────────────── The merge gate ─────────────────────────
   // Everything the pipeline could verify is green by here: verify per package (whatever that script gates,
-  // including any real-database tier the project triggers for itself), independent review adversarially
-  // verified, and the fixes re-verified. What is left is the judgment calls the pipeline explicitly
+  // including any real-database tier the project triggers for itself), independent review,
+  // and the assessments and repairs checked. What is left is the judgment calls the pipeline explicitly
   // refused to make. Those refusals ARE the gate — a deferred confirmed finding or a defect that outlives
   // this merge is the pipeline saying "a human decides this", and a human cannot decide it after it has
   // already deployed. Counted HERE in the script from structured values, never inside an agent that could
@@ -1646,14 +1420,6 @@ try {
   // acts on that — rebasing onto current main, re-running CI, merging serially per repo. Merging inside
   // the run would park a build slot on a lock while the whole queue waited behind it.
   const mergeBlockers = []
-  if (triageDeferred.length) {
-    mergeBlockers.push({
-      source: 'fixes-after-review-deferral',
-      reason: `${triageDeferred.length} confirmed review finding(s) left unfixed by fixes-after-review (${triageDeferred.map(d => `${d.severity}: ${d.title}`).join('; ')})`,
-      defectClass: true,
-      items: triageDeferred,
-    })
-  }
   if (shipped.deferredDefects > 0) {
     mergeBlockers.push({
       source: 'ship-deferral',
