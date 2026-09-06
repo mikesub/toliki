@@ -39,7 +39,7 @@ import { agent, phase, log, initRuntime, onPhase, onLog, takeAgentFailure, withA
 import { parseArgs, finish, UsageError, EXIT } from './lib/cli.mjs'
 import { initStatus, statusPhase, statusNote, statusFinish } from './lib/status.mjs'
 import { failureReason } from './lib/proc.mjs'
-import { ensureLabels, editLabels, issueLabels, issueView, comment, openPrs, prView, repositoryView, authenticatedLogin, readBack, waitedFor, terminalBudget, terminalTransition, verifyIssueEngine } from './lib/github.mjs'
+import { ensureLabels, editLabels, issueLabels, issueView, comment, openPrs, prView, repositoryView, authenticatedLogin, readBack, waitedFor, terminalBudget, terminalTimeout, terminalTransition, verifyIssueEngine } from './lib/github.mjs'
 import { git, gitOut, discoverPackages, pkgList, ensureDeps, runVerify, pushRejected, intentToAdd } from './lib/repo.mjs'
 import { defectEvidenceItems, filterDefectEvidence, matchingDefectEvidenceComment, matchingDefectRepair, publishDefectEvidence, renderDefectEvidenceSection, renderDefectRepair } from './lib/defect-evidence.mjs'
 import { finalizeFixerIssue, finalizeFixerQuotaHold } from './lib/fixer-finalize.mjs'
@@ -563,9 +563,13 @@ async function fail(failedPhase, reason) {
   if (!blockerPosted) {
     blockerPosted = true
     try {
-      await git(['reset', '--mixed', 'HEAD'])
-      await git(['checkout', '-f', '--', '.'])
-      await git(['clean', '-fd'])
+      // Never leave a half-applied repair in a worktree the next run reuses. Bounded by whatever the
+      // terminal window has left when ship's landing swap is what failed: past that write reap's
+      // settle clock is running, and a stalled local git call costs the blocker report just as an
+      // unbounded gh call would. Before any terminal write there is no clock and git's own timeout stands.
+      await git(['reset', '--mixed', 'HEAD'], terminalTimeout())
+      await git(['checkout', '-f', '--', '.'], terminalTimeout())
+      await git(['clean', '-fd'], terminalTimeout())
       await postBlocker({ phase: failedPhase, reason, prUrl, attempt })
     } catch (e) {
       log(`blocked: could not report on GitHub (${e && e.message || e})`)

@@ -121,9 +121,14 @@ export async function runVerify(packages, { timeoutMs = VERIFY_TIMEOUT_MS, tailL
 }
 
 // ───────────────────────── git state ─────────────────────────
-export async function rebaseInProgress() {
+// opts is forwarded verbatim to both probes, so a caller inside a terminal
+// window can bound them the way it bounds the abort that follows. A probe that
+// times out is not ok and so reads as no rebase in progress: the blocked run
+// skips its abort and the next run's prepare, which aborts unconditionally,
+// is the recovery.
+export async function rebaseInProgress(opts = {}) {
   for (const p of ['rebase-merge', 'rebase-apply']) {
-    const r = await git(['rev-parse', '--git-path', p])
+    const r = await git(['rev-parse', '--git-path', p], opts)
     if (r.ok && r.out && existsSync(path.resolve(r.out))) return true
   }
   return false

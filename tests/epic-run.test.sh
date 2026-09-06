@@ -129,6 +129,9 @@ scenario() { printf '\n%s\n' "$1"; reset_origin; }
 # real step would have written to the worktree), and logs its own argv so the
 # tiering assertions have something to read.
 mkdir -p "$TMP/bin"
+# The real git, resolved BEFORE anything shadows it on PATH: the git wrapper
+# below execs this, and the suite's own seeding runs unshadowed either way.
+REAL_GIT="$(command -v git)"
 cat > "$TMP/bin/claude" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -461,6 +464,25 @@ esac
 exit 0
 STUB
 chmod +x "$TMP/bin/gh"
+
+# git wrapper: a transparent exec of the real git, with one knob. A local git
+# call is just as fatal to a terminal report as a stalled gh call once a landing
+# label is resting — reap's settle clock is running either way — so a scenario
+# can arm exactly one subcommand to hang, and only AFTER the landing swap has
+# opened the window. `ready-to-merge` in the label file IS that window: the gh
+# stub writes it the moment GitHub applies the swap, and the blocker path's
+# demotion strips it again, so an armed call stalls on the fallback path and
+# nowhere else. Unarmed — every other scenario in this suite — the wrapper is
+# a plain exec and changes nothing.
+cat > "$TMP/bin/git" <<'STUB'
+#!/usr/bin/env bash
+if [[ -n "${GIT_SLOW_AFTER_LANDING:-}" && "${1:-}" == "${GIT_SLOW_AFTER_LANDING%%:*}" ]] &&
+   grep -qx 'ready-to-merge' "${STUB_GH_STATE:-/nonexistent}/labels" 2>/dev/null; then
+  sleep "${GIT_SLOW_AFTER_LANDING##*:}"
+fi
+exec "$STUB_REAL_GIT" "$@"
+STUB
+chmod +x "$TMP/bin/git"
 
 # npm stub: `ci` makes node_modules appear, `run verify` passes unless the
 # fixture set carries verify.rc. Logs argv.
@@ -864,6 +886,8 @@ run_pipeline() { # script fixtures-dir args...   (scenario knobs via GH_* env)
     GH_JOB_LOG="${GH_JOB_LOG:-}" \
     GH_FAIL_READ_AFTER_REMOVE="${GH_FAIL_READ_AFTER_REMOVE:-}" \
     GH_TERMINAL_STALL_SECONDS="${GH_TERMINAL_STALL_SECONDS:-}" \
+    STUB_REAL_GIT="$REAL_GIT" \
+    GIT_SLOW_AFTER_LANDING="${GIT_SLOW_AFTER_LANDING:-}" \
     EXPECT_HOLD_BEFORE_LABEL="${EXPECT_HOLD_BEFORE_LABEL:-}" \
     CODEX_QUOTA_STDERR_ONLY="${CODEX_QUOTA_STDERR_ONLY:-}" \
     TMPDIR="$state/tmp" \
@@ -3114,6 +3138,28 @@ assert_contains "the blocker comment still reached the issue" "$(gh_comments)" "
 assert_contains "and the pane still gets its RESULT line" "$RUN_OUT" "RESULT "
 assert_contains "which records the blocked run" "$RUN_OUT" '"blocked":true'
 
+# Same unverified landing, stalled on the OTHER kind of call the fallback makes.
+# The blocker path's first act is a rebase probe, and its two `rev-parse
+# --git-path` subprocesses run on git's own five-minute default — which past the
+# landing write is exactly as fatal to the report as a stalled gh call, because
+# reap's settle clock has been running since GitHub applied `ready-to-merge`.
+# The probe is inside the window the landing opened, so it spends that window's
+# share; a probe that times out reads as no rebase in progress and the next
+# run's prepare aborts the rebase unconditionally anyway.
+scenario 'fix-run: the blocker path'"'"'s rebase probe is bounded by the window the landing opened'
+seed_conflict
+SLOWGIT_START="$(date +%s)"
+EPIC_TERMINAL_REPORT_MS=3000 GIT_SLOW_AFTER_LANDING=rev-parse:20 GH_LABEL_READ_FAIL_AT=3 \
+  run_fix "$FIXBASE" --issue 42 --session myapp-epic-42
+SLOWGIT_ELAPSED=$(( $(date +%s) - SLOWGIT_START ))
+assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
+assert_eq "the whole fallback fits the window the landing opened" "bounded" "$( (( SLOWGIT_ELAPSED < 15 )) && echo bounded || echo "waited ${SLOWGIT_ELAPSED}s for a 20s stall" )"
+assert_eq "it rests at failed, back in the conflict fixer queue, ladder kept" "failed,fix-attempted,needs-judgment," "$(gh_labels)"
+assert_not_contains "the merge worker has nothing to select" "$(gh_labels)" "ready-to-merge"
+assert_contains "the blocker comment still reached the issue" "$(gh_comments)" "🤖 fix-conflict blocked"
+assert_contains "and the pane still gets its RESULT line" "$RUN_OUT" "RESULT "
+assert_contains "which records the blocked run" "$RUN_OUT" '"blocked":true'
+
 # ───────────────────────── ci-run ─────────────────────────
 # A finished epic PR the merge worker rebased and re-ran: its checks came back
 # red. The seed leaves the branch's single commit holding a test with no
@@ -3814,6 +3860,24 @@ GH_LABEL_READ_FAIL_AT=3 run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
 assert_rc "the unverified handoff blocks" 3 "$RUN_RC"
 assert_contains "the ship blocker names label verification" "$RUN_OUT" "label swap could not be verified"
 assert_eq "ready-to-merge is removed during review restoration" "defect-attempted,ready-to-review," "$(gh_labels)"
+
+# The same unverified handoff, with the worktree scrub that precedes the blocker
+# stalled. fail() resets, checks out and cleans before it reports, all on git's
+# five-minute default; past the landing swap those three calls sit inside reap's
+# settle window, so one of them hanging costs the demotion, the blocker comment
+# and the RESULT line exactly as a hung gh call would. They belong to the window
+# the landing write opened.
+scenario 'defect-run: the blocker path'"'"'s worktree scrub is bounded by the window the landing opened'
+seed_defect_pr
+SLOWGIT_START="$(date +%s)"
+EPIC_TERMINAL_REPORT_MS=3000 GIT_SLOW_AFTER_LANDING=reset:20 GH_LABEL_READ_FAIL_AT=3 \
+  run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+SLOWGIT_ELAPSED=$(( $(date +%s) - SLOWGIT_START ))
+assert_rc "the unverified handoff blocks" 3 "$RUN_RC"
+assert_eq "the whole fallback fits the window the landing opened" "bounded" "$( (( SLOWGIT_ELAPSED < 15 )) && echo bounded || echo "waited ${SLOWGIT_ELAPSED}s for a 20s stall" )"
+assert_eq "ready-to-merge is removed during review restoration" "defect-attempted,ready-to-review," "$(gh_labels)"
+assert_contains "the blocker comment still reached the issue" "$(gh_comments)" "🤖 fix-defect blocked"
+assert_contains "and the pane still gets its RESULT line" "$RUN_OUT" "RESULT "
 
 scenario 'defect-run: failed merge-label readback is actively demoted to review on the retry'
 seed_defect_pr
