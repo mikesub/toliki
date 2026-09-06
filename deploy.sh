@@ -1,3 +1,3 @@
 #!/usr/bin/env bash
-set -euo pipefail
+git pull --rebase
 ssh toliki 'git -C /home/ubuntu/toliki pull --rebase'
