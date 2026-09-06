@@ -77,7 +77,20 @@ Commands:
                            EPIC_ENGINE default, else claude — and nothing is written:
                            an inherited default stays a default. Queue-driven launches
                            get the engine from the issue label the same way.
+  --over-capacity          Manual epic/fix/ci/defect only: start the run even
+                           though the host is already at MAX_PARALLEL_EPICS.
+                           Refused on anything else, and never forwarded by
+                           dispatch — the queue stays bounded, and the session
+                           counts normally once it is up, so automatic ticks
+                           stay paused until usage drops below the limit.
 EOF
+}
+
+# The cap's one bypass has to stay attached to a deliberate, named pipeline
+# launch, so every path that is not one refuses it here rather than on the host.
+refuse_over_capacity() {
+  echo "[control] --over-capacity only applies to manual epic/fix/ci/defect launches" >&2
+  exit 1
 }
 
 ACTION="start"
@@ -91,6 +104,7 @@ PIPELINE=""   # the pipeline shortcut selected for a manual launch
 REF=""
 ENGINE=""
 HAVE_ENGINE=0
+HAVE_OVER_CAPACITY=0
 
 # Pull optional -m/--message and -r/--repo (any position) out of the args.
 POSITIONAL=()
@@ -138,6 +152,10 @@ while [[ $# -gt 0 ]]; do
       ENGINE="${1#*=}"
       shift
       ;;
+    --over-capacity)
+      HAVE_OVER_CAPACITY=1
+      shift
+      ;;
     *)
       POSITIONAL+=("$1")
       shift
@@ -146,6 +164,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ ${#POSITIONAL[@]} -eq 0 ]]; then
+  # No command left after the options: nothing here can be a pipeline launch,
+  # and the no-command branch below exits 0, so the override is refused first —
+  # a bare `--over-capacity` must never read as a successful invocation.
+  [[ $HAVE_OVER_CAPACITY -eq 0 ]] || refuse_over_capacity
   if [[ $HAVE_MESSAGE -eq 1 ]]; then
     ACTION="start"          # bare `-m <msg>` starts an auto-named session
   elif [[ $HAVE_REPO -eq 1 ]]; then
@@ -230,6 +252,11 @@ if [[ -z "$PIPELINE" && $HAVE_ENGINE -eq 1 ]]; then
   echo "[control] --engine only applies to manual epic/fix/ci/defect launches" >&2
   exit 1
 fi
+# Refused here rather than on the host, so start/restart/stop/ls/stop-all/usage/
+# next, a bare name and a bare -m can't even send it.
+if [[ -z "$PIPELINE" && $HAVE_OVER_CAPACITY -eq 1 ]]; then
+  refuse_over_capacity
+fi
 
 # --message only makes sense when we're launching claude.
 if [[ $HAVE_MESSAGE -eq 1 && "$ACTION" != "start" && "$ACTION" != "restart" ]]; then
@@ -311,12 +338,13 @@ case "$ACTION" in
       # A heredoc rather than a command string because the answer has to be
       # read between the two calls. `read` takes a here-string, never stdin —
       # stdin here IS this script, and reading from it would eat the rest of it.
-      ssh "$HOST" bash -s -- "$HOST_CONTROL_DIR" "$PIPELINE" "$REF" "$REPO" <<'REMOTE_INHERIT'
+      ssh "$HOST" bash -s -- "$HOST_CONTROL_DIR" "$PIPELINE" "$REF" "$REPO" "$HAVE_OVER_CAPACITY" <<'REMOTE_INHERIT'
 set -euo pipefail
 control="$1"
 kind="$2"
 ref="$3"
 repo="$4"
+over_capacity="$5"
 
 if ! answer="$("$control/bin/dispatch.sh" --resolve-issue "$ref" --repo "$repo")"; then
   exit 1
@@ -331,7 +359,11 @@ case "$source" in
     exit 1 ;;
 esac
 echo "[remote] #$ref ($repo): engine $engine selected by $why — no label written"
-exec "$control/bin/launch.sh" "--$kind" "$ref" --repo "$repo" --engine "$engine"
+# Only the launch half again: --resolve-issue above is dispatch.sh's own
+# read-only call, which knows nothing about the flag and starts no session.
+launch=("$control/bin/launch.sh" "--$kind" "$ref" --repo "$repo" --engine "$engine")
+[[ "$over_capacity" -eq 0 ]] || launch+=(--over-capacity)
+exec "${launch[@]}"
 REMOTE_INHERIT
       exit 0
     fi
@@ -341,6 +373,9 @@ REMOTE_INHERIT
     if [[ -n "$PIPELINE" ]]; then
       ROUTE="$HOST_CONTROL_DIR/bin/dispatch.sh --route-issue $(sq "$REF") $(sq "$ENGINE") --repo $(sq "$REPO")"
       REMOTE+=" --$PIPELINE $(sq "$REF") --engine $(sq "$ENGINE")"
+      # Only the launch half: --route-issue is dispatch.sh's own routing call,
+      # which knows nothing about the flag and starts no session anyway.
+      [[ $HAVE_OVER_CAPACITY -eq 0 ]] || REMOTE+=" --over-capacity"
       REMOTE="$ROUTE && $REMOTE"
     else
       if [[ -n "$SESSION" ]]; then

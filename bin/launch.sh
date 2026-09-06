@@ -23,6 +23,12 @@ set -euo pipefail
 # Exit codes: 0 launched (or the session already existed), 1 usage/config
 # error, 3 refused because the host is at MAX_PARALLEL_EPICS. 3 is separate
 # because dispatch.sh reads it as "stop this tick" rather than as a failure.
+#
+# --over-capacity is the one deliberate bypass of that refusal, and it is
+# narrow on purpose: only a named --epic/--fix/--ci/--defect launch may carry
+# it (a probe, an interactive session or a bare name exits 1), no environment
+# variable grants it, and dispatch.sh never passes it — so queue-driven work
+# stays bounded no matter how often an operator overrides by hand.
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/../etc/lib.sh"
@@ -30,10 +36,10 @@ source "$HERE/../etc/lib.sh"
 usage() {
   cat <<EOF
 Usage: $0 [session-name] [-m <message>] [-r <repo>] [--check-capacity|--check-idle]
-       $0 --epic <N> [-r <repo>] [--engine <engine>]
-       $0 --fix <N>  [-r <repo>] [--engine <engine>]
-       $0 --ci <N>   [-r <repo>] [--engine <engine>]
-       $0 --defect <N> [-r <repo>] [--engine <engine>]
+       $0 --epic <N> [-r <repo>] [--engine <engine>] [--over-capacity]
+       $0 --fix <N>  [-r <repo>] [--engine <engine>] [--over-capacity]
+       $0 --ci <N>   [-r <repo>] [--engine <engine>] [--over-capacity]
+       $0 --defect <N> [-r <repo>] [--engine <engine>] [--over-capacity]
 
 Creates a detached tmux session in the named repo (default: $DEFAULT_REPO).
 
@@ -58,6 +64,11 @@ it) and starts nothing — dispatch.sh probes it before work it would otherwise
 have to undo, so the counting stays in this one script.
 --check-idle is the same count against zero (exit 0 with nothing running, 3
 otherwise) — bin/update-claude.sh asks it before moving the claude binary.
+--over-capacity admits ONE pipeline launch over that cap on purpose, and
+bypasses nothing else: the count still runs under the launch lock, the session
+counts like any other afterwards (so dispatch stays paused until usage drops
+below $MAX_PARALLEL_EPICS), and it is refused with exit 1 on the probes above
+and on anything that isn't --epic/--fix/--ci/--defect.
 EOF
 }
 
@@ -71,6 +82,7 @@ MODE=""       # "" = interactive claude; otherwise the selected pipeline run
 ISSUE=""
 ENGINE=""     # a pipeline run with no --engine resolves the host default below
 HAVE_ENGINE=0
+OVER_CAPACITY=0            # hard-initialised: only the flag below may set it, never the environment
 
 POSITIONAL=()
 while [[ $# -gt 0 ]]; do
@@ -111,6 +123,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --check-idle)
       CHECK_IDLE=1
+      shift
+      ;;
+    --over-capacity)
+      OVER_CAPACITY=1
       shift
       ;;
     --engine)
@@ -185,6 +201,19 @@ if [[ $HAVE_ENGINE -eq 1 ]]; then
     exit 1
   fi
 fi
+# The override may only ride a launch that actually starts a pipeline. A probe
+# answers a question other callers act on — dispatch.sh skips a whole tick on
+# --check-capacity's exit 3, update-claude.sh moves a binary on --check-idle's
+# exit 0 — so an override there would make them believe something false about
+# the host rather than overload it honestly.
+if [[ $OVER_CAPACITY -eq 1 && ( $CHECK_CAPACITY -eq 1 || $CHECK_IDLE -eq 1 ) ]]; then
+  echo "[launch] --over-capacity can't be combined with --check-capacity/--check-idle — probes stay strict" >&2
+  exit 1
+fi
+if [[ $OVER_CAPACITY -eq 1 && -z "$MODE" ]]; then
+  echo "[launch] --over-capacity only applies to --epic/--fix/--ci/--defect pipeline runs" >&2
+  exit 1
+fi
 
 # A pipeline run owns its own naming: the session name IS the issue, because
 # every other part of the harness (dispatch's has-session checks, reap's sweep,
@@ -238,6 +267,14 @@ capacity_gate() {
   fi
   RUNNING="$(running_count)"
   if (( RUNNING >= MAX_PARALLEL_EPICS )); then
+    # The bypass is here, inside the gate and under the caller's lock, so an
+    # override is admitted against the same count every other launch is judged
+    # by — and is loud, because the operator is the only thing standing between
+    # this line and an overloaded box.
+    if (( OVER_CAPACITY == 1 )); then
+      echo "[launch] OVER CAPACITY: $RUNNING/$MAX_PARALLEL_EPICS already running — admitting '$SESSION' anyway (--over-capacity); dispatch stays paused until usage drops below $MAX_PARALLEL_EPICS" >&2
+      return 0
+    fi
     echo "[launch] at capacity ($RUNNING/$MAX_PARALLEL_EPICS running)${SESSION:+ — not starting '$SESSION'}" >&2
     exit 3
   fi

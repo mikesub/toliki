@@ -52,6 +52,11 @@ NAME_MAX_LEN=40
 # low and raise it after watching a full queue drain — an under-full box just
 # drains slower, whereas contention is expensive to tell apart from a
 # pipeline bug.
+#
+# An operator can exceed it for one run at a time with
+# `./remote-control.sh epic|fix|ci|defect N [--engine <e>] --over-capacity`.
+# Nothing else can: dispatch never passes the flag, and no environment variable
+# grants it.
 MAX_PARALLEL_EPICS=2
 
 # IANA zone used for every timestamp rendered for a human (pane/status/script
