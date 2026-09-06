@@ -126,11 +126,13 @@ than made launchable against a main without the code it describes.
   `etc/engines.json`, host-local, never written to GitHub.
   `node workflows/usage-report.mjs` summarizes it per step;
   `./remote-control.sh usage` runs that on the host.
-- `workflows/quota-hold.mjs` owns the one host-wide provider-quota hold:
-  reset-time parsing, schema validation, atomic monotonic writes under
-  dispatch's lock, and the read-only operator peek. A hard quota is recorded
-  before a run restores its queue labels; ordinary dispatch observes it before
-  capacity or GitHub. Routing-only and explicit manual launches bypass it.
+- `workflows/quota-hold.mjs` owns the host-wide vendor-keyed provider-quota
+  holds: reset-time parsing, schema validation, atomic per-vendor monotonic
+  writes under dispatch's lock, independent expiry, and the read-only operator
+  peek. A hard quota is recorded before a run restores its queue labels;
+  ordinary dispatch snapshots the map before capacity or GitHub and skips each
+  candidate whose engine uses a held vendor. Routing-only and explicit manual
+  launches bypass it.
 - `workflows/lib/prices.mjs` holds the published per-model prices for vendors
   whose CLI reports no cost. Claude bills itself and is not in the table; a
   Codex spawn is priced from it and stamped `costSource:"table"`, so a computed
@@ -173,11 +175,15 @@ than made launchable against a main without the code it describes.
   a green gate. Gated by `tests/dispatch-engine.test.sh` and
   `tests/epic-run.test.sh`.
 - A provider `quota-exhausted` result is never transient-respawned. The run
-  preserves its resumable state, records the host hold, refunds a fixer's
-  current attempt rung, and only then restores the appropriate queue labels;
-  failure to persist the hold or verify those labels uses the ordinary blocker
-  path. Dispatch checks that record under its tick lock before capacity or any
-  GitHub access. Expired state is cleared; malformed state fails closed.
+  preserves its resumable state, records only the failed step's vendor hold,
+  refunds a fixer's current attempt rung, and only then restores the appropriate
+  queue labels; failure to persist the hold or verify those labels uses the
+  ordinary blocker path. Dispatch validates one snapshot under its tick lock
+  before capacity or any GitHub access, then checks each resolved engine before
+  any candidate label write and continues past held candidates. Mixed engines
+  wait on the union of their vendors and are never rerouted. Expired entries
+  are pruned independently; malformed state or an unreadable engine vendor set
+  fails closed.
 - Merge eligibility is computed from structured counts in `epic-run.mjs`.
   Never replace it with a model's sign-off.
 - The merge is pinned to the sha whose check gate was evaluated

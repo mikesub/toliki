@@ -92,11 +92,14 @@ don't get re-litigated from memory.
   reading labels; the first model to run is the epic that got launched.
 - **Exhausted allowance pauses admission, not work.** A provider's hard quota
   is a host condition, so the run preserves its checkpoint and returns the
-  issue to its queue instead of manufacturing a project failure. One
-  lock-serialized hold pauses automatic dispatch until the provider reset;
-  explicit manual launches remain the operator's override. The host-wide blast
-  radius and a 30-minute fallback for unparseable reset text are deliberate:
-  they trade occasional idle capacity for avoiding a queue-wide failure storm.
+  issue to its queue instead of manufacturing a project failure. The
+  lock-serialized hold map pauses automatic admission only for engines that use
+  the exhausted vendor, so a single-vendor engine on another provider keeps the
+  box productive. A mixed engine waits on the union of its vendors and is never
+  rerouted: changing who codes or reviews is a routing decision, not a queue
+  optimization. Explicit manual launches remain the operator's override. The
+  30-minute fallback for unparseable reset text trades bounded idle capacity on
+  that vendor for avoiding a repeated failure storm.
 - **Models judge, the script acts.** The same split inside a run. Everything
   deterministic — the claim, the labels, the checkpoints, the squash, the push,
   the PR, the follow-up issues, the layout discovery, `npm run verify` — is the

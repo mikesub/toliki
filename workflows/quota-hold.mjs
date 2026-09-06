@@ -1,12 +1,14 @@
 #!/usr/bin/env node
-// One host-wide admission hold for exhausted provider allowances. Pipeline
-// processes record it; dispatch reads it while holding the same lock and stops
-// before capacity or GitHub; the operator skill peeks without mutating it.
+// One host-local admission-hold map for exhausted provider allowances. Pipeline
+// processes record the vendor whose step failed; dispatch reads the map while
+// holding the same lock and skips only engines that use an active vendor; the
+// operator skill peeks without mutating it.
 //
 // Writes run under dispatch's host lock and replace the JSON atomically. This
 // is deliberately host state, like the usage log and lock files: GitHub cannot
 // represent a provider reset shared by every registered repository. A losing
-// writer receives the winning deadline but never the other run's diagnostic.
+// writer receives that vendor's winning deadline but never another run's
+// diagnostic.
 
 import { execFile } from 'node:child_process'
 import { homedir, tmpdir } from 'node:os'
@@ -28,15 +30,40 @@ function canonicalInstant(value) {
   return ms
 }
 
-function validateRecord(value) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('provider hold must be a JSON object')
+function validateEntry(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('provider hold entry must be a JSON object')
   const keys = Object.keys(value).sort().join(',')
-  if (keys !== 'fallback,holdUntil,reason,vendor') throw new Error('provider hold has an invalid schema')
-  if (canonicalInstant(value.holdUntil) === null) throw new Error('provider hold has an invalid holdUntil')
-  if (typeof value.vendor !== 'string' || !value.vendor.trim()) throw new Error('provider hold has an invalid vendor')
-  if (typeof value.reason !== 'string' || !value.reason.trim()) throw new Error('provider hold has an invalid reason')
-  if (typeof value.fallback !== 'boolean') throw new Error('provider hold has an invalid fallback flag')
+  if (keys !== 'fallback,holdUntil,reason') throw new Error('provider hold entry has an invalid schema')
+  if (canonicalInstant(value.holdUntil) === null) throw new Error('provider hold entry has an invalid holdUntil')
+  if (typeof value.reason !== 'string' || !value.reason.trim()) throw new Error('provider hold entry has an invalid reason')
+  if (typeof value.fallback !== 'boolean') throw new Error('provider hold entry has an invalid fallback flag')
   return value
+}
+
+function validateMap(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('provider hold must be a JSON object')
+  const entries = Object.entries(value)
+  if (!entries.length) throw new Error('provider hold map must not be empty')
+  for (const [vendor, entry] of entries) {
+    if (!vendor.trim() || vendor !== vendor.trim()) throw new Error('provider hold has an invalid vendor key')
+    validateEntry(entry)
+  }
+  return value
+}
+
+// #17 wrote one exact four-field record. Accept only that shape as legacy:
+// broad coercion would turn damaged state into a launchable admission answer.
+function decodeRecord(value) {
+  if (value && typeof value === 'object' && !Array.isArray(value) &&
+      Object.keys(value).sort().join(',') === 'fallback,holdUntil,reason,vendor') {
+    if (typeof value.vendor !== 'string' || !value.vendor.trim() || value.vendor !== value.vendor.trim()) {
+      throw new Error('provider hold has an invalid legacy vendor')
+    }
+    const { vendor, ...entry } = value
+    validateEntry(entry)
+    return { records: { [vendor]: entry }, legacy: true }
+  }
+  return { records: validateMap(value), legacy: false }
 }
 
 function wallParts(ms, zone) {
@@ -83,7 +110,7 @@ async function readRecord() {
   const raw = await readFile(QUOTA_HOLD_FILE, 'utf8')
   let parsed
   try { parsed = JSON.parse(raw) } catch { throw new Error('provider hold is malformed JSON') }
-  return validateRecord(parsed)
+  return decodeRecord(parsed)
 }
 
 async function replaceRecord(record) {
@@ -100,22 +127,28 @@ async function replaceRecord(record) {
 async function recordLocked({ vendor, reason }, nowMs) {
   if (typeof vendor !== 'string' || !vendor.trim()) throw new Error('quota hold vendor is required')
   if (typeof reason !== 'string' || !reason.trim()) throw new Error('quota hold reason is required')
+  const vendorName = vendor.trim()
   const derived = deriveQuotaHold(reason, nowMs)
-  const candidate = validateRecord({ ...derived, vendor: vendor.trim(), reason: reason.trim() })
-  let existing = null
+  const candidate = validateEntry({ ...derived, reason: reason.trim() })
+  let records = {}
+  let legacy = false
   try {
-    existing = await readRecord()
+    ;({ records, legacy } = await readRecord())
   } catch (error) {
     if (error?.code !== 'ENOENT') throw error
   }
+  const existing = records[vendorName]
   const winner = existing && Date.parse(existing.holdUntil) >= Date.parse(candidate.holdUntil) ? existing : candidate
-  if (winner !== existing) await replaceRecord(winner)
-  // Only admission timing is host-wide. The provider diagnosis belongs to
-  // this invocation and may describe another repository, so never return the
-  // durable winner's vendor/reason to a losing writer.
+  if (winner !== existing || legacy) {
+    records = { ...records, [vendorName]: winner }
+    await replaceRecord(records)
+  }
+  // Only this vendor's admission timing is shared with the caller. The
+  // provider diagnosis belongs to this invocation and may describe another
+  // repository, so never return the durable winner's reason to a losing writer.
   return {
     hostHold: { holdUntil: winner.holdUntil, fallback: winner.fallback },
-    trigger: { vendor: candidate.vendor, reason: candidate.reason },
+    trigger: { vendor: vendorName, reason: candidate.reason },
   }
 }
 
@@ -161,20 +194,29 @@ export async function recordQuotaHold({ vendor, reason }, { nowMs = Date.now() }
 }
 
 async function inspect({ clearExpired }) {
-  let record
+  let decoded
   try {
-    record = await readRecord()
+    decoded = await readRecord()
   } catch (error) {
     if (error?.code === 'ENOENT') return { code: 1 }
     return { code: 2, error: error?.message || String(error) }
   }
-  if (Date.parse(record.holdUntil) > Date.now()) return { code: 0, record }
-  if (!clearExpired) return { code: 1 }
+  const active = Object.fromEntries(Object.entries(decoded.records)
+    .filter(([, entry]) => Date.parse(entry.holdUntil) > Date.now()))
+  if (!clearExpired) {
+    return Object.keys(active).length ? { code: 0, record: active } : { code: 1 }
+  }
   try {
-    await unlink(QUOTA_HOLD_FILE)
-    return { code: 1 }
+    if (!Object.keys(active).length) {
+      await unlink(QUOTA_HOLD_FILE)
+      return { code: 1 }
+    }
+    if (decoded.legacy || Object.keys(active).length !== Object.keys(decoded.records).length) {
+      await replaceRecord(active)
+    }
+    return { code: 0, record: active }
   } catch (error) {
-    return { code: 2, error: `could not clear expired provider hold: ${error?.message || error}` }
+    return { code: 2, error: `could not update expired provider holds: ${error?.message || error}` }
   }
 }
 

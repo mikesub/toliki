@@ -59,9 +59,10 @@ Run all three first; §3 and §4 read their output.
   session. Lines starting `would kill`, `would delete` or `would remove` are
   the design working: say nothing about them.
 - `ssh $SSH_HOST "node '$HOST_CONTROL_DIR/workflows/quota-hold.mjs' peek"`:
-  read-only provider admission state. Exit 0 prints one active JSON record;
-  record its `holdUntil` and `fallback`. Exit 1 means absent or expired and is
-  silent. Do not run `status` here: unlike `peek`, it may clear expired state.
+  read-only provider admission state. Exit 0 prints the active vendor map;
+  record each key with its `holdUntil` and `fallback`. Exit 1 means no vendor
+  is active and is silent. Do not run `status` here: unlike `peek`, it may
+  prune expired state.
 
 ## 2. Per-issue evidence
 
@@ -123,11 +124,12 @@ gh issue view <N> -R <owner/repo> --json comments --jq '.comments[] | select(.bo
 Heuristics about *current* state, not reporting windows: say "looks stuck",
 not "is broken".
 
-- **Active provider quota hold**: report one host-level item with its
-  `holdUntil`; append “fallback reset” only when `fallback` is true. It explains
-  why every automatic queue is paused, including work routed to another
-  provider. Manual `remote-control.sh epic|fix|ci|defect` launches are still an
-  explicit override. Say nothing when `peek` reports absent or expired state.
+- **Active provider quota hold**: report one host-level item per active vendor,
+  naming the vendor and its `holdUntil`; append “fallback reset” only when that
+  entry's `fallback` is true. An automatic candidate waits only when its engine
+  uses that vendor; a mixed engine waits on every vendor it uses and is not
+  rerouted. Manual `remote-control.sh epic|fix|ci|defect` launches are still an
+  explicit override. Say nothing when no vendor is active.
 - **`ready-to-merge` open for over ~1h**: the worker drains in minutes.
   `grep "#<N>" ~/merge.log | tail` for the why; infrastructure aborts log
   "aborting the run" and write no label. An issue a fixer just returned here —

@@ -141,6 +141,14 @@ assert_contains "operator setup invokes the host-clock helper" "$OPERATOR_SKILL_
   "bash .agents/skills/toliki/scripts/host-clock.sh"
 assert_contains "operator UTC conversion invokes the host-clock helper" "$OPERATOR_SKILL_TEXT" \
   "host-clock.sh --human-ts '<UTC instant>'"
+assert_contains "operator triage reads the active vendor map" "$OPERATOR_SKILL_TEXT" \
+  "Exit 0 prints the active vendor map"
+assert_contains "operator triage reports each held vendor separately" "$OPERATOR_SKILL_TEXT" \
+  "one host-level item per active vendor"
+assert_contains "operator triage stays silent when no vendor is held" "$OPERATOR_SKILL_TEXT" \
+  "Say nothing when no vendor is active"
+assert_not_contains "operator triage does not claim one vendor pauses every provider" \
+  "$OPERATOR_SKILL_TEXT" "including work routed to another provider"
 assert_not_contains "operator instructions never print local HOST_TIMEZONE as host state" \
   "$OPERATOR_SKILL_TEXT" '"HOST_TIMEZONE=$HOST_TIMEZONE"'
 

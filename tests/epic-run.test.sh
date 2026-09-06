@@ -581,22 +581,38 @@ LOW_WRITER=$!
 EPIC_PROVIDER_HOLD_FILE="$QUOTA_RECORD" TMPDIR="$QUOTA_LOCK_DIR" quota_probe record codex 'resets 11:00pm (UTC)' 1788631200000 &
 HIGH_WRITER=$!
 wait "$LOW_WRITER" "$HIGH_WRITER"
-# A later, lower candidate makes the max(existing,candidate) assertion
-# deterministic regardless of which concurrent writer acquired the lock first.
+# A later Claude candidate makes that vendor's max(existing,candidate)
+# assertion deterministic regardless of which concurrent writer got the lock.
 EPIC_PROVIDER_HOLD_FILE="$QUOTA_RECORD" TMPDIR="$QUOTA_LOCK_DIR" quota_probe record claude 'resets 8:30pm (UTC)' 1788631200000
+EPIC_PROVIDER_HOLD_FILE="$QUOTA_RECORD" TMPDIR="$QUOTA_LOCK_DIR" quota_probe record claude 'EQUAL_SENTINEL resets 8:30pm (UTC)' 1788631200000
+EPIC_PROVIDER_HOLD_FILE="$QUOTA_RECORD" TMPDIR="$QUOTA_LOCK_DIR" quota_probe record claude 'SHORTER_SENTINEL resets 8:15pm (UTC)' 1788631200000
 RACE_RECORD="$(jq -c . "$QUOTA_RECORD" 2>/dev/null || true)"
-assert_eq "the later timestamp wins across concurrent writers" "2026-09-05T23:00:00.000Z" "$(printf '%s' "$RACE_RECORD" | jq -r '.holdUntil // empty' 2>/dev/null)"
-assert_eq "the winning record remains complete, not field-merged" "codex|resets 11:00pm (UTC)|false" "$(printf '%s' "$RACE_RECORD" | jq -r '[.vendor,.reason,.fallback] | join("|")' 2>/dev/null)"
-assert_eq "the durable schema has exactly four fields" "fallback,holdUntil,reason,vendor" "$(printf '%s' "$RACE_RECORD" | jq -r 'keys | sort | join(",")' 2>/dev/null)"
+assert_eq "concurrent writers for different vendors both survive" "claude,codex" "$(printf '%s' "$RACE_RECORD" | jq -r 'keys | sort | join(",")' 2>/dev/null)"
+assert_eq "Claude's later timestamp wins only within Claude" "2026-09-05T20:30:00.000Z" "$(printf '%s' "$RACE_RECORD" | jq -r '.claude.holdUntil // empty' 2>/dev/null)"
+assert_eq "Codex keeps its independent deadline" "2026-09-05T23:00:00.000Z" "$(printf '%s' "$RACE_RECORD" | jq -r '.codex.holdUntil // empty' 2>/dev/null)"
+assert_eq "a shorter same-vendor hit does not replace reason or fallback" "resets 8:30pm (UTC)|false" "$(printf '%s' "$RACE_RECORD" | jq -r '[.claude.reason,.claude.fallback] | join("|")' 2>/dev/null)"
+assert_eq "each vendor entry has the exact durable schema" "fallback,holdUntil,reason|fallback,holdUntil,reason" "$(printf '%s' "$RACE_RECORD" | jq -r '[.claude,.codex] | map(keys | sort | join(",")) | join("|")' 2>/dev/null)"
+assert_not_contains "an equal-deadline diagnosis does not replace the existing entry" "$RACE_RECORD" "EQUAL_SENTINEL"
+assert_not_contains "the refused shorter diagnosis is not persisted" "$RACE_RECORD" "SHORTER_SENTINEL"
 
 printf '\nquota hold record: a losing writer gets the host deadline but keeps its own trigger\n'
-printf '%s\n' '{"holdUntil":"2099-01-01T00:00:00.000Z","vendor":"codex","reason":"PRIVATE_REPO_A_SENTINEL","fallback":false}' > "$QUOTA_RECORD"
-LOSING_RESULT="$(EPIC_PROVIDER_HOLD_FILE="$QUOTA_RECORD" TMPDIR="$QUOTA_LOCK_DIR" quota_probe record-result claude 'resets 8:30pm (UTC)' 1788631200000)"
-assert_eq "the later host record remains complete" "codex|PRIVATE_REPO_A_SENTINEL|2099-01-01T00:00:00.000Z" "$(jq -r '[.vendor,.reason,.holdUntil] | join("|")' "$QUOTA_RECORD" 2>/dev/null || true)"
+printf '%s\n' '{"claude":{"holdUntil":"2098-01-01T00:00:00.000Z","reason":"EXISTING_CLAUDE_SENTINEL","fallback":false},"codex":{"holdUntil":"2099-01-01T00:00:00.000Z","reason":"PRIVATE_REPO_A_SENTINEL","fallback":false}}' > "$QUOTA_RECORD"
+LOSING_RESULT="$(EPIC_PROVIDER_HOLD_FILE="$QUOTA_RECORD" TMPDIR="$QUOTA_LOCK_DIR" quota_probe record-result claude 'resets 8:30pm (UTC)' 1788631200000 2>/dev/null)"
+assert_eq "the later same-vendor record remains complete" "EXISTING_CLAUDE_SENTINEL|2098-01-01T00:00:00.000Z" "$(jq -r '[.claude.reason,.claude.holdUntil] | join("|")' "$QUOTA_RECORD" 2>/dev/null || true)"
+assert_eq "another vendor remains alongside the winner" "PRIVATE_REPO_A_SENTINEL|2099-01-01T00:00:00.000Z" "$(jq -r '[.codex.reason,.codex.holdUntil] | join("|")' "$QUOTA_RECORD" 2>/dev/null || true)"
 assert_eq "the return shape separates shared admission state from this trigger" "hostHold,trigger" "$(printf '%s' "$LOSING_RESULT" | jq -r 'keys | sort | join(",")' 2>/dev/null)"
-assert_eq "the losing call receives only the winner's shared timing" "2099-01-01T00:00:00.000Z|false" "$(printf '%s' "$LOSING_RESULT" | jq -r '[.hostHold.holdUntil,.hostHold.fallback] | join("|")' 2>/dev/null)"
+assert_eq "the losing call receives only its vendor's winning timing" "2098-01-01T00:00:00.000Z|false" "$(printf '%s' "$LOSING_RESULT" | jq -r '[.hostHold.holdUntil,.hostHold.fallback] | join("|")' 2>/dev/null)"
 assert_eq "the losing call retains its own provider diagnosis" "claude|resets 8:30pm (UTC)" "$(printf '%s' "$LOSING_RESULT" | jq -r '[.trigger.vendor,.trigger.reason] | join("|")' 2>/dev/null)"
 assert_not_contains "the cross-repository sentinel is absent from the losing result" "$LOSING_RESULT" "PRIVATE_REPO_A_SENTINEL"
+
+printf '\nquota hold record: the exact legacy record normalizes on a mutating path\n'
+printf '%s\n' '{"holdUntil":"2099-01-01T00:00:00.000Z","vendor":"codex","reason":"LEGACY_CODEX_SENTINEL","fallback":false}' > "$QUOTA_RECORD"
+LEGACY_RESULT="$(EPIC_PROVIDER_HOLD_FILE="$QUOTA_RECORD" TMPDIR="$QUOTA_LOCK_DIR" quota_probe record-result claude 'resets 8:30pm (UTC)' 1788631200000)"
+assert_eq "the legacy vendor and new vendor coexist after normalization" "claude,codex" "$(jq -r 'keys | sort | join(",")' "$QUOTA_RECORD" 2>/dev/null || true)"
+assert_eq "the legacy record becomes a strict vendor entry" "2099-01-01T00:00:00.000Z|LEGACY_CODEX_SENTINEL|false" "$(jq -r '[.codex.holdUntil,.codex.reason,.codex.fallback] | join("|")' "$QUOTA_RECORD" 2>/dev/null || true)"
+assert_eq "another vendor's legacy deadline does not replace this run's timing" "2026-09-05T20:30:00.000Z" "$(printf '%s' "$LEGACY_RESULT" | jq -r '.hostHold.holdUntil // empty' 2>/dev/null)"
+assert_not_contains "legacy diagnostics do not leak into another vendor's result" "$LEGACY_RESULT" "LEGACY_CODEX_SENTINEL"
+
 printf '%s\n' '{broken' > "$QUOTA_RECORD"
 BAD_RECORD_RC=0
 EPIC_PROVIDER_HOLD_FILE="$QUOTA_RECORD" TMPDIR="$QUOTA_LOCK_DIR" quota_probe record claude 'resets 8:30pm (UTC)' 1788631200000 >/dev/null 2>&1 || BAD_RECORD_RC=$?
@@ -605,29 +621,48 @@ assert_eq "a refused write does not erase the malformed evidence" "{broken" "$(c
 
 printf '\nquota hold CLI: status may clear expiry while peek is strictly read-only\n'
 CLI_HOLD="$TMP/provider-hold-cli.json"
-printf '%s\n' '{"holdUntil":"2099-01-01T00:00:00.000Z","vendor":"claude","reason":"session limit","fallback":false}' > "$CLI_HOLD"
+printf '%s\n' '{"claude":{"holdUntil":"2099-01-01T00:00:00.000Z","reason":"session limit","fallback":false},"codex":{"holdUntil":"2000-01-01T00:00:00.000Z","reason":"old limit","fallback":true}}' > "$CLI_HOLD"
 PEEK_RC=0
 PEEK_OUT="$(EPIC_PROVIDER_HOLD_FILE="$CLI_HOLD" node "$ROOT/workflows/quota-hold.mjs" peek 2>/dev/null)" || PEEK_RC=$?
 assert_rc "peek reports an active hold" 0 "$PEEK_RC"
-assert_contains "peek prints the active record" "$PEEK_OUT" '"holdUntil":"2099-01-01T00:00:00.000Z"'
-assert_eq "peek leaves an active record untouched" "2099-01-01T00:00:00.000Z" "$(jq -r '.holdUntil' "$CLI_HOLD" 2>/dev/null || true)"
-printf '%s\n' '{"holdUntil":"2000-01-01T00:00:00.000Z","vendor":"claude","reason":"session limit","fallback":false}' > "$CLI_HOLD"
+assert_eq "peek prints only the active vendor map" "claude" "$(printf '%s' "$PEEK_OUT" | jq -r 'keys | sort | join(",")' 2>/dev/null)"
+assert_eq "peek leaves active and expired durable entries untouched" "claude,codex" "$(jq -r 'keys | sort | join(",")' "$CLI_HOLD" 2>/dev/null || true)"
+STATUS_RC=0
+STATUS_OUT="$(EPIC_PROVIDER_HOLD_FILE="$CLI_HOLD" node "$ROOT/workflows/quota-hold.mjs" status 2>/dev/null)" || STATUS_RC=$?
+assert_rc "status reports the surviving active vendor" 0 "$STATUS_RC"
+assert_eq "status prints only the active vendor map" "claude" "$(printf '%s' "$STATUS_OUT" | jq -r 'keys | sort | join(",")' 2>/dev/null)"
+assert_eq "status prunes only the expired vendor from disk" "claude" "$(jq -r 'keys | sort | join(",")' "$CLI_HOLD" 2>/dev/null || true)"
+
+printf '%s\n' '{"codex":{"holdUntil":"2000-01-01T00:00:00.000Z","reason":"old limit","fallback":false}}' > "$CLI_HOLD"
 PEEK_RC=0
 EPIC_PROVIDER_HOLD_FILE="$CLI_HOLD" node "$ROOT/workflows/quota-hold.mjs" peek >/dev/null 2>&1 || PEEK_RC=$?
-assert_rc "peek treats an expired hold as inactive" 1 "$PEEK_RC"
-if [[ -f "$CLI_HOLD" ]]; then ok "peek does not clear an expired record"; else nok "peek does not clear an expired record"; fi
+assert_rc "peek treats a map of expired holds as inactive" 1 "$PEEK_RC"
+if [[ -f "$CLI_HOLD" ]]; then ok "peek does not clear an expired vendor"; else nok "peek does not clear an expired vendor"; fi
 STATUS_RC=0
 EPIC_PROVIDER_HOLD_FILE="$CLI_HOLD" node "$ROOT/workflows/quota-hold.mjs" status >/dev/null 2>&1 || STATUS_RC=$?
-assert_rc "status treats an expired hold as inactive" 1 "$STATUS_RC"
-if [[ ! -e "$CLI_HOLD" ]]; then ok "status clears an expired record"; else nok "status clears an expired record"; fi
+assert_rc "status treats a map of expired holds as inactive" 1 "$STATUS_RC"
+if [[ ! -e "$CLI_HOLD" ]]; then ok "status unlinks an empty map"; else nok "status unlinks an empty map"; fi
 STATUS_RC=0
 EPIC_PROVIDER_HOLD_FILE="$CLI_HOLD" node "$ROOT/workflows/quota-hold.mjs" status >/dev/null 2>&1 || STATUS_RC=$?
 assert_rc "status reports an absent hold without error" 1 "$STATUS_RC"
-printf '%s\n' '{broken' > "$CLI_HOLD"
+
+printf '%s\n' '{"claude":{"holdUntil":"2099-01-01T00:00:00.000Z","reason":"session limit","fallback":false,"vendor":"claude"}}' > "$CLI_HOLD"
 STATUS_RC=0
 EPIC_PROVIDER_HOLD_FILE="$CLI_HOLD" node "$ROOT/workflows/quota-hold.mjs" status >/dev/null 2>&1 || STATUS_RC=$?
-assert_rc "malformed state is distinguished from absence" 2 "$STATUS_RC"
-if [[ -f "$CLI_HOLD" ]]; then ok "malformed state is never silently deleted"; else nok "malformed state is never silently deleted"; fi
+assert_rc "an off-schema vendor entry is distinguished from absence" 2 "$STATUS_RC"
+if [[ -f "$CLI_HOLD" ]]; then ok "off-schema state is never silently deleted"; else nok "off-schema state is never silently deleted"; fi
+
+printf '%s\n' '{"holdUntil":"2099-01-01T00:00:00.000Z","vendor":"codex","reason":"legacy limit","fallback":false}' > "$CLI_HOLD"
+LEGACY_BEFORE="$(cat "$CLI_HOLD")"
+PEEK_RC=0
+PEEK_OUT="$(EPIC_PROVIDER_HOLD_FILE="$CLI_HOLD" node "$ROOT/workflows/quota-hold.mjs" peek 2>/dev/null)" || PEEK_RC=$?
+assert_rc "peek accepts an exact active legacy record" 0 "$PEEK_RC"
+assert_eq "peek presents legacy state as a vendor map" "codex" "$(printf '%s' "$PEEK_OUT" | jq -r 'keys | sort | join(",")' 2>/dev/null)"
+assert_eq "peek never rewrites a legacy record" "$LEGACY_BEFORE" "$(cat "$CLI_HOLD")"
+STATUS_RC=0
+STATUS_OUT="$(EPIC_PROVIDER_HOLD_FILE="$CLI_HOLD" node "$ROOT/workflows/quota-hold.mjs" status 2>/dev/null)" || STATUS_RC=$?
+assert_rc "status accepts an exact active legacy record" 0 "$STATUS_RC"
+assert_eq "status normalizes legacy state on disk" "codex" "$(jq -r 'keys | sort | join(",")' "$CLI_HOLD" 2>/dev/null || true)"
 
 # The runtime diagnostic is consumable data, not prose hidden inside fail().
 # This direct probe fixes the clearing and formatting API independently of any
@@ -788,7 +823,7 @@ result_json() { printf '%s\n' "$RUN_OUT" | sed -n 's/^RESULT //p' | tail -n1; }
 assert_held_contract() { # scenario-name
   local name="$1" result file_until
   result="$(result_json)"
-  file_until="$(jq -r '.holdUntil // empty' "$HOLD_FILE" 2>/dev/null || true)"
+  file_until="$(jq -r '.claude.holdUntil // empty' "$HOLD_FILE" 2>/dev/null || true)"
   assert_eq "$name RESULT has held=true" "true" "$(printf '%s' "$result" | jq -r '.held // false' 2>/dev/null)"
   assert_eq "$name RESULT names issue 42" "42" "$(printf '%s' "$result" | jq -r '.issue // empty' 2>/dev/null)"
   assert_eq "$name RESULT names Claude" "claude" "$(printf '%s' "$result" | jq -r '.vendor // empty' 2>/dev/null)"
@@ -1537,7 +1572,7 @@ assert_contains "RESULT names the issue and failed phase" "$RUN_OUT" '"issue":42
 assert_contains "RESULT names the failed phase" "$RUN_OUT" '"phase":"code"'
 assert_contains "RESULT names the provider vendor" "$RUN_OUT" '"vendor":"claude"'
 assert_eq "RESULT names the resumable slug" "42-add-widget" "$(result_json | jq -r '.slug // empty' 2>/dev/null)"
-assert_eq "RESULT carries the durable holdUntil" "$(jq -r '.holdUntil' "$HOLD_FILE" 2>/dev/null || true)" "$(result_json | jq -r '.holdUntil // empty' 2>/dev/null)"
+assert_eq "RESULT carries the durable holdUntil" "$(jq -r '.claude.holdUntil' "$HOLD_FILE" 2>/dev/null || true)" "$(result_json | jq -r '.holdUntil // empty' 2>/dev/null)"
   assert_eq "RESULT records that parsing succeeded" "false" "$(result_json | jq -r '.fallback' 2>/dev/null)"
 assert_contains "Claude's exact message survives in RESULT" "$RUN_OUT" "You've hit your session limit"
 assert_contains "the provider's reset time survives in RESULT" "$RUN_OUT" "resets 3:50pm (Europe/Amsterdam)"
@@ -1547,11 +1582,11 @@ assert_contains "the status quotes the provider reset reason" "$(cat "$GH_LOG")"
 assert_not_contains "no blocker comment is posted" "$(gh_comments)" "🤖 epic-run blocked"
 assert_eq "the issue returns to ready with no failed state" "ready," "$(gh_labels)"
 assert_eq "the hold is durable before ready is exposed" "" "$(hold_order_error)"
-assert_eq "the hold file has the exact durable schema" "fallback,holdUntil,reason,vendor" "$(jq -r 'keys | sort | join(",")' "$HOLD_FILE" 2>/dev/null || true)"
-assert_eq "the provider reset was parsed without fallback" "false" "$(jq -r '.fallback' "$HOLD_FILE" 2>/dev/null || true)"
-assert_eq "the host record names the vendor" "claude" "$(jq -r '.vendor' "$HOLD_FILE" 2>/dev/null || true)"
-assert_contains "the host record retains the provider reason" "$(jq -r '.reason' "$HOLD_FILE" 2>/dev/null || true)" "resets 3:50pm (Europe/Amsterdam)"
-assert_eq "the hold timestamp is canonical UTC" "valid" "$(jq -r '.holdUntil' "$HOLD_FILE" 2>/dev/null | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:00\.000Z$' && echo valid || echo invalid)"
+assert_eq "the hold file is keyed only by the triggering vendor" "claude" "$(jq -r 'keys | sort | join(",")' "$HOLD_FILE" 2>/dev/null || true)"
+assert_eq "the vendor entry has the exact durable schema" "fallback,holdUntil,reason" "$(jq -r '.claude | keys | sort | join(",")' "$HOLD_FILE" 2>/dev/null || true)"
+assert_eq "the provider reset was parsed without fallback" "false" "$(jq -r '.claude.fallback' "$HOLD_FILE" 2>/dev/null || true)"
+assert_contains "the host record retains the provider reason" "$(jq -r '.claude.reason' "$HOLD_FILE" 2>/dev/null || true)" "resets 3:50pm (Europe/Amsterdam)"
+assert_eq "the hold timestamp is canonical UTC" "valid" "$(jq -r '.claude.holdUntil' "$HOLD_FILE" 2>/dev/null | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:00\.000Z$' && echo valid || echo invalid)"
 assert_eq "one failed usage record is classified durably" "quota-exhausted" "$(usage_log | jq -r 'select(.label=="code:red") | .failureKind')"
 assert_contains "usage retains the provider reason" "$(usage_log)" "resets 3:50pm (Europe/Amsterdam)"
 
@@ -1565,13 +1600,13 @@ assert_rc "the fallback is still a successful hold" 0 "$RUN_RC"
 assert_contains "RESULT marks the fallback" "$RUN_OUT" '"fallback":true'
 assert_eq "fallback RESULT names issue, phase, and vendor" "42|code|claude" "$(result_json | jq -r '[.issue,.phase,.vendor] | join("|")' 2>/dev/null)"
 assert_contains "fallback RESULT retains the provider reason" "$(result_json | jq -r '.reason // empty' 2>/dev/null)" "try again later"
-assert_eq "fallback RESULT carries the durable holdUntil" "$(jq -r '.holdUntil' "$HOLD_FILE" 2>/dev/null || true)" "$(result_json | jq -r '.holdUntil // empty' 2>/dev/null)"
-assert_eq "the file marks the fallback" "true" "$(jq -r '.fallback' "$HOLD_FILE" 2>/dev/null || true)"
+assert_eq "fallback RESULT carries the durable holdUntil" "$(jq -r '.claude.holdUntil' "$HOLD_FILE" 2>/dev/null || true)" "$(result_json | jq -r '.holdUntil // empty' 2>/dev/null)"
+assert_eq "the file marks the fallback" "true" "$(jq -r '.claude.fallback' "$HOLD_FILE" 2>/dev/null || true)"
 FALLBACK_DELTA="$(HOLD_STARTED_MS="$HOLD_STARTED_MS" HOLD_FILE="$HOLD_FILE" node -e '
   const fs = require("node:fs")
   try {
     const hold = JSON.parse(fs.readFileSync(process.env.HOLD_FILE, "utf8"))
-    console.log(Date.parse(hold.holdUntil) - Number(process.env.HOLD_STARTED_MS))
+    console.log(Date.parse(hold.claude.holdUntil) - Number(process.env.HOLD_STARTED_MS))
   } catch { console.log("invalid") }
 ')"
 assert_eq "the end-to-end fallback is thirty minutes from the run clock" "in-range" "$( [[ "$FALLBACK_DELTA" =~ ^[0-9]+$ ]] && (( FALLBACK_DELTA >= 1800000 && FALLBACK_DELTA < 1810000 )) && echo in-range || echo "$FALLBACK_DELTA" )"
@@ -1581,17 +1616,29 @@ scenario 'provider quota: stderr-only reset diagnostics drive and describe the h
 CODEX_QUOTA_STDERR_ONLY=1 EXPECT_HOLD_BEFORE_LABEL=ready run_pipeline "$EPIC_RUN" "$BASE" --issue 42 --engine codex
 assert_rc "the stderr-classified quota hold exits successfully" 0 "$RUN_RC"
 assert_eq "the hard quota is not respawned" 1 "$(wc -l < "$CODEX_LOG" | tr -d ' ')"
-assert_eq "the stderr reset parses instead of using the fallback" "false" "$(jq -r '.fallback' "$HOLD_FILE" 2>/dev/null || true)"
-assert_contains "the hold file retains the matching stderr diagnosis" "$(jq -r '.reason // empty' "$HOLD_FILE" 2>/dev/null || true)" "resets 7:50pm (UTC)"
+assert_eq "the stderr reset parses instead of using the fallback" "false" "$(jq -r '.codex.fallback' "$HOLD_FILE" 2>/dev/null || true)"
+assert_contains "the hold file retains the matching stderr diagnosis" "$(jq -r '.codex.reason // empty' "$HOLD_FILE" 2>/dev/null || true)" "resets 7:50pm (UTC)"
 assert_contains "RESULT retains the matching stderr diagnosis" "$(result_json | jq -r '.reason // empty' 2>/dev/null)" "resets 7:50pm (UTC)"
 assert_contains "the final status retains the matching stderr diagnosis" "$(cat "$GH_LOG")" "resets 7:50pm (UTC)"
 
-scenario 'provider quota: a later host hold shares only timing with the current run'
-SEED_HOLD_RECORD='{"holdUntil":"2099-01-01T00:00:00.000Z","vendor":"codex","reason":"PRIVATE_REPO_A_SENTINEL","fallback":false}' \
+scenario 'provider quota: an in-flight mixed engine records only the vendor whose step failed'
+SEED_HOLD_RECORD='{"claude":{"holdUntil":"2099-01-01T00:00:00.000Z","reason":"EXISTING_CLAUDE_SENTINEL","fallback":false}}' \
+  CODEX_QUOTA_STDERR_ONLY=1 run_pipeline "$EPIC_RUN" "$BASE" --issue 42 --engine codex+claude
+assert_rc "the mixed-engine quota becomes a successful hold" 0 "$RUN_RC"
+assert_eq "the mixed run reaches its Codex review step before holding" "review|codex" "$(result_json | jq -r '[.phase,.vendor] | join("|")' 2>/dev/null)"
+assert_eq "the mixed run records Codex beside the existing Claude hold" "claude,codex" "$(jq -r 'keys | sort | join(",")' "$HOLD_FILE" 2>/dev/null || true)"
+assert_contains "the pre-existing vendor diagnosis survives the mixed run" "$(jq -r '.claude.reason // empty' "$HOLD_FILE" 2>/dev/null || true)" "EXISTING_CLAUDE_SENTINEL"
+assert_contains "the failed step's vendor gets its own diagnosis" "$(jq -r '.codex.reason // empty' "$HOLD_FILE" 2>/dev/null || true)" "resets 7:50pm (UTC)"
+assert_eq "Claude implementation completed before the Codex quota" 1 "$(calls green)"
+
+scenario "provider quota: another vendor's later hold does not affect this run's timing"
+SEED_HOLD_RECORD='{"codex":{"holdUntil":"2099-01-01T00:00:00.000Z","reason":"PRIVATE_REPO_A_SENTINEL","fallback":false}}' \
   EXPECT_HOLD_BEFORE_LABEL=ready run_pipeline "$EPIC_RUN" "$QUOTA" --issue 42
-assert_rc "the losing quota writer still produces a successful hold" 0 "$RUN_RC"
-assert_eq "the host file retains the later winner" "codex|PRIVATE_REPO_A_SENTINEL|2099-01-01T00:00:00.000Z" "$(jq -r '[.vendor,.reason,.holdUntil] | join("|")' "$HOLD_FILE" 2>/dev/null || true)"
-assert_eq "RESULT uses the host-wide winning deadline" "2099-01-01T00:00:00.000Z" "$(result_json | jq -r '.holdUntil // empty' 2>/dev/null)"
+assert_rc "the current quota writer still produces a successful hold" 0 "$RUN_RC"
+assert_eq "the host file retains the other vendor" "PRIVATE_REPO_A_SENTINEL|2099-01-01T00:00:00.000Z" "$(jq -r '[.codex.reason,.codex.holdUntil] | join("|")' "$HOLD_FILE" 2>/dev/null || true)"
+assert_eq "the current vendor is added beside it" "claude,codex" "$(jq -r 'keys | sort | join(",")' "$HOLD_FILE" 2>/dev/null || true)"
+assert_eq "RESULT uses only the current vendor's winning deadline" "$(jq -r '.claude.holdUntil' "$HOLD_FILE" 2>/dev/null || true)" "$(result_json | jq -r '.holdUntil // empty' 2>/dev/null)"
+assert_not_contains "another vendor's later deadline does not leak into RESULT" "$(result_json)" "2099-01-01T00:00:00.000Z"
 assert_eq "RESULT names the current run's vendor" "claude" "$(result_json | jq -r '.vendor // empty' 2>/dev/null)"
 assert_contains "RESULT keeps the current provider diagnosis" "$(result_json | jq -r '.reason // empty' 2>/dev/null)" "resets 3:50pm (Europe/Amsterdam)"
 assert_not_contains "RESULT does not leak the other repository's diagnosis" "$(result_json)" "PRIVATE_REPO_A_SENTINEL"
@@ -1609,7 +1656,7 @@ scenario 'provider quota: an unverified ready transition is not a successful hol
 EXPECT_HOLD_BEFORE_LABEL=ready GH_DROP_LABEL=ready run_pipeline "$EPIC_RUN" "$QUOTA" --issue 42
 assert_rc "failure to verify ready blocks the run" 3 "$RUN_RC"
 assert_not_contains "an unverified label transition never advertises held" "$RUN_OUT" '"held":true'
-assert_eq "the hold itself was durable before label restoration" "false" "$(jq -r '.fallback' "$HOLD_FILE" 2>/dev/null || true)"
+assert_eq "the hold itself was durable before label restoration" "false" "$(jq -r '.claude.fallback' "$HOLD_FILE" 2>/dev/null || true)"
 assert_eq "the issue falls back to the blocker terminal state" "failed," "$(gh_labels)"
 assert_contains "the failed transition posts the ordinary blocker comment" "$(gh_comments)" "🤖 epic-run blocked"
 
@@ -2095,7 +2142,7 @@ assert_not_contains "the rung added by this invocation was removed" "$(gh_labels
 assert_not_contains "no conflict blocker comment is posted" "$(gh_comments)" "🤖 fix-conflict blocked"
 assert_contains "the status comment says held" "$(cat "$GH_LOG")" "**held**: provider quota exhausted, resumes after"
 assert_eq "the PR branch is not pushed by the hold path" "$BEFORE" "$(origin_ref epic/42-add-widget)"
-assert_eq "the fixer wrote the shared host hold" "claude|false" "$(jq -r '[.vendor,.fallback] | join("|")' "$HOLD_FILE" 2>/dev/null || true)"
+assert_eq "the fixer wrote only Claude's host hold" "claude|false" "$(jq -r '[keys[0],.claude.fallback] | join("|")' "$HOLD_FILE" 2>/dev/null || true)"
 
 scenario 'fix-run: failed hold verification blocks without refunding the spent rung'
 seed_conflict
@@ -2288,7 +2335,7 @@ assert_not_contains "ci-retried is absent after the hold" "$(gh_labels)" "ci-ret
 assert_not_contains "no CI blocker comment is posted" "$(gh_comments)" "🤖 fix-ci blocked"
 assert_contains "the status comment says held" "$(cat "$GH_LOG")" "**held**: provider quota exhausted, resumes after"
 assert_eq "the PR branch is not pushed by the hold path" "$BEFORE" "$(origin_ref epic/42-add-widget)"
-assert_eq "the CI fixer wrote the shared host hold" "claude|false" "$(jq -r '[.vendor,.fallback] | join("|")' "$HOLD_FILE" 2>/dev/null || true)"
+assert_eq "the CI fixer wrote only Claude's host hold" "claude|false" "$(jq -r '[keys[0],.claude.fallback] | join("|")' "$HOLD_FILE" 2>/dev/null || true)"
 
 scenario 'ci-run: failed hold verification blocks without refunding the retry rung'
 seed_ci_pr
@@ -2527,7 +2574,7 @@ assert_not_contains "defect-retried is absent after the hold" "$(gh_labels)" "de
 assert_not_contains "no defect blocker comment is posted" "$(gh_comments)" "🤖 fix-defect blocked"
 assert_contains "the status comment says held" "$(cat "$GH_LOG")" "**held**: provider quota exhausted, resumes after"
 assert_eq "the PR branch is not pushed by the hold path" "$BEFORE" "$(origin_ref epic/42-add-widget)"
-assert_eq "the defect fixer wrote the shared host hold" "claude|false" "$(jq -r '[.vendor,.fallback] | join("|")' "$HOLD_FILE" 2>/dev/null || true)"
+assert_eq "the defect fixer wrote only Claude's host hold" "claude|false" "$(jq -r '[keys[0],.claude.fallback] | join("|")' "$HOLD_FILE" 2>/dev/null || true)"
 
 scenario 'defect-run: failed hold verification blocks without refunding the retry rung'
 seed_defect_pr

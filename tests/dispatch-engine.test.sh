@@ -143,6 +143,15 @@ case "${1:-} ${2:-}" in
     for add in "${adds[@]}"; do
       if [[ ",$labels," != *",$add,"* ]]; then labels="${labels:+$labels,}$add"; fi
     done
+    if [[ "${REROUTE_AFTER_SHIELD_ISSUE:-}" == "$n" && " ${adds[*]} " == *" in-progress "* ]]; then
+      kept=""
+      old_ifs="$IFS"; IFS=','
+      for label in $labels; do
+        [[ "$label" == engine:* ]] || kept="${kept:+$kept,}$label"
+      done
+      IFS="$old_ifs"
+      labels="${kept:+$kept,}engine:${REROUTE_AFTER_SHIELD_ENGINE}"
+    fi
     printf '%s' "$labels" > "$LABEL_DIR/$n"
     ;;
   "label create") ;;
@@ -172,6 +181,8 @@ run_dispatch() {
     FAIL_BLOCKER_ISSUE="${FAIL_BLOCKER_ISSUE:-}" \
     FAIL_QUEUE="${FAIL_QUEUE:-}" \
     COMMA_LABEL_ISSUE="${COMMA_LABEL_ISSUE:-}" \
+    REROUTE_AFTER_SHIELD_ISSUE="${REROUTE_AFTER_SHIELD_ISSUE:-}" \
+    REROUTE_AFTER_SHIELD_ENGINE="${REROUTE_AFTER_SHIELD_ENGINE:-}" \
     FLOCK_BUSY="${FLOCK_BUSY:-}" STUB_SESSION_NAME="${STUB_SESSION_NAME:-}" \
     CAPACITY_RC="${CAPACITY_RC:-}" LAUNCH_RC="${LAUNCH_RC:-}" \
     EPIC_PROVIDER_HOLD_FILE="$TMP/provider-hold.json" \
@@ -192,6 +203,8 @@ reset_state() {
   FAIL_BLOCKER_ISSUE=""
   FAIL_QUEUE=""
   COMMA_LABEL_ISSUE=""
+  REROUTE_AFTER_SHIELD_ISSUE=""
+  REROUTE_AFTER_SHIELD_ENGINE=""
   FLOCK_BUSY=""
   STUB_SESSION_NAME=""
   LAUNCH_RC=""
@@ -218,40 +231,96 @@ assert_rc "an unknown engine is rejected" 1 "$ENGINE_RC"
 assert_contains "the rejection lists valid choices" "$ENGINE_OUT" "available: claude codex codex+claude"
 assert_eq "a rejected engine leaves the default unchanged" "EPIC_ENGINE=claude" "$(grep '^EPIC_ENGINE=' "$ENGINE_CRON")"
 
-printf '\ndispatch hold: an active record stops before capacity, GitHub, or labels\n'
+printf '\ndispatch hold: a Claude hold skips Claude and mixed engines but admits Codex\n'
 reset_state
-READY_QUEUE=1
+READY_QUEUE='1\n2\n3'
 printf 'ready' > "$TMP/labels/1"
-printf '%s\n' '{"holdUntil":"2099-01-01T00:00:00.000Z","vendor":"claude","reason":"session limit","fallback":false}' > "$TMP/provider-hold.json"
+printf 'ready,engine:claude' > "$TMP/labels/2"
+printf 'ready,engine:codex' > "$TMP/labels/3"
+printf '%s\n' '{"claude":{"holdUntil":"2099-01-01T00:00:00.000Z","reason":"session limit","fallback":false}}' > "$TMP/provider-hold.json"
+export EPIC_ENGINE=codex+claude
 run_dispatch
-assert_rc "an active hold is a clean tick" 0 "$RUN_RC"
-assert_eq "the required hold line is logged exactly once" 1 "$(printf '%s\n' "$RUN_OUT" | grep -c 'provider quota exhausted — holding launches until 2099-01-01 01:00:00 CET' || true)"
-assert_not_contains "a parsed reset has no fallback marker" "$RUN_OUT" "(fallback)"
-assert_eq "capacity is not even probed" "" "$(cat "$TMP/launch.log")"
-assert_eq "GitHub is untouched while held" "" "$(cat "$TMP/gh.log")"
-assert_eq "the queued issue label is unchanged" "ready," "$(issue_labels 1)"
+unset EPIC_ENGINE
+assert_rc "selective admission is a clean tick" 0 "$RUN_RC"
+assert_eq "the default mixed engine logs one Claude hold line" 1 "$(printf '%s\n' "$RUN_OUT" | grep -c '#1: held (claude quota until 2099-01-01 01:00:00 CET)' || true)"
+assert_eq "the explicit Claude engine logs one Claude hold line" 1 "$(printf '%s\n' "$RUN_OUT" | grep -c '#2: held (claude quota until 2099-01-01 01:00:00 CET)' || true)"
+assert_contains "engine:codex candidate launches while claude is held" "$(cat "$TMP/launch.log")" '--epic 3 --repo testrepo --engine codex'
+assert_not_contains "the mixed engine is not launched" "$(cat "$TMP/launch.log")" '--epic 1'
+assert_not_contains "the Claude engine is not launched" "$(cat "$TMP/launch.log")" '--epic 2'
+assert_eq "held ready issues receive no label write" "" "$(grep 'issue edit [12] ' "$TMP/gh.log" || true)"
 
-printf '\ndispatch hold: fallback and dry-run use the same admission gate\n'
+printf '\ndispatch hold: dry-run uses the same selective gate and keeps walking\n'
 reset_state
-READY_QUEUE=2
-printf 'ready' > "$TMP/labels/2"
-printf '%s\n' '{"holdUntil":"2099-01-01T00:00:00.000Z","vendor":"claude","reason":"limit without reset","fallback":true}' > "$TMP/provider-hold.json"
+READY_QUEUE='4\n5'
+printf 'ready,engine:codex' > "$TMP/labels/4"
+printf 'ready,engine:claude' > "$TMP/labels/5"
+printf '%s\n' '{"codex":{"holdUntil":"2099-01-01T00:00:00.000Z","reason":"limit without reset","fallback":true}}' > "$TMP/provider-hold.json"
 run_dispatch --dry-run
-assert_rc "dry-run under a hold exits cleanly" 0 "$RUN_RC"
-assert_eq "dry-run logs one hold line" 1 "$(printf '%s\n' "$RUN_OUT" | grep -c 'provider quota exhausted — holding launches until 2099-01-01 01:00:00 CET (fallback)' || true)"
-assert_eq "dry-run does not walk GitHub while held" "" "$(cat "$TMP/gh.log")"
-assert_eq "dry-run does not call launch, including capacity" "" "$(cat "$TMP/launch.log")"
+assert_rc "selective dry-run exits cleanly" 0 "$RUN_RC"
+assert_eq "dry-run logs the held Codex candidate once" 1 "$(printf '%s\n' "$RUN_OUT" | grep -c '#4: held (codex quota until 2099-01-01 01:00:00 CET)' || true)"
+assert_contains "dry-run still reports an unheld Claude launch" "$RUN_OUT" "#5 (testrepo): would launch 'testrepo-epic-5' with claude"
+assert_not_contains "dry-run does not report the held candidate as launchable" "$RUN_OUT" "would launch 'testrepo-epic-4'"
+assert_eq "dry-run calls no launch command" "" "$(cat "$TMP/launch.log")"
+
+printf '\ndispatch hold: every matching vendor is named and both vendors stop all candidates\n'
+reset_state
+READY_QUEUE='6\n7\n8'
+printf 'ready,engine:codex+claude' > "$TMP/labels/6"
+printf 'ready,engine:claude' > "$TMP/labels/7"
+printf 'ready,engine:codex' > "$TMP/labels/8"
+printf '%s\n' '{"claude":{"holdUntil":"2099-01-01T00:00:00.000Z","reason":"session limit","fallback":false},"codex":{"holdUntil":"2099-01-02T00:00:00.000Z","reason":"usage limit","fallback":true}}' > "$TMP/provider-hold.json"
+run_dispatch
+assert_rc "an all-held tick is clean" 0 "$RUN_RC"
+assert_eq "the mixed candidate gets exactly one held line" 1 "$(printf '%s\n' "$RUN_OUT" | grep -c '#6: held (' || true)"
+assert_contains "the mixed held line names Claude" "$RUN_OUT" "#6: held (claude quota until 2099-01-01 01:00:00 CET"
+assert_contains "the mixed held line also names Codex" "$RUN_OUT" "codex quota until 2099-01-02 01:00:00 CET"
+assert_eq "both held vendors launch no candidate" "" "$(grep -- '--epic' "$TMP/launch.log" || true)"
+assert_eq "an all-held tick writes no labels" "" "$(grep 'issue edit' "$TMP/gh.log" || true)"
+
+printf '\ndispatch hold: all-held candidates are reported even when the host is full\n'
+reset_state
+FIXER_QUEUE=44
+READY_QUEUE='45\n46'
+printf 'failed,needs-judgment,engine:claude' > "$TMP/labels/44"
+printf 'ready,engine:codex+claude' > "$TMP/labels/45"
+printf 'ready,engine:claude' > "$TMP/labels/46"
+printf '%s\n' '{"claude":{"holdUntil":"2099-01-01T00:00:00.000Z","reason":"session limit","fallback":false}}' > "$TMP/provider-hold.json"
+CAPACITY_RC=3
+run_dispatch
+assert_rc "an all-held full-host tick is clean" 0 "$RUN_RC"
+for num in 44 45 46; do
+  assert_eq "held candidate #$num is reported exactly once" 1 "$(printf '%s\n' "$RUN_OUT" | grep -c "#$num: held (claude quota until 2099-01-01 01:00:00 CET)" || true)"
+done
+assert_not_contains "capacity is not probed without an unheld candidate" "$(cat "$TMP/launch.log")" '--check-capacity'
+assert_eq "no fixer or epic launch is attempted" "" "$(grep -E -- '--(fix|ci|defect|epic)' "$TMP/launch.log" || true)"
+assert_eq "the full-host all-held scan writes no labels" "" "$(grep 'issue edit' "$TMP/gh.log" || true)"
+
+printf '\ndispatch hold: cached full capacity stays a clean read-only scan\n'
+reset_state
+READY_QUEUE='47\n48\n49'
+printf 'ready,engine:codex' > "$TMP/labels/47"
+printf 'ready,engine:codex' > "$TMP/labels/48"
+printf 'ready,engine:claude' > "$TMP/labels/49"
+printf '%s\n' '{"claude":{"holdUntil":"2099-01-01T00:00:00.000Z","reason":"session limit","fallback":false}}' > "$TMP/provider-hold.json"
+CAPACITY_RC=3
+run_dispatch
+assert_rc "cached full capacity is a clean deferral" 0 "$RUN_RC"
+assert_eq "capacity is probed exactly once" 1 "$(grep -c '^--check-capacity$' "$TMP/launch.log" || true)"
+assert_eq "full capacity is reported exactly once" 1 "$(printf '%s\n' "$RUN_OUT" | grep -c 'host at capacity — nothing can launch, continuing held-candidate reporting' || true)"
+assert_eq "no launch is attempted after the full-capacity probe" "" "$(grep -E -- '--(fix|ci|defect|epic)' "$TMP/launch.log" || true)"
+assert_eq "the full-host scan writes no labels" "" "$(grep 'issue edit' "$TMP/gh.log" || true)"
+assert_eq "the later held candidate is still reported" 1 "$(printf '%s\n' "$RUN_OUT" | grep -c '#49: held (claude quota until 2099-01-01 01:00:00 CET)' || true)"
 
 printf '\ndispatch hold: expiry is cleared and normal dispatch resumes\n'
 reset_state
-READY_QUEUE=3
-printf 'ready' > "$TMP/labels/3"
-printf '%s\n' '{"holdUntil":"2000-01-01T00:00:00.000Z","vendor":"claude","reason":"old limit","fallback":false}' > "$TMP/provider-hold.json"
+READY_QUEUE=9
+printf 'ready' > "$TMP/labels/9"
+printf '%s\n' '{"claude":{"holdUntil":"2000-01-01T00:00:00.000Z","reason":"old limit","fallback":false}}' > "$TMP/provider-hold.json"
 run_dispatch
 assert_rc "an expired hold does not block the tick" 0 "$RUN_RC"
 if [[ ! -e "$TMP/provider-hold.json" ]]; then ok "the expired hold is cleared under the tick lock"; else nok "the expired hold is cleared under the tick lock"; fi
 assert_contains "capacity is probed after expiry" "$(cat "$TMP/launch.log")" "--check-capacity"
-assert_contains "the ready issue launches after expiry" "$(cat "$TMP/launch.log")" "--epic 3 --repo testrepo --engine claude"
+assert_contains "the ready issue launches after expiry" "$(cat "$TMP/launch.log")" "--epic 9 --repo testrepo --engine claude"
 
 printf '\ndispatch hold: malformed and unreadable host state fail closed\n'
 reset_state
@@ -273,20 +342,20 @@ assert_eq "unreadable state blocks every GitHub call" "" "$(cat "$TMP/gh.log")"
 
 printf '\ndispatch hold: routing-only modes bypass launch admission\n'
 reset_state
-READY_QUEUE=6
-printf 'ready' > "$TMP/labels/6"
-printf '%s\n' '{"holdUntil":"2099-01-01T00:00:00.000Z","vendor":"claude","reason":"session limit","fallback":false}' > "$TMP/provider-hold.json"
+READY_QUEUE=10
+printf 'ready' > "$TMP/labels/10"
+printf '%s\n' '{"claude":{"holdUntil":"2099-01-01T00:00:00.000Z","reason":"session limit","fallback":false}}' > "$TMP/provider-hold.json"
 run_dispatch --route-next codex
 assert_rc "route-next remains available during a hold" 0 "$RUN_RC"
-assert_contains "route-next persists its label" "$(cat "$TMP/labels/6")" "engine:codex"
-assert_not_contains "route-next does not report launch admission" "$RUN_OUT" "provider quota exhausted"
+assert_contains "route-next persists its label" "$(cat "$TMP/labels/10")" "engine:codex"
+assert_not_contains "route-next does not report launch admission" "$RUN_OUT" "quota until"
 assert_eq "route-next never probes capacity" "" "$(cat "$TMP/launch.log")"
-printf 'ready,engine:claude' > "$TMP/labels/7"
-run_dispatch --route-issue 7 codex --repo testrepo
+printf 'ready,engine:claude' > "$TMP/labels/11"
+run_dispatch --route-issue 11 codex --repo testrepo
 assert_rc "route-issue remains available during a hold" 0 "$RUN_RC"
-assert_contains "route-issue persists its label" "$(cat "$TMP/labels/7")" "engine:codex"
-assert_not_contains "route-issue does not report launch admission" "$RUN_OUT" "provider quota exhausted"
-assert_eq "the routing bypass leaves the active hold intact" "2099-01-01T00:00:00.000Z" "$(jq -r '.holdUntil' "$TMP/provider-hold.json" 2>/dev/null || true)"
+assert_contains "route-issue persists its label" "$(cat "$TMP/labels/11")" "engine:codex"
+assert_not_contains "route-issue does not report launch admission" "$RUN_OUT" "quota until"
+assert_eq "the routing bypass leaves the active hold intact" "2099-01-01T00:00:00.000Z" "$(jq -r '.claude.holdUntil' "$TMP/provider-hold.json" 2>/dev/null || true)"
 
 printf '\ndispatch: an invalid registry timezone fails before host-facing work\n'
 reset_state
@@ -385,6 +454,27 @@ assert_rc "tick exits 0" 0 "$RUN_RC"
 assert_contains "the engine name is forwarded as-is" "$(cat "$TMP/launch.log")" '--epic 15 --repo testrepo --engine mixed'
 cp "$ROOT/etc/engines.json" "$HARNESS/etc/engines.json"
 
+printf '\ndispatch hold: vendor sets come from every step in the engine table\n'
+reset_state
+jq '. + {"future-mixed": .["codex+claude"]}' "$ROOT/etc/engines.json" > "$HARNESS/etc/engines.json"
+READY_QUEUE=16
+printf 'ready,engine:future-mixed' > "$TMP/labels/16"
+printf '%s\n' '{"claude":{"holdUntil":"2099-01-01T00:00:00.000Z","reason":"session limit","fallback":false}}' > "$TMP/provider-hold.json"
+run_dispatch --dry-run
+assert_rc "a future mixed engine is resolved cleanly" 0 "$RUN_RC"
+assert_eq "a vendor found only through the engine table holds the candidate" 1 "$(printf '%s\n' "$RUN_OUT" | grep -c '#16: held (claude quota until 2099-01-01 01:00:00 CET)' || true)"
+assert_not_contains "the future mixed engine is not treated as launchable" "$RUN_OUT" "would launch 'testrepo-epic-16'"
+
+reset_state
+jq '. + {broken: {architect: 7}}' "$ROOT/etc/engines.json" > "$HARNESS/etc/engines.json"
+READY_QUEUE=17
+printf 'ready,engine:broken' > "$TMP/labels/17"
+printf '%s\n' '{"claude":{"holdUntil":"2099-01-01T00:00:00.000Z","reason":"session limit","fallback":false}}' > "$TMP/provider-hold.json"
+run_dispatch --dry-run
+assert_rc "an unresolvable engine vendor set fails closed" 1 "$RUN_RC"
+assert_not_contains "an unresolvable engine is never launchable" "$RUN_OUT" "would launch 'testrepo-epic-17'"
+cp "$ROOT/etc/engines.json" "$HARNESS/etc/engines.json"
+
 printf '\nroute-next: exact queue order, blockers, and explicit routes are respected\n'
 reset_state
 READY_QUEUE='1\n2\n3'
@@ -431,6 +521,56 @@ printf 'failed,needs-judgment,engine:codex' > "$TMP/labels/9"
 run_dispatch
 assert_rc "tick exits 0" 0 "$RUN_RC"
 assert_contains "fixer launch keeps Codex" "$(cat "$TMP/launch.log")" '--fix 9 --repo testrepo --engine codex'
+
+printf '\ndispatch hold: held fixers are skipped before their terminal-label shield\n'
+reset_state
+FIXER_QUEUE='40\n41'
+printf 'failed,needs-judgment,engine:claude' > "$TMP/labels/40"
+printf 'failed,needs-judgment,engine:codex' > "$TMP/labels/41"
+printf '%s\n' '{"claude":{"holdUntil":"2099-01-01T00:00:00.000Z","reason":"session limit","fallback":false}}' > "$TMP/provider-hold.json"
+run_dispatch
+assert_rc "a held fixer does not make the tick fail" 0 "$RUN_RC"
+assert_eq "the held fixer logs exactly once" 1 "$(printf '%s\n' "$RUN_OUT" | grep -c '#40: held (claude quota until 2099-01-01 01:00:00 CET)' || true)"
+assert_eq "the held fixer's labels are untouched" "engine:claude,failed,needs-judgment," "$(issue_labels 40)"
+assert_eq "the held fixer receives no label write" "" "$(grep 'issue edit 40 ' "$TMP/gh.log" || true)"
+assert_contains "the fixer walk continues to an unheld engine" "$(cat "$TMP/launch.log")" '--fix 41 --repo testrepo --engine codex'
+assert_eq "only the launched fixer gets the in-progress shield" "engine:codex,in-progress,needs-judgment," "$(issue_labels 41)"
+
+printf '\ndispatch hold: a fixer rerouted after admission is reverted and skipped\n'
+reset_state
+FIXER_QUEUE='47\n48'
+printf 'failed,needs-judgment,engine:codex' > "$TMP/labels/47"
+printf 'failed,needs-judgment,engine:codex' > "$TMP/labels/48"
+printf '%s\n' '{"claude":{"holdUntil":"2099-01-01T00:00:00.000Z","reason":"session limit","fallback":false}}' > "$TMP/provider-hold.json"
+REROUTE_AFTER_SHIELD_ISSUE=47
+REROUTE_AFTER_SHIELD_ENGINE=claude
+run_dispatch
+assert_rc "a racing fixer reroute is a clean skip" 0 "$RUN_RC"
+assert_not_contains "the fixer is not launched on its newly held engine" "$(cat "$TMP/launch.log")" '--fix 47'
+assert_eq "the changed fixer is restored to its queue" "engine:claude,failed,needs-judgment," "$(issue_labels 47)"
+assert_contains "the fixer walk continues to a stable unheld candidate" "$(cat "$TMP/launch.log")" '--fix 48 --repo testrepo --engine codex'
+assert_eq "the stable fixer alone receives the shield" "engine:codex,in-progress,needs-judgment," "$(issue_labels 48)"
+
+reset_state
+CI_QUEUE=42
+printf 'failed,needs-ci-fix,engine:claude' > "$TMP/labels/42"
+printf '%s\n' '{"claude":{"holdUntil":"2099-01-01T00:00:00.000Z","reason":"session limit","fallback":false}}' > "$TMP/provider-hold.json"
+run_dispatch
+assert_rc "a held CI fixer is a clean skip" 0 "$RUN_RC"
+assert_eq "the held CI fixer logs once" 1 "$(printf '%s\n' "$RUN_OUT" | grep -c '#42: held (claude quota until 2099-01-01 01:00:00 CET)' || true)"
+assert_eq "a held CI fixer receives no label write" "" "$(grep 'issue edit 42 ' "$TMP/gh.log" || true)"
+assert_eq "a held CI fixer keeps its resting labels" "engine:claude,failed,needs-ci-fix," "$(issue_labels 42)"
+
+reset_state
+set_defect_fix_repos "testrepo"
+DEFECT_QUEUE=43
+printf 'ready-to-review,needs-defect-fix,engine:claude' > "$TMP/labels/43"
+printf '%s\n' '{"claude":{"holdUntil":"2099-01-01T00:00:00.000Z","reason":"session limit","fallback":false}}' > "$TMP/provider-hold.json"
+run_dispatch
+assert_rc "a held defect fixer is a clean skip" 0 "$RUN_RC"
+assert_eq "the held defect fixer logs once" 1 "$(printf '%s\n' "$RUN_OUT" | grep -c '#43: held (claude quota until 2099-01-01 01:00:00 CET)' || true)"
+assert_eq "a held defect fixer receives no label write" "" "$(grep 'issue edit 43 ' "$TMP/gh.log" || true)"
+assert_eq "a held defect fixer keeps ready-to-review" "engine:claude,needs-defect-fix,ready-to-review," "$(issue_labels 43)"
 
 printf '\nfixer: a red check goes to the CI fixer, not the conflict fixer\n'
 reset_state

@@ -28,8 +28,10 @@ set -euo pipefail
 # never over-dispatch.
 #
 # Capacity is not decided here either — bin/launch.sh owns it (see the comment
-# at its capacity check). Before asking, an automatic tick observes the shared
-# provider hold under this script's lock; routing-only modes bypass admission.
+# at its capacity check). Before asking, an automatic tick snapshots the
+# vendor-keyed provider holds under this script's lock; each candidate is then
+# admitted from the vendors used by its resolved engine. Routing-only modes
+# bypass admission.
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/../etc/lib.sh"
@@ -75,9 +77,9 @@ until the host hits MAX_PARALLEL_EPICS ($MAX_PARALLEL_EPICS).
                       Persist an explicit manual epic/fix engine choice on one
                       issue. Requires -r; labels only and launches nothing.
 
-An active host provider-quota hold stops an ordinary or dry-run tick before
-capacity and GitHub. Routing-only modes and explicit remote-control launches
-remain available as operator overrides.
+An active host provider-quota hold skips ordinary and dry-run candidates whose
+engine uses that vendor; other engines keep walking. Routing-only modes and
+explicit remote-control launches remain available as operator overrides.
 EOF
 }
 
@@ -289,29 +291,42 @@ if (( HAVE_ROUTE_ISSUE )); then
   exit 0
 fi
 
-# Admission comes after routing-only exits and before even the capacity probe.
-# `status` is allowed to clear an expired record because fd 9 already owns the
-# same lock every writer uses. Malformed or unreadable host state fails closed:
-# absence is launchable, uncertainty is not.
+# Admission state is loaded once after routing-only exits and before even the
+# capacity probe. `status` may prune expired entries because fd 9 already owns
+# the same lock every writer uses. Malformed or unreadable host state fails
+# closed: absence is launchable, uncertainty is not. An active map does not end
+# the tick; candidate_is_held applies it after each issue's engine is resolved.
+HOLD_STATE='{}'
+ACTIVE_HOLDS=0
 if (( ! HAVE_ROUTE_NEXT )); then
   set +e
   HOLD_STATE="$(node "$HERE/../workflows/quota-hold.mjs" status 2>&1)"
   hold_rc=$?
   set -e
   case "$hold_rc" in
-    0)
-      read -r HOLD_UNTIL HOLD_FALLBACK < <(node -e '
-        const value = JSON.parse(process.argv[1])
-        process.stdout.write(`${value.holdUntil} ${value.fallback ? "true" : "false"}\n`)
-      ' "$HOLD_STATE")
-      say "provider quota exhausted — holding launches until $HOLD_UNTIL$([[ "$HOLD_FALLBACK" == true ]] && printf ' (fallback)')"
-      exit 0 ;;
-    1) ;;
+    0) ACTIVE_HOLDS=1 ;;
+    1) HOLD_STATE='{}' ;;
     *)
       warn "provider quota hold state is unreadable — refusing to launch: ${HOLD_STATE:-unknown error}"
       exit 1 ;;
   esac
 fi
+
+HELD_DETAILS=""
+candidate_is_held() { # resolved engine; 0 held, 1 clear, 2 invalid engine rows
+  local engine="$1" vendors vendor hold_until
+  HELD_DETAILS=""
+  if ! vendors="$(engine_vendors "$engine")"; then
+    return 2
+  fi
+  while IFS= read -r vendor; do
+    [[ -n "$vendor" ]] || continue
+    if hold_until="$(jq -er --arg vendor "$vendor" '.[$vendor].holdUntil' <<<"$HOLD_STATE" 2>/dev/null)"; then
+      HELD_DETAILS="${HELD_DETAILS:+$HELD_DETAILS, }$vendor quota until $hold_until"
+    fi
+  done <<<"$vendors"
+  [[ -n "$HELD_DETAILS" ]]
+}
 
 # ───────────────────────── Fixer walks ─────────────────────────
 # Three queues, each selected by a durable label rather than comment prose:
@@ -337,29 +352,61 @@ fixer_queue() {
       --state open --limit "$QUEUE_LIMIT" --json number --jq '.[].number')
 }
 
-# A full host ends the whole tick BEFORE the fixer walk's label swap, not
-# after: without this probe, every tick at capacity would swap an issue
-# failed → in-progress only to revert it when launch says 3 — two label
-# writes and two timeline events per minute for as long as the box stays
-# full, churn that also resets updatedAt and so hides the issue from
-# /toliki's "sat unchanged" heuristic. The probe is launch.sh's own counting
-# (--check-capacity runs the same capacity_gate as a real launch), so the cap
-# still lives in exactly one place. Not run for --dry-run, which is
-# documented as not simulating capacity.
-if (( ! DRY_RUN && ! HAVE_ROUTE_NEXT )); then
+# A full host must be known BEFORE a fixer's label swap: probing afterwards
+# would churn failed/ready-to-review → in-progress → back on every tick. With no
+# active holds, keep the eager check that avoids even reading the queues. With
+# a hold map, delay it until an unheld candidate is otherwise eligible, so an
+# all-held tick still reports every held issue and never probes capacity. Once
+# a delayed probe finds the host full, the walk continues read-only to report
+# later held candidates. launch.sh remains the one owner of the capacity count.
+CAPACITY_CHECKED=0
+HOST_AT_CAPACITY=0
+CAPACITY_REPORTED=0
+capacity_available() {
+  local capacity_rc
+  if (( CAPACITY_CHECKED )); then
+    if (( HOST_AT_CAPACITY )); then
+      return "$EXIT_AT_CAPACITY"
+    fi
+    return 0
+  fi
   set +e
   "$LAUNCH" --check-capacity </dev/null 9>&-
-  rc=$?
+  capacity_rc=$?
   set -e
-  case "$rc" in
-    0) ;;
+  case "$capacity_rc" in
+    0)
+      CAPACITY_CHECKED=1
+      return 0 ;;
     "$EXIT_AT_CAPACITY")
-      say "host at capacity — nothing can launch, ending tick"
-      exit 0 ;;
+      CAPACITY_CHECKED=1
+      HOST_AT_CAPACITY=1
+      return "$EXIT_AT_CAPACITY" ;;
     *)
-      warn "launch.sh rejected its configuration — aborting tick"
-      exit 1 ;;
+      return 1 ;;
   esac
+}
+report_capacity_once() {
+  if (( ! CAPACITY_REPORTED )); then
+    say "host at capacity — nothing can launch, continuing held-candidate reporting"
+    CAPACITY_REPORTED=1
+  fi
+}
+
+if (( ! DRY_RUN && ! HAVE_ROUTE_NEXT && ! ACTIVE_HOLDS )); then
+  if capacity_available; then
+    :
+  else
+    rc=$?
+    case "$rc" in
+      "$EXIT_AT_CAPACITY")
+        say "host at capacity — nothing can launch, ending tick"
+        exit 0 ;;
+      *)
+        warn "launch.sh rejected its configuration — aborting tick"
+        exit 1 ;;
+    esac
+  fi
 fi
 
 if (( ! HAVE_ROUTE_NEXT )); then
@@ -409,6 +456,33 @@ for repo in $(repo_names); do
       FAILED=$((FAILED + 1))
       continue
     fi
+    admitted_engine="$ISSUE_ENGINE"
+    if candidate_is_held "$ISSUE_ENGINE"; then
+      say "  #$num: held ($HELD_DETAILS)"
+      continue
+    else
+      admission_rc=$?
+      if (( admission_rc == 2 )); then
+        warn "  #$num ($repo): vendor set for engine '$ISSUE_ENGINE' is unreadable or invalid — not launching"
+        FAILED=$((FAILED + 1))
+        continue
+      fi
+    fi
+    if (( ! DRY_RUN )); then
+      if capacity_available; then
+        :
+      else
+        rc=$?
+        case "$rc" in
+          "$EXIT_AT_CAPACITY")
+            report_capacity_once
+            continue ;;
+          *)
+            warn "launch.sh rejected its configuration — aborting tick"
+            exit 1 ;;
+        esac
+      fi
+    fi
     if (( DRY_RUN )); then
       say "  #$num ($repo): would launch $QKIND fixer '$session' with $ISSUE_ENGINE"
       LAUNCHED=$((LAUNCHED + 1))
@@ -445,19 +519,20 @@ for repo in $(repo_names); do
     # is no longer the fixer's. Revert and move on — fail closed on a read
     # that errors, for the same reason.
     if ! read_issue_engine "$path" "$num" \
-        || [[ "$ISSUE_STATE" != "OPEN" ]] || ! has_issue_label "$QLABEL" || has_issue_label "$QLADDER"; then
-      say "  #$num ($repo): issue changed under the queue or its engine routing became invalid (state ${ISSUE_STATE:-unreadable}, labels ${ISSUE_LABELS:-none}) — reverting the swap, skipping"
+        || [[ "$ISSUE_STATE" != "OPEN" ]] || ! has_issue_label "$QLABEL" || has_issue_label "$QLADDER" \
+        || [[ "$ISSUE_ENGINE" != "$admitted_engine" ]]; then
+      say "  #$num ($repo): issue changed under the queue or its engine routing no longer matches admission (state ${ISSUE_STATE:-unreadable}, labels ${ISSUE_LABELS:-none}) — reverting the swap, skipping"
       (cd "$path" && gh issue edit "$num" --add-label "$QREST" --remove-label in-progress >/dev/null 2>&1) \
         || warn "  #$num ($repo): the label revert failed too — issue may be stuck in-progress, fix by hand"
       continue
     fi
 
-    say "  #$num ($repo): launching $QKIND fixer '$session' with $ISSUE_ENGINE"
+    say "  #$num ($repo): launching $QKIND fixer '$session' with $admitted_engine"
     launched_fixer=1
     set +e
     # </dev/null: nothing in launch.sh should ever read the tick's stdin;
     # 9>&- as in the ready walk below.
-    "$LAUNCH" "$QFLAG" "$num" --repo "$repo" --engine "$ISSUE_ENGINE" </dev/null 9>&-
+    "$LAUNCH" "$QFLAG" "$num" --repo "$repo" --engine "$admitted_engine" </dev/null 9>&-
     rc=$?
     set -e
     if (( rc != 0 )); then
@@ -469,6 +544,13 @@ for repo in $(repo_names); do
       "$EXIT_AT_CAPACITY")
         # Deferred, not failed: the revert above put the issue back in the
         # queue, and the next tick retries once reap frees a slot.
+        if (( ACTIVE_HOLDS )); then
+          CAPACITY_CHECKED=1
+          HOST_AT_CAPACITY=1
+          launched_fixer=0
+          report_capacity_once
+          continue
+        fi
         say "host at capacity — ending tick with $LAUNCHED launched"
         exit 0 ;;
       1)
@@ -631,6 +713,34 @@ for entry in "${ORDER[@]}"; do
     exit 0
   fi
 
+  if candidate_is_held "$ISSUE_ENGINE"; then
+    say "  #$num: held ($HELD_DETAILS)"
+    continue
+  else
+    admission_rc=$?
+    if (( admission_rc == 2 )); then
+      warn "  #$num ($repo): vendor set for engine '$ISSUE_ENGINE' is unreadable or invalid — not launching"
+      FAILED=$((FAILED + 1))
+      continue
+    fi
+  fi
+
+  if (( ! DRY_RUN )); then
+    if capacity_available; then
+      :
+    else
+      rc=$?
+      case "$rc" in
+        "$EXIT_AT_CAPACITY")
+          report_capacity_once
+          continue ;;
+        *)
+          warn "launch.sh rejected its configuration — aborting tick"
+          exit 1 ;;
+      esac
+    fi
+  fi
+
   if (( DRY_RUN )); then
     say "  #$num ($repo): would launch '$session' with $ISSUE_ENGINE"
     LAUNCHED=$((LAUNCHED + 1))
@@ -647,6 +757,12 @@ for entry in "${ORDER[@]}"; do
   case "$rc" in
     0) LAUNCHED=$((LAUNCHED + 1)) ;;
     "$EXIT_AT_CAPACITY")
+      if (( ACTIVE_HOLDS )); then
+        CAPACITY_CHECKED=1
+        HOST_AT_CAPACITY=1
+        report_capacity_once
+        continue
+      fi
       say "host at capacity — ending tick with $LAUNCHED launched"
       exit 0 ;;
     1)
@@ -672,6 +788,7 @@ fi
 
 if (( DRY_RUN )); then
   say "dry run: $LAUNCHED would launch (capacity not simulated)"
+  if (( FAILED != 0 )); then exit 1; fi
   exit 0
 fi
 say "tick done, $LAUNCHED launched, $FAILED failed"

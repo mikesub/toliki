@@ -73,12 +73,28 @@ DEFAULT_ENGINE="${EPIC_ENGINE:-claude}"
 
 # The engines a run can be routed to are the top-level keys of etc/engines.json,
 # tracked beside this file (a label must mean the same on every machine). The
-# full table — vendor/model/effort per step — is the orchestrator's to read;
-# the shell only ever needs the names. A missing or unparseable file makes
-# engine_known false for every name, so nothing launches on it.
+# full table — vendor/model/effort per step — is primarily the orchestrator's
+# to read. Dispatch also derives a selected engine's complete vendor set from
+# those rows so quota admission has no second routing table to drift. A missing
+# or unparseable file makes either lookup fail, so nothing launches on it.
 ENGINES_FILE="$_LIB_DIR/engines.json"
 engine_names() { jq -r 'keys[]' "$ENGINES_FILE" 2>/dev/null || true; }
 engine_known() { jq -e --arg e "$1" 'has($e)' "$ENGINES_FILE" >/dev/null 2>&1; }
+engine_vendors() { # engine name; one unique vendor per line
+  jq -er --arg e "$1" '
+    def vendor:
+      if type != "string" then error("engine step is not a string") else . end
+      | split("/") as $parts
+      | if ($parts | length) == 3 and all($parts[]; length > 0)
+        then $parts[0]
+        else error("engine step is not vendor/model/effort")
+        end;
+    if has($e) and (.[$e] | type) == "object" and (.[$e] | length) > 0
+      then [.[$e][] | vendor] | unique[]
+      else error("unknown or empty engine")
+    end
+  ' "$ENGINES_FILE" 2>/dev/null
+}
 
 repo_names() {
   local e
