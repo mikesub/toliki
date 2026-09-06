@@ -462,6 +462,15 @@ printf '%s\n' "$*" >> "${STUB_NPM_LOG:-/dev/null}"
 case "$*" in
   ci) mkdir -p node_modules; exit 0 ;;
   "run verify")
+    if [[ "${STUB_VERIFY_MIXED_STREAM:-}" == "1" ]]; then
+      printf 'VERIFY_STDOUT_ASSERTION expected 2 got 1\n'
+      noise_line=1
+      while [[ "$noise_line" -le 45 ]]; do
+        printf 'verify stderr noise %02d\n' "$noise_line" >&2
+        noise_line=$((noise_line + 1))
+      done
+      exit 1
+    fi
     if [[ -f "${STUB_FIXTURES:-/nonexistent}/verify.rc" ]]; then
       printf 'verify: widget.test.ts expected 2 got 1\n' >&2
       exit "$(cat "$STUB_FIXTURES/verify.rc")"
@@ -528,6 +537,34 @@ NPM_LOG_REAL="$TMP/npm-real.log"; : > "$NPM_LOG_REAL"
 OUT="$(PATH="$TMP/bin:$PATH" REPO_MODULE="$ROOT/workflows/lib/repo.mjs" DEP_DIR="$NPM_DIR" STUB_NPM_LOG="$NPM_LOG_REAL" node "$TMP/dep-check.mjs")"
 assert_contains "a package with a lockfile still gets npm ci when node_modules is missing" "$OUT" "npm ci (node_modules missing)"
 assert_eq "npm ci ran once for the lockfile-carrying package" "1" "$(grep -c '^ci$' "$NPM_LOG_REAL")"
+
+# ───────────────────────── runVerify: stdout failures survive noisy stderr ─────────────────────────
+# Exercise repo.mjs directly so the diagnostic formatting contract is isolated
+# from the pipeline state machine. The stderr stream deliberately exceeds the
+# configured tail bound: concatenating streams before slicing would erase the
+# distinctive stdout assertion from both detail and tail.
+cat > "$TMP/verify-check.mjs" <<'NODE'
+const { runVerify } = await import(process.env.REPO_MODULE)
+process.chdir(process.env.VERIFY_DIR)
+const result = await runVerify(['.'], { tailLines: 40 })
+console.log(`GREEN=${result.green}`)
+console.log(`DETAIL=${result.detail}`)
+console.log(`TAIL=${JSON.stringify(result.tail)}`)
+NODE
+
+VERIFY_DIR="$TMP/verify-mixed"; mkdir -p "$VERIFY_DIR"
+VERIFY_OUT="$(PATH="$TMP/bin:$PATH" REPO_MODULE="$ROOT/workflows/lib/repo.mjs" VERIFY_DIR="$VERIFY_DIR" STUB_VERIFY_MIXED_STREAM=1 node "$TMP/verify-check.mjs")"
+VERIFY_GREEN="$(printf '%s\n' "$VERIFY_OUT" | sed -n 's/^GREEN=//p')"
+VERIFY_DETAIL="$(printf '%s\n' "$VERIFY_OUT" | sed -n 's/^DETAIL=//p')"
+VERIFY_TAIL="$(printf '%s\n' "$VERIFY_OUT" | sed -n 's/^TAIL=//p')"
+VERIFY_STDOUT_FAILURE='VERIFY_STDOUT_ASSERTION expected 2 got 1'
+
+assert_eq "runVerify keeps the nonzero exit as the failure verdict" "false" "$VERIFY_GREEN"
+assert_eq "runVerify detail preserves independently bounded stdout and stderr" ". — fail: $VERIFY_STDOUT_FAILURE | verify stderr noise 43 | verify stderr noise 44 | verify stderr noise 45" "$VERIFY_DETAIL"
+assert_contains "runVerify tail preserves the stdout assertion past forty stderr lines" "$VERIFY_TAIL" "$VERIFY_STDOUT_FAILURE"
+assert_contains "runVerify tail keeps stderr represented" "$VERIFY_TAIL" "verify stderr noise 45"
+assert_not_contains "runVerify tail bounds stderr independently" "$VERIFY_TAIL" "verify stderr noise 05"
+assert_matches "runVerify tail orders stdout before stderr" "$VERIFY_TAIL" 'VERIFY_STDOUT_ASSERTION expected 2 got 1.*verify stderr noise 45'
 
 # A success envelope carrying structured output, exactly the shape the CLI's
 # own result schema describes (see lib/engine.mjs).

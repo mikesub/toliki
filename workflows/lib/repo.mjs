@@ -93,8 +93,8 @@ export async function ensureDeps(packages, { pairs = [] } = {}) {
 
 // ───────────────────────── verify ─────────────────────────
 // The project's whole gate, package by package. The exit code is the verdict;
-// the detail line carries the first genuinely failing thing for a human, and
-// the tail carries the last lines of each failing run for an agent's retry.
+// the detail and retry tail independently bound stdout and stderr so noise in
+// one stream cannot displace the useful failure from the other.
 // Structured failures retain bounded output and process status so test-first
 // can match its expected assertion without treating a timeout or spawn failure as RED.
 export async function runVerify(packages, { timeoutMs = VERIFY_TIMEOUT_MS, tailLines = 40 } = {}) {
@@ -106,11 +106,15 @@ export async function runVerify(packages, { timeoutMs = VERIFY_TIMEOUT_MS, tailL
     const r = await sh('npm', ['run', 'verify'], { cwd: pkg === '.' ? '.' : pkg, timeoutMs, stdoutCap: 256 * 1024 })
     if (r.ok) { details.push(`${pkg} — pass`); continue }
     green = false
-    const lines = `${r.out}\n${r.err}`.split('\n').filter(l => l.trim())
-    const last = r.timedOut ? 'timed out' : (lines.slice(-3).join(' | ') || `exit ${r.code}`)
+    const stdoutLines = r.out.split('\n').filter(l => l.trim())
+    const stderrLines = r.err.split('\n').filter(l => l.trim())
+    const detailLines = [...stdoutLines.slice(-3), ...stderrLines.slice(-3)]
+    const last = r.timedOut ? 'timed out' : (detailLines.join(' | ') || `exit ${r.code}`)
     details.push(`${pkg} — fail: ${last}`)
     const output = `${r.out}\n${r.err}`.trim()
-    tails.push(`--- ${pkg}: npm run verify ${r.timedOut ? 'timed out' : `exited ${r.code}`} ---\n${lines.slice(-tailLines).join('\n')}`)
+    const stdoutTail = tailLines > 0 ? stdoutLines.slice(-tailLines) : []
+    const stderrTail = tailLines > 0 ? stderrLines.slice(-tailLines) : []
+    tails.push(`--- ${pkg}: npm run verify ${r.timedOut ? 'timed out' : `exited ${r.code}`} ---\n${[...stdoutTail, ...stderrTail].join('\n')}`)
     failures.push({ package: pkg, code: r.code, timedOut: r.timedOut, spawnError: !!r.spawnError, output })
   }
   return { green, detail: details.join('; '), tail: tails.join('\n'), failures }
