@@ -105,7 +105,7 @@ Return: survives, confidence (0-100), reasoning (name the evidence, whichever wa
 // ───────────────────────── Config ─────────────────────────
 // Which vendor, model and effort each step runs on is a row of the run's
 // engine in etc/engines.json; every agent() call names only its step.
-// fix-ci is the repair itself, and confirm-review is the last gate before an
+// fix-ci is the repair itself, and final-review is the last gate before an
 // unattended merge, so a row for either wants the strong model.
 
 // ───────────────────────── Schemas ─────────────────────────
@@ -568,7 +568,7 @@ try {
   // later stage with `git add -A`.
   await intentToAdd()
   const check = await agent(PROMPTS.check(issue, prep, `git diff ${prep.prHead}`, dispositions),
-    { label: 'ci-check', phase: 'Check', step: 'confirm-review', schema: CHECK_SCHEMA })
+    { label: 'ci-check', phase: 'Check', step: 'final-review', schema: CHECK_SCHEMA })
   if (!check) return await fail('check', 'the adversarial checker produced no result — an unchecked fix must not rejoin the merge queue.')
   if (!check.survives || check.confidence < 75) {
     return await fail('check', `the adversarial check refuted the fix (survives=${check.survives}, confidence ${check.confidence}): ${check.reasoning}`)

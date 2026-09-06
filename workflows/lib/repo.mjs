@@ -276,26 +276,31 @@ ${d.review.rationale}
   return text
 }
 // The assessment ledger preserves every finding and its index. A coder's
-// rejection is only a claim; only the independent check can mark it cleared.
-// Ship reads final states, including uncertainty, without reconstructing them
-// from builder prose or matching potentially duplicate titles.
-export function renderReview(dir, items, { rounds = 0, note = null } = {}) {
+// dispute is only a claim; only the independent final review can mark an item
+// cleared. Ship reads final states, including uncertainty and what the review
+// found still unmet, without reconstructing them from builder prose or matching
+// potentially duplicate titles.
+export function renderReview(dir, items, { checked = false, note = null, unmet = [] } = {}) {
   let text = '# Review\n\n'
-  if (rounds) {
-    text += '## Post-fix check\n\n'
-    if (rounds > 1) text += 'A second and final fix round ran over open items; every finding was rechecked against the final tree.\n\n'
+  if (checked) {
+    text += '## Final review\n\n'
     if (note) text += `${note}.\n\n`
-    text += `${items.filter(item => item.cleared && item.verdict?.verdict === 'fixed').length} fixes confirmed; ${items.filter(item => item.cleared && item.verdict?.verdict === 'rejected').length} rejections confirmed; ${items.filter(item => !item.cleared).length} open.\n\n`
+    text += `${items.filter(item => item.cleared && item.verdict?.verdict === 'resolved').length} resolved; ${items.filter(item => item.cleared && item.verdict?.verdict === 'disproved').length} disproved; ${items.filter(item => !item.cleared).length} unresolved.\n\n`
+    if (unmet.length) {
+      text += '### Unmet requirements\n\n'
+      for (const u of unmet) text += `- ${u.requirement} — ${u.evidence}\n`
+      text += '\n'
+    }
   }
   text += '## Findings\n\n'
   if (!items.length) text += 'No review findings.\n'
   items.forEach((item, i) => {
     const { finding: f, assessment, verdict } = item
     const state = item.cleared
-      ? `independently ${verdict.verdict}${verdict.verdict === 'rejected' ? ' — not deferred work' : ''}`
-      : verdict?.verdict === 'defect' && verdict.confidence >= 75
-        ? 'OPEN — independently confirmed defect'
-        : 'OPEN — NOT confirmed; requires independent evidence or a human'
+      ? (verdict.verdict === 'disproved' ? 'disproved — not deferred work' : 'resolved')
+      : verdict?.defect === true && verdict.confidence >= 75
+        ? 'OPEN — unresolved, defect still present'
+        : 'OPEN — unresolved; a human decides'
     text += `### Finding ${i + 1}: ${f.title}
 - severity: ${f.severity}
 - confidence: ${f.confidence}
@@ -304,7 +309,7 @@ export function renderReview(dir, items, { rounds = 0, note = null } = {}) {
 - fix: ${f.fix}
 - gate: ${f.gate}
 - assessment: ${assessment ? `${assessment.action} — ${assessment.reason}` : 'pending'}
-- independent verdict: ${verdict ? `${verdict.verdict} (confidence ${verdict.confidence}) — ${verdict.reasoning}` : 'pending'}
+- final verdict: ${verdict ? `${verdict.verdict} (confidence ${verdict.confidence}) — ${verdict.reasoning}` : 'pending'}
 - state: ${state}
 
 `

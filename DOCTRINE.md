@@ -43,26 +43,29 @@ don't get re-litigated from memory.
   request one additional reviewer for a concrete risk question, such as whether
   a migration preserves existing records; it cannot disable the general review
   or request an unbounded fan-out. Both review actual behavior and evidence,
-  without the builder's conclusions. The fixer assesses each finding and
-  either repairs it, rejects it with evidence, or defers it. One independent
-  checker then judges every disposition against the original requirement and
-  code, including no-edit rejections. Assessment and repair share one pass to
-  avoid reading the same bug twice before any edit; the trade-off is that a
-  mistaken finding can cause unnecessary edits, so the independent checker
-  examines the before/after code for both false-positive repairs and regressions.
-  A builder's dismissal never clears itself. Every finding keeps an indexed
-  disposition and verdict; rejected findings remain in the audit record.
-  Open non-deferred items get one final repair round. Its checker revisits all
-  findings and the complete repair delta, because the second repair can break
-  something the first check cleared. Missing evidence or a claimed repair with
-  no diff holds immediately. Two rounds inside an epic, never a third, because
-  a third round is a round that is not converging. An unsupported repair or
-  rejection still needs a human; uncertainty never enters a repair queue.
-  A hold made entirely of independently confirmed remaining defects may enter
-  a separate, label-bounded defect-fixer session in repositories that explicitly opt in;
-  uncertainty still goes directly to a human. The strong model goes to design
-  and adjudication, where being wrong is expensive; implementation runs on a
-  cheaper model under the test gate.
+  without the builder's conclusions. Their findings are actionable as they
+  stand: one fresh fixer either repairs each one, disputes it with code
+  evidence, or defers it as unsafe to repair. Assessment and repair share that
+  one pass rather than confirming every finding first, and the accepted cost is
+  that a mistaken finding can consume the fixer's time and prompt an
+  unnecessary edit. The adjudication is a single independent final review over
+  the final tree: it decides each finding resolved, disproved or unresolved,
+  and names what the repair broke and what the requirement still lacks. It is
+  given the requirement, the findings, the complete diff and the exact repair
+  delta, and deliberately not the fixer's explanation — agreeing with a
+  narrative is not independent judgment. A builder's dismissal never clears
+  itself, and uncertainty is unresolved, never a disproof. Every finding keeps
+  an indexed disposition and verdict; disproved findings remain in the audit
+  record. There is no second repair round: what the final review leaves open
+  ends the epic at a human, because another round is a round that is not
+  converging. A hold made entirely of remaining defects the final review
+  positively showed may enter a separate, label-bounded defect-fixer session in
+  repositories that explicitly opt in; uncertainty still goes directly to a
+  human. Both the fixer and the final reviewer are fresh processes that
+  reconstruct their context and end when they return, which repeats some
+  exploration and buys an adjudication that owes the previous process nothing.
+  The strong model goes to design and adjudication, where being wrong is
+  expensive; implementation runs on a cheaper model under the test gate.
 - **Repairs stay proportional.** Fix the named defect and add meaningful
   regression coverage. A review finding does not automatically require a new
   abstraction, lint rule or instruction to prevent an entire class of problems.
@@ -83,7 +86,7 @@ don't get re-litigated from memory.
   retry. An epic already rebases onto current `main` at ship, so this rebase
   usually finds nothing left to do and a conflict here means `main` moved in
   the window between ship and merge.
-- **Repair is bounded: two fix rounds inside the epic, then a new bounded
+- **Repair is bounded: one repair round inside the epic, then a new bounded
   session, never an unbounded loop.** Conflict, CI and ship-gate defect repair
   each have an independent two-attempt ladder in GitHub labels. The defect rung
   is additionally per-repo opt-in because it changes an already reviewed PR and
@@ -128,7 +131,7 @@ don't get re-litigated from memory.
   the PR, the follow-up issues, the layout discovery, `npm run verify` — is the
   orchestrator's own work, so what a run did is a fact it established rather
   than a claim a model reported. Models are spawned only where a judgment is
-  needed: the design, the code, the reviewers and their skeptic, the fixes,
+  needed: the design, the code, the reviewer, the fixer, the final reviewer,
   what the PR says. The rule that falls out of it: an agent's word that it ran
   a gate is never the gate. Test-first establishes a clean baseline and requires
   the red step's expected assertion failure to appear in the orchestrator's

@@ -170,7 +170,7 @@ Return: survives, confidence (0-100), reasoning (name the hunk and the evidence,
 // Which vendor, model and effort each step runs on is a row of the run's
 // engine in etc/engines.json; every agent() call names only its step.
 // fix-conflicts is the judgment core — the entire reason a model is in the
-// loop — and confirm-review is the last gate before a rewritten merge ships to
+// loop — and final-review is the last gate before a rewritten merge ships to
 // a force-push, so a row for either wants the strong model.
 
 // ───────────────────────── Schemas ─────────────────────────
@@ -1002,7 +1002,7 @@ try {
     phase('Check')
     if (prep.partialRecord) await intentToAdd()
     check = await agent(PROMPTS.check(issue, prep, dispositions),
-      { label: 'check', phase: 'Check', step: 'confirm-review', schema: CHECK_SCHEMA })
+      { label: 'check', phase: 'Check', step: 'final-review', schema: CHECK_SCHEMA })
     if (!check) return await fail('check', 'the adversarial checker produced no result — an unchecked resolution must not ship.')
     if (!check.survives || check.confidence < 75) {
       return await fail('check', `the adversarial check refuted the resolution (survives=${check.survives}, confidence ${check.confidence}): ${check.reasoning}`)

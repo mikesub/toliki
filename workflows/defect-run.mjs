@@ -698,7 +698,7 @@ try {
   phase('Check')
   await intentToAdd()
   const check = await agent(PROMPTS.check(issue, prep, `git diff ${prep.prHead}`, dispositions),
-    { label: 'defect-check', phase: 'Check', step: 'confirm-review', schema: CHECK_SCHEMA })
+    { label: 'defect-check', phase: 'Check', step: 'final-review', schema: CHECK_SCHEMA })
   if (!check) return await fail('check', 'the adversarial checker produced no result — an unchecked repair must not rejoin the merge queue.')
   if (!check.survives || check.confidence < 75) {
     return await fail('check', `the adversarial check refuted the repair (survives=${check.survives}, confidence ${check.confidence}): ${check.reasoning}`)
