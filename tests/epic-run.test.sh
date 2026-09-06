@@ -268,6 +268,9 @@ case "${1:-} ${2:-}" in
         n="$(cat "$state/evidence-reads" 2>/dev/null || echo 0)"; n=$((n + 1)); printf '%s' "$n" > "$state/evidence-reads"
         if [[ -n "${GH_EVIDENCE_STALE_READS:-}" && "$n" -le "${GH_EVIDENCE_STALE_READS}" ]]; then hide=1; fi
       fi
+      if grep -q '^🤖 conflict-fix partial evidence$' "$state/comments" 2>/dev/null; then
+        [[ "${GH_CONFLICT_EVIDENCE_READ_FAIL:-}" != "1" ]] || { printf 'HTTP 502\n' >&2; exit 1; }
+      fi
       if [[ -s "$state/comments" ]]; then
         authors="$(jq -cn --arg raw "${GH_SEED_COMMENT_AUTHORS:-}" '$raw | split(",") | map(select(length > 0))')"
         jq -R -s --argjson authors "$authors" --argjson hide "$hide" --arg login "${GH_AUTH_LOGIN:-toliki-bot}" \
@@ -371,8 +374,12 @@ case "${1:-} ${2:-}" in
     while [[ $# -gt 0 ]]; do
       case "$1" in --body-file) body="$(cat "$2")"; body_file=1; shift 2 ;; --body) body="$2"; shift 2 ;; *) shift ;; esac
     done
-    if [[ "${GH_BODY_FILE_COMMENT_FAIL:-}" == "1" && "$body_file" == "1" ]] || \
-       [[ "${GH_EVIDENCE_COMMENT_FAIL:-}" == "1" && "$body" == '🤖 defect-fix evidence'* ]]; then
+    # Conflict evidence is a separate pre-push durability gate; this knob
+    # targets only the later audit so the pushed-partial fallback remains
+    # independently testable.
+    if [[ "${GH_BODY_FILE_COMMENT_FAIL:-}" == "1" && "$body_file" == "1" && "$body" != '🤖 conflict-fix partial evidence'* ]] || \
+       [[ "${GH_EVIDENCE_COMMENT_FAIL:-}" == "1" && "$body" == '🤖 defect-fix evidence'* ]] || \
+       [[ "${GH_CONFLICT_EVIDENCE_COMMENT_FAIL:-}" == "1" && "$body" == '🤖 conflict-fix partial evidence'* ]]; then
       printf 'HTTP 502\n' >&2
       exit 1
     fi
@@ -426,6 +433,7 @@ case "${1:-} ${2:-}" in
     printf 'https://github.com/o/r/pull/7\n' ;;
   "api "*)
     if [[ "$*" == "api user"* ]]; then
+      [[ "${GH_AUTH_READ_FAIL:-}" != "1" ]] || { printf 'HTTP 502\n' >&2; exit 1; }
       printf '{"login":"%s"}\n' "${GH_AUTH_LOGIN:-toliki-bot}"
     elif [[ "$*" == *"--method POST"* && "$*" == *dependencies/blocked_by* ]]; then
       # Ship ordering a follow-up behind the epic's own issue. Records
@@ -445,7 +453,7 @@ case "${1:-} ${2:-}" in
     else
       # The status comment's edit. Slow on demand, so a scenario can have one
       # in flight when the run finishes.
-      [[ "${GH_SLOW_PATCH:-}" != "1" ]] || sleep 1
+      [[ -z "${GH_SLOW_PATCH:-}" ]] || sleep "$GH_SLOW_PATCH"
       printf '{}\n'
     fi ;;
   *) : ;;
@@ -844,6 +852,9 @@ run_pipeline() { # script fixtures-dir args...   (scenario knobs via GH_* env)
     GH_BODY_FILE_COMMENT_FAIL="${GH_BODY_FILE_COMMENT_FAIL:-}" \
     GH_EVIDENCE_COMMENT_FAIL="${GH_EVIDENCE_COMMENT_FAIL:-}" \
     GH_EVIDENCE_READ_FAIL="${GH_EVIDENCE_READ_FAIL:-}" \
+    GH_CONFLICT_EVIDENCE_COMMENT_FAIL="${GH_CONFLICT_EVIDENCE_COMMENT_FAIL:-}" \
+    GH_CONFLICT_EVIDENCE_READ_FAIL="${GH_CONFLICT_EVIDENCE_READ_FAIL:-}" \
+    GH_AUTH_READ_FAIL="${GH_AUTH_READ_FAIL:-}" \
     GH_AUTH_LOGIN="${GH_AUTH_LOGIN:-}" \
     GH_SEED_COMMENT_AUTHORS="${GH_SEED_COMMENT_AUTHORS:-}" \
     GH_ISSUE_BODY="${GH_ISSUE_BODY:-}" \
@@ -889,6 +900,20 @@ gh_evidence_comment() {
     found && $0 == "---" { exit }
     found { print }
   ' "$STATE_DIR/gh/comments" 2>/dev/null
+}
+# The original evidence can be followed by a head-bound replacement after a
+# partial defect landing. Return the newest evidence block, not merely the first
+# marker in the issue's comment stream.
+gh_last_evidence_comment() {
+  awk '
+    $0 == "🤖 defect-fix evidence" { block = $0 ORS; inside = 1; next }
+    inside && $0 == "---" { last = block; block = ""; inside = 0; next }
+    inside { block = block $0 ORS }
+    END { if (inside) last = block; printf "%s", last }
+  ' "$STATE_DIR/gh/comments" 2>/dev/null
+}
+evidence_json() {
+  awk '$0 == "```json" { inside = 1; next } inside && $0 == "```" { exit } inside { print }'
 }
 gh_issues_created() { cat "$STATE_DIR/gh/issues-created" 2>/dev/null || true; }
 gh_pr_created() { cat "$STATE_DIR/gh/pr-created" 2>/dev/null || true; }
@@ -2657,6 +2682,15 @@ seed_conflict_moved() {
   seed_branch epic/42-add-widget main 'printf "export const items = []\n\nexport function land() {\n  return finish()\n}\n\nexport const noop = () => {}\n\nexport const other = () => {}\n\nexport function postBlocker() {\n  return abort()\n}\n" > frontend/src/index.ts && git commit -qam "feat: move the abort out of land()" -m "Closes #42"'
   seed_branch main main 'printf "export const items = []\n\nexport function land() {\n  return abort(bounded())\n}\n\nexport const noop = () => {}\n\nexport const other = () => {}\n" > frontend/src/index.ts && git commit -qam "main: bound the abort" -m "Closes #41"'
 }
+# Three independent judgment hunks let the partial path prove that declining one
+# named conflict does not discard the other two resolutions. The declined hunk
+# deliberately keeps the PR-side text on the rebased branch: that is the public
+# partial-conflict trade-off while a human holds the PR.
+seed_conflict_three() {
+  seed_branch main main 'printf "export const a = \"base-a\"\n" > frontend/src/a.ts && printf "export const b = \"base-b\"\n" > frontend/src/b.ts && printf "export const c = \"base-c\"\n" > frontend/src/c.ts && git add -A && git commit -qm "base: three conflict targets" -m "Closes #40"'
+  seed_branch epic/42-add-widget main 'printf "export const a = \"pr-a\"\n" > frontend/src/a.ts && printf "export const b = \"pr-b\"\n" > frontend/src/b.ts && printf "export const c = \"pr-c\"\n" > frontend/src/c.ts && git commit -qam "feat: change three targets" -m "Closes #42"'
+  seed_branch main main 'printf "export const a = \"main-a\"\n" > frontend/src/a.ts && printf "export const b = \"main-b\"\n" > frontend/src/b.ts && printf "export const c = \"main-c\"\n" > frontend/src/c.ts && git commit -qam "main: change three targets" -m "Closes #41"'
+}
 FIXBASE="$TMP/fixtures-fix"
 mkdir -p "$FIXBASE"
 fixture "$FIXBASE" fix-resolve '{"completed":true,"resolutions":[{"file":"frontend/src/index.ts","hunk":1,"mainIntent":"main renamed the helper","prIntent":"the PR added a guard","resolution":"Keeps the rename and the guard."}]}'
@@ -2711,6 +2745,183 @@ assert_contains "the audit comment states the PR's intent" "$(gh_comments)" "the
 assert_contains "the audit comment records the adversarial check" "$(gh_comments)" "confidence 88/100"
 assert_contains "and says the merge worker re-runs the checks before anything lands" "$(gh_comments)" "re-runs the real checks before anything lands"
 assert_eq "the labels: ready-to-merge, ladder kept, needs-judgment cleared" "fix-attempted,ready-to-merge," "$(gh_labels)"
+
+scenario 'fix-run: two repaired judgment hunks survive one declined hunk and are held for review'
+seed_conflict_three
+PARTIALFIX="$TMP/fixtures-fix-partial"; cp -R "$FIXBASE" "$PARTIALFIX"; rm -f "$PARTIALFIX/fix-resolve.sh"
+fixture "$PARTIALFIX" fix-resolve '{"dispositions":[{"index":1,"action":"repaired","reason":"kept the main rename and the PR guard","mainIntent":"main renamed a","prIntent":"the PR guarded a","resolution":"Both intents survive in a."},{"index":2,"action":"repaired","reason":"kept the main rename and the PR guard","mainIntent":"main renamed b","prIntent":"the PR guarded b","resolution":"Both intents survive in b."},{"index":3,"action":"declined","reason":"the two sides require mutually exclusive c values"}],"summary":"Resolved a and b; retained the PR-side c text for human review."}'
+fixture_sh "$PARTIALFIX" fix-resolve 'printf "export const a = \"main-a pr-a\"\n" > frontend/src/a.ts; printf "export const b = \"main-b pr-b\"\n" > frontend/src/b.ts; printf "export const c = \"pr-c\"\n" > frontend/src/c.ts; git add frontend/src/a.ts frontend/src/b.ts frontend/src/c.ts; rebase_dir="$(git rev-parse --git-path rebase-merge)"; rebase_apply="$(git rev-parse --git-path rebase-apply)"; if [[ -d "$rebase_dir" || -d "$rebase_apply" ]]; then GIT_EDITOR=true git rebase --continue >/dev/null; fi'
+BEFORE="$(origin_ref epic/42-add-widget)"
+run_fix "$PARTIALFIX" --issue 42
+AFTER="$(origin_ref epic/42-add-widget)"
+assert_rc "a verified partial conflict repair is a successful human-held result" 0 "$RUN_RC"
+assert_eq "the partial conflict repair advances the remote branch" "advanced" "$([[ "$AFTER" != "$BEFORE" ]] && echo advanced || echo unchanged)"
+assert_eq "the partial conflict branch remains one commit above main" 1 "$(origin_count epic/42-add-widget)"
+assert_contains "the first repaired hunk is carried by the pushed tree" "$(git -C "$ORIGIN" show epic/42-add-widget:frontend/src/a.ts)" "main-a pr-a"
+assert_contains "the second repaired hunk is carried by the pushed tree" "$(git -C "$ORIGIN" show epic/42-add-widget:frontend/src/b.ts)" "main-b pr-b"
+assert_eq "the declined conflict hunk keeps the exact PR-side text" 'export const c = "pr-c"' "$(git -C "$ORIGIN" show epic/42-add-widget:frontend/src/c.ts)"
+assert_eq "a mixed conflict round still runs verify and its skeptic" "1 1" "$(grep -c '^run verify$' "$NPM_LOG" || true) $(calls fix-check)"
+CONFLICT_CHECK_PROMPT="$(cat "$STATE_DIR/fix-check.0.prompt" 2>/dev/null || true)"
+assert_contains "the conflict skeptic receives the declined-hunk claim" "$CONFLICT_CHECK_PROMPT" "the two sides require mutually exclusive c values"
+assert_contains "the conflict skeptic applies the repaired-hunk contract" "$CONFLICT_CHECK_PROMPT" "For every repaired item, refute if both intents do not demonstrably survive"
+assert_contains "the conflict skeptic applies the declined-hunk contract" "$CONFLICT_CHECK_PROMPT" "For every declined item, compare the original PR side with HEAD"
+assert_not_contains "the conflict skeptic does not require both intents in a deliberately declined hunk" "$CONFLICT_CHECK_PROMPT" 'in every one of those hunks, both what origin/main changed and what the PR changed survive'
+assert_contains "the conflict-check schema states the per-disposition verdict" "$(cat "$RUN_LOG")" "every repaired hunk preserves both sides' intents, every declined hunk is unchanged from its original PR-side text, and the complete delta has no other changes"
+assert_not_contains "the conflict-check schema does not make every declined hunk preserve main too" "$(cat "$RUN_LOG")" "both sides' intents demonstrably survive in every judgment hunk"
+assert_eq "the partial conflict is human-held with its rung spent and queue removed" "fix-attempted,ready-to-review," "$(gh_labels)"
+assert_not_contains "a partial conflict never claims unattended merge" "$RUN_OUT$(gh_labels)" "readyToMerge"
+assert_contains "the partial conflict audit names a repaired hunk" "$(gh_comments)" "frontend/src/a.ts"
+assert_contains "the partial conflict audit names every repaired hunk" "$(gh_comments)" "frontend/src/b.ts"
+assert_contains "the partial conflict audit names the declined hunk" "$(gh_comments)" "frontend/src/c.ts"
+assert_contains "the partial conflict audit names the declined hunk and reason" "$(gh_comments)" "the two sides require mutually exclusive c values"
+assert_contains "the partial conflict audit says the branch carries the repairs" "$(gh_comments)" "branch now carries"
+assert_contains "the partial conflict live status is held for review" "$(cat "$GH_LOG")" "held for review"
+assert_contains "the partial conflict live status names the decline" "$(cat "$GH_LOG")" "the two sides require mutually exclusive c values"
+
+scenario 'fix-run: a retained queue cannot redispatch and promote a durable partial conflict head'
+seed_conflict_three
+GH_KEEP_LABEL=needs-judgment run_fix "$PARTIALFIX" --issue 42
+PARTIAL_CONFLICT_COMMENTS="$(gh_comments)"
+PARTIAL_CONFLICT_HEAD="$(origin_ref epic/42-add-widget)"
+assert_rc "the first partial blocks when its queue label cannot be removed" 3 "$RUN_RC"
+assert_eq "the first partial records the retained automatic queue" "failed,fix-attempted,needs-judgment," "$(gh_labels)"
+FIX_LABELS="failed,needs-judgment,fix-attempted" SEED_COMMENTS="$PARTIAL_CONFLICT_COMMENTS" \
+  run_fix "$PARTIALFIX" --issue 42
+assert_rc "the redispatched partial head is refused for a human" 2 "$RUN_RC"
+assert_eq "the retained-queue guard starts no resolver or checker" "0 0" "$(calls fix-resolve) $(calls fix-check)"
+assert_eq "the guarded partial head is unchanged" "$PARTIAL_CONFLICT_HEAD" "$(origin_ref epic/42-add-widget)"
+assert_not_contains "the guarded partial head never reaches unattended merge" "$RUN_OUT$(gh_labels)" "readyToMerge"
+assert_not_contains "the guarded partial head has no merge-queue label" "$(gh_labels)" "ready-to-merge"
+
+scenario 'fix-run: a human-granted round receives only durable declined conflict hunks'
+seed_conflict_three
+GRANTBASE="$TMP/fixtures-fix-grant-base"; cp -R "$PARTIALFIX" "$GRANTBASE"
+fixture "$GRANTBASE" fix-resolve '{"dispositions":[{"index":1,"action":"repaired","reason":"kept both a intents","mainIntent":"main changed a","prIntent":"the PR changed a","resolution":"Both a intents survive."},{"index":2,"action":"declined","reason":"b still needs judgment"},{"index":3,"action":"declined","reason":"c still needs judgment"}],"summary":"Repaired a and retained b and c for review."}'
+fixture_sh "$GRANTBASE" fix-resolve 'printf "export const a = \"main-a pr-a\"\n" > frontend/src/a.ts; printf "export const b = \"pr-b\"\n" > frontend/src/b.ts; printf "export const c = \"pr-c\"\n" > frontend/src/c.ts; git add frontend/src/a.ts frontend/src/b.ts frontend/src/c.ts; GIT_EDITOR=true git rebase --continue >/dev/null'
+run_fix "$GRANTBASE" --issue 42
+GRANTED_COMMENTS="$(gh_comments)"
+GRANTED_BEFORE="$(origin_ref epic/42-add-widget)"
+GRANTED="$TMP/fixtures-fix-granted"; cp -R "$GRANTBASE" "$GRANTED"
+fixture "$GRANTED" fix-resolve '{"dispositions":[{"index":1,"action":"repaired","reason":"b now safely composes","mainIntent":"main changed b","prIntent":"the PR changed b","resolution":"Both b intents survive."},{"index":2,"action":"declined","reason":"c still needs a human"}],"summary":"Repaired b; retained c for review."}'
+fixture_sh "$GRANTED" fix-resolve 'printf "export const b = \"main-b pr-b\"\n" > frontend/src/b.ts'
+FIX_LABELS="failed,needs-judgment" SEED_COMMENTS="$GRANTED_COMMENTS" run_fix "$GRANTED" --issue 42
+GRANTED_AFTER="$(origin_ref epic/42-add-widget)"
+assert_rc "the granted partial-conflict round completes as a human hold" 0 "$RUN_RC"
+assert_eq "the granted round advances the partial head" "advanced" "$([[ "$GRANTED_AFTER" != "$GRANTED_BEFORE" ]] && echo advanced || echo unchanged)"
+GRANTED_RESOLVE_PROMPT="$(cat "$STATE_DIR/fix-resolve.0.prompt" 2>/dev/null || true)"
+GRANTED_CHECK_PROMPT="$(cat "$STATE_DIR/fix-check.0.prompt" 2>/dev/null || true)"
+assert_contains "the granted resolver receives prior decline b" "$GRANTED_RESOLVE_PROMPT" "b still needs judgment"
+assert_contains "the granted resolver receives prior decline c" "$GRANTED_RESOLVE_PROMPT" "c still needs judgment"
+assert_not_contains "the granted resolver does not receive repaired a as work" "$GRANTED_RESOLVE_PROMPT" "kept both a intents"
+assert_contains "the granted checker receives repaired b" "$GRANTED_CHECK_PROMPT" "b now safely composes"
+assert_contains "the granted checker receives still-declined c" "$GRANTED_CHECK_PROMPT" "c still needs a human"
+assert_not_contains "the granted checker does not revisit repaired a" "$GRANTED_CHECK_PROMPT" "kept both a intents"
+assert_eq "the granted round pushes its b repair" 'export const b = "main-b pr-b"' "$(git -C "$ORIGIN" show epic/42-add-widget:frontend/src/b.ts)"
+assert_eq "the still-declined c text remains unchanged" 'export const c = "pr-c"' "$(git -C "$ORIGIN" show epic/42-add-widget:frontend/src/c.ts)"
+assert_eq "a still-partial granted round stays human-held" "fix-attempted,ready-to-review," "$(gh_labels)"
+assert_not_contains "the still-partial granted round never claims unattended merge" "$RUN_OUT" '"readyToMerge":true'
+GRANTED_PARTIAL_COMMENT="$(gh_last_comment)"
+assert_contains "the granted partial audit names repaired b" "$GRANTED_PARTIAL_COMMENT" "frontend/src/b.ts"
+assert_contains "the granted partial audit records b's repaired reason" "$GRANTED_PARTIAL_COMMENT" "b now safely composes"
+assert_contains "the granted partial audit names declined c" "$GRANTED_PARTIAL_COMMENT" "frontend/src/c.ts"
+assert_contains "the granted partial audit records c's decline reason" "$GRANTED_PARTIAL_COMMENT" "c still needs a human"
+assert_contains "the granted partial audit says the branch carries its repair" "$GRANTED_PARTIAL_COMMENT" "branch now carries the repaired hunks"
+GRANTED_PARTIAL_COMMENTS="$(gh_comments)"
+GRANTED_PARTIAL_HEAD="$GRANTED_AFTER"
+GRANTED_ALL="$TMP/fixtures-fix-granted-all"; cp -R "$GRANTED" "$GRANTED_ALL"
+fixture "$GRANTED_ALL" fix-resolve '{"dispositions":[{"index":1,"action":"repaired","reason":"c now safely composes","mainIntent":"main changed c","prIntent":"the PR changed c","resolution":"Both c intents survive."}],"summary":"Repaired the final declined c hunk."}'
+fixture_sh "$GRANTED_ALL" fix-resolve 'printf "export const c = \"main-c pr-c\"\n" > frontend/src/c.ts'
+FIX_LABELS="ready-to-review,needs-judgment" SEED_COMMENTS="$GRANTED_PARTIAL_COMMENTS" run_fix "$GRANTED_ALL" --issue 42
+assert_rc "a granted round can repair every remaining conflict hunk" 0 "$RUN_RC"
+assert_eq "the fully repaired continuation advances the partial head" "advanced" "$([[ "$(origin_ref epic/42-add-widget)" != "$GRANTED_PARTIAL_HEAD" ]] && echo advanced || echo unchanged)"
+assert_eq "the fully repaired continuation returns to unattended merge" "fix-attempted,ready-to-merge," "$(gh_labels)"
+GRANTED_ALL_COMMENT="$(gh_last_comment)"
+assert_contains "the fully repaired continuation audit names repaired c" "$GRANTED_ALL_COMMENT" "frontend/src/c.ts"
+assert_contains "the fully repaired continuation audit records c's disposition" "$GRANTED_ALL_COMMENT" "disposition: repaired"
+assert_contains "the fully repaired continuation audit records c's reason" "$GRANTED_ALL_COMMENT" "c now safely composes"
+assert_contains "the fully repaired continuation says the branch carries its repair" "$GRANTED_ALL_COMMENT" "branch now carries the repaired hunks"
+
+scenario 'fix-run: a moved main holds a human-granted conflict continuation out of the automatic queue'
+seed_conflict_three
+run_fix "$GRANTBASE" --issue 42
+STALE_CONTINUATION_COMMENTS="$(gh_comments)"
+STALE_CONTINUATION_HEAD="$(origin_ref epic/42-add-widget)"
+seed_branch main main 'printf "main advanced\n" > README.md && git add README.md && git commit -qm "main: advance after partial evidence"'
+FIX_LABELS="failed,needs-judgment" SEED_COMMENTS="$STALE_CONTINUATION_COMMENTS" run_fix "$GRANTED" --issue 42
+assert_rc "a stale granted continuation is a final human hold" 2 "$RUN_RC"
+assert_eq "the stale continuation starts no resolver or checker" "0 0" "$(calls fix-resolve) $(calls fix-check)"
+assert_eq "the stale continuation leaves the partial branch unchanged" "$STALE_CONTINUATION_HEAD" "$(origin_ref epic/42-add-widget)"
+assert_eq "the stale continuation rests human-only with its rung recorded" "fix-attempted,ready-to-review," "$(gh_labels)"
+assert_contains "the stale continuation audit names the moved main" "$(gh_last_comment)" "origin/main moved after the partial-conflict evidence was captured"
+STALE_FINAL_LABELS="$(gh_labels)"; STALE_FINAL_LABELS="${STALE_FINAL_LABELS%,}"
+FIX_LABELS="$STALE_FINAL_LABELS" run_fix "$GRANTED" --issue 42
+assert_rc "the human-only stale continuation is absent from the next fixer launch" 2 "$RUN_RC"
+assert_contains "the subsequent launch sees no conflict-fixer queue label" "$RUN_OUT" "not labelled needs-judgment"
+assert_eq "the subsequent launch still starts no resolver or checker" "0 0" "$(calls fix-resolve) $(calls fix-check)"
+
+scenario 'fix-run: partial-head guard reports only the labels still needing repair'
+seed_conflict_three
+run_fix "$GRANTBASE" --issue 42
+GUARDED_COMMENTS="$(gh_comments)"
+GUARDED_HEAD="$(origin_ref epic/42-add-widget)"
+FIX_LABELS="failed,needs-judgment,fix-attempted" SEED_COMMENTS="$GUARDED_COMMENTS" GH_DROP_LABEL=ready-to-review \
+  run_fix "$PARTIALFIX" --issue 42
+assert_rc "the guarded partial head refuses without model work" 2 "$RUN_RC"
+assert_eq "the half-transition guard starts no resolver or checker" "0 0" "$(calls fix-resolve) $(calls fix-check)"
+assert_eq "the half-transition guard leaves the branch unchanged" "$GUARDED_HEAD" "$(origin_ref epic/42-add-widget)"
+GUARD_COMMENT="$(gh_last_comment)"
+assert_contains "the guard asks to set the missing review label" "$GUARD_COMMENT" "set ready-to-review"
+assert_not_contains "the guard does not ask to remove an already-removed queue label" "$GUARD_COMMENT" "remove needs-judgment"
+
+for EVIDENCE_FAILURE in write readback; do
+  scenario "fix-run: conflict partial evidence $EVIDENCE_FAILURE failure stops before push and cleans the worktree"
+  seed_conflict_three
+  BEFORE="$(origin_ref epic/42-add-widget)"
+  if [[ "$EVIDENCE_FAILURE" == write ]]; then
+    GH_CONFLICT_EVIDENCE_COMMENT_FAIL=1 run_fix "$PARTIALFIX" --issue 42
+  else
+    GH_CONFLICT_EVIDENCE_READ_FAIL=1 run_fix "$PARTIALFIX" --issue 42
+  fi
+  assert_rc "$EVIDENCE_FAILURE conflict-evidence failure blocks" 3 "$RUN_RC"
+  assert_contains "$EVIDENCE_FAILURE conflict-evidence failure names the durability gate" "$RUN_OUT" "partial-conflict evidence could not be published and read back"
+  assert_eq "$EVIDENCE_FAILURE conflict-evidence failure leaves origin untouched" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+  assert_eq "$EVIDENCE_FAILURE conflict-evidence failure keeps the bounded retry state" "failed,fix-attempted,needs-judgment," "$(gh_labels)"
+  assert_eq "$EVIDENCE_FAILURE conflict-evidence failure cleans the worktree" "" "$(git -C "$WT" status --porcelain)"
+  assert_eq "$EVIDENCE_FAILURE conflict-evidence failure leaves no rebase state" "" "$(cd "$WT" && ls -d .git/rebase-merge .git/rebase-apply 2>/dev/null)"
+done
+
+scenario 'fix-run: declining every judgment hunk preserves the original branch'
+seed_conflict_three
+ALLDECLINEFIX="$TMP/fixtures-fix-all-declined"; cp -R "$FIXBASE" "$ALLDECLINEFIX"; rm -f "$ALLDECLINEFIX/fix-resolve.sh"
+fixture "$ALLDECLINEFIX" fix-resolve '{"dispositions":[{"index":1,"action":"declined","reason":"a requires a product decision"},{"index":2,"action":"declined","reason":"b requires a product decision"},{"index":3,"action":"declined","reason":"c requires a product decision"}],"summary":"No judgment hunk was safely repairable."}'
+BEFORE="$(origin_ref epic/42-add-widget)"
+run_fix "$ALLDECLINEFIX" --issue 42
+assert_rc "an all-declined conflict round follows the refusal path" 3 "$RUN_RC"
+assert_eq "an all-declined conflict round runs neither verify nor check" "0 0" "$(grep -c '^run verify$' "$NPM_LOG" || true) $(calls fix-check)"
+assert_eq "an all-declined conflict round does not push" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+assert_eq "an all-declined conflict round restores its existing queue state" "failed,fix-attempted,needs-judgment," "$(gh_labels)"
+assert_contains "the all-declined conflict refusal retains every named reason" "$(gh_comments)" "c requires a product decision"
+
+scenario 'fix-run: duplicate conflict disposition indexes fail closed'
+seed_conflict_three
+BADPARTIALFIX="$TMP/fixtures-fix-bad-dispositions"; cp -R "$PARTIALFIX" "$BADPARTIALFIX"
+fixture "$BADPARTIALFIX" fix-resolve '{"dispositions":[{"index":1,"action":"repaired","reason":"first claim"},{"index":1,"action":"repaired","reason":"duplicate claim"},{"index":3,"action":"declined","reason":"third claim"}],"summary":"Index two is missing."}'
+BEFORE="$(origin_ref epic/42-add-widget)"
+run_fix "$BADPARTIALFIX" --issue 42
+assert_rc "duplicate conflict dispositions block" 3 "$RUN_RC"
+assert_eq "duplicate conflict dispositions never reach verify or check" "0 0" "$(grep -c '^run verify$' "$NPM_LOG" || true) $(calls fix-check)"
+assert_eq "duplicate conflict dispositions never push" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+assert_not_contains "duplicate conflict dispositions never expose the merge queue" "$(gh_labels)" "ready-to-merge"
+
+scenario 'fix-run: an unconfirmed review label after a partial push cannot restore either autonomous queue'
+seed_conflict_three
+BEFORE="$(origin_ref epic/42-add-widget)"
+GH_DROP_LABEL=ready-to-review run_fix "$PARTIALFIX" --issue 42
+AFTER="$(origin_ref epic/42-add-widget)"
+assert_eq "the checked conflict partial remains pushed despite terminal-label trouble" "advanced" "$([[ "$AFTER" != "$BEFORE" ]] && echo advanced || echo unchanged)"
+assert_not_contains "terminal-label trouble never exposes the conflict partial to merge" "$(gh_labels)" "ready-to-merge"
+assert_not_contains "terminal-label trouble never restores the conflict fixer queue" "$(gh_labels)" "needs-judgment"
+assert_contains "terminal-label trouble leaves a human-owned terminal state" "$(gh_labels)" "failed"
 
 scenario 'fix-run: an intent carried outside the marker block ships, and is recorded'
 seed_conflict_moved
@@ -2823,6 +3034,28 @@ assert_eq "no resolver was woken" 0 "$(calls fix-resolve)"
 assert_contains "the refusal was commented" "$(gh_comments)" "🤖 fix-conflict refused: attempt ladder exhausted"
 assert_contains "the issue is left failed" "$(gh_labels)" "failed,"
 assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+
+scenario 'fix-run: unreadable conflict evidence is a human-only final refusal'
+seed_conflict
+BEFORE="$(origin_ref epic/42-add-widget)"
+EVIDENCE_REFUSAL_START="$(date +%s)"
+EPIC_TERMINAL_REPORT_MS=1200 GH_SLOW_PATCH=5 GH_AUTH_READ_FAIL=1 run_fix "$FIXBASE" --issue 42
+EVIDENCE_REFUSAL_ELAPSED=$(( $(date +%s) - EVIDENCE_REFUSAL_START ))
+assert_rc "exits 2 (skipped/refused before work)" 2 "$RUN_RC"
+assert_eq "the final status edit stays inside the refusal's existing terminal window" "bounded" "$( (( EVIDENCE_REFUSAL_ELAPSED < 4 )) && echo bounded || echo "waited ${EVIDENCE_REFUSAL_ELAPSED}s for a 5s status stall" )"
+assert_contains "the refusal names the unreadable trusted evidence" "$RUN_OUT" "trusted partial-conflict evidence could not be read"
+assert_eq "no resolver or adversarial checker ran" "0 0" "$(calls fix-resolve) $(calls fix-check)"
+assert_not_contains "no first attempt rung was consumed" "$(gh_labels)" "fix-attempted"
+assert_not_contains "no retry rung was consumed" "$(gh_labels)" "fix-retried"
+assert_eq "the unreadable-evidence refusal removes the automatic queue" "failed," "$(gh_labels)"
+assert_eq "the PR branch is unchanged" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+EVIDENCE_REFUSAL_COMMENT="$(gh_comments)"
+assert_contains "the comment reports the automatic queue removal" "$EVIDENCE_REFUSAL_COMMENT" "needs-judgment has been removed automatically"
+assert_contains "the comment names the human-only resting label" "$EVIDENCE_REFUSAL_COMMENT" "rests at failed"
+FINAL_FIX_LABELS="$(gh_labels)"; FINAL_FIX_LABELS="${FINAL_FIX_LABELS%,}"
+FIX_LABELS="$FINAL_FIX_LABELS" run_fix "$FIXBASE" --issue 42
+assert_contains "a subsequent launch sees the issue is no longer in the dispatch queue" "$RUN_OUT" "not labelled needs-judgment"
+assert_eq "the removed queue cannot start resolver or checker work" "0 0" "$(calls fix-resolve) $(calls fix-check)"
 
 scenario 'fix-run: no open PR is a final refusal'
 seed_conflict
@@ -2943,6 +3176,78 @@ assert_contains "and gets the failing job log" "$FIXPROMPT" "expected createWidg
 assert_contains "and is told the failure reproduces locally" "$FIXPROMPT" "RED locally on this exact tree"
 assert_contains "and is forbidden to weaken a test" "$FIXPROMPT" "Never weaken, skip, delete or loosen a test"
 assert_eq "verify ran before and after the fix" 2 "$(grep -c '^run verify$' "$NPM_LOG")"
+
+scenario 'ci-run: two repaired checks survive one declined check and are held for review'
+seed_ci_pr
+PARTIALCI="$TMP/fixtures-ci-partial"; cp -R "$CIBASE" "$PARTIALCI"; rm -f "$PARTIALCI/ci-fix.sh"
+fixture "$PARTIALCI" ci-fix '{"dispositions":[{"index":1,"action":"repaired","reason":"restored the missing build export"},{"index":2,"action":"repaired","reason":"removed the type error without widening the type"},{"index":3,"action":"declined","reason":"the security failure needs a missing repository secret, not a code change"}],"cause":"Two failures are code defects; the third is external configuration.","summary":"Repairs build and typecheck while leaving security unchanged.","files":["frontend/src/widget.ts","frontend/src/types.ts"]}'
+fixture_sh "$PARTIALCI" ci-fix 'printf "export const createWidget = () => ({})\n" > frontend/src/widget.ts; printf "export const widgetType = \"safe\"\n" > frontend/src/types.ts'
+BEFORE="$(origin_ref epic/42-add-widget)"
+CI_RED=build,typecheck,security run_ci "$CI_RUN" "$PARTIALCI" --issue 42
+AFTER="$(origin_ref epic/42-add-widget)"
+assert_rc "a verified partial CI repair is a successful human-held result" 0 "$RUN_RC"
+assert_eq "the partial CI repair advances the remote branch" "advanced" "$([[ "$AFTER" != "$BEFORE" ]] && echo advanced || echo unchanged)"
+assert_eq "the partial CI branch remains one commit above main" 1 "$(origin_count epic/42-add-widget)"
+assert_contains "the first CI repair is in the pushed tree" "$(git -C "$ORIGIN" show epic/42-add-widget:frontend/src/widget.ts 2>/dev/null || true)" "createWidget"
+assert_contains "the second CI repair is in the pushed tree" "$(git -C "$ORIGIN" show epic/42-add-widget:frontend/src/types.ts 2>/dev/null || true)" "widgetType"
+assert_eq "a mixed CI round runs post-edit verify and its skeptic" "2 1" "$(grep -c '^run verify$' "$NPM_LOG" || true) $(calls ci-check)"
+assert_contains "the CI skeptic receives the declined-check claim" "$(cat "$STATE_DIR/ci-check.0.prompt" 2>/dev/null || true)" "missing repository secret"
+assert_eq "the partial CI repair is human-held with its rung spent and queue removed" "ci-attempted,ready-to-review," "$(gh_labels)"
+assert_not_contains "a partial CI repair never claims unattended merge" "$RUN_OUT" '"readyToMerge":true'
+assert_contains "the partial CI audit names the repaired build check" "$(gh_comments)" "build"
+assert_contains "the partial CI audit names the repaired typecheck" "$(gh_comments)" "typecheck"
+assert_contains "the partial CI audit names the declined security check and reason" "$(gh_comments)" "missing repository secret"
+assert_contains "the partial CI audit says the branch carries the repairs" "$(gh_comments)" "branch now carries"
+assert_contains "the partial CI live status is held for review" "$(cat "$GH_LOG")" "held for review"
+assert_contains "the partial CI live status names the decline" "$(cat "$GH_LOG")" "missing repository secret"
+
+scenario 'ci-run: new repair files are in the exact checked delta and cleaned after refutation'
+seed_ci_pr
+NEWFILECI="$TMP/fixtures-ci-new-files"; cp -R "$PARTIALCI" "$NEWFILECI"
+fixture_sh "$NEWFILECI" ci-fix 'printf "export const createWidget = () => ({})\n" > frontend/src/widget.ts; printf "export const widgetType = \"safe\"\n" > frontend/src/types.ts'
+fixture_sh "$NEWFILECI" ci-check 'git diff --name-only "$(git rev-parse refs/remotes/origin/epic/42-add-widget)" > "$STUB_STATE/check-names"; git diff "$(git rev-parse refs/remotes/origin/epic/42-add-widget)" > "$STUB_STATE/check-diff"'
+fixture "$NEWFILECI" ci-check '{"survives":false,"confidence":20,"reasoning":"The new files do not establish the repair."}'
+BEFORE="$(origin_ref epic/42-add-widget)"
+CI_RED=build,typecheck,security run_ci "$CI_RUN" "$NEWFILECI" --issue 42
+assert_rc "the CI adversarial refutation blocks" 3 "$RUN_RC"
+assert_contains "the CI checker sees the new implementation path" "$(cat "$STATE_DIR/check-names" 2>/dev/null || true)" "frontend/src/widget.ts"
+assert_contains "the CI checker sees the second new path" "$(cat "$STATE_DIR/check-names" 2>/dev/null || true)" "frontend/src/types.ts"
+assert_contains "the CI checker sees new-file content" "$(cat "$STATE_DIR/check-diff" 2>/dev/null || true)" "createWidget"
+assert_eq "the refuted CI worktree and index are clean" "" "$(git -C "$WT" status --porcelain)"
+assert_eq "the refuted CI new files were never pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+
+scenario 'ci-run: declining every failed check preserves the original branch'
+seed_ci_pr
+ALLDECLINECI="$TMP/fixtures-ci-all-declined"; cp -R "$CIBASE" "$ALLDECLINECI"; rm -f "$ALLDECLINECI/ci-fix.sh"
+fixture "$ALLDECLINECI" ci-fix '{"dispositions":[{"index":1,"action":"declined","reason":"build needs a missing secret"},{"index":2,"action":"declined","reason":"typecheck is a runner outage"},{"index":3,"action":"declined","reason":"security is an external service outage"}],"cause":"None of the failures can be repaired in this tree.","summary":"No code was changed.","files":[]}'
+BEFORE="$(origin_ref epic/42-add-widget)"
+CI_RED=build,typecheck,security run_ci "$CI_RUN" "$ALLDECLINECI" --issue 42
+assert_rc "an all-declined CI round follows the refusal path" 3 "$RUN_RC"
+assert_eq "an all-declined CI round skips post-edit verify and check" "1 0" "$(grep -c '^run verify$' "$NPM_LOG" || true) $(calls ci-check)"
+assert_eq "an all-declined CI round does not push" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+assert_eq "an all-declined CI round restores its existing queue state" "ci-attempted,failed,needs-ci-fix," "$(gh_labels)"
+assert_contains "the all-declined CI refusal retains every named reason" "$(gh_comments)" "security is an external service outage"
+
+scenario 'ci-run: missing failed-check disposition indexes fail closed'
+seed_ci_pr
+BADPARTIALCI="$TMP/fixtures-ci-bad-dispositions"; cp -R "$PARTIALCI" "$BADPARTIALCI"
+fixture "$BADPARTIALCI" ci-fix '{"dispositions":[{"index":1,"action":"repaired","reason":"build repaired"},{"index":3,"action":"declined","reason":"security declined"}],"cause":"Index two is missing.","summary":"Malformed coverage must not land.","files":["frontend/src/widget.ts"]}'
+BEFORE="$(origin_ref epic/42-add-widget)"
+CI_RED=build,typecheck,security run_ci "$CI_RUN" "$BADPARTIALCI" --issue 42
+assert_rc "missing CI dispositions block" 3 "$RUN_RC"
+assert_eq "missing CI dispositions never reach post-edit verify or check" "1 0" "$(grep -c '^run verify$' "$NPM_LOG" || true) $(calls ci-check)"
+assert_eq "missing CI dispositions never push" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+assert_not_contains "missing CI dispositions never expose the merge queue" "$(gh_labels)" "ready-to-merge"
+
+scenario 'ci-run: audit failure after a partial push cannot restore either autonomous queue'
+seed_ci_pr
+BEFORE="$(origin_ref epic/42-add-widget)"
+CI_RED=build,typecheck,security GH_BODY_FILE_COMMENT_FAIL=1 run_ci "$CI_RUN" "$PARTIALCI" --issue 42
+AFTER="$(origin_ref epic/42-add-widget)"
+assert_eq "the checked CI partial remains pushed despite audit trouble" "advanced" "$([[ "$AFTER" != "$BEFORE" ]] && echo advanced || echo unchanged)"
+assert_not_contains "audit trouble never exposes the CI partial to merge" "$(gh_labels)" "ready-to-merge"
+assert_not_contains "audit trouble never restores the CI fixer queue" "$(gh_labels)" "needs-ci-fix"
+assert_contains "audit trouble leaves the CI partial human-held" "$(gh_labels)" "ready-to-review"
 
 scenario 'ci-run: a quota hold refunds only the retry rung it added'
 seed_ci_pr
@@ -3137,6 +3442,25 @@ make_defect_evidence() { # head [blocker title] [requirement body]
     blockers: [{source: "ship-deferral", reason: $title, items: [{title: $title, severity: "Important", why: "firstItem dereferences items[0] without a guard."}]}]
   }'
 }
+make_three_defect_evidence() { # head
+  local head="$1"
+  printf '🤖 defect-fix evidence\n'
+  jq -cn --arg head "$head" '{
+    version: 1,
+    issue: 42,
+    pr: {number: 7, url: "https://github.com/o/r/pull/7", branch: "epic/42-add-widget", head: $head},
+    requirement: {title: "Add widget", body: "Build a widget."},
+    blockers: [{
+      source: "ship-deferral",
+      reason: "Three concrete defects remain",
+      items: [
+        {title: "Empty list still crashes", severity: "Critical", why: "firstItem dereferences items[0] without a guard."},
+        {title: "Null member still crashes", severity: "Important", why: "firstItem dereferences name when the first member is null."},
+        {title: "Stable peers would be reordered", severity: "Important", why: "the requested tie-breaker would destroy stable input order."}
+      ]
+    }]
+  }'
+}
 make_canonical_defect_evidence() { # head summary
   local head="$1" summary="$2" legacy json
   legacy="$(make_defect_evidence "$head")"
@@ -3217,6 +3541,108 @@ assert_contains "the skeptic sees the durable named defect" "$CHECKPROMPT" "Empt
 assert_contains "the skeptic is pointed at the exact captured-head delta" "$CHECKPROMPT" "git diff $BEFORE"
 assert_not_contains "the skeptic is blind to the fixer's explanation" "$CHECKPROMPT" "PRIVATE_FIXER_EXPLANATION"
 assert_eq "verify runs once after the edit" 1 "$(grep -c '^run verify$' "$NPM_LOG")"
+
+scenario 'defect-run: two repaired defects survive one decline, reissue evidence, and are held for review'
+seed_defect_pr
+PARTIALDEFECT="$TMP/fixtures-defect-partial"; cp -R "$DEFECTBASE" "$PARTIALDEFECT"; rm -f "$PARTIALDEFECT/defect-fix.sh"
+fixture "$PARTIALDEFECT" defect-fix '{"dispositions":[{"index":1,"action":"repaired","reason":"guarded the empty list"},{"index":2,"action":"repaired","reason":"guarded a null first member"},{"index":3,"action":"declined","reason":"the requested tie-breaker would introduce an unstable-order regression"}],"summary":"Repairs the two safe dereferences and leaves stable ordering unchanged.","files":["frontend/src/widget.ts","frontend/src/null-guard.test.ts"]}'
+fixture_sh "$PARTIALDEFECT" defect-fix 'printf "export const firstItem = items => items.length && items[0] ? items[0].name : null\n" > frontend/src/widget.ts; printf "empty and null are guarded\n" > frontend/src/null-guard.test.ts'
+fixture "$PARTIALDEFECT" defect-check '{"survives":true,"confidence":93,"reasoning":"The exact delta repairs defects 1 and 2, leaves declined defect 3 unchanged, weakens no gate, and introduces no unrelated behavior."}'
+BEFORE="$(origin_ref epic/42-add-widget)"
+DEFECT_COMMENTS="$(make_three_defect_evidence "$BEFORE")" run_defect "$DEFECT_RUN" "$PARTIALDEFECT" --issue 42
+AFTER="$(origin_ref epic/42-add-widget)"
+assert_rc "a verified partial defect repair is a successful human-held result" 0 "$RUN_RC"
+assert_eq "partial defect repair advances the remote branch" "advanced" "$([[ "$AFTER" != "$BEFORE" ]] && echo advanced || echo unchanged)"
+assert_eq "the partial defect branch remains one commit above main" 1 "$(origin_count epic/42-add-widget)"
+assert_contains "the two safe repairs are carried by the pushed tree" "$(git -C "$ORIGIN" show epic/42-add-widget:frontend/src/widget.ts)" "items.length && items[0]"
+assert_contains "the partial defect push includes intent-added coverage" "$(git -C "$ORIGIN" show epic/42-add-widget:frontend/src/null-guard.test.ts 2>/dev/null || true)" "empty and null are guarded"
+assert_eq "a mixed defect round runs verify and its skeptic" "1 1" "$(grep -c '^run verify$' "$NPM_LOG" || true) $(calls defect-check)"
+PARTIAL_CHECK_PROMPT="$(cat "$STATE_DIR/defect-check.0.prompt" 2>/dev/null || true)"
+assert_contains "the defect skeptic receives the repaired-item claims" "$PARTIAL_CHECK_PROMPT" "guarded the empty list"
+assert_contains "the defect skeptic receives the declined-item claim" "$PARTIAL_CHECK_PROMPT" "unstable-order regression"
+assert_eq "the partial defect repair is human-held with its rung spent and queue removed" "defect-attempted,ready-to-review," "$(gh_labels)"
+assert_not_contains "a partial defect repair never claims unattended merge" "$RUN_OUT" '"readyToMerge":true'
+assert_contains "the partial defect audit names the first repaired item" "$(gh_comments)" "Empty list still crashes"
+assert_contains "the partial defect audit names the second repaired item" "$(gh_comments)" "Null member still crashes"
+assert_contains "the partial defect audit names the decline and its reason" "$(gh_comments)" "the requested tie-breaker would introduce an unstable-order regression"
+assert_contains "the partial defect audit says the branch carries the repairs" "$(gh_comments)" "branch now carries"
+assert_not_contains "a partial defect audit cannot authorize landing-only promotion" "$(gh_comments)" "🤖 defect-fix landing record"
+assert_contains "the partial defect live status is held for review" "$(cat "$GH_LOG")" "held for review"
+assert_contains "the partial defect live status names the decline" "$(cat "$GH_LOG")" "Stable peers would be reordered"
+REISSUED="$(gh_last_evidence_comment)"
+REISSUED_JSON="$(printf '%s\n' "$REISSUED" | evidence_json)"
+assert_eq "reissued defect evidence is pinned to the amended head" "$AFTER" "$(printf '%s' "$REISSUED_JSON" | jq -r '.pr.head // empty' 2>/dev/null)"
+assert_eq "reissued defect evidence contains only the declined item" "Stable peers would be reordered" "$(printf '%s' "$REISSUED_JSON" | jq -r '[.blockers[].items[].title] | join("|")' 2>/dev/null)"
+
+# A human may grant another round by restoring the queue and stripping the
+# ladder labels. Its brief must come from the reissued head-bound envelope, so
+# work already pushed is not sent to the fixer again.
+FOLLOWUPDEFECT="$TMP/fixtures-defect-partial-followup"; cp -R "$DEFECTBASE" "$FOLLOWUPDEFECT"; rm -f "$FOLLOWUPDEFECT/defect-fix.sh"
+fixture "$FOLLOWUPDEFECT" defect-fix '{"dispositions":[{"index":1,"action":"repaired","reason":"implemented a stable tie-break without reordering peers"}],"summary":"Repairs the remaining stable-order defect.","files":["frontend/src/widget.ts"]}'
+fixture_sh "$FOLLOWUPDEFECT" defect-fix 'printf "export const firstItem = items => items.length && items[0] ? items[0].name : null\nexport const stablePeers = items => items\n" > frontend/src/widget.ts'
+DEFECT_COMMENTS="$REISSUED" run_defect "$DEFECT_RUN" "$FOLLOWUPDEFECT" --issue 42
+FOLLOWUP_PROMPT="$(cat "$STATE_DIR/defect-fix.0.prompt" 2>/dev/null || true)"
+assert_contains "a granted later round receives the declined defect" "$FOLLOWUP_PROMPT" "Stable peers would be reordered"
+assert_not_contains "a granted later round does not receive repaired defect one" "$FOLLOWUP_PROMPT" "Empty list still crashes"
+assert_not_contains "a granted later round does not receive repaired defect two" "$FOLLOWUP_PROMPT" "Null member still crashes"
+
+scenario 'defect-run: declining every named defect preserves the original branch'
+seed_defect_pr
+ALLDECLINEDEFECT="$TMP/fixtures-defect-all-declined"; cp -R "$DEFECTBASE" "$ALLDECLINEDEFECT"; rm -f "$ALLDECLINEDEFECT/defect-fix.sh"
+fixture "$ALLDECLINEDEFECT" defect-fix '{"dispositions":[{"index":1,"action":"declined","reason":"the empty case needs product input"},{"index":2,"action":"declined","reason":"the null case needs product input"},{"index":3,"action":"declined","reason":"the stable-order case needs product input"}],"summary":"No named defect was safely repairable.","files":[]}'
+BEFORE="$(origin_ref epic/42-add-widget)"
+DEFECT_COMMENTS="$(make_three_defect_evidence "$BEFORE")" run_defect "$DEFECT_RUN" "$ALLDECLINEDEFECT" --issue 42
+assert_rc "an all-declined defect round follows the refusal path" 3 "$RUN_RC"
+assert_eq "an all-declined defect round runs neither verify nor check" "0 0" "$(grep -c '^run verify$' "$NPM_LOG" || true) $(calls defect-check)"
+assert_eq "an all-declined defect round does not push" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+assert_eq "an all-declined defect round preserves review, queue, and rung" "defect-attempted,needs-defect-fix,ready-to-review," "$(gh_labels)"
+assert_contains "the all-declined defect refusal retains every named reason" "$(gh_comments)" "the stable-order case needs product input"
+
+scenario 'defect-run: an out-of-range defect disposition fails closed'
+seed_defect_pr
+BADPARTIALDEFECT="$TMP/fixtures-defect-bad-dispositions"; cp -R "$PARTIALDEFECT" "$BADPARTIALDEFECT"
+fixture "$BADPARTIALDEFECT" defect-fix '{"dispositions":[{"index":1,"action":"repaired","reason":"first repaired"},{"index":2,"action":"repaired","reason":"second repaired"},{"index":4,"action":"declined","reason":"out of range"}],"summary":"Index three is missing and four is invalid.","files":["frontend/src/widget.ts"]}'
+BEFORE="$(origin_ref epic/42-add-widget)"
+DEFECT_COMMENTS="$(make_three_defect_evidence "$BEFORE")" run_defect "$DEFECT_RUN" "$BADPARTIALDEFECT" --issue 42
+assert_rc "out-of-range defect dispositions block" 3 "$RUN_RC"
+assert_eq "out-of-range defect dispositions never reach verify or check" "0 0" "$(grep -c '^run verify$' "$NPM_LOG" || true) $(calls defect-check)"
+assert_eq "out-of-range defect dispositions never push" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+assert_not_contains "out-of-range defect dispositions never expose the merge queue" "$(gh_labels)" "ready-to-merge"
+
+scenario 'defect-run: a skeptic refutation discards a mixed partial repair'
+seed_defect_pr
+REFUTEDPARTIALDEFECT="$TMP/fixtures-defect-partial-refuted"; cp -R "$PARTIALDEFECT" "$REFUTEDPARTIALDEFECT"
+fixture "$REFUTEDPARTIALDEFECT" defect-check '{"survives":false,"confidence":94,"reasoning":"Defect two is still reachable through a null member."}'
+BEFORE="$(origin_ref epic/42-add-widget)"
+DEFECT_COMMENTS="$(make_three_defect_evidence "$BEFORE")" run_defect "$DEFECT_RUN" "$REFUTEDPARTIALDEFECT" --issue 42
+assert_rc "a refuted partial defect repair follows the refusal path" 3 "$RUN_RC"
+assert_eq "a refuted partial defect repair still ran verify and check" "1 1" "$(grep -c '^run verify$' "$NPM_LOG" || true) $(calls defect-check)"
+assert_contains "the partial refutation reason reaches the refusal" "$RUN_OUT$(gh_comments)" "Defect two is still reachable"
+assert_eq "a refuted partial defect repair does not push" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+assert_eq "a refuted partial defect repair restores its review queue" "defect-attempted,needs-defect-fix,ready-to-review," "$(gh_labels)"
+
+scenario 'defect-run: red verification discards a mixed partial repair before checking'
+seed_defect_pr
+REDPARTIALDEFECT="$TMP/fixtures-defect-partial-red"; cp -R "$PARTIALDEFECT" "$REDPARTIALDEFECT"; printf '1' > "$REDPARTIALDEFECT/verify.rc"
+BEFORE="$(origin_ref epic/42-add-widget)"
+DEFECT_COMMENTS="$(make_three_defect_evidence "$BEFORE")" run_defect "$DEFECT_RUN" "$REDPARTIALDEFECT" --issue 42
+assert_rc "a red partial defect repair follows the refusal path" 3 "$RUN_RC"
+assert_eq "a red partial defect repair verifies once and never reaches its skeptic" "1 0" "$(grep -c '^run verify$' "$NPM_LOG" || true) $(calls defect-check)"
+assert_contains "the partial verification failure reaches the refusal" "$RUN_OUT$(gh_comments)" "npm run verify is red"
+assert_eq "a red partial defect repair does not push" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+
+scenario 'defect-run: evidence publication failure after a partial push cannot reopen an autonomous queue'
+seed_defect_pr
+BEFORE="$(origin_ref epic/42-add-widget)"
+DEFECT_COMMENTS="$(make_three_defect_evidence "$BEFORE")" GH_EVIDENCE_COMMENT_FAIL=1 \
+  run_defect "$DEFECT_RUN" "$PARTIALDEFECT" --issue 42
+AFTER="$(origin_ref epic/42-add-widget)"
+assert_rc "an unrecorded partial defect landing blocks" 3 "$RUN_RC"
+assert_eq "the already-verified partial branch remains pushed" "advanced" "$([[ "$AFTER" != "$BEFORE" ]] && echo advanced || echo unchanged)"
+assert_contains "the post-push blocker names evidence publication" "$RUN_OUT$(gh_comments)" "evidence"
+assert_not_contains "post-push evidence trouble never exposes unattended merge" "$(gh_labels)" "ready-to-merge"
+assert_not_contains "post-push evidence trouble never restores the defect queue" "$(gh_labels)" "needs-defect-fix"
+assert_contains "post-push evidence trouble remains human-visible" "$(gh_labels)" "ready-to-review"
 
 scenario 'defect-run: a quota hold refunds only the retry rung it added'
 seed_defect_pr

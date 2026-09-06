@@ -98,6 +98,19 @@ don't get re-litigated from memory.
   swap left work to finish, but it is the LANDING, not the repair, so the next
   rung redoes only that — from its own durable head-bound record — rather than
   sending a second repair at defects that are already repaired.
+  Each fixer also preserves a verified partial round instead of throwing its
+  safe work away: exact indexed repaired/declined claims pass through the same
+  project verify and adversarial delta check, then the amended branch rests at
+  `ready-to-review` with its fixer queue removed. That spends the rung and
+  requires a human because a decline is still unresolved; it does not erase
+  repairs the human would otherwise have to repeat. Partial conflict evidence
+  is likewise authenticated and bound to the amended head, with only the
+  declined hunk identities and their original diff3 sides. A retained queue
+  can therefore never reinterpret the already-rebased head as a clean complete
+  repair; clearing both ladder labels explicitly grants one round over only
+  those declines, provided main has not moved. A partial defect round reissues
+  the authenticated evidence on the amended head with only declined items, so
+  a human-granted later round cannot repair completed work again.
 - **Crons watch, models act.** Dispatch, reap and merge ticks are plain shell
   reading labels; the first model to run is the epic that got launched.
 - **Exhausted allowance pauses admission, not work.** A provider's hard quota

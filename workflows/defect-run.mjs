@@ -6,9 +6,10 @@
 // persisted on GitHub, edits exactly those defects, runs the project's real
 // verify contract, and intent-adds new files before giving the exact delta to a
 // blind adversarial checker.
-// Only a verified fix is amended and force-pushed under a lease, after which
-// the issue returns to ready-to-merge for the merge worker's rebase and check
-// re-run. Everything else rests at ready-to-review for a human.
+// Only a verified fix is amended and force-pushed under a lease. A complete
+// repair returns to ready-to-merge; a verified partial repair is preserved but
+// rests at ready-to-review with fresh head-bound evidence containing only its
+// declines. Everything else rests with a human.
 //
 // Every readback that verifies one of this run's own writes — the PR head after
 // the force push, the labels after the landing swap — is bounded rather than
@@ -40,7 +41,7 @@ import { initStatus, statusPhase, statusNote, statusFinish } from './lib/status.
 import { failureReason } from './lib/proc.mjs'
 import { ensureLabels, editLabels, issueLabels, issueView, comment, openPrs, prView, repositoryView, authenticatedLogin, readBack, waitedFor, terminalBudget, terminalTransition, verifyIssueEngine } from './lib/github.mjs'
 import { git, gitOut, discoverPackages, pkgList, ensureDeps, runVerify, pushRejected, intentToAdd } from './lib/repo.mjs'
-import { matchingDefectEvidenceComment, matchingDefectRepair, renderDefectEvidenceSection, renderDefectRepair } from './lib/defect-evidence.mjs'
+import { defectEvidenceItems, filterDefectEvidence, matchingDefectEvidenceComment, matchingDefectRepair, publishDefectEvidence, renderDefectEvidenceSection, renderDefectRepair } from './lib/defect-evidence.mjs'
 import { finalizeFixerIssue, finalizeFixerQuotaHold } from './lib/fixer-finalize.mjs'
 import { recordQuotaHold } from './quota-hold.mjs'
 
@@ -61,6 +62,9 @@ The authenticated, PR/head-bound ship-gate evidence is:
 
 ${JSON.stringify(prep.evidence, null, 2)}
 
+The named defects, numbered for the disposition record:
+${prep.evidenceItems.map(item => `${item.index}. ${item.title} — ${item.reason}`).join('\n')}
+
 The original requirement captured by that completed epic-run is pinned here (do not re-read the mutable issue body):
 
 Title: ${prep.evidence.requirement.title}
@@ -70,21 +74,24 @@ ${prep.evidence.requirement.body}
 The original PR change is \`git diff origin/main...HEAD\` (also --stat).
 
 Rules:
-1. Repair every defect named by the gate evidence; ignore non-defect deferrals, which are context rather than permission to expand this repair.
-2. Never reclassify or dismiss a named defect to keep the merge moving. If the evidence does not support a safe code change, escalate instead of guessing.
+1. Judge every numbered defect independently. Repair each safe defect; ignore non-defect deferrals, which are context rather than permission to expand this repair.
+2. Never reclassify or dismiss a named defect to keep the merge moving. If the evidence does not support a safe code change for one item, decline that item with the reason instead of guessing, and continue repairing the others.
 3. Make no unrelated change. This PR was already reviewed; keep the delta as small as the named defects allow.
 4. Never weaken, skip, delete, or loosen a test, check, assertion, type, lint rule, or security guard. If a test is genuinely wrong, make the smallest correction and say so in the summary.
 5. Do NOT commit, amend, push, or touch labels/comments. Leave the repair in the working tree for the orchestrator to verify and check.
 6. Do NOT open anything under \`.epics/\`; durable GitHub evidence above is the entire repair brief.
 
-Return: completed (true only if every gate-named defect is repaired), escalate (instead of completing when a safe complete repair is not possible), summary, and files (each file touched).`,
+Return dispositions with exactly one entry for every numbered defect: index, action ("repaired" or "declined"), and a non-empty reason. Also return summary and files (each file touched). No missing, duplicate, or extra indexes.`,
 
-  check: (issue, prep, fixDiffCmd) =>
+  check: (issue, prep, fixDiffCmd, dispositions) =>
 `Adversarially check a ship-gate defect repair you did not write. The finished PR on branch ${prep.branch} (issue #${issue}) was held by the durable evidence below. Something edited the tree, and that edit is exactly \`${fixDiffCmd}\` (also readable with --stat). The fixer's explanation is deliberately withheld: judge only the evidence and code.
 
 Authenticated, PR/head-bound ship-gate evidence:
 
 ${JSON.stringify(prep.evidence, null, 2)}
+
+The fixer's indexed claims (claims to test, never authority):
+${dispositions.map(d => `${d.index}. ${d.title}: ${d.action} — ${d.reason}`).join('\n')}
 
 Pinned original requirement (do not re-read the mutable issue body):
 
@@ -92,31 +99,80 @@ Title: ${prep.evidence.requirement.title}
 Body:
 ${prep.evidence.requirement.body}
 
-Try to refute all three claims: every named defect is actually fixed; no test/check/assertion/type/lint/security guard was weakened or removed; and the delta introduces no unrelated behavior or regression. Ignore non-defect deferrals. Never accept reclassification of a named defect as a fix.
+Try to refute all four claims: every item marked repaired is actually fixed; every item marked declined is unchanged by this delta; no test/check/assertion/type/lint/security guard was weakened or removed; and the delta introduces no unrelated behavior or regression. Ignore non-defect deferrals. Never accept reclassification of a named defect as a fix.
 
 Gather the original PR change from \`git diff origin/main...HEAD\`. Do NOT open \`.epics/\`.
 
-Default to refuted. If you cannot positively establish every claim from the code and durable evidence, return survives=false. This issue rejoins the unattended merge queue only on a surviving verdict with confidence at least 75.
+Default to refuted. If you cannot positively establish every claim from the code and durable evidence, return survives=false. A complete repair rejoins the unattended merge queue only on a surviving verdict with confidence at least 75; a surviving partial is held for a human.
 
 Return: survives, confidence (0-100), reasoning (name the evidence, whichever way you rule).`,
 }
 
 const FIX_SCHEMA = {
-  type: 'object', additionalProperties: false, required: ['completed'],
+  type: 'object', additionalProperties: false, required: [],
   properties: {
     completed: { type: 'boolean', description: 'true only when every gate-named defect is repaired' },
     escalate: { type: 'string', description: 'set instead of completing when the evidence does not support a safe complete repair' },
     summary: { type: 'string', description: 'what changed and why it repairs the named defects' },
     files: { type: 'array', items: { type: 'string' }, description: 'each file touched' },
+    dispositions: {
+      type: 'array',
+      description: 'one repaired or declined disposition per numbered defect',
+      items: {
+        type: 'object', additionalProperties: false, required: ['index', 'action', 'reason'],
+        properties: {
+          index: { type: 'number' },
+          action: { enum: ['repaired', 'declined'] },
+          reason: { type: 'string' },
+        },
+      },
+    },
   },
 }
 const CHECK_SCHEMA = {
   type: 'object', additionalProperties: false, required: ['survives', 'confidence', 'reasoning'],
   properties: {
-    survives: { type: 'boolean', description: 'true only if every named defect is fixed without weakening a gate or causing unrelated regressions' },
+    survives: { type: 'boolean', description: 'true only if every repaired defect is fixed, every decline is unchanged, and no gate or unrelated behavior regresses' },
     confidence: { type: 'number', description: '0-100' },
     reasoning: { type: 'string', description: 'names the evidence, whichever way it rules' },
   },
+}
+
+const nonblank = value => typeof value === 'string' && value.trim().length > 0
+
+function normalizedDispositions(result, items) {
+  if (result?.escalate) return { problem: `escalated rather than guessed: ${result.escalate}` }
+  let dispositions
+  if (Array.isArray(result?.dispositions)) {
+    dispositions = result.dispositions
+  } else if (result?.completed === true) {
+    // Preserve complete payloads from an interrupted pre-disposition run. The
+    // synthesized reason stays generic so the blind checker still never sees
+    // the fixer's private summary.
+    dispositions = items.map(item => ({ index: item.index, action: 'repaired', reason: 'reported repaired' }))
+  } else if (result?.completed === false) {
+    return { problem: 'the defect fixer did not complete every named repair' }
+  } else {
+    return { problem: 'the defect fixer returned no indexed defect dispositions' }
+  }
+  if (dispositions.length !== items.length) {
+    return { problem: `the defect fixer returned ${dispositions.length} disposition(s) for ${items.length} named defect(s)` }
+  }
+  const byIndex = new Map()
+  for (const disposition of dispositions) {
+    const index = Number(disposition?.index)
+    if (!Number.isInteger(index) || index < 1 || index > items.length || byIndex.has(index)) {
+      return { problem: 'the defect fixer returned duplicate, missing, or out-of-range disposition indexes' }
+    }
+    if (!['repaired', 'declined'].includes(disposition.action) || !nonblank(disposition.reason)) {
+      return { problem: `defect disposition ${index} needs a repaired/declined action and non-empty reason` }
+    }
+    byIndex.set(index, disposition)
+  }
+  if (byIndex.size !== items.length) return { problem: 'the defect fixer did not cover every named defect exactly once' }
+  return {
+    dispositions: items.map(item => ({ ...byIndex.get(item.index), index: item.index, title: item.title })),
+  }
 }
 
 let ARGS
@@ -283,6 +339,7 @@ async function prepare(issue) {
       'missing trusted defect-fix evidence for the selected PR head', { removeQueue: true })
   }
   const { evidence, summary: evidenceSummary } = evidenceRecord || landing.evidenceRecord
+  const evidenceItems = defectEvidenceItems(evidence)
 
   // Count and verify the attempt before a model can edit anything.
   const attempt = labels.includes('defect-attempted') ? 2 : 1
@@ -296,7 +353,7 @@ async function prepare(issue) {
   }
   const base = {
     attempt, branch: pr.headRefName, prUrl: pr.url, prNumber: pr.number,
-    prHead: pr.headRefOid, repoName, evidence, evidenceSummary,
+    prHead: pr.headRefOid, repoName, actor, evidence, evidenceSummary, evidenceItems,
     ...(landing ? { landing: landing.record } : {}),
   }
 
@@ -323,7 +380,7 @@ async function prepare(issue) {
   return { ...base, packages, depLines }
 }
 
-// The landing half: the swap back into the unattended merge queue and the
+// The complete-repair landing half: the swap back into the unattended merge queue and the
 // readback that verifies it. Separate from the push half because a relaunch
 // after a pushed-but-unverified landing has only this left to do. The caller
 // posts its own audit comment first — before the swap, so the record it carries
@@ -351,7 +408,7 @@ async function land(issue) {
   return { labelled: seen.matched, note: seen.matched ? '' : (flip.ok ? `observed labels: ${labels.join(', ')}` : failureReason(flip)) }
 }
 
-async function ship(issue, prep, body) {
+async function ship(issue, prep, body, { partial = false, declinedIndexes = [] } = {}) {
   await gitOut(['add', '-A'], 'git add -A')
   if ((await git(['diff', '--cached', '--quiet'])).code === 0) return { pushed: false, labelled: false, note: 'nothing staged to amend' }
   await gitOut(['commit', '-q', '--amend', '--no-edit'], 'git commit --amend')
@@ -366,7 +423,12 @@ async function ship(issue, prep, body) {
   // the record's whole purpose is to survive a landing this run cannot finish:
   // written after the head readback it would be missing in exactly the case it
   // exists for, and the next attempt would repair defects already repaired.
-  await comment(issue, body(amendedHead))
+  try {
+    await comment(issue, body(amendedHead))
+  } catch (e) {
+    if (partial) return { pushed: true, labelled: false, stage: 'audit', note: `the partial-repair audit could not be posted (${e?.message || e})` }
+    throw e
+  }
   // GitHub shows a force push seconds after it lands, so the head is re-read
   // until it equals the amended commit or the window ends. No terminal label has
   // been written yet, so this is on the default budget and outside reap's settle
@@ -380,10 +442,27 @@ async function ship(issue, prep, body) {
       () => prView(prep.prNumber, 'number,headRefName,headRefOid,isCrossRepository,headRepository,headRepositoryOwner'),
       matches)
   } catch (e) {
-    return { pushed: true, labelled: false, note: `the selected PR could not be read after push (${e?.message || e})` }
+    return { pushed: true, labelled: false, ...(partial ? { stage: 'head' } : {}), note: `the selected PR could not be read after push (${e?.message || e})` }
   }
   if (!seen.matched) {
-    return { pushed: true, labelled: false, note: `selected PR head did not advance to amended HEAD ${amendedHead} (observed ${seen.observed.headRefOid || 'missing'} after ${seen.reads} reads over ${waitedFor(seen.waitedMs)})` }
+    return { pushed: true, labelled: false, ...(partial ? { stage: 'head' } : {}), note: `selected PR head did not advance to amended HEAD ${amendedHead} (observed ${seen.observed.headRefOid || 'missing'} after ${seen.reads} reads over ${waitedFor(seen.waitedMs)})` }
+  }
+  if (partial) {
+    try {
+      const evidence = filterDefectEvidence(prep.evidence, declinedIndexes, { head: amendedHead })
+      await publishDefectEvidence({ issue, evidence, actor: prep.actor })
+    } catch (e) {
+      return { pushed: true, amendedHead, labelled: false, stage: 'evidence', note: `remaining defect evidence could not be published and read back (${e?.message || e})` }
+    }
+    const settled = await settle(issue, null, { removeQueue: true })
+    return {
+      pushed: true,
+      amendedHead,
+      labelled: settled.settled,
+      reported: settled.reported,
+      stage: settled.settled ? '' : 'labels',
+      note: settled.settled ? '' : settled.stateError,
+    }
   }
   return { pushed: true, amendedHead, ...(await land(issue)) }
 }
@@ -408,6 +487,22 @@ const blockerBody = ({ failedPhase, reason, prUrl, attempt }, state) =>
 
 async function postBlocker({ phase: failedPhase, reason, prUrl, attempt }) {
   await settle(issue, state => blockerBody({ failedPhase, reason, prUrl, attempt }, state))
+}
+
+async function blockPushedPartial(reason, { stage }) {
+  blockerPosted = true
+  const terminal = stage === 'labels' ? 'failed' : 'review'
+  let state = await settle(issue, result => [
+    '🤖 fix-defect partial repair needs human attention',
+    `- reason: ${reason}`,
+    `- pr: ${prUrl || 'not resolved'}`,
+    '- branch: the verified partial repairs are already pushed',
+    `- labels: ${result.settled ? `the fixer queue is removed and the issue rests at ${result.resting}` : `the safe terminal transition could not be verified (${result.stateError})`}`,
+  ].join('\n'), { terminal, removeQueue: true })
+  if (!state.settled && terminal !== 'failed') {
+    state = await settle(issue, null, { terminal: 'failed', removeQueue: true })
+  }
+  return { blocked: true, issue, phase: 'ship', reason, prUrl: prUrl || undefined, attempt, partialPushed: true }
 }
 
 let currentPhase = 'prepare'
@@ -482,32 +577,43 @@ async function fail(failedPhase, reason) {
 // Posted BEFORE the landing swap, so the landing record it carries is durable
 // even when the swap that follows cannot be verified — which is the whole case
 // the record exists for.
-const buildComment = (prep, fix, verifyDetail, check, amendedHead) => [
-  '🤖 fix-defect repaired ship-gate defects',
-  `- pr: ${prep.prUrl}`,
-  `- attempt: ${prep.attempt}`,
-  '',
-  'Gate evidence:',
-  renderDefectEvidenceSection(prep.evidence, { summary: prep.evidenceSummary }),
-  '',
-  `Fix: ${fix.summary || 'not stated'}`,
-  ...(Array.isArray(fix.files) && fix.files.length ? [`Files: ${fix.files.join(', ')}`] : []),
-  '',
-  `An adversarial check, blind to the fixer's explanation, confirmed every named defect is repaired without a weakened gate or unrelated regression (confidence ${check.confidence}/100).`,
-  '',
-  `verify: ${verifyDetail}`,
-  '',
-  'The branch is amended and force-pushed. The issue goes back to ready-to-merge next, and the merge worker rebases it onto current main and re-runs the real checks before anything lands.',
-  '',
-  renderDefectRepair({
-    version: 1,
-    issue,
-    pr: { number: prep.prNumber, url: prep.prUrl, branch: prep.branch, head: amendedHead, priorHead: prep.prHead },
-    attempt: prep.attempt,
-    verify: verifyDetail,
-    checkConfidence: check.confidence,
-  }),
-].join('\n')
+const buildComment = (prep, fix, dispositions, verifyDetail, check, amendedHead) => {
+  const declined = dispositions.filter(d => d.action === 'declined')
+  const lines = [
+    declined.length ? '🤖 fix-defect landed a partial ship-gate repair' : '🤖 fix-defect repaired ship-gate defects',
+    `- pr: ${prep.prUrl}`,
+    `- attempt: ${prep.attempt}`,
+    '',
+    'Gate evidence:',
+    renderDefectEvidenceSection(prep.evidence, { summary: prep.evidenceSummary }),
+    '',
+    'Defect dispositions:',
+    ...dispositions.map(d => `- ${d.title}: ${d.action} — ${d.reason}`),
+    '',
+    `Fix: ${fix.summary || 'not stated'}`,
+    ...(Array.isArray(fix.files) && fix.files.length ? [`Files: ${fix.files.join(', ')}`] : []),
+    '',
+    `An adversarial check tested every repaired claim, every declined defect, and the complete delta without accepting a weakened gate or unrelated regression (confidence ${check.confidence}/100).`,
+    '',
+    `verify: ${verifyDetail}`,
+    '',
+  ]
+  if (declined.length) {
+    lines.push('The branch now carries the repairs and is amended and force-pushed. Fresh evidence on the amended head names only the declined defects; the issue is held at ready-to-review for a human and never enters the unattended merge queue.')
+  } else {
+    lines.push('The branch is amended and force-pushed. The issue goes back to ready-to-merge next, and the merge worker rebases it onto current main and re-runs the real checks before anything lands.')
+    lines.push('')
+    lines.push(renderDefectRepair({
+      version: 1,
+      issue,
+      pr: { number: prep.prNumber, url: prep.prUrl, branch: prep.branch, head: amendedHead, priorHead: prep.prHead },
+      attempt: prep.attempt,
+      verify: verifyDetail,
+      checkConfidence: check.confidence,
+    }))
+  }
+  return lines.join('\n')
+}
 
 // The landing-only relaunch's own record. It claims nothing about code: the
 // code claim belongs to the attempt that made it, and is named here as that
@@ -565,8 +671,14 @@ try {
   const fix = await agent(PROMPTS.fix(issue, prep),
     { label: 'fix-defect', phase: 'Fix', step: 'fixes-after-review', schema: FIX_SCHEMA })
   if (!fix) return await fail('fix', 'the defect fixer produced no result — nothing was pushed and the PR branch is untouched.')
-  if (fix.escalate) return await fail('fix', `escalated rather than guessed: ${fix.escalate}`)
-  if (!fix.completed) return await fail('fix', 'the defect fixer did not complete every named repair.')
+  const normalized = normalizedDispositions(fix, prep.evidenceItems)
+  if (normalized.problem) return await fail('fix', normalized.problem)
+  const dispositions = normalized.dispositions
+  const declined = dispositions.filter(d => d.action === 'declined')
+  const repaired = dispositions.filter(d => d.action === 'repaired')
+  if (!repaired.length) {
+    return await fail('fix', `the defect fixer declined every named defect: ${declined.map(d => `${d.title}: ${d.reason}`).join('; ')}`)
+  }
   if (!(await gitOut(['status', '--porcelain'], 'git status'))) {
     return await fail('fix', 'the defect fixer reported a fix but changed no file — the named defects remain in the captured PR tree.')
   }
@@ -581,7 +693,7 @@ try {
   currentPhase = 'check'
   phase('Check')
   await intentToAdd()
-  const check = await agent(PROMPTS.check(issue, prep, `git diff ${prep.prHead}`),
+  const check = await agent(PROMPTS.check(issue, prep, `git diff ${prep.prHead}`, dispositions),
     { label: 'defect-check', phase: 'Check', step: 'confirm-review', schema: CHECK_SCHEMA })
   if (!check) return await fail('check', 'the adversarial checker produced no result — an unchecked repair must not rejoin the merge queue.')
   if (!check.survives || check.confidence < 75) {
@@ -591,10 +703,24 @@ try {
 
   currentPhase = 'ship'
   phase('Ship')
-  const shipped = await ship(issue, prep, amendedHead => buildComment(prep, fix, verified.detail, check, amendedHead))
+  const partial = declined.length > 0
+  const shipped = await ship(
+    issue,
+    prep,
+    amendedHead => buildComment(prep, fix, dispositions, verified.detail, check, amendedHead),
+    { partial, declinedIndexes: declined.map(d => d.index) })
   if (!shipped.pushed) return await fail('ship', `the force-with-lease push did not land${shipped.note ? ` (${shipped.note})` : ''} — the branch on origin is untouched.`)
+  if (partial && (!shipped.labelled || !shipped.reported)) {
+    return await blockPushedPartial(
+      `the partial repair was pushed, but its evidence and human-held landing could not be fully verified${shipped.note ? ` (${shipped.note})` : ''}`,
+      { stage: shipped.stage })
+  }
   if (!shipped.labelled) return await fail('ship', `pushed, but the ready-to-merge label swap could not be verified${shipped.note ? ` (${shipped.note})` : ''} — a human finishes the labels; the PR itself is fixed.`)
-  log(`Ship: pushed and labelled ready-to-merge — ${prep.prUrl}`)
+  if (partial) {
+    log(`Ship: partial repair pushed and held for review — ${declined.map(d => `${d.title}: ${d.reason}`).join('; ')}`)
+  } else {
+    log(`Ship: pushed and labelled ready-to-merge — ${prep.prUrl}`)
+  }
 
   return {
     issue,
@@ -602,9 +728,10 @@ try {
     branch: prep.branch,
     attempt,
     summary: fix.summary,
+    declinedDefects: declined.map(d => ({ title: d.title, reason: d.reason })),
     checkConfidence: check.confidence,
     verify: verified.detail,
-    readyToMerge: true,
+    ...(partial ? { readyToReview: true } : { readyToMerge: true }),
   }
 } catch (e) {
   return await fail(currentPhase, (e && e.message) || String(e))
@@ -612,5 +739,5 @@ try {
 }
 
 const RESULT = await main()
-await statusFinish(RESULT?.held ? `**held**: provider quota exhausted, resumes after ${RESULT.holdUntil} — vendor: ${RESULT.vendor}; provider reason: "${RESULT.reason}"` : RESULT?.blocked ? `**blocked** at ${RESULT.phase}: ${RESULT.reason}` : RESULT?.skipped ? `**skipped**: ${RESULT.reason}` : RESULT?.readyToMerge ? `**done** — ${RESULT.prUrl} is back to ready-to-merge` : '**finished**', { budget: terminalWindow || undefined })
+await statusFinish(RESULT?.held ? `**held**: provider quota exhausted, resumes after ${RESULT.holdUntil} — vendor: ${RESULT.vendor}; provider reason: "${RESULT.reason}"` : RESULT?.blocked ? `**blocked** at ${RESULT.phase}: ${RESULT.reason}` : RESULT?.skipped ? `**skipped**: ${RESULT.reason}` : RESULT?.readyToMerge ? `**done** — ${RESULT.prUrl} is back to ready-to-merge` : RESULT?.readyToReview ? `**done, held for review** — ${RESULT.prUrl}; declined: ${RESULT.declinedDefects.map(d => `${d.title}: ${d.reason}`).join('; ')}` : '**finished**', { budget: terminalWindow || undefined })
 process.exit(finish(RESULT))

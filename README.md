@@ -49,8 +49,8 @@ only where a judgment is needed. Claude Code and Codex are both supported.
    is accepted for repos with no CI.
    Mechanical rebase conflicts it resolves itself under a line-containment
    gate; a conflict that needs judgment is labeled for **`fix-run.mjs`**, a
-   dispatched fixer run that resolves it under an adversarial check and puts
-   the PR back in the merge queue. A red check on the rebased head is labeled
+   dispatched fixer run that resolves it under an adversarial check and puts a
+   complete repair back in the merge queue. A red check on the rebased head is labeled
    for **`ci-run.mjs`**, which reads the failing job logs, repairs the cause
    under its own adversarial check, and puts the PR back in the merge queue —
    where its checks are re-run before anything lands.
@@ -58,8 +58,13 @@ only where a judgment is needed. Claude Code and Codex are both supported.
    **`defect-run.mjs`**, a separate two-attempt fixer. Epic-run first persists
    and reads back one automation-authored repair envelope bound to the PR head;
    the fixer accepts only that envelope, verifies and adversarially checks its
-   exact delta, then returns the PR to that same merge queue. Mixed, missing or
-   stale evidence stays with a human. Every readback that confirms one of the
+   exact delta, then returns a complete repair to that same merge queue. Any of
+   the three fixers that repairs some named items and declines others still
+   verifies and checks the exact delta, then pushes the repairs and holds the PR
+   at `ready-to-review` with its fixer queue removed. A partial defect repair
+   reissues its authenticated envelope on the amended head with only the
+   declines, so a human-granted later round does not repeat pushed work. Mixed,
+   missing or stale ship-gate evidence stays with a human. Every readback that confirms one of the
    run's own writes — the PR head after a force push, the labels after a swap —
    is retried over a bounded window rather than read once, and an attempt that
    pushed a complete repair it could not label leaves a record that lets the

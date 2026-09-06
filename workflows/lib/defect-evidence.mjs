@@ -7,6 +7,8 @@
 // unattended write instruction. Human-facing fields are rendered as inert
 // GitHub Markdown; only validated PR and follow-up URLs become links.
 
+import { authenticatedLogin, comment, issueView, readBack } from './github.mjs'
+
 export const DEFECT_EVIDENCE_MARKER = '🤖 defect-fix evidence'
 
 const isObject = value => value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -151,6 +153,73 @@ export function matchingDefectEvidenceComment(comments, { actor, issue, prNumber
 
 export function matchingDefectEvidence(comments, criteria) {
   return matchingDefectEvidenceComment(comments, criteria)?.evidence || null
+}
+
+// The fixer addresses one flat, numbered list even though the durable envelope
+// retains blocker groups for provenance. Keep the numbering and filtering in
+// this module so epic-run's publisher and defect-run's later-round handoff
+// cannot disagree about which item an index names.
+export function defectEvidenceItems(evidence) {
+  if (!validDefectEvidence(evidence)) throw new Error('refusing to flatten malformed defect-fix evidence')
+  const items = []
+  for (let blockerIndex = 0; blockerIndex < evidence.blockers.length; blockerIndex++) {
+    const blocker = evidence.blockers[blockerIndex]
+    for (let itemIndex = 0; itemIndex < blocker.items.length; itemIndex++) {
+      const item = blocker.items[itemIndex]
+      items.push({
+        index: items.length + 1,
+        blockerIndex,
+        itemIndex,
+        source: blocker.source,
+        reason: blocker.reason,
+        title: itemTitle(item) || `defect ${items.length + 1}`,
+        item,
+      })
+    }
+  }
+  return items
+}
+
+export function filterDefectEvidence(evidence, indexes, { head } = {}) {
+  const flat = defectEvidenceItems(evidence)
+  const wanted = new Set(indexes)
+  if (!head || wanted.size !== indexes.length || [...wanted].some(index => !Number.isInteger(index) || index < 1 || index > flat.length)) {
+    throw new Error('refusing to filter defect-fix evidence with invalid item indexes or head')
+  }
+  const blockers = evidence.blockers.map((blocker, blockerIndex) => ({
+    ...blocker,
+    items: blocker.items.filter((_item, itemIndex) =>
+      flat.some(entry => entry.blockerIndex === blockerIndex && entry.itemIndex === itemIndex && wanted.has(entry.index))),
+  })).filter(blocker => blocker.items.length)
+  const filtered = { ...evidence, pr: { ...evidence.pr, head }, blockers }
+  if (!validDefectEvidence(filtered)) throw new Error('refusing to publish empty filtered defect-fix evidence')
+  return filtered
+}
+
+// Canonical publication is one authenticated write/readback operation shared
+// by epic-run and defect-run. `options` may be a function because epic-run is
+// already inside its one terminal-report window and must ask for the remaining
+// budget separately for each GitHub call.
+export async function publishDefectEvidence({ issue, evidence, actor, renderOptions, options } = {}) {
+  if (!validDefectEvidence(evidence) || evidence.issue !== Number(issue)) {
+    throw new Error('refusing to publish malformed or mismatched defect-fix evidence')
+  }
+  const opts = () => typeof options === 'function' ? options() : options
+  const login = actor || await authenticatedLogin(opts())
+  await comment(issue, renderDefectEvidence(evidence, renderOptions), opts())
+  const criteria = {
+    actor: login,
+    issue,
+    prNumber: evidence.pr.number,
+    branch: evidence.pr.branch,
+    head: evidence.pr.head,
+  }
+  const seen = await readBack(
+    () => issueView(issue, 'comments', opts()),
+    view => !!matchingDefectEvidence(view.comments, criteria),
+    opts())
+  if (!seen.matched) throw new Error('canonical defect-fix evidence was not observed after posting')
+  return matchingDefectEvidenceComment(seen.observed.comments, criteria)
 }
 
 // ───────────────────────── the landing record ─────────────────────────

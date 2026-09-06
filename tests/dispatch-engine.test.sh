@@ -620,6 +620,17 @@ run_dispatch
 assert_rc "tick exits 0" 0 "$RUN_RC"
 assert_contains "fixer launch keeps Codex" "$(cat "$TMP/launch.log")" '--fix 9 --repo testrepo --engine codex'
 
+printf '\nfixer: a human-only evidence refusal is absent from a subsequent dry run\n'
+reset_state
+# This is the terminal label state fix-run leaves after it cannot authenticate
+# conflict evidence before consuming a rung. GitHub's needs-judgment search
+# consequently returns no candidate on the next tick.
+printf 'failed,engine:claude' > "$TMP/labels/34"
+run_dispatch --dry-run
+assert_rc "the dry run exits cleanly" 0 "$RUN_RC"
+assert_not_contains "the human-only refusal is not reported as launchable" "$RUN_OUT" "would launch conflict fixer 'testrepo-epic-34'"
+assert_eq "the dry run starts no fixer" "" "$(grep -- '--fix 34' "$TMP/launch.log" || true)"
+
 printf '\ndispatch hold: held fixers are skipped before their terminal-label shield\n'
 reset_state
 FIXER_QUEUE='40\n41'
