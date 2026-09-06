@@ -841,9 +841,10 @@ gh_pr_created() { cat "$STATE_DIR/gh/pr-created" 2>/dev/null || true; }
 hold_order_error() { cat "$STATE_DIR/hold-order-error" 2>/dev/null || true; }
 result_json() { printf '%s\n' "$RUN_OUT" | sed -n 's/^RESULT //p' | tail -n1; }
 assert_held_contract() { # scenario-name
-  local name="$1" result file_until
+  local name="$1" result file_until status_log
   result="$(result_json)"
   file_until="$(jq -r '.claude.holdUntil // empty' "$HOLD_FILE" 2>/dev/null || true)"
+  status_log="$(cat "$GH_LOG")"
   assert_eq "$name RESULT has held=true" "true" "$(printf '%s' "$result" | jq -r '.held // false' 2>/dev/null)"
   assert_eq "$name RESULT names issue 42" "42" "$(printf '%s' "$result" | jq -r '.issue // empty' 2>/dev/null)"
   assert_eq "$name RESULT names Claude" "claude" "$(printf '%s' "$result" | jq -r '.vendor // empty' 2>/dev/null)"
@@ -851,6 +852,8 @@ assert_held_contract() { # scenario-name
   assert_eq "$name RESULT carries the durable holdUntil" "$file_until" "$(printf '%s' "$result" | jq -r '.holdUntil // empty' 2>/dev/null)"
   assert_eq "$name RESULT marks a parsed reset" "false" "$(printf '%s' "$result" | jq -r '.fallback' 2>/dev/null)"
   assert_contains "$name RESULT retains the provider reason" "$(printf '%s' "$result" | jq -r '.reason // empty' 2>/dev/null)" "resets 7:50pm (UTC)"
+  assert_matches "$name status localizes the deadline with a zone abbreviation" "$status_log" 'resumes after [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} [[:alpha:]+-]+ — vendor: claude'
+  assert_not_contains "$name status does not expose the canonical holdUntil" "$status_log" "$file_until"
 }
 
 # The one invariant EVERY run here must satisfy, so it is asserted for every run
