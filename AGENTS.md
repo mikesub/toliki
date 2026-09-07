@@ -110,6 +110,15 @@ than made launchable against a main without the code it describes.
 - `workflows/epic-run.mjs`, `workflows/fix-run.mjs`, `workflows/ci-run.mjs`
   and `workflows/defect-run.mjs`
   are plain Node orchestrators. They must not name a vendor.
+- `workflows/lib/fixer-lifecycle.mjs` owns the three fixers' shared argv/runtime
+  setup, repair → verify → check → publish sequencing, indexed-disposition
+  gate, run state, quota/refund and blocker paths, terminal budget, status and
+  `RESULT`. The entry points remain explicit cause adapters: conflict owns
+  rebase/autoresolve and pre-push partial evidence, CI owns failing-check/log
+  capture and local reproduction, and defect owns authenticated evidence,
+  post-push head/evidence confirmation and landing-only recovery. Pushed
+  partial state is monotonic in the runner and can never return through an
+  ordinary requeueing blocker. Gated by `tests/epic-run.test.sh`.
 - `workflows/lib/engine.mjs` is the only file that knows how a vendor CLI is
   invoked. Its loader validates `etc/engines.json` before any phase touches
   GitHub. A Codex phase is ephemeral, sandboxed from the charter's tools, and

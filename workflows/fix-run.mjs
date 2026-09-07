@@ -26,26 +26,22 @@
 // a rung can be consumed remove the queue label and also stay failed for a
 // human, rather than becoming an unbounded uncounted retry.
 //
-// Two model steps: the resolver and its skeptic. Everything else — the gates,
-// the ladder write, the rebase, the partial autoresolve, verify, the push, the
-// audit comment, the labels — is the orchestrator's own work through
-// lib/github.mjs and lib/repo.mjs, so what got pushed and what got labelled is
-// a fact this script established, not a claim a model reported.
+// Two model steps: the resolver and its skeptic. The shared fixed-purpose fixer
+// lifecycle owns their sequencing, common gates, failure/refund handling and
+// final RESULT. This adapter retains rebase/autoresolve, conflict evidence,
+// continuation and publication ordering.
 // A hard provider-quota death aborts any in-progress rebase and records the
 // host-wide hold before labels move. A verified hold refunds this invocation's
 // rung; an unverified transition restores it and blocks inside the same
 // terminal-report window. Neither path pushes.
 
 import { readFileSync } from 'node:fs'
-import { agent, phase, log, initRuntime, onPhase, onLog, takeAgentFailure, withAgentFailure } from './lib/runtime.mjs'
+import { log } from './lib/runtime.mjs'
 import { HARNESS_DIR } from './lib/engine.mjs'
-import { parseArgs, finish, UsageError, EXIT } from './lib/cli.mjs'
-import { initStatus, statusPhase, statusNote, statusFinish } from './lib/status.mjs'
 import { sh, must, failureReason } from './lib/proc.mjs'
-import { authenticatedLogin, ensureLabels, editLabels, issueLabels, issueView, comment, openPrs, readBack, terminalBudget, terminalSpend, terminalTimeout, terminalTransition, verifyIssueEngine } from './lib/github.mjs'
-import { git, gitOut, discoverPackages, pkgList, ensureDeps, runVerify, rebaseInProgress, pushRejected, intentToAdd } from './lib/repo.mjs'
-import { finalizeFixerIssue, finalizeFixerQuotaHold } from './lib/fixer-finalize.mjs'
-import { recordQuotaHold } from './quota-hold.mjs'
+import { authenticatedLogin, ensureLabels, editLabels, issueLabels, issueView, comment, openPrs, readBack, terminalTransition } from './lib/github.mjs'
+import { git, gitOut, discoverPackages, pkgList, ensureDeps, rebaseInProgress, pushRejected, intentToAdd } from './lib/repo.mjs'
+import { runFixerLifecycle, validateIndexedDispositions } from './lib/fixer-lifecycle.mjs'
 
 const USAGE = `Usage: fix-run.mjs --issue <N> [--session <name>] [--engine <name>]
 
@@ -243,29 +239,6 @@ const CHECK_SCHEMA = {
   },
 }
 
-// ───────────────────────── Args ─────────────────────────
-let ARGS
-try {
-  ARGS = parseArgs(process.argv.slice(2), { allowSlug: false, usage: USAGE })
-} catch (e) {
-  if (e instanceof UsageError) {
-    process.stderr.write((e.message ? `fix-run: ${e.message}\n\n` : '') + e.usage + '\n')
-    process.exit(e.message ? EXIT.ERROR : EXIT.OK)
-  }
-  throw e
-}
-initRuntime({ scriptName: 'fix-run', sessionName: ARGS.session, defaultEngine: ARGS.engine, issue: ARGS.issue })
-// The issue's live status comment mirrors the pane's narration: the label says
-// WHICH state the issue is in, this says whether the run is alive and where it
-// got to.
-initStatus({ issue: ARGS.issue, script: 'fix-run', session: ARGS.session, phases: ['Prepare', 'Resolve', 'Verify', 'Check', 'Ship'] })
-onPhase(statusPhase)
-// Once a terminal label opens reap's clock, the awaited, budgeted final edit is
-// the only status write still worth queueing. A throttled note here would run
-// ahead of statusFinish on status.mjs's promise chain with the default timeout.
-onLog(message => { if (!terminalSpend()) statusNote(message) })
-const issue = ARGS.issue
-
 // ───────────────────────── Transport ─────────────────────────
 // The ladder labels are the attempt store — queues here are label queries,
 // never comment greps — and the write is VERIFIED because it is the bound
@@ -393,20 +366,12 @@ function captureJudgmentEvidence(markedFiles, judgments) {
   return judgments.map(item => captured.find(value => value.file === item.file && value.hunk === item.hunk))
 }
 
-async function prepare(issue) {
-  const view = await issueView(issue, 'state,labels,title')
-  const labels = Array.isArray(view.labels) ? view.labels.map(l => l.name) : []
-  if (String(view.state || '').toUpperCase() === 'CLOSED') return { refused: `issue #${issue} is closed` }
-  if (!labels.includes('needs-judgment')) return { refused: `issue #${issue} is not labelled needs-judgment — not a fixer's issue` }
-
-  // Routing is permanent once the epic claimed the issue. Verify the strong
-  // issue-label view before consuming a retry rung or touching the PR tree.
-  await verifyIssueEngine(issue, ARGS.engine)
+async function prepare(ctx, { labels }) {
+  const { issue } = ctx
 
   // A refusal a retry cannot fix is commented and left `failed` for a human.
   const refuseFinal = async (body, reason, transition = { add: ['failed'], remove: ['in-progress'] }) => {
-    const settled = await finalizeFixerIssue({ issue, body, ...transition })
-    terminalWindow = settled.budget
+    const settled = await ctx.finalizeIssue({ issue, body, ...transition })
     if (!settled.reported) log(`blocked: GitHub report failed (${settled.reportError})`)
     if (!settled.settled) log(`blocked: terminal label restoration failed (${settled.stateError})`)
     return { refused: reason, refusalFinal: true }
@@ -457,7 +422,7 @@ async function prepare(issue) {
     actor, issue, prNumber: pr.number, branch: pr.headRefName, head: pr.headRefOid,
   })
   if (partialRecord && (labels.includes('fix-attempted') || labels.includes('fix-retried'))) {
-    const settled = await finalizeFixerIssue({
+    const settled = await ctx.finalizeIssue({
       issue,
       body: state => {
         let transition
@@ -476,7 +441,6 @@ async function prepare(issue) {
       },
       ...terminalTransition({ rest: 'ready-to-review', drop: ['needs-judgment'] }),
     })
-    terminalWindow = settled.budget
     if (!settled.reported) log(`blocked: GitHub report failed (${settled.reportError})`)
     if (!settled.settled) log(`blocked: terminal label restoration failed (${settled.stateError})`)
     return { refused: 'current PR head is a verified partial conflict repair with a spent ladder rung', refusalFinal: true }
@@ -487,14 +451,16 @@ async function prepare(issue) {
   }
 
   // Attempt ladder + start signal, VERIFIED: an uncounted attempt must not run.
-  const attempt = labels.includes('fix-attempted') ? 2 : 1
-  const ladderLabel = attempt === 2 ? 'fix-retried' : 'fix-attempted'
-  await ensureLabels(['fix-attempted', 'fix-retried', 'in-progress'])
-  await editLabels(issue, { add: ['in-progress', ladderLabel], remove: ['failed'] })
-  const now = await issueLabels(issue)
-  if (!now.includes('in-progress') || !now.includes(ladderLabel) || now.includes('failed')) {
+  const consumed = await ctx.consumeAttempt({
+    labels,
+    first: 'fix-attempted',
+    retry: 'fix-retried',
+    remove: ['failed'],
+  })
+  if (!consumed.recorded) {
     return { refused: 'could not record the attempt (label write failed)' }
   }
+  const { attempt, rung: ladderLabel } = consumed
   const base = { attempt, branch: pr.headRefName, prUrl: pr.url, prNumber: pr.number, prHead: pr.headRefOid, actor }
 
   // Git setup, in the session's own worktree. Scrub what a killed predecessor may have left first: a
@@ -588,47 +554,28 @@ const nonblank = value => typeof value === 'string' && value.trim().length > 0
 // same safe full-repair path; they are converted only when every named hunk has
 // one matching intent record.
 function normalizedDispositions(result, hunks) {
-  if (result?.escalate) return { problem: `escalated rather than guessed: ${result.escalate}` }
-  let dispositions
-  if (Array.isArray(result?.dispositions)) {
-    dispositions = result.dispositions
-  } else if (result?.completed === true && Array.isArray(result.resolutions)) {
-    dispositions = hunks.map((hunk, index) => {
-      const matches = result.resolutions.filter(r => r.file === hunk.file && Number(r.hunk) === hunk.hunk)
-      if (matches.length !== 1) return null
-      return { index: index + 1, action: 'repaired', reason: matches[0].resolution, ...matches[0] }
-    })
-    if (dispositions.some(value => value === null)) {
-      return { problem: 'the resolver returned legacy resolutions without exact coverage of every numbered judgment hunk' }
-    }
-  } else if (result?.completed === false) {
-    return { problem: 'the resolver did not complete the rebase' }
-  } else {
-    return { problem: 'the resolver returned no indexed hunk dispositions' }
-  }
-
-  if (dispositions.length !== hunks.length) {
-    return { problem: `the resolver returned ${dispositions.length} disposition(s) for ${hunks.length} numbered judgment hunk(s)` }
-  }
-  const byIndex = new Map()
-  for (const disposition of dispositions) {
-    const index = Number(disposition?.index)
-    if (!Number.isInteger(index) || index < 1 || index > hunks.length || byIndex.has(index)) {
-      return { problem: 'the resolver returned duplicate, missing, or out-of-range disposition indexes' }
-    }
-    if (!['repaired', 'declined'].includes(disposition.action) || !nonblank(disposition.reason)) {
-      return { problem: `hunk disposition ${index} needs a repaired/declined action and non-empty reason` }
-    }
-    if (disposition.action === 'repaired' &&
-        ![disposition.mainIntent, disposition.prIntent, disposition.resolution].every(nonblank)) {
-      return { problem: `repaired hunk disposition ${index} is missing its main intent, PR intent, or resolution` }
-    }
-    byIndex.set(index, disposition)
-  }
-  if (byIndex.size !== hunks.length) return { problem: 'the resolver did not cover every numbered judgment hunk exactly once' }
-  return {
-    dispositions: hunks.map((hunk, index) => ({ ...hunk, ...byIndex.get(index + 1), file: hunk.file, hunk: hunk.hunk, index: index + 1 })),
-  }
+  return validateIndexedDispositions(result, hunks, {
+    subject: 'the resolver', itemName: 'hunk',
+    missing: 'the resolver returned no indexed hunk dispositions',
+    incomplete: 'the resolver did not complete the rebase',
+    legacy: value => {
+      if (value?.completed !== true || !Array.isArray(value.resolutions)) return null
+      const dispositions = hunks.map((hunk, index) => {
+        const matches = value.resolutions.filter(r => r.file === hunk.file && Number(r.hunk) === hunk.hunk)
+        return matches.length === 1
+          ? { index: index + 1, action: 'repaired', reason: matches[0].resolution, ...matches[0] }
+          : null
+      })
+      return dispositions.some(value => value === null)
+        ? { problem: 'the resolver returned legacy resolutions without exact coverage of every numbered judgment hunk' }
+        : { dispositions }
+    },
+    validate: (disposition, index) => disposition.action === 'repaired' &&
+      ![disposition.mainIntent, disposition.prIntent, disposition.resolution].every(nonblank)
+      ? `repaired hunk disposition ${index} is missing its main intent, PR intent, or resolution`
+      : null,
+    decorate: (hunk, disposition, index) => ({ ...hunk, ...disposition, file: hunk.file, hunk: hunk.hunk, index }),
+  })
 }
 
 // What the resolver claims, checked against the tree: no rebase in progress, exactly one commit above
@@ -642,7 +589,7 @@ async function resolutionProblem(markedFiles) {
   return null
 }
 
-function partialConflictRecord(prep, dispositions, head, verifyDetail, check) {
+function partialConflictRecord(issue, prep, dispositions, head, verifyDetail, check) {
   const declines = dispositions.filter(item => item.action === 'declined').map(item => ({
     file: item.file,
     hunk: item.hunk,
@@ -667,7 +614,8 @@ function partialConflictRecord(prep, dispositions, head, verifyDetail, check) {
 // branch the push is rejected and nothing further happens. A human-granted
 // continuation starts from an already committed partial head, so its checked
 // working-tree delta is amended before the push just as CI/defect repairs are.
-async function ship(issue, prep, body, { partial = false, dispositions = [], verifyDetail, check } = {}) {
+async function ship(ctx, prep, body, { partial = false, dispositions = [], verifyDetail, check } = {}) {
+  const { issue } = ctx
   if (prep.partialRecord) {
     await gitOut(['add', '-A'], 'git add -A')
     if ((await git(['diff', '--cached', '--quiet'])).code === 0) {
@@ -685,7 +633,7 @@ async function ship(issue, prep, body, { partial = false, dispositions = [], ver
   // partial merely because the later label transition or audit comment failed.
   if (partial) {
     try {
-      const record = partialConflictRecord(prep, dispositions, shippedHead, verifyDetail, check)
+      const record = partialConflictRecord(issue, prep, dispositions, shippedHead, verifyDetail, check)
       await publishConflictPartial({ issue, actor: prep.actor, record })
     } catch (e) {
       return { pushed: false, labelled: false, note: `partial-conflict evidence could not be published and read back (${e?.message || e})` }
@@ -694,12 +642,11 @@ async function ship(issue, prep, body, { partial = false, dispositions = [], ver
   const push = await git(['push', `--force-with-lease=refs/heads/${prep.branch}:${prep.prHead}`, 'origin', `HEAD:refs/heads/${prep.branch}`])
   if (!push.ok) return { pushed: false, labelled: false, note: pushRejected(push) ? `rejected — ${prep.branch} moved on origin under this run` : failureReason(push) }
   if (partial) {
-    const settled = await finalizeFixerIssue({
+    const settled = await ctx.finalizeIssue({
       issue,
       body: body(shippedHead),
       ...terminalTransition({ rest: 'ready-to-review', drop: ['needs-judgment'] }),
     })
-    terminalWindow = settled.budget
     const notes = [
       ...(!settled.settled ? [`terminal label transition failed: ${settled.stateError}`] : []),
       ...(!settled.reported ? [`audit comment failed: ${settled.reportError}`] : []),
@@ -716,7 +663,7 @@ async function ship(issue, prep, body, { partial = false, dispositions = [], ver
   // one budget (see terminalBudget) and the run still has a RESULT line to write.
   // A readback that cannot confirm the landing drops into the blocker path, which
   // transitions the labels again — inside THIS window, not a second one.
-  const budget = terminalBudget()
+  const budget = ctx.openTerminalBudget()
   await ensureLabels(['ready-to-merge'], { budget })
   const absent = ['in-progress', 'needs-judgment', 'ready-to-review', 'failed']
   const flip = await editLabels(issue, { add: ['ready-to-merge'], remove: absent }, { budget })
@@ -759,120 +706,12 @@ function attemptGuidance(attempt, state) {
 const blockerBody = ({ phase, reason, prUrl, attempt }, state) =>
   `🤖 fix-conflict blocked\n- phase: ${phase}\n- reason: ${reason}\n- pr: ${prUrl || 'not resolved'}\n- next: ${attemptGuidance(attempt, state)}\n`
 
-async function postBlocker({ issue, phase, reason, prUrl, attempt }, budget) {
-  // The worktree must not be left mid-rebase for the next run to trip over. The probe is bounded
-  // as well as the abort, because its own `rev-parse` subprocesses can stall just as long. Bounded
-  // by what the terminal window has left when it is ship's landing swap that failed: past that write
-  // reap's settle clock is running, and a stalled local git call costs the blocker report just as an
-  // unbounded gh call would. Before any terminal write there is no clock and git's own timeout stands.
-  await cleanConflictWorktree(terminalTimeout)
-  // needs-judgment keeps the issue in the fixer queue and the ladder labels bound the retries; both
-  // stay — and needs-judgment is RESTORED rather than assumed, because a landing swap that GitHub
-  // applied but this run could not verify has already stripped it and put `ready-to-merge` on — the
-  // one label bin/merge-worker.sh selects on, so a blocked run's PR would be landed unattended. A run
-  // resting at `failed` beside a landing label it never verified reports one state and presents
-  // another, so the transition names the one label it rests at and derives every removal from it.
-  const settled = await finalizeFixerIssue({
-    issue,
-    body: state => blockerBody({ phase, reason, prUrl, attempt }, state),
-    ...terminalTransition({ rest: 'failed', queue: ['needs-judgment'] }),
-    budget,
-  })
-  terminalWindow = settled.budget
-  if (!settled.reported) log(`blocked: GitHub report failed (${settled.reportError})`)
-  if (!settled.settled) log(`blocked: terminal label restoration failed (${settled.stateError})`)
-}
-
-// Once a checked partial branch is pushed, retrying the conflict fixer could
-// overwrite or promote work a human now owns. Reporting trouble leaves the
-// verified review label alone; an unverified review transition is quarantined
-// at failed with the fixer queue deliberately absent.
-async function blockPushedPartial(reason, { reviewSettled }) {
-  blockerPosted = true
-  if (reviewSettled) {
-    log(`blocked after partial push: ${reason}`)
-  } else {
-    const settled = await finalizeFixerIssue({
-      issue,
-      body: state => blockerBody({ phase: 'ship', reason, prUrl, attempt }, state),
-      ...terminalTransition({ rest: 'failed', drop: ['needs-judgment'] }),
-      budget: terminalWindow || terminalBudget(),
-    })
-    terminalWindow = settled.budget
-    if (!settled.reported) log(`blocked: GitHub report failed (${settled.reportError})`)
-    if (!settled.settled) log(`blocked: terminal label quarantine failed (${settled.stateError})`)
-  }
-  return { blocked: true, issue, phase: 'ship', reason, prUrl: prUrl || undefined, attempt, partialPushed: true }
-}
-
-// ───────────────────────── Blocker path ─────────────────────────
-// Same shape as epic-run's fail(): comment the blocker, restore the terminal
-// label, return a structured block. blockerPosted guards re-entry when the
-// outer catch fires after a phase that already failed.
-let currentPhase = 'prepare'
-let blockerPosted = false
-let prUrl = null
-let attempt = 0
-let terminalWindow = null
 async function cleanConflictWorktree(options) {
   const opts = () => typeof options === 'function' ? options() : options
   if (await rebaseInProgress(opts())) await git(['rebase', '--abort'], opts())
   await git(['reset', '--mixed', 'HEAD'], opts())
   await git(['checkout', '-f', '--', '.'], opts())
   await git(['clean', '-fd'], opts())
-}
-async function holdForQuota(phase, failure, reason) {
-  try {
-    await cleanConflictWorktree()
-    const { hostHold, trigger } = await recordQuotaHold({ vendor: failure.vendor, reason: failure.reason })
-    const rung = attemptRung(attempt)
-    const finalized = await finalizeFixerQuotaHold({
-      issue,
-      rung,
-      hold: { add: ['failed'], remove: ['in-progress', rung], required: ['failed', 'needs-judgment'] },
-      blocked: { add: ['failed'], remove: ['in-progress'], required: ['failed', 'needs-judgment'] },
-      body: (state, holdState) => blockerBody({
-        phase,
-        reason: withAgentFailure(`${reason} Provider quota hold failed: ${holdState.stateError}.`, failure),
-        prUrl,
-        attempt,
-      }, state),
-    })
-    terminalWindow = finalized.budget
-    if (!finalized.held) {
-      blockerPosted = true
-      if (!finalized.blockState.reported) log(`blocked: GitHub report failed (${finalized.blockState.reportError})`)
-      if (!finalized.blockState.settled) log(`blocked: terminal label restoration failed (${finalized.blockState.stateError})`)
-      return {
-        blocked: true, issue, phase,
-        reason: withAgentFailure(`${reason} Provider quota hold failed: ${finalized.holdState.stateError}.`, failure),
-        prUrl: prUrl || undefined,
-        attempt,
-      }
-    }
-    return { held: true, issue, phase, ...hostHold, ...trigger, attempt }
-  } catch (error) {
-    return { error: error?.message || String(error) }
-  }
-}
-
-async function fail(phase, reason) {
-  const failure = takeAgentFailure()
-  if (failure?.kind === 'quota-exhausted') {
-    const held = await holdForQuota(phase, failure, reason)
-    if (!held.error) return held
-    reason = `${reason} Provider quota hold failed: ${held.error}.`
-  }
-  reason = withAgentFailure(reason, failure)
-  if (!blockerPosted) {
-    blockerPosted = true
-    try {
-      await postBlocker({ issue, phase, reason, prUrl, attempt })
-    } catch (e) {
-      log(`blocked: could not report on GitHub (${e && e.message || e})`)
-    }
-  }
-  return { blocked: true, issue, phase, reason, prUrl: prUrl || undefined, attempt }
 }
 
 // ───────────────────────── The audit comment ─────────────────────────
@@ -933,137 +772,101 @@ const buildComment = (prep, dispositions, verifyDetail, check) => {
   return lines.join('\n')
 }
 
-// ───────────────────────── Pipeline ─────────────────────────
-async function main() {
-try {
-  phase('Prepare')
-  const prep = await prepare(issue)
-  if (prep.refused) {
-    log(`Prepare refused: ${prep.refused}`)
-    return { skipped: true, issue, reason: prep.refused, refusalFinal: !!prep.refusalFinal }
-  }
-  attempt = prep.attempt
-  prUrl = prep.prUrl || null
-  if (prep.gitBlocked) return await fail('prepare', prep.gitBlocked)
-  // Fail closed on discovery, exactly like epic-run: an empty package list
-  // would make the verify gate a silent no-op on a rewritten merge.
-  const packages = Array.isArray(prep.packages) ? prep.packages : []
-  if (!packages.length) {
-    return await fail('prepare', 'layout discovery found no package declaring an `npm run verify` script — refusing to ship a resolution nothing would verify.')
-  }
-  const marked = Array.isArray(prep.markedFiles) ? prep.markedFiles : []
-  log(prep.partialRecord
-    ? `Prepare: attempt ${attempt} on PR ${prep.prUrl} — authenticated partial record selected ${prep.judgmentHunks.length} previously declined hunk(s); captured origin/main is unchanged. Packages: ${pkgList(packages)}.`
-    : prep.cleanRebase
-    ? `Prepare: attempt ${attempt} on PR ${prep.prUrl} — rebase onto origin/main was CLEAN (the conflict evaporated).`
-    : `Prepare: attempt ${attempt} on PR ${prep.prUrl} — mechanical hunks settled, ${marked.length} file(s) left for judgment${marked.length ? ` (${marked.join(', ')})` : ''}. Packages: ${pkgList(packages)}.`)
-
-  // ───────────────────────── Resolve (judgment hunks only) ─────────────────────────
-  let dispositions = []
-  if (marked.length) {
-    currentPhase = 'resolve'
-    phase('Resolve')
-    const res = await agent(PROMPTS.resolve(issue, prep),
-      { label: 'resolve', phase: 'Resolve', step: 'fix-conflicts', schema: RESOLVE_SCHEMA })
-    if (!res) return await fail('resolve', 'the resolver produced no result — the rebase is aborted for a clean retry.')
-    const normalized = normalizedDispositions(res, prep.judgmentHunks)
-    if (normalized.problem) return await fail('resolve', normalized.problem)
-    dispositions = normalized.dispositions
-    const declined = dispositions.filter(d => d.action === 'declined')
-    const repaired = dispositions.filter(d => d.action === 'repaired')
-    if (!repaired.length) {
-      return await fail('resolve', `the resolver declined every judgment hunk: ${declined.map(d => `${d.file} hunk ${d.hunk}: ${d.reason}`).join('; ')}`)
-    }
-    // The claim of completion, checked against the tree.
-    if (prep.partialRecord) {
-      if (!(await gitOut(['status', '--porcelain'], 'git status'))) {
-        return await fail('resolve', 'the resolver reported a repaired prior decline but changed no file')
-      }
-      log(`Resolve: ${repaired.length} previously declined hunk(s) repaired, ${declined.length} still declined; working-tree delta ready for verification.`)
-    } else {
-      const problem = await resolutionProblem(marked)
-      if (problem) return await fail('resolve', `the resolver reported completion but ${problem}.`)
-      log(`Resolve: ${repaired.length} judgment hunk(s) repaired, ${declined.length} declined; rebase finished clean.`)
-    }
-  }
-
-  // ───────────────────────── Verify ─────────────────────────
-  // The fixer NEVER fixes code: a red verify here means the resolution (or the
-  // combination of the two sides) broke something, and that goes to a human.
-  currentPhase = 'verify'
-  phase('Verify')
-  const v = await runVerify(packages)
-  if (!v.green) return await fail('verify', `npm run verify is red after the resolution (${v.detail}) — the fixer never fixes code, so nothing was pushed and the PR branch is untouched.`)
-  log(`Verify: green — ${v.detail}`)
-
-  // ───────────────────────── Adversarial check ─────────────────────────
-  // Skipped when no judgment was exercised: a clean rebase or an all-
-  // mechanical stop has nothing for a skeptic to refute — the containment
-  // gate already proved the mechanical share, line by line.
-  let check = null
-  if (marked.length) {
-    currentPhase = 'check'
-    phase('Check')
-    if (prep.partialRecord) await intentToAdd()
-    check = await agent(PROMPTS.check(issue, prep, dispositions),
-      { label: 'check', phase: 'Check', step: 'confirm-review', schema: CHECK_SCHEMA })
-    if (!check) return await fail('check', 'the adversarial checker produced no result — an unchecked resolution must not ship.')
-    if (!check.survives || check.confidence < 75) {
-      return await fail('check', `the adversarial check refuted the resolution (survives=${check.survives}, confidence ${check.confidence}): ${check.reasoning}`)
-    }
-    log(`Check: survived — ${check.reasoning} (confidence ${check.confidence}).`)
-  }
-
-  // ───────────────────────── Ship ─────────────────────────
-  currentPhase = 'ship'
-  phase('Ship')
-  const declined = dispositions.filter(d => d.action === 'declined')
-  const partial = declined.length > 0
-  const shipped = await ship(issue, prep, () => buildComment(prep, dispositions, v.detail, check), {
-    partial,
-    dispositions,
-    verifyDetail: v.detail,
-    check,
-  })
-  if (!shipped.pushed) {
-    return await fail('ship', `the force-with-lease push did not land${shipped.note ? ` (${shipped.note})` : ''} — the branch on origin is untouched.`)
-  }
-  if (partial && (!shipped.labelled || !shipped.reported)) {
-    return await blockPushedPartial(
-      `the partial repair was pushed, but its human-held landing could not be fully verified${shipped.note ? ` (${shipped.note})` : ''}`,
-      { reviewSettled: shipped.labelled })
-  }
-  if (!shipped.labelled) {
-    // Fail closed on the label half too: pushed-but-unlabelled would leave a
-    // fixed PR on an issue reap reads as "still working" — a leaked slot and
-    // an invisible success. failed + the blocker comment puts a human on it.
-    return await fail('ship', `pushed, but the ready-to-merge label swap could not be verified${shipped.note ? ` (${shipped.note})` : ''} — a human finishes the labels; the PR itself is fixed and rebased.`)
-  }
-  if (partial) {
-    log(`Ship: partial repair pushed and held for review — ${declined.map(d => `${d.file} hunk ${d.hunk}: ${d.reason}`).join('; ')}`)
-  } else {
-    log(`Ship: pushed and labelled ready-to-merge — ${prep.prUrl}`)
-  }
-
-  return {
-    issue,
+await runFixerLifecycle({
+  scriptName: 'fix-run',
+  usage: USAGE,
+  phases: ['Prepare', 'Resolve', 'Verify', 'Check', 'Ship'],
+  queue: {
+    label: 'needs-judgment',
+    missing: issue => `issue #${issue} is not labelled needs-judgment — not a fixer's issue`,
+  },
+  prepare,
+  prepared: async (ctx, prep) => {
+    // An empty package list would turn verification of a rewritten merge into
+    // a silent no-op, so discovery remains a hard pre-model gate.
+    const packages = Array.isArray(prep.packages) ? prep.packages : []
+    if (!packages.length) throw new Error('layout discovery found no package declaring an `npm run verify` script — refusing to ship a resolution nothing would verify.')
+    const marked = Array.isArray(prep.markedFiles) ? prep.markedFiles : []
+    log(prep.partialRecord
+      ? `Prepare: attempt ${ctx.attempt} on PR ${prep.prUrl} — authenticated partial record selected ${prep.judgmentHunks.length} previously declined hunk(s); captured origin/main is unchanged. Packages: ${pkgList(packages)}.`
+      : prep.cleanRebase
+      ? `Prepare: attempt ${ctx.attempt} on PR ${prep.prUrl} — rebase onto origin/main was CLEAN (the conflict evaporated).`
+      : `Prepare: attempt ${ctx.attempt} on PR ${prep.prUrl} — mechanical hunks settled, ${marked.length} file(s) left for judgment${marked.length ? ` (${marked.join(', ')})` : ''}. Packages: ${pkgList(packages)}.`)
+  },
+  repair: {
+    needed: prep => Array.isArray(prep.markedFiles) && prep.markedFiles.length > 0,
+    key: 'resolve', phase: 'Resolve',
+    prompt: (ctx, prep) => PROMPTS.resolve(ctx.issue, prep),
+    agent: { label: 'resolve', phase: 'Resolve', step: 'fix-conflicts', schema: RESOLVE_SCHEMA },
+    noResult: 'the resolver produced no result — the rebase is aborted for a clean retry.',
+    normalize: (result, prep) => normalizedDispositions(result, prep.judgmentHunks),
+    allDeclined: declined => `the resolver declined every judgment hunk: ${declined.map(d => `${d.file} hunk ${d.hunk}: ${d.reason}`).join('; ')}`,
+    treeProblem: async (_ctx, prep) => {
+      if (prep.partialRecord) return (await gitOut(['status', '--porcelain'], 'git status'))
+        ? null
+        : 'the resolver reported a repaired prior decline but changed no file'
+      const problem = await resolutionProblem(prep.markedFiles)
+      return problem ? `the resolver reported completion but ${problem}.` : null
+    },
+    log: (_ctx, prep, _result, repaired, declined) => log(prep.partialRecord
+      ? `Resolve: ${repaired.length} previously declined hunk(s) repaired, ${declined.length} still declined; working-tree delta ready for verification.`
+      : `Resolve: ${repaired.length} judgment hunk(s) repaired, ${declined.length} declined; rebase finished clean.`),
+  },
+  verify: {
+    packages: prep => prep.packages,
+    log: (_ctx, _prep, verified) => { if (verified.green) log(`Verify: green — ${verified.detail}`) },
+    failure: (_prep, verified) => `npm run verify is red after the resolution (${verified.detail}) — the fixer never fixes code, so nothing was pushed and the PR branch is untouched.`,
+  },
+  check: {
+    needed: prep => Array.isArray(prep.markedFiles) && prep.markedFiles.length > 0,
+    before: (_ctx, prep) => prep.partialRecord ? intentToAdd() : undefined,
+    prompt: (ctx, prep, dispositions) => PROMPTS.check(ctx.issue, prep, dispositions),
+    agent: { label: 'check', phase: 'Check', step: 'confirm-review', schema: CHECK_SCHEMA },
+    noResult: 'the adversarial checker produced no result — an unchecked resolution must not ship.',
+    refuted: check => `the adversarial check refuted the resolution (survives=${check.survives}, confidence ${check.confidence}): ${check.reasoning}`,
+    log: (_ctx, _prep, check) => log(`Check: survived — ${check.reasoning} (confidence ${check.confidence}).`),
+  },
+  ship: (ctx, { prep, dispositions, verified, check, partial }) => ship(
+    ctx, prep, () => buildComment(prep, dispositions, verified.detail, check),
+    { partial, dispositions, verifyDetail: verified.detail, check }),
+  shipFailure: shipped => `the force-with-lease push did not land${shipped.note ? ` (${shipped.note})` : ''} — the branch on origin is untouched.`,
+  partialShipFailure: shipped => `the partial repair was pushed, but its human-held landing could not be fully verified${shipped.note ? ` (${shipped.note})` : ''}`,
+  landingFailure: shipped => `pushed, but the ready-to-merge label swap could not be verified${shipped.note ? ` (${shipped.note})` : ''} — a human finishes the labels; the PR itself is fixed and rebased.`,
+  shipLog: (_ctx, prep, declined, partial) => log(partial
+    ? `Ship: partial repair pushed and held for review — ${declined.map(d => `${d.file} hunk ${d.hunk}: ${d.reason}`).join('; ')}`
+    : `Ship: pushed and labelled ready-to-merge — ${prep.prUrl}`),
+  result: (ctx, { prep, dispositions, declined, verified, check, partial }) => ({
+    issue: ctx.issue,
     prUrl: prep.prUrl,
     branch: prep.branch,
-    attempt,
+    attempt: ctx.attempt,
     cleanRebase: !!prep.cleanRebase,
     resolvedHunks: dispositions.filter(d => d.action === 'repaired').length,
     declinedHunks: declined.map(d => ({ file: d.file, hunk: d.hunk, reason: d.reason })),
     checkConfidence: check ? check.confidence : null,
-    verify: v.detail,
+    verify: verified.detail,
     ...(partial ? { readyToReview: true } : { readyToMerge: true }),
-  }
-} catch (e) {
-  return await fail(currentPhase, (e && e.message) || String(e))
-}
-}
-
-const RESULT = await main()
-// Best effort, and awaited so the edit lands before the process goes: this is the
-// last thing the issue page will show until a human or the merge worker acts.
-await statusFinish(RESULT?.held ? `**held**: provider quota exhausted, resumes after ${RESULT.holdUntil} — vendor: ${RESULT.vendor}; provider reason: "${RESULT.reason}"` : RESULT?.blocked ? `**blocked** at ${RESULT.phase}: ${RESULT.reason}` : RESULT?.skipped ? `**skipped**: ${RESULT.reason}` : RESULT?.readyToMerge ? `**done** — ${RESULT.prUrl} is back to ready-to-merge` : RESULT?.readyToReview ? `**done, held for review** — ${RESULT.prUrl}; declined: ${RESULT.declinedHunks.map(d => `${d.file} hunk ${d.hunk}: ${d.reason}`).join('; ')}` : '**finished**', { budget: terminalWindow || undefined })
-process.exit(finish(RESULT))
+  }),
+  cleanup: (_ctx, options) => cleanConflictWorktree(options),
+  attemptRung,
+  quota: (_ctx, rung) => ({
+    hold: { add: ['failed'], remove: ['in-progress', rung], required: ['failed', 'needs-judgment'] },
+    blocked: { add: ['failed'], remove: ['in-progress'], required: ['failed', 'needs-judgment'] },
+  }),
+  blocker: {
+    transition: () => terminalTransition({ rest: 'failed', queue: ['needs-judgment'] }),
+    body: (ctx, { phase, reason }, state) => blockerBody({ phase, reason, prUrl: ctx.prUrl, attempt: ctx.attempt }, state),
+  },
+  partialFailure: async (ctx, reason, { labelled }) => {
+    if (labelled) return log(`blocked after partial push: ${reason}`)
+    const settled = await ctx.finalizeIssue({
+      issue: ctx.issue,
+      body: state => blockerBody({ phase: 'ship', reason, prUrl: ctx.prUrl, attempt: ctx.attempt }, state),
+      ...terminalTransition({ rest: 'failed', drop: ['needs-judgment'] }),
+      budget: ctx.terminalWindow || ctx.openTerminalBudget(),
+    })
+    if (!settled.reported) log(`blocked: GitHub report failed (${settled.reportError})`)
+    if (!settled.settled) log(`blocked: terminal label quarantine failed (${settled.stateError})`)
+  },
+  status: result => result?.held ? `**held**: provider quota exhausted, resumes after ${result.holdUntil} — vendor: ${result.vendor}; provider reason: "${result.reason}"` : result?.blocked ? `**blocked** at ${result.phase}: ${result.reason}` : result?.skipped ? `**skipped**: ${result.reason}` : result?.readyToMerge ? `**done** — ${result.prUrl} is back to ready-to-merge` : result?.readyToReview ? `**done, held for review** — ${result.prUrl}; declined: ${result.declinedHunks.map(d => `${d.file} hunk ${d.hunk}: ${d.reason}`).join('; ')}` : '**finished**',
+})

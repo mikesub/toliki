@@ -18,22 +18,19 @@
 // exhausted → refuses and stays failed. Its own ladder, not the conflict
 // fixer's: a PR can need both, and one budget would starve the other.
 //
-// Two model steps: the fixer and its skeptic. Everything else — the gates, the
-// ladder write, the log gathering, verify, the amend, the push, the audit
-// comment, the labels — is the orchestrator's own work.
+// Two model steps: the fixer and its skeptic. The shared fixed-purpose fixer
+// lifecycle owns their sequencing, common gates, failure/refund handling and
+// final RESULT; this adapter owns red-check capture, prompts and publication.
 // A hard provider-quota death cleans the unpushed edit and records the
 // host-wide hold before labels move. A verified hold refunds this invocation's
 // rung; an unverified transition restores it and blocks inside the same
 // terminal-report window.
 
-import { agent, phase, log, initRuntime, onPhase, onLog, takeAgentFailure, withAgentFailure } from './lib/runtime.mjs'
-import { parseArgs, finish, UsageError, EXIT } from './lib/cli.mjs'
-import { initStatus, statusPhase, statusNote, statusFinish } from './lib/status.mjs'
+import { log } from './lib/runtime.mjs'
 import { failureReason } from './lib/proc.mjs'
-import { gh, ensureLabels, editLabels, issueLabels, issueView, comment, openPrs, withBodyFile, readBack, terminalBudget, terminalTimeout, terminalTransition, verifyIssueEngine } from './lib/github.mjs'
+import { gh, ensureLabels, editLabels, issueLabels, comment, openPrs, readBack, terminalTransition } from './lib/github.mjs'
 import { git, gitOut, discoverPackages, pkgList, ensureDeps, runVerify, pushRejected, intentToAdd } from './lib/repo.mjs'
-import { finalizeFixerIssue, finalizeFixerQuotaHold } from './lib/fixer-finalize.mjs'
-import { recordQuotaHold } from './quota-hold.mjs'
+import { runFixerLifecycle, validateIndexedDispositions } from './lib/fixer-lifecycle.mjs'
 
 const USAGE = `Usage: ci-run.mjs --issue <N> [--session <name>] [--engine <name>]
 
@@ -141,23 +138,6 @@ const CHECK_SCHEMA = {
   },
 }
 
-// ───────────────────────── Args ─────────────────────────
-let ARGS
-try {
-  ARGS = parseArgs(process.argv.slice(2), { allowSlug: false, usage: USAGE })
-} catch (e) {
-  if (e instanceof UsageError) {
-    process.stderr.write((e.message ? `ci-run: ${e.message}\n\n` : '') + e.usage + '\n')
-    process.exit(e.message ? EXIT.ERROR : EXIT.OK)
-  }
-  throw e
-}
-initRuntime({ scriptName: 'ci-run', sessionName: ARGS.session, defaultEngine: ARGS.engine, issue: ARGS.issue })
-initStatus({ issue: ARGS.issue, script: 'ci-run', session: ARGS.session, phases: ['Prepare', 'Fix', 'Verify', 'Check', 'Ship'] })
-onPhase(statusPhase)
-onLog(statusNote)
-const issue = ARGS.issue
-
 // ───────────────────────── Transport ─────────────────────────
 // Which checks are red on a PR head, from the same rollup the merge worker
 // reads. Skipped and neutral count as success there and here; a check with no
@@ -175,39 +155,18 @@ function failedChecks(rollup) {
   return out
 }
 
-const nonblank = value => typeof value === 'string' && value.trim().length > 0
-
 function normalizedDispositions(result, checks) {
-  if (result?.escalate) return { problem: `escalated rather than guessed: ${result.escalate}` }
-  let dispositions
-  if (Array.isArray(result?.dispositions)) {
-    dispositions = result.dispositions
-  } else if (result?.completed === true) {
-    // Compatibility for complete repairs emitted before indexed dispositions
-    // were introduced. The generic reason avoids leaking the fixer's private
-    // narrative into the blind checker.
-    dispositions = checks.map((_name, index) => ({ index: index + 1, action: 'repaired', reason: 'reported repaired' }))
-  } else if (result?.completed === false) {
-    return { problem: 'the fixer did not complete' }
-  } else {
-    return { problem: 'the fixer returned no indexed failed-check dispositions' }
-  }
-  if (dispositions.length !== checks.length) {
-    return { problem: `the fixer returned ${dispositions.length} disposition(s) for ${checks.length} failed check(s)` }
-  }
-  const byIndex = new Map()
-  for (const disposition of dispositions) {
-    const index = Number(disposition?.index)
-    if (!Number.isInteger(index) || index < 1 || index > checks.length || byIndex.has(index)) {
-      return { problem: 'the fixer returned duplicate, missing, or out-of-range disposition indexes' }
-    }
-    if (!['repaired', 'declined'].includes(disposition.action) || !nonblank(disposition.reason)) {
-      return { problem: `failed-check disposition ${index} needs a repaired/declined action and non-empty reason` }
-    }
-    byIndex.set(index, disposition)
-  }
-  if (byIndex.size !== checks.length) return { problem: 'the fixer did not cover every failed check exactly once' }
-  return { dispositions: checks.map((name, index) => ({ ...byIndex.get(index + 1), index: index + 1, name })) }
+  return validateIndexedDispositions(result, checks, {
+    subject: 'the fixer', itemName: 'failed check',
+    missing: 'the fixer returned no indexed failed-check dispositions',
+    incomplete: 'the fixer did not complete',
+    // Compatibility for complete pre-disposition payloads. The generic reason
+    // keeps the repairer's private narrative out of the blind checker.
+    legacy: value => value?.completed === true ? {
+      dispositions: checks.map((_name, index) => ({ index: index + 1, action: 'repaired', reason: 'reported repaired' })),
+    } : null,
+    decorate: (name, disposition, index) => ({ ...disposition, index, name }),
+  })
 }
 
 // The failing jobs' logs, which is the evidence a human would open first.
@@ -230,18 +189,11 @@ async function jobLogs(checks) {
   return blocks.length ? `What the failing job(s) printed:\n\n${blocks.join('\n\n')}` : ''
 }
 
-async function prepare(issue) {
-  const view = await issueView(issue, 'state,labels,title')
-  const labels = Array.isArray(view.labels) ? view.labels.map(l => l.name) : []
-  if (String(view.state || '').toUpperCase() === 'CLOSED') return { refused: `issue #${issue} is closed` }
-  if (!labels.includes('needs-ci-fix')) return { refused: `issue #${issue} is not labelled needs-ci-fix — not a CI fixer's issue` }
-
-  // A fixer inherits the claim's durable route; it cannot fall back to a host
-  // default that may have changed since the original epic ran.
-  await verifyIssueEngine(issue, ARGS.engine)
+async function prepare(ctx, { labels }) {
+  const { issue } = ctx
 
   const refuseFinal = async (body, reason) => {
-    const settled = await finalizeFixerIssue({ issue, body, add: ['failed'], remove: ['in-progress'] })
+    const settled = await ctx.finalizeIssue({ issue, body, add: ['failed'], remove: ['in-progress'] })
     if (!settled.reported) log(`blocked: GitHub report failed (${settled.reportError})`)
     if (!settled.settled) log(`blocked: terminal label restoration failed (${settled.stateError})`)
     return { refused: reason, refusalFinal: true }
@@ -264,14 +216,16 @@ async function prepare(issue) {
   const pr = prs[0]
 
   // Attempt ladder + start signal, VERIFIED: an uncounted attempt must not run.
-  const attempt = labels.includes('ci-attempted') ? 2 : 1
-  const ladderLabel = attempt === 2 ? 'ci-retried' : 'ci-attempted'
-  await ensureLabels(['ci-attempted', 'ci-retried', 'in-progress'])
-  await editLabels(issue, { add: ['in-progress', ladderLabel], remove: ['failed'] })
-  const now = await issueLabels(issue)
-  if (!now.includes('in-progress') || !now.includes(ladderLabel) || now.includes('failed')) {
+  const consumed = await ctx.consumeAttempt({
+    labels,
+    first: 'ci-attempted',
+    retry: 'ci-retried',
+    remove: ['failed'],
+  })
+  if (!consumed.recorded) {
     return { refused: 'could not record the attempt (label write failed)' }
   }
+  const { attempt } = consumed
   const base = { attempt, branch: pr.headRefName, prUrl: pr.url, prNumber: pr.number, prHead: pr.headRefOid }
 
   // The checks have to be red RIGHT NOW, not when the merge worker looked: a
@@ -311,7 +265,8 @@ async function prepare(issue) {
 
 // Amend the branch's single commit, keeping its message (and so its Closes
 // line), then push under a lease pinned to the head this run inspected.
-async function ship(issue, prep, body, { partial = false } = {}) {
+async function ship(ctx, prep, body, { partial = false } = {}) {
+  const { issue } = ctx
   await gitOut(['add', '-A'], 'git add -A')
   if ((await git(['diff', '--cached', '--quiet'])).code === 0) return { pushed: false, labelled: false, note: 'nothing staged to amend' }
   await gitOut(['commit', '-q', '--amend', '--no-edit'], 'git commit --amend')
@@ -321,12 +276,11 @@ async function ship(issue, prep, body, { partial = false } = {}) {
   const push = await git(['push', `--force-with-lease=refs/heads/${prep.branch}:${prep.prHead}`, 'origin', `HEAD:refs/heads/${prep.branch}`])
   if (!push.ok) return { pushed: false, labelled: false, note: pushRejected(push) ? `rejected — ${prep.branch} moved on origin under this run` : failureReason(push) }
   if (partial) {
-    const settled = await finalizeFixerIssue({
+    const settled = await ctx.finalizeIssue({
       issue,
       body,
       ...terminalTransition({ rest: 'ready-to-review', drop: ['needs-ci-fix'] }),
     })
-    terminalWindow = settled.budget
     const notes = [
       ...(!settled.settled ? [`terminal label transition failed: ${settled.stateError}`] : []),
       ...(!settled.reported ? [`audit comment failed: ${settled.reportError}`] : []),
@@ -342,7 +296,7 @@ async function ship(issue, prep, body, { partial = false } = {}) {
   // one budget (see terminalBudget) and the run still has a RESULT line to write.
   // A readback that cannot confirm the landing drops into the blocker path, which
   // transitions the labels again — inside THIS window, not a second one.
-  const budget = terminalBudget()
+  const budget = ctx.openTerminalBudget()
   await ensureLabels(['ready-to-merge'], { budget })
   const flip = await editLabels(issue, { add: ['ready-to-merge'], remove: ['in-progress', 'needs-ci-fix'] }, { budget })
   // Bounded, not single-shot: GitHub can take seconds to show a swap it has
@@ -378,110 +332,11 @@ function attemptGuidance(attempt, state) {
 const blockerBody = ({ phase, reason, prUrl, attempt }, state) =>
   `🤖 fix-ci blocked\n- phase: ${phase}\n- reason: ${reason}\n- pr: ${prUrl || 'not resolved'}\n- next: ${attemptGuidance(attempt, state)}\n`
 
-async function postBlocker({ issue, phase, reason, prUrl, attempt }, budget) {
-  // needs-ci-fix keeps the issue in the queue and the ladder labels bound the retries; both stay —
-  // and `needs-ci-fix` is RESTORED rather than assumed, because a landing swap that GitHub applied
-  // but this run could not verify has already stripped it and put `ready-to-merge` on. Resting at
-  // `failed` beside that landing label would hand a blocked run's PR to the merge worker, so the
-  // transition names the one label the run rests at and derives every removal from it.
-  const settled = await finalizeFixerIssue({
-    issue,
-    body: state => blockerBody({ phase, reason, prUrl, attempt }, state),
-    ...terminalTransition({ rest: 'failed', queue: ['needs-ci-fix'] }),
-    budget,
-  })
-  terminalWindow = settled.budget
-  if (!settled.reported) log(`blocked: GitHub report failed (${settled.reportError})`)
-  if (!settled.settled) log(`blocked: terminal label restoration failed (${settled.stateError})`)
-}
-
-async function blockPushedPartial(reason, { reviewSettled }) {
-  blockerPosted = true
-  if (reviewSettled) {
-    log(`blocked after partial push: ${reason}`)
-  } else {
-    const settled = await finalizeFixerIssue({
-      issue,
-      body: state => blockerBody({ phase: 'ship', reason, prUrl, attempt }, state),
-      ...terminalTransition({ rest: 'failed', drop: ['needs-ci-fix'] }),
-      budget: terminalWindow || terminalBudget(),
-    })
-    terminalWindow = settled.budget
-    if (!settled.reported) log(`blocked: GitHub report failed (${settled.reportError})`)
-    if (!settled.settled) log(`blocked: terminal label quarantine failed (${settled.stateError})`)
-  }
-  return { blocked: true, issue, phase: 'ship', reason, prUrl: prUrl || undefined, attempt, partialPushed: true }
-}
-
-// ───────────────────────── Blocker path ─────────────────────────
-let currentPhase = 'prepare'
-let blockerPosted = false
-let prUrl = null
-let attempt = 0
-let terminalWindow = null
 async function cleanUnpushedEdits(options) {
   const opts = () => typeof options === 'function' ? options() : options
   await git(['reset', '--mixed', 'HEAD'], opts())
   await git(['checkout', '-f', '--', '.'], opts())
   await git(['clean', '-fd'], opts())
-}
-async function holdForQuota(phase, failure, reason) {
-  try {
-    await cleanUnpushedEdits()
-    const { hostHold, trigger } = await recordQuotaHold({ vendor: failure.vendor, reason: failure.reason })
-    const rung = attemptRung(attempt)
-    const finalized = await finalizeFixerQuotaHold({
-      issue,
-      rung,
-      hold: { add: ['failed', 'needs-ci-fix'], remove: ['in-progress', rung] },
-      blocked: { add: ['failed', 'needs-ci-fix'], remove: ['in-progress'] },
-      body: (state, holdState) => blockerBody({
-        phase,
-        reason: withAgentFailure(`${reason} Provider quota hold failed: ${holdState.stateError}.`, failure),
-        prUrl,
-        attempt,
-      }, state),
-    })
-    terminalWindow = finalized.budget
-    if (!finalized.held) {
-      blockerPosted = true
-      if (!finalized.blockState.reported) log(`blocked: GitHub report failed (${finalized.blockState.reportError})`)
-      if (!finalized.blockState.settled) log(`blocked: terminal label restoration failed (${finalized.blockState.stateError})`)
-      return {
-        blocked: true, issue, phase,
-        reason: withAgentFailure(`${reason} Provider quota hold failed: ${finalized.holdState.stateError}.`, failure),
-        prUrl: prUrl || undefined,
-        attempt,
-      }
-    }
-    return { held: true, issue, phase, ...hostHold, ...trigger, attempt }
-  } catch (error) {
-    return { error: error?.message || String(error) }
-  }
-}
-
-async function fail(phase, reason) {
-  const failure = takeAgentFailure()
-  if (failure?.kind === 'quota-exhausted') {
-    const held = await holdForQuota(phase, failure, reason)
-    if (!held.error) return held
-    reason = `${reason} Provider quota hold failed: ${held.error}.`
-  }
-  reason = withAgentFailure(reason, failure)
-  if (!blockerPosted) {
-    blockerPosted = true
-    try {
-      // Never leave a half-applied fix in a worktree the next run reuses. Bounded by whatever the
-      // terminal window has left when ship's landing swap is what failed: past that write reap's
-      // settle clock is running, and a stalled local git call costs the blocker report just as an
-      // unbounded gh call would. Before any terminal write there is no clock and git's own timeout stands.
-      await cleanUnpushedEdits(terminalTimeout)
-      await postBlocker({ issue, phase, reason, prUrl, attempt })
-    } catch (e) {
-      log(`blocked: could not report on GitHub (${e && e.message || e})`)
-    }
-  }
-  return { blocked: true, issue, phase, reason, prUrl: prUrl || undefined, attempt }
 }
 
 // ───────────────────────── The audit comment ─────────────────────────
@@ -513,107 +368,83 @@ const buildComment = (prep, fix, dispositions, verifyDetail, check) => {
 ].join('\n')
 }
 
-// ───────────────────────── Pipeline ─────────────────────────
-async function main() {
-try {
-  phase('Prepare')
-  const prep = await prepare(issue)
-  if (prep.refused) {
-    log(`Prepare refused: ${prep.refused}`)
-    return { skipped: true, issue, reason: prep.refused, refusalFinal: !!prep.refusalFinal }
-  }
-  attempt = prep.attempt
-  prUrl = prep.prUrl || null
-  if (prep.gitBlocked) return await fail('prepare', prep.gitBlocked)
-  log(`Prepare: attempt ${attempt} on PR ${prep.prUrl} — red: ${prep.failedChecks.join(', ')}. Local verify ${prep.localVerify.green ? 'GREEN (the failure does not reproduce here)' : 'red (the failure reproduces here)'}. Packages: ${pkgList(prep.packages)}.`)
-
-  // ───────────────────────── Fix ─────────────────────────
-  currentPhase = 'fix'
-  phase('Fix')
-  const fix = await agent(PROMPTS.fix(issue, prep),
-    { label: 'fix-ci', phase: 'Fix', step: 'fix-ci', schema: FIX_SCHEMA })
-  if (!fix) return await fail('fix', 'the fixer produced no result — nothing was pushed and the PR branch is untouched.')
-  const normalized = normalizedDispositions(fix, prep.failedChecks)
-  if (normalized.problem) return await fail('fix', normalized.problem)
-  const dispositions = normalized.dispositions
-  const declined = dispositions.filter(d => d.action === 'declined')
-  const repaired = dispositions.filter(d => d.action === 'repaired')
-  if (!repaired.length) {
-    return await fail('fix', `the fixer declined every failed check: ${declined.map(d => `${d.name}: ${d.reason}`).join('; ')}`)
-  }
-  // A fix that changed nothing cannot have fixed anything.
-  if (!(await gitOut(['status', '--porcelain'], 'git status'))) {
-    return await fail('fix', 'the fixer reported a fix but changed no file — the checks would come back red exactly as they are.')
-  }
-  log(`Fix: ${fix.cause || 'cause not stated'} — ${fix.summary || 'no summary'}`)
-
-  // ───────────────────────── Verify ─────────────────────────
-  // Necessary, not sufficient: the failing check may be one `npm run verify`
-  // never runs (a CI-only job, another platform). The merge worker re-running
-  // the real checks on the true base is what finally proves it; this gate is
-  // what stops an obviously broken tree from getting that far.
-  currentPhase = 'verify'
-  phase('Verify')
-  const v = await runVerify(prep.packages)
-  log(`Verify: ${v.green ? 'green' : 'RED'} — ${v.detail}`)
-  if (!v.green) return await fail('verify', `npm run verify is red after the fix (${v.detail}) — nothing was pushed and the PR branch is untouched.`)
-
-  // ───────────────────────── Adversarial check ─────────────────────────
-  // The last gate before a complete repair rejoins the unattended merge queue
-  // or a partial repair is preserved for a human.
-  currentPhase = 'check'
-  phase('Check')
-  // A repair may legitimately add a file. Give it an intent-to-add entry so
-  // the exact git diff named in the prompt includes every byte ship() will
-  // later stage with `git add -A`.
-  await intentToAdd()
-  const check = await agent(PROMPTS.check(issue, prep, `git diff ${prep.prHead}`, dispositions),
-    { label: 'ci-check', phase: 'Check', step: 'confirm-review', schema: CHECK_SCHEMA })
-  if (!check) return await fail('check', 'the adversarial checker produced no result — an unchecked fix must not rejoin the merge queue.')
-  if (!check.survives || check.confidence < 75) {
-    return await fail('check', `the adversarial check refuted the fix (survives=${check.survives}, confidence ${check.confidence}): ${check.reasoning}`)
-  }
-  log(`Check: survived — ${check.reasoning} (confidence ${check.confidence}).`)
-
-  // ───────────────────────── Ship ─────────────────────────
-  currentPhase = 'ship'
-  phase('Ship')
-  const partial = declined.length > 0
-  const shipped = await ship(issue, prep, buildComment(prep, fix, dispositions, v.detail, check), { partial })
-  if (!shipped.pushed) {
-    return await fail('ship', `the force-with-lease push did not land${shipped.note ? ` (${shipped.note})` : ''} — the branch on origin is untouched.`)
-  }
-  if (partial && (!shipped.labelled || !shipped.reported)) {
-    return await blockPushedPartial(
-      `the partial repair was pushed, but its human-held landing could not be fully verified${shipped.note ? ` (${shipped.note})` : ''}`,
-      { reviewSettled: shipped.labelled })
-  }
-  if (!shipped.labelled) {
-    return await fail('ship', `pushed, but the ready-to-merge label swap could not be verified${shipped.note ? ` (${shipped.note})` : ''} — a human finishes the labels; the PR itself is fixed.`)
-  }
-  if (partial) {
-    log(`Ship: partial repair pushed and held for review — ${declined.map(d => `${d.name}: ${d.reason}`).join('; ')}`)
-  } else {
-    log(`Ship: pushed and labelled ready-to-merge — ${prep.prUrl}`)
-  }
-
-  return {
-    issue,
+await runFixerLifecycle({
+  scriptName: 'ci-run',
+  usage: USAGE,
+  phases: ['Prepare', 'Fix', 'Verify', 'Check', 'Ship'],
+  queue: {
+    label: 'needs-ci-fix',
+    missing: issue => `issue #${issue} is not labelled needs-ci-fix — not a CI fixer's issue`,
+  },
+  prepare,
+  prepared: (ctx, prep) => log(`Prepare: attempt ${ctx.attempt} on PR ${prep.prUrl} — red: ${prep.failedChecks.join(', ')}. Local verify ${prep.localVerify.green ? 'GREEN (the failure does not reproduce here)' : 'red (the failure reproduces here)'}. Packages: ${pkgList(prep.packages)}.`),
+  repair: {
+    needed: () => true,
+    key: 'fix', phase: 'Fix',
+    prompt: (ctx, prep) => PROMPTS.fix(ctx.issue, prep),
+    agent: { label: 'fix-ci', phase: 'Fix', step: 'fix-ci', schema: FIX_SCHEMA },
+    noResult: 'the fixer produced no result — nothing was pushed and the PR branch is untouched.',
+    normalize: (result, prep) => normalizedDispositions(result, prep.failedChecks),
+    allDeclined: declined => `the fixer declined every failed check: ${declined.map(d => `${d.name}: ${d.reason}`).join('; ')}`,
+    treeProblem: async () => (await gitOut(['status', '--porcelain'], 'git status'))
+      ? null
+      : 'the fixer reported a fix but changed no file — the checks would come back red exactly as they are.',
+    log: (_ctx, _prep, fix) => log(`Fix: ${fix.cause || 'cause not stated'} — ${fix.summary || 'no summary'}`),
+  },
+  verify: {
+    packages: prep => prep.packages,
+    log: (_ctx, _prep, verified) => log(`Verify: ${verified.green ? 'green' : 'RED'} — ${verified.detail}`),
+    failure: (_prep, verified) => `npm run verify is red after the fix (${verified.detail}) — nothing was pushed and the PR branch is untouched.`,
+  },
+  check: {
+    needed: () => true,
+    before: () => intentToAdd(),
+    prompt: (ctx, prep, dispositions) => PROMPTS.check(ctx.issue, prep, `git diff ${prep.prHead}`, dispositions),
+    agent: { label: 'ci-check', phase: 'Check', step: 'confirm-review', schema: CHECK_SCHEMA },
+    noResult: 'the adversarial checker produced no result — an unchecked fix must not rejoin the merge queue.',
+    refuted: check => `the adversarial check refuted the fix (survives=${check.survives}, confidence ${check.confidence}): ${check.reasoning}`,
+    log: (_ctx, _prep, check) => log(`Check: survived — ${check.reasoning} (confidence ${check.confidence}).`),
+  },
+  ship: (ctx, { prep, repairResult, dispositions, verified, check, partial }) =>
+    ship(ctx, prep, buildComment(prep, repairResult, dispositions, verified.detail, check), { partial }),
+  shipFailure: shipped => `the force-with-lease push did not land${shipped.note ? ` (${shipped.note})` : ''} — the branch on origin is untouched.`,
+  partialShipFailure: shipped => `the partial repair was pushed, but its human-held landing could not be fully verified${shipped.note ? ` (${shipped.note})` : ''}`,
+  landingFailure: shipped => `pushed, but the ready-to-merge label swap could not be verified${shipped.note ? ` (${shipped.note})` : ''} — a human finishes the labels; the PR itself is fixed.`,
+  shipLog: (_ctx, prep, declined, partial) => log(partial
+    ? `Ship: partial repair pushed and held for review — ${declined.map(d => `${d.name}: ${d.reason}`).join('; ')}`
+    : `Ship: pushed and labelled ready-to-merge — ${prep.prUrl}`),
+  result: (ctx, { prep, repairResult, declined, verified, check, partial }) => ({
+    issue: ctx.issue,
     prUrl: prep.prUrl,
     branch: prep.branch,
-    attempt,
+    attempt: ctx.attempt,
     failedChecks: prep.failedChecks,
-    cause: fix.cause,
+    cause: repairResult.cause,
     declinedChecks: declined.map(d => ({ name: d.name, reason: d.reason })),
     checkConfidence: check.confidence,
-    verify: v.detail,
+    verify: verified.detail,
     ...(partial ? { readyToReview: true } : { readyToMerge: true }),
-  }
-} catch (e) {
-  return await fail(currentPhase, (e && e.message) || String(e))
-}
-}
-
-const RESULT = await main()
-await statusFinish(RESULT?.held ? `**held**: provider quota exhausted, resumes after ${RESULT.holdUntil} — vendor: ${RESULT.vendor}; provider reason: "${RESULT.reason}"` : RESULT?.blocked ? `**blocked** at ${RESULT.phase}: ${RESULT.reason}` : RESULT?.skipped ? `**skipped**: ${RESULT.reason}` : RESULT?.readyToMerge ? `**done** — ${RESULT.prUrl} is back to ready-to-merge` : RESULT?.readyToReview ? `**done, held for review** — ${RESULT.prUrl}; declined: ${RESULT.declinedChecks.map(d => `${d.name}: ${d.reason}`).join('; ')}` : '**finished**', { budget: terminalWindow || undefined })
-process.exit(finish(RESULT))
+  }),
+  cleanup: (_ctx, options) => cleanUnpushedEdits(options),
+  attemptRung,
+  quota: (_ctx, rung) => ({
+    hold: { add: ['failed', 'needs-ci-fix'], remove: ['in-progress', rung] },
+    blocked: { add: ['failed', 'needs-ci-fix'], remove: ['in-progress'] },
+  }),
+  blocker: {
+    transition: () => terminalTransition({ rest: 'failed', queue: ['needs-ci-fix'] }),
+    body: (ctx, { phase, reason }, state) => blockerBody({ phase, reason, prUrl: ctx.prUrl, attempt: ctx.attempt }, state),
+  },
+  partialFailure: async (ctx, reason, { labelled }) => {
+    if (labelled) return log(`blocked after partial push: ${reason}`)
+    const settled = await ctx.finalizeIssue({
+      issue: ctx.issue,
+      body: state => blockerBody({ phase: 'ship', reason, prUrl: ctx.prUrl, attempt: ctx.attempt }, state),
+      ...terminalTransition({ rest: 'failed', drop: ['needs-ci-fix'] }),
+      budget: ctx.terminalWindow || ctx.openTerminalBudget(),
+    })
+    if (!settled.reported) log(`blocked: GitHub report failed (${settled.reportError})`)
+    if (!settled.settled) log(`blocked: terminal label quarantine failed (${settled.stateError})`)
+  },
+  status: result => result?.held ? `**held**: provider quota exhausted, resumes after ${result.holdUntil} — vendor: ${result.vendor}; provider reason: "${result.reason}"` : result?.blocked ? `**blocked** at ${result.phase}: ${result.reason}` : result?.skipped ? `**skipped**: ${result.reason}` : result?.readyToMerge ? `**done** — ${result.prUrl} is back to ready-to-merge` : result?.readyToReview ? `**done, held for review** — ${result.prUrl}; declined: ${result.declinedChecks.map(d => `${d.name}: ${d.reason}`).join('; ')}` : '**finished**',
+})
