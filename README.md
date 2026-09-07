@@ -36,7 +36,12 @@ only where a judgment is needed. Claude Code and Codex are both supported.
    rebases the run's checkpoint chain onto current `main` and re-runs verify
    before squashing, so a base that moved during the run is met here rather
    than by the merge worker; a conflict or a failed fetch ships on the run's
-   own base and leaves it to the worker. The run ends at an open PR with
+   own base and leaves it to the worker. After the PR exists, ship appends one
+   candidate-bound delivery summary to the source issue with its narrative,
+   actual verification, review/repair tally, remaining work, and pre-handoff
+   gate state. The issue body remains the specification; the PR description is
+   only deterministic linkage back to that issue plus required project markers
+   and the closing relationship. The run ends at an open PR with
    `ready-to-merge` (gates cleared, lands unattended)
    or `ready-to-review` (a human decides). A hard provider quota is a successful
    held outcome instead: the resumable branch is preserved, the issue returns
@@ -45,8 +50,11 @@ only where a judgment is needed. Claude Code and Codex are both supported.
    once.
 4. **`bin/merge-worker.sh`** (cron) — one PR at a time per repo: rebase onto
    current main, give checks time to register, then wait for every published
-   check on the rebased head and squash-merge. An empty rollup after the grace
-   is accepted for repos with no CI.
+   check on the rebased head and squash-merge. It explicitly supplies the full
+   commit subject/body read from that exact checked candidate, so repository
+   squash defaults and mutable PR text cannot replace the durable rationale or
+   closing metadata; an unreadable message fails closed. An empty rollup after
+   the grace is accepted for repos with no CI.
    Mechanical rebase conflicts it resolves itself under a line-containment
    gate; a conflict that needs judgment is labeled for **`fix-run.mjs`**, a
    dispatched fixer run that resolves it under an adversarial check and puts a
@@ -75,8 +83,12 @@ only where a judgment is needed. Claude Code and Codex are both supported.
 
 The operator watches from a laptop with `./remote-control.sh ls` (and
 `./remote-control.sh usage` for what the steps cost), and reads a
-run with `tmux attach` / `capture-pane` — the pane carries its phase log and a
-final `RESULT` line. (Interactive sessions, started by hand, still connect via
+completed run from its source issue: the body is the specification, the
+candidate delivery summary is the immutable run snapshot, and later status,
+deferral, blocker, and fixer comments preserve subsequent history. The PR is
+the technical surface for its diff and checks. For a live process,
+`tmux attach` / `capture-pane` carries its phase log and a final `RESULT` line.
+(Interactive sessions, started by hand, still connect via
 the Claude Code Desktop app's remote control; pipeline runs have no such
 channel, by design — the only mid-run lever is kill.) Everything
 else is scripts — no daemon, no database, no web UI; GitHub issues, labels and

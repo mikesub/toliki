@@ -7,10 +7,11 @@
 //
 // Edited rather than re-posted, which is what makes it affordable at all — the
 // three reasons per-phase comments were removed all turn on re-posting: an edit
-// notifies no watcher, this carries run state rather than a second copy of the
-// PR body, and the orchestrator does it directly instead of spending an agent
-// spawn on the critical path. The PR keeps its job (what was built, the review
-// outcome, line comments); this only answers "alive, and where?".
+// notifies no watcher, this carries live state rather than duplicating the
+// issue's append-only delivery record, and the orchestrator does it directly
+// instead of spending an agent spawn on the critical path. The issue carries
+// the specification and run record; the PR is the technical artifact for the
+// diff, checks and line comments. This comment only answers "alive, and where?".
 //
 // Every call is BEST EFFORT and swallows its errors. The final edit can share
 // the caller's terminal-report deadline after a label write starts reap's
@@ -70,7 +71,7 @@ function body() {
     `started ${startedAt} · updated ${humanTimestamp()}`,
   ]
   if (lastNote) lines.push('', humanizeTimestamps(lastNote))
-  lines.push('', '_Live status, edited in place. The PR carries what was built and the review outcome._')
+  lines.push('', '_Live status, edited in place. The issue carries the specification and run record; the PR is the technical artifact._')
   return lines.join('\n')
 }
 

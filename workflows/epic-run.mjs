@@ -7,7 +7,7 @@
 // run that loses the race skips), resuming an existing branch when one is left
 // over — and skipping completed code when that branch already carries a code
 // checkpoint (recovering its structured review plan when needed) → checkpoint commits after code/fixes → squashed single-commit PR at
-// ship + blocker-comment → merge gate labels the issue ready-to-merge when
+// ship + an append-only delivery summary on the source issue → merge gate labels the issue ready-to-merge when
 // nothing was deferred, or ready-to-review when the PR is held; a hold made
 // exclusively of concrete defects also enters the separate bounded fixer queue.
 // Manual mode (`--slug S`): builds on the current tree, no git; needs
@@ -20,7 +20,9 @@
 // orchestrator through lib/github.mjs and lib/repo.mjs, so a claim, a label, a
 // checkpoint or an open PR is a fact the script established, never a claim a
 // model reported. A model runs only where a judgment is needed: design, code,
-// the independent reviewer(s) and their skeptic, the fixes, and what the PR says.
+// the independent reviewer(s) and their skeptic, the fixes, and the delivery
+// narrative and durable commit rationale. The PR body itself is deterministic
+// linkage back to the issue specification and run record.
 // A hard provider-quota death is not a project blocker: the branch is
 // checkpointed and pushed, the host-wide hold is recorded under dispatch's
 // lock, then the issue returns to ready so the next run resumes it.
@@ -228,11 +230,11 @@ A fixed/rejected verdict clears a finding only when it matches the reported acti
 Also return regressions: new defects introduced by the COMPLETE repair delta, including damage to previously cleared findings or unnecessary edits prompted by false positives. Check every edit for weakened tests/checks, behavior changes outside the repair, dropped side effects and broken neighbours. List only concrete regressions at confidence 75 or above, with the review finding fields (title, severity, confidence, location, problem, fix, gate). Do not duplicate a defect already covered by one of the numbered verdicts.
 Do NOT open anything under \`.epics/\` — it contains builder and fixer framing. The requirement and findings above are the only narrative context you need.`,
 
-  // Judgment only: what the PR says, what was left undone and how each item is
+  // Judgment only: what the issue delivery record and commit say, what was left undone and how each item is
   // classed. The pipeline squashes, pushes, opens the PR, files the follow-ups
   // and labels the issue from the JSON — and counts the merge gate from `kind`.
   ship: (dir, issue, design, triageStatus, tally, blockerCatalog) =>
-`Ship phase, autonomous. The work is complete and verified. You decide what the PR says and what was left undone; the pipeline then squashes, pushes, opens the PR, records deferrals on the issue and labels it from what you return. Run NO git or gh commands.
+`Ship phase, autonomous. The work is complete and verified. You write the human delivery narrative and durable commit rationale and decide what was left undone; the pipeline then squashes, pushes, opens a minimally described PR, records the delivery summary and deferrals on the issue, and labels it from what you return. Run NO git or gh commands.
 
 Some unfinished items already have an opaque identity assigned by the orchestrator. Preserve that identity even when you rephrase the item:
 ${blockerCatalog || '(none)'}
@@ -242,10 +244,10 @@ Every deferred entry has a blockerId. Copy the exact blocker ID above when the e
 Your output is schema-enforced JSON:
 
 1. title: the PR title, also the squashed commit's subject line (one line, imperative, ≤ 72 chars).
-2. body: the PR body, in markdown — keep it about THIS diff, not future work. Do NOT include a files-modified/diff-stat listing or a verification/test-results section; the PR's Files tab and checks already show both. Capture, against ${dir}/requirements.md: what was built; the architecture approach — "${design?.approach}": ${design?.rationale}; review outcome — OPEN that section with this tally verbatim: "${tally}", then the findings independently confirmed fixed. Read review.md's final states: independently rejected findings are not deferred work; omit their details but keep the rejected count in the tally. Do NOT enumerate deferred/out-of-scope work in the body, and do NOT write a "Closes #${issue}" line: the pipeline appends both a pointer to the issue's deferred record and the Closes line.
+2. body: the human delivery narrative for an append-only comment on the SOURCE ISSUE, in markdown — keep it about THIS diff, not future work. Do NOT include a files-modified/diff-stat listing or a verification/test-results section; the orchestrator renders its actual verify evidence separately. Capture, against ${dir}/requirements.md: what was built; the architecture approach — "${design?.approach}": ${design?.rationale}; review outcome — OPEN that section with this tally verbatim: "${tally}", then the findings independently confirmed fixed. Read review.md's final states: independently rejected findings are not deferred work; omit their details but keep the rejected count in the tally. Do NOT enumerate deferred/out-of-scope work in the body, and do NOT write a "Closes #${issue}" line. This is a captured candidate record before deterministic handoff: do not claim it is queued, merged, or delivered. The pipeline generates the minimal PR linkage independently.
    **Never write a bare \`#<number>\` for anything except issue #${issue} itself.** GitHub turns every \`#N\` into a live cross-reference and renders it as that issue or PR's TITLE, so numbering findings \`#1\`, \`#2\`, \`#3\` splices the titles of three unrelated PRs into your sentences and notifies them. Refer to a finding as \`Finding 3\`, or just lead with what it was; the same goes for hunks, steps, requirements and packages, in every field you return. Fixes-after-review status: ${triageStatus}
-3. commitBody: a short commit body (the why and notable details), or an empty string.
-4. legalMarker: apply THIS project's own legal/compliance review trigger, if it has one: look in its AGENTS.md for a section defining when a change needs legal or policy review. If one exists, judge this diff against the criteria written there — not against any you remember from elsewhere — and when they are met, return the exact marker string that section specifies; the pipeline adds it to the commit body and the PR body. If the project defines no such trigger, or the criteria are not met, omit the field: do NOT invent criteria and do NOT import another project's.
+3. commitBody: a useful, concise commit body stating why the concrete change was made and its significant design or implementation choices. Scale it to the change; do not turn it into a run transcript, review ledger, verification report, or temporary status. It must not be empty.
+4. legalMarker: apply THIS project's own legal/compliance review trigger, if it has one: look in its AGENTS.md for a section defining when a change needs legal or policy review. If one exists, judge this diff against the criteria written there — not against any you remember from elsewhere — and when they are met, return the exact marker string that section specifies; the pipeline adds it to the commit body and the minimal PR body. If the project defines no such trigger, or the criteria are not met, omit the field: do NOT invent criteria and do NOT import another project's.
 5. deferred: everything deferred or out of scope, one entry each; empty array when nothing was. Read ${dir}/epic.md's phase log and ${dir}/review.md. Use the FINAL ledger states: every OPEN finding IS deferred work. Only OPEN independently confirmed defects are kind "defect"; an unsupported repair, rejection or deferral is uncertainty (kind "other"), never a proven bug. Independently fixed or rejected findings are resolved and are NOT deferred work. Never use the coder's claimed action as the final verdict. Also collect: deferred review findings (with why), scope cut, edge cases intentionally skipped, clarifying answers that narrowed scope, uncovered test surfaces. For each entry:
    - blockerId: the existing opaque ID listed above, or the literal string "new" for a genuinely new item.
    - title and why: one line each.
@@ -268,7 +270,7 @@ Capture, against ${dir}/requirements.md: what was built; the architecture approa
 // What a row is written against:
 // architect — designs the epic in one pass. It is the one step that fixes the shape of everything downstream
 // (coding and verification follow that contract), so a weak call here is the most expensive kind.
-// code — red, green or direct, and ship's judgment half (what the PR says, what was deferred and of what kind, the
+// code — red, green or direct, and ship's judgment half (issue narrative, commit rationale, what was deferred and of what kind, the
 // project's own legal trigger). Ship's `kind` per deferral feeds the merge gate, which is why it is not a
 // cheaper row.
 // confirm-review — independently judges repairs, rejections and deferrals after
@@ -438,8 +440,8 @@ const SHIP_SCHEMA = {
   required: ['title', 'body', 'commitBody', 'deferred'],
   properties: {
     title: { type: 'string', description: 'PR title and squashed-commit subject, one line' },
-    body: { type: 'string', description: 'PR body markdown; no bare #N except this issue; no Closes line' },
-    commitBody: { type: 'string', description: 'short commit body; empty string when none' },
+    body: { type: 'string', description: 'source-issue delivery narrative; no bare #N except this issue; no Closes line' },
+    commitBody: { type: 'string', description: 'concise non-empty why and significant design/implementation choices for the durable commit' },
     legalMarker: { type: 'string', description: "the project's own legal-review marker, only when its AGENTS.md defines one and the criteria are met" },
     deferred: {
       type: 'array',
@@ -646,23 +648,32 @@ async function prepare(issue) {
 // budget cannot cap.
 const spend = terminalSpend
 
-// Squash, push, open the PR, record deferrals, label — from ship's JSON.
-async function shipTransport({ issue, slug, dir, decision, blockerIdentity }) {
-  const branch = `epic/${slug}`
+const deliveryMarker = candidate => `<!-- toliki-delivery-summary candidate:${candidate} -->`
+
+const matchingDeliverySummaries = (comments, candidate) => {
+  const marker = deliveryMarker(candidate)
+  return (Array.isArray(comments) ? comments : [])
+    .map(c => String(c?.body || ''))
+    .filter(body => body.startsWith('🤖 epic delivery summary\n') && body.split('\n').includes(marker))
+}
+
+const renderPrBody = ({ issue, decision }) => {
   const deferred = Array.isArray(decision.deferred) ? decision.deferred : []
-  // The merge gate's input, counted here from the classification, never taken as a number a model
-  // typed.
-  const deferredDefects = deferred.filter(d => d.kind === 'defect').length
+  const pointer = deferred.length
+    ? `Specification and run record: #${issue}. Deferred items recorded on #${issue}.`
+    : `Specification and run record: #${issue}.`
+  return [pointer, decision.legalMarker, `Closes #${issue}`].filter(Boolean).join('\n\n') + '\n'
+}
+
+// Build and push the checked candidate, then open its technical PR. Nothing
+// append-only is written to the issue here: the caller records this returned
+// identity immediately, so every later reporting failure can name the real PR,
+// branch and candidate rather than offering a retry prepare will skip.
+async function createCandidate({ issue, slug, decision }) {
+  const branch = `epic/${slug}`
   const title = String(decision.title || '').trim().split('\n')[0]
   if (!title) throw new Error('ship returned no PR title')
-
-  // summary.md is the PR body source. The Closes line is what auto-closes the issue on merge — a
-  // bare (#N) only links — so it is appended here, unconditionally.
-  let body = String(decision.body || '').trim()
-  if (decision.legalMarker) body += `\n\n${decision.legalMarker}`
-  if (deferred.length) body += `\n\nDeferred items recorded on #${issue}.`
-  body += `\n\nCloses #${issue}\n`
-  writeFileSync(path.join(dir, 'summary.md'), body)
+  const body = renderPrBody({ issue, decision })
 
   // Squash to ONE clean commit: fold leftovers into the checkpoint chain, soft-reset to the merge
   // base (NOT origin/main, which may have advanced during the run), commit once.
@@ -671,7 +682,8 @@ async function shipTransport({ issue, slug, dir, decision, blockerIdentity }) {
   const mergeBase = await gitOut(['merge-base', 'HEAD', 'origin/main'], 'git merge-base')
   await gitOut(['reset', '--soft', mergeBase], 'git reset --soft')
   if ((await git(['diff', '--cached', '--quiet'])).code === 0) throw new Error('nothing to ship — the branch holds no change against origin/main')
-  const message = [title, '', String(decision.commitBody || '').trim(), decision.legalMarker ? `\n${decision.legalMarker}` : '', '', `Closes #${issue}`]
+  const commitBody = String(decision.commitBody || '').trim()
+  const message = [title, '', commitBody, decision.legalMarker ? `\n${decision.legalMarker}` : '', '', `Closes #${issue}`]
     .join('\n').replace(/\n{3,}/g, '\n\n')
   await withBodyFile(message, (file) => gitOut(['commit', '-q', '-F', file], 'git commit (squash)'))
 
@@ -681,9 +693,116 @@ async function shipTransport({ issue, slug, dir, decision, blockerIdentity }) {
   const push = await git(['push', '--force-with-lease', '-u', 'origin', branch])
   if (!push.ok) throw new Error(pushRejected(push) ? `the force-with-lease push was rejected — ${branch} moved on origin under this run` : `git push failed (${failureReason(push)})`)
 
-  const prUrl = await prCreate({ head: branch, title, bodyFile: path.join(dir, 'summary.md') })
-  const prNumber = Number(String(prUrl).trim().split('/').pop())
   const prHead = await gitOut(['rev-parse', 'HEAD'], 'git rev-parse HEAD')
+  const prUrl = await withBodyFile(body, file => prCreate({ head: branch, title, bodyFile: file }))
+  const prNumber = Number(String(prUrl).trim().split('/').pop())
+  return { prUrl, prNumber, prHead, branch, title, body }
+}
+
+const deliverySummary = ({ candidate, decision, verify, reviewTally, deferred, mergeBlockers, blockerIdentity }) => {
+  const lines = [
+    '🤖 epic delivery summary',
+    deliveryMarker(candidate.prHead),
+    '',
+    `Technical PR: [#${candidate.prNumber}](${candidate.prUrl})`,
+    `Branch: \`${candidate.branch}\``,
+    `Candidate: \`${candidate.prHead}\``,
+    '',
+    '## Implementation, design, and review',
+    '',
+    String(decision.body || '').trim(),
+    '',
+    '## Orchestrator evidence',
+    '',
+    `- Verification: ${verify?.evidence || verify?.detail || 'no final verification result captured'}`,
+    `- Independent review and repair: ${reviewTally}`,
+    '',
+    '## Remaining work',
+    '',
+  ]
+
+  // The deterministic gate, not ship's prose ledger, is authoritative about
+  // unresolved review work. Render those items first so an empty ship ledger
+  // cannot erase them, then add ship-only deferrals. The registry preserves
+  // identity across rephrased model copies, so a blocker represented in both
+  // sources still gets exactly one remaining-work line.
+  const remaining = []
+  const seen = new Set()
+  const addRemaining = item => {
+    if (!item || typeof item !== 'object') return
+    const identity = blockerIdentity.idFor(item) || item
+    if (seen.has(identity)) return
+    seen.add(identity)
+    const source = item.finding && typeof item.finding === 'object' ? item.finding : item
+    const title = String(source.title || item.title || 'Unresolved item').trim() || 'Unresolved item'
+    const kind = String(item.kind || source.kind || '').trim()
+    const why = String(item.verdict?.reasoning || item.why || source.verdict?.reasoning || source.problem || source.why || '').trim()
+    const checkNote = String(item.checkNote || source.checkNote || '').trim()
+    remaining.push(`- ${title}${kind ? ` (${kind})` : ''}${why ? `: ${why}` : ''}${checkNote ? ` — ${checkNote}` : ''}`)
+  }
+  for (const blocker of mergeBlockers) {
+    // ship-deferral contains the same decision objects added below. Other
+    // blocker sources carry the actual review/check outcomes and take
+    // precedence over ship's rephrasing for a shared opaque identity.
+    if (blocker.source !== 'ship-deferral') {
+      for (const item of Array.isArray(blocker.items) ? blocker.items : []) addRemaining(item)
+    }
+  }
+  for (const item of deferred) addRemaining(item)
+
+  if (remaining.length) {
+    lines.push(...remaining)
+  } else if (mergeBlockers.length) {
+    lines.push('- The candidate gate is held by the structured blocker(s) below.')
+  } else {
+    lines.push('None recorded for this candidate.')
+  }
+
+  lines.push('', `Candidate gate: **${mergeBlockers.length ? 'held' : 'clear-pending-handoff'}**`)
+  if (mergeBlockers.length) {
+    for (const blocker of mergeBlockers) lines.push(`- ${blocker.reason}`)
+  } else {
+    lines.push('- No structured merge blocker was present when this candidate record was captured.')
+  }
+  return lines.join('\n').trim() + '\n'
+}
+
+// Exactly one candidate-specific append-only record. A failed comment command
+// is ambiguous because GitHub can accept the write before the error reaches the
+// client, so write at most once and let the bounded readback decide. An existing
+// single match is success; missing or duplicate matches fail closed.
+async function publishDeliverySummary({ issue, candidate, body }) {
+  const readMatches = async () => {
+    const view = await issueView(issue, 'comments')
+    return matchingDeliverySummaries(view.comments, candidate.prHead)
+  }
+  const before = await readMatches()
+  if (before.length > 1) throw new Error(`found ${before.length} delivery summaries for candidate ${candidate.prHead}; refusing an ambiguous run record`)
+  if (before.length === 1) {
+    log(`Ship: delivery summary for ${candidate.prHead} already exists — left as it is`)
+    return
+  }
+
+  let writeError = null
+  try {
+    await comment(issue, body)
+  } catch (e) {
+    writeError = e
+  }
+  const seen = await readBack(readMatches, matches => matches.length > 0)
+  if (seen.observed.length > 1) throw new Error(`found ${seen.observed.length} delivery summaries for candidate ${candidate.prHead} after publication; refusing an ambiguous run record`)
+  if (!seen.matched) {
+    const detail = writeError ? `the write failed (${writeError.message || writeError})` : 'the write returned but no matching record became visible'
+    throw new Error(`delivery summary for candidate ${candidate.prHead} was not confirmed: ${detail}`)
+  }
+  if (writeError) log(`Ship: delivery-summary write errored but exactly one candidate record was observed on readback (${writeError.message || writeError})`)
+}
+
+// Once the candidate summary is confirmed, create the later durable deferral
+// artifacts and place the issue at the conservative ready-to-review rest.
+async function recordCandidateDeferrals({ issue, slug, dir, decision, blockerIdentity, candidate }) {
+  const deferred = Array.isArray(decision.deferred) ? decision.deferred : []
+  const deferredDefects = deferred.filter(d => d.kind === 'defect').length
 
   // Deferred work is recorded on the ISSUE, not the PR — and only now that the PR exists.
   // Everything above is idempotent under a re-run (the branch is rebuilt, the push is a lease, and
@@ -741,8 +860,8 @@ async function shipTransport({ issue, slug, dir, decision, blockerIdentity }) {
   await ensureLabels(['ready-to-review'], spend())
   const flip = await editLabels(issue, { add: ['ready-to-review'], remove: ['in-progress'] }, spend())
   if (!flip.ok) log(`Ship: label flip to ready-to-review failed (${failureReason(flip)}) — the PR is open; a human finishes the labels`)
-  updateEpicMd(dir, { phase: 'ship → done', log: `ship: PR opened ${prUrl}; ${deferred.length} deferred item(s), ${filed} filed, ${deferredDefects} defect(s)` })
-  return { prUrl, prNumber, prHead, deferredDefects, deferredCount: deferred.length, filed, followUps }
+  updateEpicMd(dir, { phase: 'ship → done', log: `ship: PR opened ${candidate.prUrl}; delivery summary confirmed; ${deferred.length} deferred item(s), ${filed} filed, ${deferredDefects} defect(s)` })
+  return { ...candidate, deferredDefects, deferredCount: deferred.length, filed, followUps }
 }
 
 // Transport, not judgment: the merge gate has already been computed from structured counts, and this
@@ -831,10 +950,12 @@ async function preserveWork({ slug, phase }) {
 }
 
 // The blocker report: preserve the work, say where it is, flip the label to failed.
-async function postBlocker({ issue, slug, phase, reason, prUrl }) {
+async function postBlocker({ issue, slug, phase, reason, prUrl, candidate }) {
   const branch = slug ? `epic/${slug}` : null
   let branchLine
-  if (prUrl) {
+  if (candidate?.missingSummary) {
+    branchLine = `- PR: ${candidate.prUrl} — open on ${candidate.branch}, NOT merged and NOT queued for the merge worker; candidate \`${candidate.prHead}\` exists, but its append-only delivery summary was not confirmed.\n- manual recovery: publish exactly one \`🤖 epic delivery summary\` record for that full candidate SHA on this issue, then recreate any deferred record, follow-ups, and defect evidence that the failed ship had not reached; only after checking the structured blockers should a human replace \`failed\` with \`ready-to-merge\` or \`ready-to-review\`. Do not merge by hand.`
+  } else if (prUrl) {
     // A block AFTER ship: the PR is open, pushed and complete — the work needs a human, not
     // preservation, and a re-run would skip it (prepare's open-PR guard) rather than resume.
     branchLine = `- PR: ${prUrl} — open on ${branch}, NOT merged and NOT queued for the merge worker; the change itself is complete. Fix the cause above, push, and swap \`failed\` → \`ready-to-merge\` if the deferred record on this issue lists no defect (else \`ready-to-review\`); the merge worker rebases, re-checks and lands it. Do not merge by hand. A re-run of /epic #${issue} will skip (an open PR already delivers this issue).`
@@ -877,6 +998,7 @@ async function postBlocker({ issue, slug, phase, reason, prUrl }) {
 let currentPhase = 'prepare'
 let blockerPosted = false
 let openPr = null
+let openCandidate = null
 async function holdForQuota(phase, failure) {
   if (!gitMode) return { error: 'quota holds require issue mode' }
   try {
@@ -908,7 +1030,7 @@ async function fail(phase, reason, suppliedFailure = undefined) {
     if (!blockerPosted) {
       blockerPosted = true
       try {
-        await postBlocker({ issue, slug, phase, reason, prUrl: openPr })
+        await postBlocker({ issue, slug, phase, reason, prUrl: openPr, candidate: openCandidate })
       } catch (e) {
         log(`blocked: could not report on GitHub (${e && e.message || e})`)
       }
@@ -918,10 +1040,11 @@ async function fail(phase, reason, suppliedFailure = undefined) {
   return { error: `${phase}: ${reason}` }
 }
 
-// The issue carries no per-phase commentary: the ready → in-progress → ready-to-merge/ready-to-review/failed
-// label lifecycle is the live signal, the PR body is the record of HOW it was built, and the only comments
-// are the deferred list (nothing else records it) and the blocker report. A concrete defect-only review
-// hold also carries needs-defect-fix for the separate bounded repair queue.
+// The issue carries one best-effort live status comment plus append-only durable
+// records: the candidate delivery summary, deferred list, evidence, blocker and
+// fixer audits. Its body remains the specification. The PR is the technical
+// artifact; labels are the authoritative lifecycle signal. A concrete
+// defect-only review hold also carries needs-defect-fix for the separate queue.
 
 let requirement
 let requirementTitle = ''
@@ -1039,8 +1162,12 @@ try {
   phase('Code')
 
   // The verify gate, run here. A step's own verify run is its feedback loop; this one is the verdict.
+  // Keep the latest complete result as well: the issue's candidate record uses
+  // the orchestrator's actual final output rather than model-written claims.
+  let finalVerify = null
   const verifyGate = async (label) => {
     const v = await runVerify(packages)
+    finalVerify = v
     log(`${label}: verify ${v.green ? 'green' : 'RED'} — ${v.detail}`)
     return v
   }
@@ -1294,8 +1421,9 @@ try {
   log(`Review: ${reviewTally}.`)
 
   // ───────────────────────── Phase 5: Ship ─────────────────────────
-  // Issue mode: ship decides what the PR says; the script squashes to one commit (Closes #N), pushes,
-  // opens the PR. Slug mode: summary.md only, no git.
+  // Issue mode: ship decides the issue narrative and commit rationale; the
+  // script squashes, pushes, opens a minimally described PR, then publishes the
+  // candidate record. Slug mode: summary.md only, no git.
   currentPhase = 'ship'
   phase('Ship')
 
@@ -1325,10 +1453,10 @@ try {
   // something: the change now sits on code nothing verified it against, so the verify gate runs
   // again, and red blocks the run rather than opening a PR whose green belongs to a base main left
   // behind. Everything downstream reads the rebased tree on its own — DIFF is
-  // `git diff origin/main...HEAD`, and shipTransport takes the merge base fresh — so nothing here is
+  // `git diff origin/main...HEAD`, and createCandidate takes the merge base fresh — so nothing here is
   // captured for later.
   //
-  // Whatever is still loose in the tree is folded in FIRST, with the very commit shipTransport makes
+  // Whatever is still loose in the tree is folded in FIRST, with the very commit createCandidate makes
   // below (which then finds nothing left to do). A rebase refuses a dirty tree, and that refusal
   // would otherwise be reported as a conflict when it is nothing of the sort. The checkpoint chain
   // underneath is untouched, so prepare still finds its code/triage subjects on a resume.
@@ -1371,7 +1499,11 @@ try {
   const decision = await agent(PROMPTS.ship(dir, issue, design, triageStatus, reviewTally, knownBlockers.text),
     { label: 'ship:pr', phase: 'Ship', step: 'code', schema: SHIP_SCHEMA },
   )
-  if (!decision) return await fail('ship', 'Ship produced no PR description — nothing was pushed; the change is on epic/' + slug + ' (checkpoint commits + working tree).')
+  if (!decision) return await fail('ship', 'Ship produced no delivery narrative or commit rationale — nothing was pushed; the change is on epic/' + slug + ' (checkpoint commits + working tree).')
+  const blankShipFields = ['title', 'body', 'commitBody'].filter(field => !nonblank(decision[field]))
+  if (blankShipFields.length) {
+    return await fail('ship', `Ship returned blank ${blankShipFields.join(', ')} — refusing candidate transport without a title, delivery narrative, and durable commit rationale.`)
+  }
   try {
     blockerIdentity.registerShipDeferrals(decision, knownBlockers.ids)
   } catch (e) {
@@ -1382,7 +1514,7 @@ try {
   // Ship's `kind` per deferral feeds the merge gate, and ship is the builder side. Every item it did
   // not call a defect goes to the skeptic, whose verdict can only escalate: a builder's "defect" stands,
   // a builder's "other" that the skeptic calls a defect becomes one. A dead check holds the PR.
-  // This MUST stay ahead of shipTransport: that call writes `ready-to-review`, the run's first terminal
+  // This MUST stay ahead of candidate creation: no model may run after the later ready-to-review write,
   // label, which opens the reporting window — and runtime's agent() refuses any spawn once it is open,
   // so a check moved below the write would be refused and would hold a PR that had nothing wrong with it.
   const deferralBlockers = []
@@ -1415,9 +1547,49 @@ try {
     }
   }
 
-  const shipped = await shipTransport({ issue, slug, dir, decision, blockerIdentity })
-  openPr = shipped.prUrl
-  log(`Ship: PR opened — ${shipped.prUrl} (${shipped.deferredCount} deferred item(s), ${shipped.filed} filed as follow-ups)`)
+  // ───────────────────────── The merge gate ─────────────────────────
+  // Everything the pipeline could verify is green by here: verify per package (whatever that script gates,
+  // including any real-database tier the project triggers for itself), independent review,
+  // and the assessments and repairs checked. What is left is the judgment calls the pipeline explicitly
+  // refused to make. Those refusals ARE the gate — a deferred confirmed finding or a defect that outlives
+  // this merge is the pipeline saying "a human decides this", and a human cannot decide it after it has
+  // already deployed. Counted HERE in the script from structured values, never inside an agent that could
+  // talk itself past them.
+  //
+  // The gate merges nothing; it chooses which terminal label the issue wears, and `bin/merge-worker.sh`
+  // acts on that — rebasing onto current main, re-running CI, merging serially per repo. Merging inside
+  // the run would park a build slot on a lock while the whole queue waited behind it.
+  const mergeBlockers = []
+  const deferredDefects = deferred.filter(d => d.kind === 'defect').length
+  if (deferredDefects > 0) {
+    mergeBlockers.push({
+      source: 'ship-deferral',
+      reason: `${deferredDefects} deferred defect(s) that still exist on main after this merge`,
+      defectClass: true,
+      items: deferred.filter(d => d.kind === 'defect'),
+    })
+  }
+  mergeBlockers.push(...fixBlockers, ...deferralBlockers)
+
+  const candidate = await createCandidate({ issue, slug, decision })
+  openPr = candidate.prUrl
+  openCandidate = { ...candidate, missingSummary: true }
+  log(`Ship: PR opened — ${candidate.prUrl}; publishing the candidate record before later deferral artifacts.`)
+
+  // summary.md remains the local source for the generated PR description, but
+  // it is rendered only after the PR identity is a fact. The durable narrative
+  // is the candidate-specific issue comment below, not this minimal file.
+  writeFileSync(path.join(dir, 'summary.md'), candidate.body)
+  const record = deliverySummary({ candidate, decision, verify: finalVerify, reviewTally, deferred, mergeBlockers, blockerIdentity })
+  try {
+    await publishDeliverySummary({ issue, candidate, body: record })
+  } catch (e) {
+    return await fail('ship', `the delivery summary for ${candidate.branch} candidate ${candidate.prHead} was not confirmed (${e && e.message || e}). The PR exists at ${candidate.prUrl}, but no later deferred record, follow-up, or defect evidence was created; recover the issue record manually.`)
+  }
+  openCandidate.missingSummary = false
+
+  const shipped = await recordCandidateDeferrals({ issue, slug, dir, decision, blockerIdentity, candidate })
+  log(`Ship: candidate record confirmed — ${shipped.prUrl} (${shipped.deferredCount} deferred item(s), ${shipped.filed} filed as follow-ups)`)
 
   const result = {
     issue,
@@ -1432,29 +1604,6 @@ try {
     triageStatus,
     readyToMerge: false,
   }
-
-  // ───────────────────────── The merge gate ─────────────────────────
-  // Everything the pipeline could verify is green by here: verify per package (whatever that script gates,
-  // including any real-database tier the project triggers for itself), independent review,
-  // and the assessments and repairs checked. What is left is the judgment calls the pipeline explicitly
-  // refused to make. Those refusals ARE the gate — a deferred confirmed finding or a defect that outlives
-  // this merge is the pipeline saying "a human decides this", and a human cannot decide it after it has
-  // already deployed. Counted HERE in the script from structured values, never inside an agent that could
-  // talk itself past them.
-  //
-  // The gate merges nothing; it chooses which terminal label the issue wears, and `bin/merge-worker.sh`
-  // acts on that — rebasing onto current main, re-running CI, merging serially per repo. Merging inside
-  // the run would park a build slot on a lock while the whole queue waited behind it.
-  const mergeBlockers = []
-  if (shipped.deferredDefects > 0) {
-    mergeBlockers.push({
-      source: 'ship-deferral',
-      reason: `${shipped.deferredDefects} deferred defect(s) that still exist on main after this merge`,
-      defectClass: true,
-      items: deferred.filter(d => d.kind === 'defect'),
-    })
-  }
-  mergeBlockers.push(...fixBlockers, ...deferralBlockers)
 
   if (mergeBlockers.length) {
     const why = mergeBlockers.map(b => b.reason).join(' + ')

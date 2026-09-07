@@ -87,6 +87,27 @@ for f in "$GH_DIR/$key.$n.rc" "$GH_DIR/$key.rc"; do
     exit "$(cat "$f")"
   fi
 done
+if [[ "$key" == pr-merge && "${GH_FAKE_SQUASH:-}" == "1" ]]; then
+  subject="${GH_REPOSITORY_DEFAULT_SUBJECT:-repository default subject}"
+  body="${GH_REPOSITORY_DEFAULT_BODY:-repository default body}"
+  checked=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --subject) subject="$2"; shift 2 ;;
+      --body-file)
+        if [[ "$2" == - ]]; then body="$(cat)"; else body="$(cat "$2")"; fi
+        shift 2 ;;
+      --match-head-commit) checked="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  squash="$GH_DIR/squash-worktree"
+  git clone -q "$GH_ORIGIN" "$squash"
+  git -C "$squash" checkout -q main
+  git -C "$squash" read-tree --reset -u "$checked^{tree}"
+  printf '%s\n\n%s\n' "$subject" "$body" | git -C "$squash" commit -q -F -
+  git -C "$squash" push -q origin HEAD:main
+fi
 for f in "$GH_DIR/$key.$n" "$GH_DIR/$key"; do
   if [[ -f "$f" ]]; then cat "$f"; exit 0; fi
 done
@@ -136,6 +157,22 @@ seed_epic() { # branch file content
   git -C "$dir" push -q origin "HEAD:refs/heads/$1"
   git -C "$ORIGIN" rev-parse "refs/heads/$1"
 }
+amend_epic_message() { # branch subject body
+  local dir="$TMP/message-seeder"
+  rm -rf "$dir"; git clone -q "$ORIGIN" "$dir"
+  git -C "$dir" checkout -q --detach "origin/$1"
+  printf '%s\n\n%s\n' "$2" "$3" | git -C "$dir" commit -q --amend -F -
+  git -C "$dir" push -qf origin "HEAD:refs/heads/$1"
+  git -C "$ORIGIN" rev-parse "refs/heads/$1"
+}
+blank_epic_message() { # branch
+  local dir="$TMP/blank-message-seeder"
+  rm -rf "$dir"; git clone -q "$ORIGIN" "$dir"
+  git -C "$dir" checkout -q --detach "origin/$1"
+  git -C "$dir" commit -q --amend --allow-empty-message -m ''
+  git -C "$dir" push -qf origin "HEAD:refs/heads/$1"
+  git -C "$ORIGIN" rev-parse "refs/heads/$1"
+}
 # Move main so the epic branch must actually rebase.
 advance_main() { # file content
   local dir="$TMP/mover"
@@ -161,6 +198,9 @@ run_worker() {
     MERGE_WORKTREE_ROOT="$TMP/wt" \
     MERGE_CI_TIMEOUT="${MERGE_CI_TIMEOUT:-2}" MERGE_CI_POLL="${MERGE_CI_POLL:-1}" \
     MERGE_CI_REGISTRATION_GRACE="${MERGE_CI_REGISTRATION_GRACE:-1}" \
+    GH_ORIGIN="$ORIGIN" GH_FAKE_SQUASH="${GH_FAKE_SQUASH:-}" \
+    GH_REPOSITORY_DEFAULT_SUBJECT="${GH_REPOSITORY_DEFAULT_SUBJECT:-}" \
+    GH_REPOSITORY_DEFAULT_BODY="${GH_REPOSITORY_DEFAULT_BODY:-}" \
     FLOCK_BUSY="${FLOCK_BUSY:-}" \
     bash "$WORKER" --repo myapp 2>&1
   )" || RUN_RC=$?
@@ -183,6 +223,9 @@ run_prepared() {
     MERGE_WORKTREE_ROOT="$TMP/wt" \
     MERGE_CI_TIMEOUT="${MERGE_CI_TIMEOUT:-2}" MERGE_CI_POLL="${MERGE_CI_POLL:-1}" \
     MERGE_CI_REGISTRATION_GRACE="${MERGE_CI_REGISTRATION_GRACE:-1}" \
+    GH_ORIGIN="$ORIGIN" GH_FAKE_SQUASH="${GH_FAKE_SQUASH:-}" \
+    GH_REPOSITORY_DEFAULT_SUBJECT="${GH_REPOSITORY_DEFAULT_SUBJECT:-}" \
+    GH_REPOSITORY_DEFAULT_BODY="${GH_REPOSITORY_DEFAULT_BODY:-}" \
     FLOCK_BUSY="${FLOCK_BUSY:-}" \
     bash "$WORKER" --repo myapp 2>&1
   )" || RUN_RC=$?
@@ -227,6 +270,51 @@ assert_contains "the merge is pinned to the sha whose checks went green" "$(gh_l
 assert_contains "and the label is dropped" "$(edits)" "--remove-label ready-to-merge"
 assert_eq "the rebased branch is what origin holds" "$REBASED" "$(git -C "$ORIGIN" rev-parse refs/heads/epic/42-change)"
 assert_eq "nothing was marked failed" "" "$(comments)"
+
+scenario 'merge-worker: the checked candidate message becomes the real main commit literally'
+seed_epic epic/42-change app.txt 'one
+two
+three
+epic' >/dev/null
+LITERAL_SUBJECT='feat: preserve $dollar; `backticks` & "quotes"'
+LITERAL_BODY=$'Make the source issue the durable run record.\n\nKeep $(subshell), $variables, `ticks`, single \047quotes\047, double "quotes", ampersands &, and semicolons ; literal.\n\nLEGAL-REVIEW: required\n\nCloses #42'
+HEAD_SHA="$(amend_epic_message epic/42-change "$LITERAL_SUBJECT" "$LITERAL_BODY")"
+advance_main other.txt 'main moved under the candidate'
+REBASED="$(rebased_sha epic/42-change)"
+CHECKED_MESSAGE="$(git -C "$TMP/rebaser" log -1 --format=%B)"
+standard_pr "$HEAD_SHA"
+green_checks "$REBASED"
+GH_FAKE_SQUASH=1 \
+GH_REPOSITORY_DEFAULT_SUBJECT='repository default title that must not land' \
+GH_REPOSITORY_DEFAULT_BODY='mutable PR body that must not land' \
+  run_prepared
+MAIN_MESSAGE="$(git -C "$ORIGIN" log -1 --format=%B main)"
+assert_rc "the literal-message merge completes" 0 "$RUN_RC"
+assert_eq "fake main receives the complete checked candidate message" "$CHECKED_MESSAGE" "$MAIN_MESSAGE"
+assert_contains "the exact candidate subject is passed explicitly" "$(gh_log)" "--subject $LITERAL_SUBJECT"
+assert_contains "the complete body is streamed instead of shell-expanded" "$(gh_log)" "--body-file -"
+assert_not_contains "repository squash defaults cannot replace the candidate subject" "$MAIN_MESSAGE" "repository default title that must not land"
+assert_not_contains "mutable PR prose cannot replace the candidate body" "$MAIN_MESSAGE" "mutable PR body that must not land"
+assert_contains "the issue closing line survives on main" "$MAIN_MESSAGE" "Closes #42"
+assert_contains "the project marker survives on main" "$MAIN_MESSAGE" "LEGAL-REVIEW: required"
+assert_contains "shell-sensitive body text survives literally" "$MAIN_MESSAGE" 'Keep $(subshell), $variables, `ticks`'
+
+scenario 'merge-worker: an empty checked candidate message never falls back to repository defaults'
+seed_epic epic/42-change app.txt 'one
+two
+three
+epic' >/dev/null
+HEAD_SHA="$(blank_epic_message epic/42-change)"
+standard_pr "$HEAD_SHA"
+green_checks "$HEAD_SHA"
+GH_FAKE_SQUASH=1 \
+GH_REPOSITORY_DEFAULT_SUBJECT='repository fallback must not be used' \
+GH_REPOSITORY_DEFAULT_BODY='PR fallback must not be used' \
+  run_prepared
+assert_rc "the queue drain reports the invalid candidate without crashing" 0 "$RUN_RC"
+assert_contains "the refusal names the unreadable or empty candidate message" "$(comments)" "candidate commit message"
+assert_eq "an empty candidate never reaches gh pr merge" 0 "$(grep -c 'pr merge' "$STATE/log")"
+assert_contains "the issue is marked failed rather than silently falling back" "$(edits)" "--add-label failed"
 
 scenario 'merge-worker: checks that have not registered yet are waited for, not failed'
 HEAD_SHA="$(seed_epic epic/42-change app.txt 'one

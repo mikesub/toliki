@@ -29,6 +29,12 @@ don't get re-litigated from memory.
   failing test is not presented as newly established RED. The issue body is
   the only requirement the run is judged against; nobody answers follow-up
   questions at 3 a.m., so a spec that needs clarification is a spec that fails.
+  Once a technical PR exists, the run appends a candidate-bound delivery
+  summary to that same issue: implementation/design narrative, actual verify
+  evidence, independent review outcome, remaining work, and the pre-handoff
+  gate state. The PR description stays a deterministic pointer to the issue.
+  Later fixer audits and status remain separate comments instead of rewriting
+  the immutable candidate snapshot.
 - **The pipeline outlives its engine.** Every phase is a process behind one
   adapter, so which vendor's CLI runs an epic is a routing value, not an
   architecture. That is worth the orchestration we now own outright (a
@@ -77,9 +83,13 @@ don't get re-litigated from memory.
   an unresolved blocker in the current delivery.
 - **Merge** — a serial per-repo worker rebases each finished PR onto current
   `main`, gives checks a short registration window, waits for every published
-  check on the rebased head, then squash-merges. An empty check rollup after
-  that window is the supported no-CI case: there is no result to invent, while
-  every check a repo does publish remains binding.
+  check on the rebased head, then squash-merges with the complete subject and
+  body read from that exact checked commit. Passing the message explicitly
+  keeps rationale, project markers, and closing metadata independent of mutable
+  PR prose and repository squash-message defaults; an unreadable or empty
+  message fails closed. An empty check rollup after that window is the supported
+  no-CI case: there is no result to invent, while every check a repo does publish
+  remains binding.
   Serial is not caution: every merge invalidates every other PR's green, so
   there is no parallelism to be had. Its two decline classes that a machine can
   own — a judgment-class conflict and a red check — go to fixer runs rather
@@ -142,14 +152,17 @@ don't get re-litigated from memory.
   orchestrator's own work, so what a run did is a fact it established rather
   than a claim a model reported. Models are spawned only where a judgment is
   needed: the design, the code, the reviewers and their skeptic, the fixes,
-  what the PR says. The rule that falls out of it: an agent's word that it ran
-  a gate is never the gate. Test-first establishes a clean baseline and requires
+  the human delivery narrative and durable commit rationale. The script renders
+  the PR linkage and factual evidence. The rule that falls out of it: an agent's
+  word that it ran a gate is never the gate. Test-first establishes a clean baseline and requires
   the red step's expected assertion failure to appear in the orchestrator's
   verify output; a failed command or timeout is not a regression test. Both
   coding paths must finish with verify green because the orchestrator ran it,
   not because a step said so.
-- **Work state is GitHub.** Issues, lifecycle and engine-routing labels,
-  `blocked_by` edges, claim refs, PRs. Ephemeral machine facts stay on the
+- **Work state is GitHub.** An issue body is the specification and its
+  append-only comments are the human run record; lifecycle and engine-routing
+  labels, `blocked_by` edges, claim refs, and technical PRs carry the remaining
+  durable state. Ephemeral machine facts stay on the
   machine: locks, usage telemetry, and the provider-quota hold that answers
   whether this host may currently admit another automatic run. The hold orders
   no issue and expires without becoming a second work database.

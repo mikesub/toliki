@@ -99,15 +99,18 @@ export async function ensureDeps(packages, { pairs = [] } = {}) {
 // can match its expected assertion without treating a timeout or spawn failure as RED.
 export async function runVerify(packages, { timeoutMs = VERIFY_TIMEOUT_MS, tailLines = 40 } = {}) {
   const details = []
+  const evidence = []
   const tails = []
   const failures = []
   let green = true
   for (const pkg of packages) {
     const r = await sh('npm', ['run', 'verify'], { cwd: pkg === '.' ? '.' : pkg, timeoutMs, stdoutCap: 256 * 1024 })
-    if (r.ok) { details.push(`${pkg} — pass`); continue }
-    green = false
     const stdoutLines = r.out.split('\n').filter(l => l.trim())
     const stderrLines = r.err.split('\n').filter(l => l.trim())
+    const evidenceLines = [...stdoutLines.slice(-3), ...stderrLines.slice(-3)]
+    evidence.push(`${pkg} — ${evidenceLines.join(' | ') || (r.ok ? 'exit 0' : `exit ${r.code}`)}`)
+    if (r.ok) { details.push(`${pkg} — pass`); continue }
+    green = false
     const detailLines = [...stdoutLines.slice(-3), ...stderrLines.slice(-3)]
     const last = r.timedOut ? 'timed out' : (detailLines.join(' | ') || `exit ${r.code}`)
     details.push(`${pkg} — fail: ${last}`)
@@ -117,7 +120,7 @@ export async function runVerify(packages, { timeoutMs = VERIFY_TIMEOUT_MS, tailL
     tails.push(`--- ${pkg}: npm run verify ${r.timedOut ? 'timed out' : `exited ${r.code}`} ---\n${[...stdoutTail, ...stderrTail].join('\n')}`)
     failures.push({ package: pkg, code: r.code, timedOut: r.timedOut, spawnError: !!r.spawnError, output })
   }
-  return { green, detail: details.join('; '), tail: tails.join('\n'), failures }
+  return { green, detail: details.join('; '), evidence: evidence.join('; '), tail: tails.join('\n'), failures }
 }
 
 // ───────────────────────── git state ─────────────────────────
