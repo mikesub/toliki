@@ -11,7 +11,11 @@ don't get re-litigated from memory.
 
 - **`/spec`** — an interactive design conversation that ends as GitHub issues,
   each a complete definition of done, labeled `ready`. The only human gate in
-  the system.
+  the system: the human resolves open requirements and confirms the titles of
+  a split into multiple issues. A single clear issue is filed immediately;
+  the skill writes the bodies without requiring a prose review. The whole
+  batch's bodies and dependencies are completed and read back before any
+  issue enters the build queue.
 - **Build** — cron dispatches one detached run per unblocked `ready` issue: a
   plain Node orchestrator that walks architecture → implementation → blind
   review → fixes after review → an open, green PR, spawning one short-lived
