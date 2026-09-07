@@ -91,7 +91,7 @@ engine_vendors() { # engine name; one unique vendor per line
 # The engine a run gets when nothing names one: no engine:* label on the issue,
 # no --engine on launch.sh. EPIC_ENGINE is still the one knob (the Node side
 # reads the same name), but it is read from the INSTALLED cron file — the
-# deployed copy of etc/dispatch.cron, which is what default-engine.sh already
+# deployed copy of etc/dispatch.cron, which is what config.sh already
 # treats as the source of truth — and never from this process's own
 # environment. The two callers that must agree do not share an environment: cron
 # exports the file's value into every dispatch tick, while a manual
@@ -132,7 +132,7 @@ resolve_host_default_engine() {
       HOST_DEFAULT_ENGINE_ERROR="engine configuration cannot be read consistently: $cron_file is not readable"
       return 1
     fi
-    # Same rule as default-engine.sh's read_default: exactly one line, or the
+    # Same rule as config.sh's read_engine: exactly one line, or the
     # file does not state one default and nothing may act on it.
     count="$(awk '/^EPIC_ENGINE=/{n++} END{print n+0}' "$cron_file")"
     if [[ "$count" != "1" ]]; then

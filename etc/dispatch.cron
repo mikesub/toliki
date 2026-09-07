@@ -67,8 +67,10 @@ PATH=/home/ubuntu/.local/bin:/home/ubuntu/.bun/bin:/usr/local/sbin:/usr/local/bi
 # than its own environment, since cron exports it into a tick and an ssh
 # command never sees it. So keep it to exactly one EPIC_ENGINE line — two of
 # them, or an installed value that disagrees with an exported one, refuses to
-# launch instead of picking a side. `./default-engine.sh` edits this line in
-# place on the VM (and reads it back), which is the supported way to change it.
+# launch instead of picking a side. `./config.sh --engine <name>` edits this
+# line in place on the VM (and reads it back), which is the supported way to
+# change it. The same helper reports and controls MAX_PARALLEL_EPICS in the
+# host's machine-local etc/repos.conf.
 EPIC_ENGINE=codex
 * * * * * ubuntu /home/ubuntu/toliki/bin/dispatch.sh >> /home/ubuntu/dispatch.log 2>&1
 * * * * * ubuntu /home/ubuntu/toliki/bin/reap.sh >> /home/ubuntu/reap.log 2>&1

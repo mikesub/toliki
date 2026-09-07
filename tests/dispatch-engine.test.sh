@@ -37,7 +37,7 @@ REPO="$TMP/repo"
 mkdir -p "$HARNESS" "$REPO/.git" "$TMP/bin" "$TMP/labels" "$TMP/blockers" "$TMP/locks"
 cp -R "$ROOT/bin" "$ROOT/etc" "$HARNESS/"
 cp "$ROOT/remote-control.sh" "$HARNESS/"
-cp "$ROOT/default-engine.sh" "$HARNESS/"
+cp "$ROOT/config.sh" "$HARNESS/"
 # dispatch resolves the shared hold CLI relative to its own copied harness.
 # During RED the module intentionally does not exist yet.
 mkdir -p "$HARNESS/workflows"
@@ -270,22 +270,42 @@ reset_state() {
 
 assert_contains "the tracked config documents an empty-by-default defect allowlist" "$(cat "$ROOT/etc/repos.conf.template")" "DEFECT_FIX_REPOS=("
 
-printf '\ndefault engine: reports, validates, updates, and reads back live cron state\n'
+printf '\nhost config: reports, validates, updates, and reads back engine and capacity\n'
 ENGINE_CRON="$TMP/harness-dispatch"
+CONFIG_REPOS="$TMP/host-repos.conf"
 cp "$HARNESS/etc/dispatch.cron" "$ENGINE_CRON"
-ENGINE_OUT="$(PATH="$TMP/bin:$PATH" EXEC_SSH_STDIN=1 DEFAULT_ENGINE_CRON="$ENGINE_CRON" bash "$HARNESS/default-engine.sh")"
+cp "$HARNESS/etc/repos.conf" "$CONFIG_REPOS"
+ENGINE_OUT="$(PATH="$TMP/bin:$PATH" EXEC_SSH_STDIN=1 DEFAULT_ENGINE_CRON="$ENGINE_CRON" CONFIG_REPOS_FILE="$CONFIG_REPOS" bash "$HARNESS/config.sh")"
 assert_contains "the current installed default is shown" "$ENGINE_OUT" "default: codex"
 assert_contains "every configured engine is shown" "$ENGINE_OUT" "available: claude codex codex+claude"
-PATH="$TMP/bin:$PATH" EXEC_SSH_STDIN=1 DEFAULT_ENGINE_CRON="$ENGINE_CRON" bash "$HARNESS/default-engine.sh" claude >/dev/null
+assert_contains "the current concurrent run limit is shown" "$ENGINE_OUT" "max concurrent runs: 2"
+ENGINE_OUT="$(PATH="$TMP/bin:$PATH" EXEC_SSH_STDIN=1 DEFAULT_ENGINE_CRON="$ENGINE_CRON" CONFIG_REPOS_FILE="$CONFIG_REPOS" bash "$HARNESS/config.sh" --engine claude --max-concurrent 3)"
 assert_eq "the selected engine is written once" "EPIC_ENGINE=claude" "$(grep '^EPIC_ENGINE=' "$ENGINE_CRON")"
 assert_contains "the rest of the cron file is preserved" "$(cat "$ENGINE_CRON")" "bin/merge-tick.sh"
+assert_eq "the selected concurrent run limit is written once" "MAX_PARALLEL_EPICS=3" "$(grep '^MAX_PARALLEL_EPICS=' "$CONFIG_REPOS")"
+assert_contains "an update reports the resulting engine" "$ENGINE_OUT" "default: claude"
+assert_contains "an update reports the resulting concurrent run limit" "$ENGINE_OUT" "max concurrent runs: 3"
 set +e
-ENGINE_OUT="$(PATH="$TMP/bin:$PATH" EXEC_SSH_STDIN=1 DEFAULT_ENGINE_CRON="$ENGINE_CRON" bash "$HARNESS/default-engine.sh" missing 2>&1)"
+ENGINE_OUT="$(PATH="$TMP/bin:$PATH" EXEC_SSH_STDIN=1 DEFAULT_ENGINE_CRON="$ENGINE_CRON" CONFIG_REPOS_FILE="$CONFIG_REPOS" bash "$HARNESS/config.sh" --engine missing 2>&1)"
 ENGINE_RC=$?
 set -e
 assert_rc "an unknown engine is rejected" 1 "$ENGINE_RC"
 assert_contains "the rejection lists valid choices" "$ENGINE_OUT" "available: claude codex codex+claude"
 assert_eq "a rejected engine leaves the default unchanged" "EPIC_ENGINE=claude" "$(grep '^EPIC_ENGINE=' "$ENGINE_CRON")"
+set +e
+ENGINE_OUT="$(PATH="$TMP/bin:$PATH" EXEC_SSH_STDIN=1 DEFAULT_ENGINE_CRON="$ENGINE_CRON" CONFIG_REPOS_FILE="$CONFIG_REPOS" bash "$HARNESS/config.sh" --max-concurrent 0 2>&1)"
+ENGINE_RC=$?
+set -e
+assert_rc "a non-positive concurrent run limit is rejected" 1 "$ENGINE_RC"
+assert_contains "the capacity rejection names the constraint" "$ENGINE_OUT" "max concurrent runs must be a positive integer"
+assert_eq "a rejected capacity leaves the limit unchanged" "MAX_PARALLEL_EPICS=3" "$(grep '^MAX_PARALLEL_EPICS=' "$CONFIG_REPOS")"
+printf 'MAX_PARALLEL_EPICS=4\n' >> "$CONFIG_REPOS"
+set +e
+ENGINE_OUT="$(PATH="$TMP/bin:$PATH" EXEC_SSH_STDIN=1 DEFAULT_ENGINE_CRON="$ENGINE_CRON" CONFIG_REPOS_FILE="$CONFIG_REPOS" bash "$HARNESS/config.sh" 2>&1)"
+ENGINE_RC=$?
+set -e
+assert_rc "an ambiguous installed capacity is rejected" 1 "$ENGINE_RC"
+assert_contains "the ambiguity names the source file contract" "$ENGINE_OUT" "must contain exactly one MAX_PARALLEL_EPICS line, found 2"
 
 printf '\ndispatch hold: a Claude hold skips Claude and mixed engines but admits Codex\n'
 reset_state

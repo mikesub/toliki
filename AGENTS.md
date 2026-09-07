@@ -440,8 +440,8 @@ than made launchable against a main without the code it describes.
   launch refuses. It is read from the installed cron file, not the process
   environment: the file must hold exactly one `EPIC_ENGINE=` line, and if the
   environment also names one it must agree — a malformed file or a disagreement
-  refuses to launch (`default-engine.sh` edits that file, so the minute after
-  an edit can log one loud tick).
+  refuses to launch (`config.sh` edits that file and reports this setting with
+  `MAX_PARALLEL_EPICS`, so the minute after an edit can log one loud tick).
 - Every name in `DEFECT_FIX_REPOS` must be registered in `REPOS`; empty or
   unset disables autonomous defect repair without disabling manual launches.
 - Changing `HOST_TIMEZONE` in the host registry requires a `bin/provision.sh`
