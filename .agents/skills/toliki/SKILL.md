@@ -78,7 +78,12 @@ Every run edits one status comment on its issue, starting `🤖 **epic-run**`
 timestamp while it runs, and on exit a note: `**blocked** at <phase>:
 <reason>`, `**skipped**: <reason>`, `**done** …`, `**done, held for
 review** … (<reason>)`, or `**held**: provider quota exhausted …`. Every other
-pipeline record is a 🤖 comment too. Read
+pipeline record is a 🤖 comment too. A successful epic also appends exactly one
+`🤖 epic delivery summary`, identified by its captured candidate SHA. Treat it
+as the immutable implementation/design, actual verification, independent
+review/repair, remaining-work, and pre-handoff gate snapshot. Later deferred,
+defect-evidence, blocker, and fixer-audit comments are subsequent history; do
+not collapse them into or replace them with the candidate summary. Read
 them all in one call, oldest first:
 
 ```
@@ -104,11 +109,15 @@ gh issue view <N> -R <owner/repo> --json comments --jq '.comments[] | select(.bo
     blocked` comment names the cause, and `gh pr view <P> --json mergeable`
     says whether a conflict is still live. Report a one-line cause, the PR
     link, and what finishing takes: typically *fix the cause, push, swap
-    `failed` → `ready-to-merge`; the merge worker lands it from there*.
-- **`ready-to-review`**: a `🤖 deferred / not done` comment (an epic's ship).
-  Extract the actual decision the human is being asked to make from its items,
-  not the whole list. The status note's `held for review` reason is the gate
-  that held it.
+    `failed` → `ready-to-merge`; the merge worker lands it from there*. A
+    post-PR blocker that says its candidate delivery summary is unconfirmed is
+    different: report the real PR, branch, full SHA, and its manual publication
+    recipe verbatim. Never suggest rerunning the epic; prepare skips open PRs.
+- **`ready-to-review`**: read the candidate's `🤖 epic delivery summary` for the
+  captured implementation and review context, then the later `🤖 deferred / not
+  done` and defect/fixer evidence for the current decision. Extract the actual
+  decision the human is being asked to make, not the whole list. The status
+  note's `held for review` reason is the current gate that held it.
 - **`in-progress` with no `running` session of its name in `ls`**: stranded,
   and nothing automated recovers it (reap never relabels; dispatch skips an
   issue whose session still exists, dead or not). Report the phase and

@@ -136,7 +136,9 @@ than made launchable against a main without the code it describes.
   transport: every claim, label swap, comment, checkpoint, squash, push, PR,
   follow-up issue, layout discovery, `npm ci` and the fixer's verify run is
   executed there by the orchestrator, never delegated to a model. The merge
-  gate's inputs are counted from ship's structured deferral kinds. Gated by
+  gate's inputs are counted from ship's structured deferral kinds. The source
+  issue is specification plus append-only run record; generated PR prose is
+  only deterministic technical linkage. Gated by
   `tests/epic-run.test.sh`.
 - `workflows/lib/usage.mjs` appends one JSON line per agent spawn (step,
   vendor, model, effort, tokens, seconds, cost, and the failure kind/reason when
@@ -213,7 +215,10 @@ than made launchable against a main without the code it describes.
   Never replace it with a model's sign-off.
 - The merge is pinned to the sha whose check gate was evaluated
   (`--match-head-commit`). Anything pushed between green and merge makes
-  GitHub refuse rather than land on a result it never earned.
+  GitHub refuse rather than land on a result it never earned. The worker also
+  reads the complete subject/body from that exact SHA and passes both explicitly
+  to the squash merge; an unreadable or empty message never falls back to PR
+  text or repository defaults.
 - Session admission is one critical section in `bin/launch.sh`: the capacity
   count and `tmux new-session` run under a lock, so a manual launch racing a
   cron tick cannot overrun the cap. `--over-capacity` is the only way past it —
@@ -221,9 +226,15 @@ than made launchable against a main without the code it describes.
   `bin/dispatch.sh` and never carried on a `--route-issue` segment or a probe.
   Every `has-session` target is `=`-pinned;
   a bare one matches name prefixes, so epic-26 reads a live epic-263 as itself.
-- GitHub artifacts a retry cannot undo — a filed follow-up, the deferred
-  record — are created only after the PR exists, and a record already on the
-  issue is left alone. Everything before the PR is idempotent under a re-run.
+- GitHub artifacts a retry cannot undo — the candidate-specific delivery
+  summary, a filed follow-up, the deferred record — are created only after the
+  PR exists. The summary is published and read back before the later artifacts;
+  exactly one matching candidate marker is accepted, including when a write
+  errors after GitHub accepted it. Missing or duplicate confirmation blocks
+  with the real PR/branch/SHA and manual recovery guidance, because an ordinary
+  rerun skips an open PR. A matching existing record and an existing deferred
+  record are each left alone. Everything before the PR is idempotent under a
+  re-run.
 - Follow-up URLs in defect evidence are correlated by opaque, run-local blocker
   IDs assigned before ship, never by title, reason or occurrence. Ship copies
   every known ID into any non-empty deferred ledger; unknown, repeated or

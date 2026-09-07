@@ -51,6 +51,12 @@ set -euo pipefail
 # classifies the error text instead (transient_gh_error) and aborts only on an
 # infrastructure signature; likewise the read-back that confirms the merge,
 # where a failed read is not evidence the merge did not happen.
+#
+# The squash request supplies the complete subject/body from the exact rebased
+# SHA whose checks cleared. A one-commit branch does not make GitHub's repository
+# squash-message defaults trustworthy: those settings may choose mutable PR
+# prose instead. If either required message part cannot be read or is blank,
+# the PR is failed visibly rather than merged with a substitute record.
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/../etc/lib.sh"
@@ -457,9 +463,21 @@ merge_one() {
   say "$REPO: PR #$pr waiting on checks for $rebased"
   wait_for_ci "$pr" "$rebased" || return 1
 
-  # The branch holds exactly one commit (ship squashed it; rebasing one commit
-  # yields one), so --squash preserves its message and its `Closes #N`.
-  #
+  # Read the intended durable message from exactly the checked candidate. Do
+  # not fall back to PR text or repository defaults: either would let mutable
+  # prose replace the rationale and closing metadata this gate evaluated.
+  local merge_subject merge_body
+  if ! merge_subject="$(git -C "$WT" log -1 --format=%s "$rebased" 2>/dev/null)" || \
+     ! grep -q '[^[:space:]]' <<<"$merge_subject"; then
+    FAIL="candidate commit message subject for checked head $rebased is unreadable or empty"
+    return 1
+  fi
+  if ! merge_body="$(git -C "$WT" log -1 --format=%b "$rebased" 2>/dev/null)" || \
+     ! grep -q '[^[:space:]]' <<<"$merge_body"; then
+    FAIL="candidate commit message body for checked head $rebased is unreadable or empty"
+    return 1
+  fi
+
   # --match-head-commit pins the merge to the EXACT sha whose check gate this
   # run evaluated. Without it, the window between wait_for_ci returning and
   # this call is a stale-green hole: anything that pushed to the branch in
@@ -468,10 +486,11 @@ merge_one() {
   # prevent. GitHub refuses instead, and the next tick re-rebases and re-runs
   # the checks on whatever the branch has become.
   #
-  # Those are the only two flags, ever: --admin would merge past the gates this
-  # script exists to honour, and GitHub deletes the remote branch on merge.
+  # --admin would merge past the gates this script exists to honour. Subject is
+  # quoted and body is streamed so multiline and shell-sensitive text remain
+  # literal; GitHub deletes the remote branch on merge.
   local merge_err merge_rc=0
-  merge_err="$(gh pr merge "$pr" -R "$ORIGIN" --squash --match-head-commit "$rebased" 2>&1)" || merge_rc=$?
+  merge_err="$(printf '%s' "$merge_body" | gh pr merge "$pr" -R "$ORIGIN" --squash --match-head-commit "$rebased" --subject "$merge_subject" --body-file - 2>&1)" || merge_rc=$?
   if (( merge_rc != 0 )); then
     # A refusal is this PR's verdict; an outage is nobody's. Aborting leaves
     # the label on, so the next tick re-runs the whole merge — and if this call
