@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Laptop-side setup: exposes /spec and its spec-explorer agent to Claude and Codex,
-# then seeds the machine-local registry. The VM-side Claude equivalent is
-# inside bin/provision.sh (which also rebuilds the whole box).
+# Laptop-side setup: seeds the machine-local registry and exposes /spec and
+# spec-explorer to Claude and Codex. Codex's role uses the real charter path
+# because its loader rejects a final symlink. The VM-side Claude equivalent
+# is inside bin/provision.sh (which also rebuilds the whole box).
 #
 # Idempotent: re-run any time; a healthy machine reports zero changes and
 # exits 0. Refuses rather than clobbers: anything at a target path that isn't
 # ours is reported as a manual step and left alone.
 #
-# The two selected items are linked into real directories so user-level
-# content from other sources can coexist. Pipeline skills and charters stay
+# Selected Claude content and the Codex skill use individual links so content
+# from other sources can coexist; Codex's role points at the shared charter
+# through its user configuration. Pipeline skills and charters stay
 # private to the harness: host scripts launch pipelines, and the engine reads
 # its charters directly from this checkout.
 

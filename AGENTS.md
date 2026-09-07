@@ -168,9 +168,15 @@ than made launchable against a main without the code it describes.
 - `setup.sh` (laptop) and `bin/provision.sh` (host) both source
   `etc/wire-claude-content.sh`, which exposes only `/spec` and `spec-explorer` as
   user-level Claude content. Laptop setup also links `/spec` into Codex's
-  user-level skill directory and the native `agents/spec-explorer.toml` charter
-  into its custom-agent directory. Pipeline entry points and charters stay
-  internal; Codex's built-in `explorer` remains unshadowed.
+  user-level skill directory and registers `agents/spec-explorer.toml` through
+  `agents.spec-explorer.config_file` with the charter's real repo path:
+  Codex 0.153.4 advertises the symlink but refuses to load it on spawn.
+  The native Codex config API preserves other settings, checks the config
+  version before writing and reads registration
+  back; a foreign role is left alone and reported. Only after registration
+  succeeds does setup remove its old agent symlink, avoiding duplicate role
+  definitions. Pipeline entry points and charters stay internal; Codex's
+  built-in `explorer` remains unshadowed.
 - `remote-control.sh` is the one script that runs on the laptop; everything in
   `bin/` runs on the host and never sshes.
 - `.agents/skills/toliki` is the cross-client project-level source of the
@@ -445,10 +451,10 @@ than made launchable against a main without the code it describes.
   installed binary, so a stale binary silently turns them into pins.
 - The Docker GC policy loads only on a full daemon restart, and unknown keys
   are dropped silently. Verify with `docker buildx inspect`.
-- Only `spec` and `spec-explorer` are user-level symlinks; laptop setup
-  publishes the same pair to Codex in its native paths. A project-local copy
-  silently shadows shared content. Pipeline skills and charters are not
-  published.
+- Only `spec` and `spec-explorer` are user-level Claude symlinks; laptop setup
+  links the Codex skill and registers its agent's real repo path in user config.
+  A project-local copy silently shadows shared content. Pipeline skills and
+  charters are not published.
 - Never invent a second session-name pattern: reap, dispatch and the cap all key
   on `<repo>-epic-<N>`.
 

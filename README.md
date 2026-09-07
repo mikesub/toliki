@@ -163,6 +163,15 @@ gh repo clone mikesub/toliki && cd toliki
 ./remote-control.sh ls
 ```
 
+Setup links `/spec` into both clients and its charter into Claude. For Codex it
+registers the charter's real repo path in `~/.codex/config.toml`: Codex 0.153.4
+lists a
+symlinked agent but refuses that symlink when launching it. This keeps the repo
+charter as the shared source without copying it. Setup removes its old Codex agent
+symlink after registration succeeds, avoiding duplicate definitions. Re-run
+`./setup.sh` after updating an older setup, then start a fresh Codex session to
+load the registration. Node and Codex must be installed for this registration step.
+
 ## Reading order
 
 - **`AGENTS.md`** — the project instructions for any agent (`CLAUDE.md` is a

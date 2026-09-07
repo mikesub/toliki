@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 
-# Publish Toliki's interactive human gate into the user-level Codex skill
-# directory and its read-only spec-explorer charter into Codex's custom-agent
-# directory. Both are symlinked so this checkout remains the source of truth.
+# Link /spec into Codex's user-level skill directory and register spec-explorer
+# against its real charter path, so this checkout stays the source of truth.
+# Codex 0.153.4 advertises a symlinked charter but refuses to open that symlink
+# on spawn. Retire our old discovery link only after registration succeeds:
+# keeping both definitions makes Codex report a duplicate role.
 #
 # Sourced by setup.sh. The caller provides ok, changed, and blocked.
 
@@ -15,7 +17,7 @@ wire_codex_content() {
   local agent_item="$harness_dir/agents/spec-explorer.toml"
   local agent_dest="$agent_dir/spec-explorer.toml"
   local legacy_agent_dest="$agent_dir/explorer.toml"
-  local old_target agent_linked=0
+  local old_target registration
 
   mkdir -p "$HOME/.agents"
 
@@ -64,29 +66,43 @@ wire_codex_content() {
 
   if [[ ! -e "$agent_item" ]]; then
     blocked "$agent_item doesn't exist — is this a complete checkout?"
-  elif [[ -L "$agent_dest" && "$(readlink "$agent_dest")" == "$agent_item" ]]; then
-    ok "agents: spec-explorer"
-    agent_linked=1
-  elif [[ -L "$agent_dest" && ! -e "$agent_dest" ]]; then
-    old_target="$(readlink "$agent_dest")"
-    rm "$agent_dest"
-    ln -s "$agent_item" "$agent_dest"
-    changed "replaced dangling link ~/.codex/agents/spec-explorer.toml (was $old_target) -> $agent_item"
-    ok "agents: spec-explorer"
-    agent_linked=1
+    return
   elif [[ -e "$agent_dest" || -L "$agent_dest" ]]; then
-    blocked "~/.codex/agents/spec-explorer.toml exists and isn't a link into this checkout — it would shadow the harness copy; resolve by hand"
+    if [[ ! -L "$agent_dest" || "$(readlink "$agent_dest")" != "$agent_item" ]]; then
+      blocked "~/.codex/agents/spec-explorer.toml exists and isn't a link into this checkout — it would shadow the harness copy; resolve by hand"
+      return
+    fi
+  fi
+
+  if ! command -v node >/dev/null 2>&1 || ! command -v codex >/dev/null 2>&1; then
+    blocked "node and codex are required to register spec-explorer — install them and re-run setup.sh"
+    return
+  fi
+  if registration="$(node "$harness_dir/etc/register-codex-agent.mjs" "$HOME/.codex/config.toml" "$agent_item" 2>&1)"; then
+    if [[ "$registration" == "registered" ]]; then
+      changed "registered spec-explorer with its real repo path in ~/.codex/config.toml"
+    elif [[ "$registration" == "unchanged" ]]; then
+      ok "Codex spec-explorer registration"
+    else
+      blocked "Codex spec-explorer registration returned an unknown result"
+      return
+    fi
   else
-    ln -s "$agent_item" "$agent_dest"
-    changed "linked ~/.codex/agents/spec-explorer.toml -> $agent_item"
-    ok "agents: spec-explorer"
-    agent_linked=1
+    blocked "$registration"
+    return
+  fi
+  if [[ -L "$agent_dest" && "$(readlink "$agent_dest")" == "$agent_item" ]]; then
+    rm "$agent_dest"
+    changed "removed obsolete discovery link ~/.codex/agents/spec-explorer.toml"
+  elif [[ -e "$agent_dest" || -L "$agent_dest" ]]; then
+    blocked "~/.codex/agents/spec-explorer.toml changed during registration — left it alone; resolve by hand"
+    return
   fi
 
   # explorer is a Codex built-in. Remove only the old link published by this
   # checkout, and only after its replacement is healthy, so the built-in is no
   # longer shadowed without touching user-owned agent definitions.
-  if [[ $agent_linked -eq 1 && -L "$legacy_agent_dest" && "$(readlink "$legacy_agent_dest")" == "$harness_dir/agents/explorer.toml" ]]; then
+  if [[ -L "$legacy_agent_dest" && "$(readlink "$legacy_agent_dest")" == "$harness_dir/agents/explorer.toml" ]]; then
     rm "$legacy_agent_dest"
     changed "pruned legacy link ~/.codex/agents/explorer.toml"
   fi
