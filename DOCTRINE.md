@@ -115,6 +115,15 @@ don't get re-litigated from memory.
   those declines, provided main has not moved. A partial defect round reissues
   the authenticated evidence on the amended head with only declined items, so
   a human-granted later round cannot repair completed work again.
+  These three sessions use one fixed-purpose lifecycle runner for the common
+  repair, verify, adversarial-check, failure/refund and reporting path. They are
+  adapters rather than rows in a generic workflow framework: conflict evidence
+  must exist before its prospective partial head is pushed, defect evidence can
+  be refreshed only after the pushed head is observed, and defect landing-only
+  recovery intentionally bypasses model and verification work. Keeping those
+  cause-specific operations local makes their ordering visible while ensuring
+  a common failure fix is maintained once. A pushed partial is monotonic shared
+  state, so no later error can restore its autonomous queue.
 - **Crons watch, models act.** Dispatch, reap and merge ticks are plain shell
   reading labels; the first model to run is the epic that got launched.
 - **Exhausted allowance pauses admission, not work.** A provider's hard quota

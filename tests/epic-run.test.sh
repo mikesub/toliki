@@ -476,6 +476,10 @@ chmod +x "$TMP/bin/gh"
 # a plain exec and changes nothing.
 cat > "$TMP/bin/git" <<'STUB'
 #!/usr/bin/env bash
+if [[ "${GIT_REJECT_FIXER_PUSH:-}" == "1" && "${1:-}" == push && " $* " == *" --force-with-lease="* ]]; then
+  printf '%s\n' 'rejected: stale info' >&2
+  exit 1
+fi
 if [[ -n "${GIT_SLOW_AFTER_LANDING:-}" && "${1:-}" == "${GIT_SLOW_AFTER_LANDING%%:*}" ]] &&
    grep -qx 'ready-to-merge' "${STUB_GH_STATE:-/nonexistent}/labels" 2>/dev/null; then
   sleep "${GIT_SLOW_AFTER_LANDING##*:}"
@@ -890,6 +894,7 @@ run_pipeline() { # script fixtures-dir args...   (scenario knobs via GH_* env)
     GH_FAIL_READ_AFTER_REMOVE="${GH_FAIL_READ_AFTER_REMOVE:-}" \
     GH_TERMINAL_STALL_SECONDS="${GH_TERMINAL_STALL_SECONDS:-}" \
     STUB_REAL_GIT="$REAL_GIT" \
+    GIT_REJECT_FIXER_PUSH="${GIT_REJECT_FIXER_PUSH:-}" \
     GIT_SLOW_AFTER_LANDING="${GIT_SLOW_AFTER_LANDING:-}" \
     EXPECT_HOLD_BEFORE_LABEL="${EXPECT_HOLD_BEFORE_LABEL:-}" \
     CODEX_QUOTA_STDERR_ONLY="${CODEX_QUOTA_STDERR_ONLY:-}" \
@@ -2925,6 +2930,10 @@ seed_clean() {
   seed_branch epic/42-add-widget main 'printf "export const items = [] // pr-guard\n" > frontend/src/index.ts && git commit -qam "feat: add guard" -m "Closes #42"'
   seed_branch main main 'printf "# app\n\nmoved on\n" > README.md && git commit -qam "docs: main moved" -m "Closes #41"'
 }
+seed_mechanical_conflict() {
+  seed_branch epic/42-add-widget main 'printf "export const items = []\nexport const fromPr = true\nexport const tail = true\n" > frontend/src/index.ts && git commit -qam "feat: add PR value" -m "Closes #42"'
+  seed_branch main main 'printf "export const items = []\nexport const fromMain = true\nexport const tail = true\n" > frontend/src/index.ts && git commit -qam "main: add main value" -m "Closes #41"'
+}
 # The shape toliki#17 declined twice: main bounded a call that sits INSIDE the
 # conflicting block, while the PR moved that same call OUT of the block into a
 # new function below. Keeping both intents takes the marker block plus one line
@@ -2998,6 +3007,27 @@ assert_contains "the audit comment states the PR's intent" "$(gh_comments)" "the
 assert_contains "the audit comment records the adversarial check" "$(gh_comments)" "confidence 88/100"
 assert_contains "and says the merge worker re-runs the checks before anything lands" "$(gh_comments)" "re-runs the real checks before anything lands"
 assert_eq "the labels: ready-to-merge, ladder kept, needs-judgment cleared" "fix-attempted,ready-to-merge," "$(gh_labels)"
+
+scenario 'fix-run: a missing checker result cannot push or promote the resolution'
+seed_conflict
+MISSING_FIX_CHECK="$TMP/fixtures-fix-missing-check"; cp -R "$FIXBASE" "$MISSING_FIX_CHECK"; rm -f "$MISSING_FIX_CHECK/fix-check.json"
+BEFORE="$(origin_ref epic/42-add-widget)"
+run_fix "$MISSING_FIX_CHECK" --issue 42
+assert_rc "a missing conflict checker result blocks" 3 "$RUN_RC"
+assert_contains "the conflict refusal names the missing checker" "$RUN_OUT" "checker produced no result"
+assert_eq "the missing checker gets only the runtime's bounded retry" 2 "$(calls fix-check)"
+assert_eq "the unchecked conflict resolution is not pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+assert_not_contains "the unchecked conflict resolution is never promoted" "$(gh_labels)" "ready-to-merge"
+
+scenario 'fix-run: a rejected lease push leaves the captured branch and queue intact'
+seed_conflict
+BEFORE="$(origin_ref epic/42-add-widget)"
+GIT_REJECT_FIXER_PUSH=1 run_fix "$FIXBASE" --issue 42
+assert_rc "a rejected conflict lease blocks" 3 "$RUN_RC"
+assert_contains "the conflict lease refusal names the lost race" "$RUN_OUT" "rejected — epic/42-add-widget moved on origin under this run"
+assert_eq "the rejected conflict lease leaves origin untouched" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+assert_eq "the rejected conflict lease keeps its spent rung and queue" "failed,fix-attempted,needs-judgment," "$(gh_labels)"
+assert_not_contains "the rejected conflict lease never exposes merge" "$(gh_labels)" "ready-to-merge"
 
 scenario 'fix-run: two repaired judgment hunks survive one declined hunk and are held for review'
 seed_conflict_three
@@ -3351,6 +3381,17 @@ assert_eq "the branch was rebased onto the new main and pushed" 1 "$(origin_coun
 if git -C "$ORIGIN" merge-base --is-ancestor main epic/42-add-widget; then ok "and sits on top of main"; else nok "and sits on top of main"; fi
 assert_contains "the audit comment says the conflict evaporated" "$(gh_comments)" "the conflict had evaporated"
 
+scenario 'fix-run: a wholly mechanical rebase verifies and ships without model stages'
+seed_mechanical_conflict
+run_fix "$FIXBASE" --issue 42
+assert_rc "a wholly mechanical conflict ships" 0 "$RUN_RC"
+assert_eq "the mechanical conflict starts neither resolver nor checker" "0 0" "$(calls fix-resolve) $(calls fix-check)"
+assert_eq "the mechanical conflict still runs project verification" 1 "$(grep -c '^run verify$' "$NPM_LOG" || true)"
+assert_contains "the mechanical conflict records its deterministic stage skip" "$(gh_comments)" "every hunk had turned mechanical"
+assert_contains "the mechanical resolution keeps main's addition" "$(git -C "$ORIGIN" show epic/42-add-widget:frontend/src/index.ts)" "fromMain"
+assert_contains "the mechanical resolution keeps the PR's addition" "$(git -C "$ORIGIN" show epic/42-add-widget:frontend/src/index.ts)" "fromPr"
+assert_eq "the wholly mechanical result reaches the merge queue" "fix-attempted,ready-to-merge," "$(gh_labels)"
+
 # The fixer's landing swap is a terminal write too: `ready-to-merge` rests the
 # issue and starts reap's settle clock as soon as GitHub applies it, while the
 # client can still be waiting on the response. The readback the label verdict is
@@ -3473,6 +3514,28 @@ assert_contains "and gets the failing job log" "$FIXPROMPT" "expected createWidg
 assert_contains "and is told the failure reproduces locally" "$FIXPROMPT" "RED locally on this exact tree"
 assert_contains "and is forbidden to weaken a test" "$FIXPROMPT" "Never weaken, skip, delete or loosen a test"
 assert_eq "verify ran before and after the fix" 2 "$(grep -c '^run verify$' "$NPM_LOG")"
+
+scenario 'ci-run: malformed checker output cannot push or promote the repair'
+seed_ci_pr
+BAD_CI_CHECK="$TMP/fixtures-ci-bad-check"; cp -R "$CIBASE" "$BAD_CI_CHECK"
+fixture "$BAD_CI_CHECK" ci-check '{}'
+BEFORE="$(origin_ref epic/42-add-widget)"
+run_ci "$CI_RUN" "$BAD_CI_CHECK" --issue 42
+assert_rc "malformed CI checker output blocks" 3 "$RUN_RC"
+assert_contains "the malformed CI checker ends at the missing-result gate" "$RUN_OUT" "checker produced no result"
+assert_eq "the malformed CI checker is respawned once and no more" 2 "$(calls ci-check)"
+assert_eq "the unchecked CI repair is not pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+assert_not_contains "the unchecked CI repair is never promoted" "$(gh_labels)" "ready-to-merge"
+
+scenario 'ci-run: a rejected lease push leaves the captured branch and queue intact'
+seed_ci_pr
+BEFORE="$(origin_ref epic/42-add-widget)"
+GIT_REJECT_FIXER_PUSH=1 run_ci "$CI_RUN" "$CIBASE" --issue 42
+assert_rc "a rejected CI lease blocks" 3 "$RUN_RC"
+assert_contains "the CI lease refusal names the lost race" "$RUN_OUT" "rejected — epic/42-add-widget moved on origin under this run"
+assert_eq "the rejected CI lease leaves origin untouched" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+assert_eq "the rejected CI lease keeps its spent rung and queue" "ci-attempted,failed,needs-ci-fix," "$(gh_labels)"
+assert_not_contains "the rejected CI lease never exposes merge" "$(gh_labels)" "ready-to-merge"
 
 scenario 'ci-run: two repaired checks survive one declined check and are held for review'
 seed_ci_pr
@@ -3838,6 +3901,28 @@ assert_contains "the skeptic sees the durable named defect" "$CHECKPROMPT" "Empt
 assert_contains "the skeptic is pointed at the exact captured-head delta" "$CHECKPROMPT" "git diff $BEFORE"
 assert_not_contains "the skeptic is blind to the fixer's explanation" "$CHECKPROMPT" "PRIVATE_FIXER_EXPLANATION"
 assert_eq "verify runs once after the edit" 1 "$(grep -c '^run verify$' "$NPM_LOG")"
+
+scenario 'defect-run: malformed checker output cannot push or promote the repair'
+seed_defect_pr
+BAD_DEFECT_CHECK="$TMP/fixtures-defect-bad-check"; cp -R "$DEFECTBASE" "$BAD_DEFECT_CHECK"
+fixture "$BAD_DEFECT_CHECK" defect-check '{}'
+BEFORE="$(origin_ref epic/42-add-widget)"
+run_defect "$DEFECT_RUN" "$BAD_DEFECT_CHECK" --issue 42
+assert_rc "malformed defect checker output blocks" 3 "$RUN_RC"
+assert_contains "the malformed defect checker ends at the missing-result gate" "$RUN_OUT" "checker produced no result"
+assert_eq "the malformed defect checker is respawned once and no more" 2 "$(calls defect-check)"
+assert_eq "the unchecked defect repair is not pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+assert_not_contains "the unchecked defect repair is never promoted" "$(gh_labels)" "ready-to-merge"
+
+scenario 'defect-run: a rejected lease push leaves the captured branch and queue intact'
+seed_defect_pr
+BEFORE="$(origin_ref epic/42-add-widget)"
+GIT_REJECT_FIXER_PUSH=1 run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+assert_rc "a rejected defect lease blocks" 3 "$RUN_RC"
+assert_contains "the defect lease refusal names the lost race" "$RUN_OUT" "rejected — epic/42-add-widget moved on origin under this run"
+assert_eq "the rejected defect lease leaves origin untouched" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+assert_eq "the rejected defect lease keeps its spent rung and review queue" "defect-attempted,needs-defect-fix,ready-to-review," "$(gh_labels)"
+assert_not_contains "the rejected defect lease never exposes merge" "$(gh_labels)" "ready-to-merge"
 
 scenario 'defect-run: two repaired defects survive one decline, reissue evidence, and are held for review'
 seed_defect_pr

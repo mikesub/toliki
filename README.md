@@ -184,9 +184,12 @@ load the registration. Node and Codex must be installed for this registration st
   that were considered and rejected, with reasons.
 - **`bin/`, `etc/`** — the host-side scripts and config; each header states
   its contract and the incident behind it.
-- **`workflows/`** — the epic pipeline and three fixers (`epic-run`, `fix-run`,
-  `ci-run`, and `defect-run`) plus the small runtime they sit on: the engine
-  adapter, the git/gh/npm transport, the concurrency gate, structured-output
+- **`workflows/`** — the epic pipeline and three fixer entry points (`epic-run`,
+  `fix-run`, `ci-run`, and `defect-run`). The fixers share one fixed lifecycle
+  runner for execution, verification/check gates, failure and final reporting,
+  while each entry point keeps its cause-specific preparation, evidence,
+  publication and recovery ordering. The surrounding runtime provides the
+  engine adapter, git/gh/npm transport, concurrency gate, structured-output
   validation, and the per-spawn usage log `usage-report.mjs` summarizes.
 - **`skills/`, `agents/`** — `/spec` and its `spec-explorer` are exposed to local
   Claude and Codex sessions; pipeline entry contracts and phase charters stay
