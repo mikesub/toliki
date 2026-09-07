@@ -150,6 +150,13 @@ run_adapter reviewer gpt-5.6-terra medium 0 text
 ARGS="$(cat "$TMP/args")"
 assert_contains "a third pair: model" "$ARGS" 'ARG:gpt-5.6-terra'
 assert_contains "a third pair: effort" "$ARGS" 'ARG:model_reasoning_effort="medium"'
+assert_contains "a reviewer is read-only" "$ARGS" 'ARG:read-only'
+
+printf '\nCodex adapter: ship prose is read-only too\n'
+run_adapter shipper gpt-5.6-sol xhigh 0 text
+ARGS="$(cat "$TMP/args")"
+assert_contains "a shipper is read-only" "$ARGS" 'ARG:read-only'
+assert_contains "the shipper charter reaches developer instructions" "$ARGS" 'Write only the structured delivery prose'
 
 printf '\nCodex adapter: usage comes from the event stream\n'
 run_adapter coder gpt-5.6-sol xhigh 1

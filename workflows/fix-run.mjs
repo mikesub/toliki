@@ -167,7 +167,7 @@ Return: survives, confidence (0-100), reasoning (name the hunk and the evidence,
 // Which vendor, model and effort each step runs on is a row of the run's
 // engine in etc/engines.json; every agent() call names only its step.
 // fix-conflicts is the judgment core — the entire reason a model is in the
-// loop — and confirm-review is the last gate before a rewritten merge ships to
+// loop — and final-review is the last gate before a rewritten merge ships to
 // a force-push, so a row for either wants the strong model.
 
 // ───────────────────────── Schemas ─────────────────────────
@@ -821,7 +821,7 @@ await runFixerLifecycle({
     needed: prep => Array.isArray(prep.markedFiles) && prep.markedFiles.length > 0,
     before: (_ctx, prep) => prep.partialRecord ? intentToAdd() : undefined,
     prompt: (ctx, prep, dispositions) => PROMPTS.check(ctx.issue, prep, dispositions),
-    agent: { label: 'check', phase: 'Check', step: 'confirm-review', schema: CHECK_SCHEMA },
+    agent: { label: 'check', phase: 'Check', step: 'final-review', schema: CHECK_SCHEMA },
     noResult: 'the adversarial checker produced no result — an unchecked resolution must not ship.',
     refuted: check => `the adversarial check refuted the resolution (survives=${check.survives}, confidence ${check.confidence}): ${check.reasoning}`,
     log: (_ctx, _prep, check) => log(`Check: survived — ${check.reasoning} (confidence ${check.confidence}).`),

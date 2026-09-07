@@ -102,7 +102,7 @@ Return: survives, confidence (0-100), reasoning (name the evidence, whichever wa
 // ───────────────────────── Config ─────────────────────────
 // Which vendor, model and effort each step runs on is a row of the run's
 // engine in etc/engines.json; every agent() call names only its step.
-// fix-ci is the repair itself, and confirm-review is the last gate before an
+// fix-ci is the repair itself, and final-review is the last gate before an
 // unattended merge, so a row for either wants the strong model.
 
 // ───────────────────────── Schemas ─────────────────────────
@@ -400,7 +400,7 @@ await runFixerLifecycle({
     needed: () => true,
     before: () => intentToAdd(),
     prompt: (ctx, prep, dispositions) => PROMPTS.check(ctx.issue, prep, `git diff ${prep.prHead}`, dispositions),
-    agent: { label: 'ci-check', phase: 'Check', step: 'confirm-review', schema: CHECK_SCHEMA },
+    agent: { label: 'ci-check', phase: 'Check', step: 'final-review', schema: CHECK_SCHEMA },
     noResult: 'the adversarial checker produced no result — an unchecked fix must not rejoin the merge queue.',
     refuted: check => `the adversarial check refuted the fix (survives=${check.survives}, confidence ${check.confidence}): ${check.reasoning}`,
     log: (_ctx, _prep, check) => log(`Check: survived — ${check.reasoning} (confidence ${check.confidence}).`),

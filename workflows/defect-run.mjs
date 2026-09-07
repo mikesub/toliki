@@ -559,7 +559,7 @@ await runFixerLifecycle({
     needed: () => true,
     before: () => intentToAdd(),
     prompt: (ctx, prep, dispositions) => PROMPTS.check(ctx.issue, prep, `git diff ${prep.prHead}`, dispositions),
-    agent: { label: 'defect-check', phase: 'Check', step: 'confirm-review', schema: CHECK_SCHEMA },
+    agent: { label: 'defect-check', phase: 'Check', step: 'final-review', schema: CHECK_SCHEMA },
     noResult: 'the adversarial checker produced no result — an unchecked repair must not rejoin the merge queue.',
     refuted: check => `the adversarial check refuted the repair (survives=${check.survives}, confidence ${check.confidence}): ${check.reasoning}`,
     log: (_ctx, _prep, check) => log(`Check: survived — ${check.reasoning} (confidence ${check.confidence}).`),

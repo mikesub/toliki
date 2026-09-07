@@ -61,12 +61,16 @@ in the same change.
   fixers require the exact persisted singleton; the label survives fixer
   retries. A manual launch may omit `--engine`, and then inherits — issue label,
   else host default, else claude — without writing any label.
-- **Step**: one of the seven pipeline steps in `STEPS` in
+- **Step**: one of the eight pipeline steps in `STEPS` in
   `workflows/lib/engine.mjs`, each a judgment call. Pipelines name steps; the
   engine file says who runs them; `STEPS` fixes each step's charter and tool
-  boundary, so architect, review and confirm-review stay read-only under any
-  vendor. Nothing deterministic is a step: git, gh and npm work runs in the
-  orchestrator.
+  boundary, so architect, review, final-review and ship stay read-only under any
+  vendor. Claude's reviewer and shipper charters withhold Bash, Edit and Write;
+  Codex runs the same charters in its read-only sandbox. The orchestrator
+  supplies captured diff evidence and also proves the worktree, index, Git
+  configuration, hooks and ancestry metadata unchanged around review, final
+  review and ship. Nothing deterministic is a step: git, gh and npm work runs
+  in the orchestrator.
 - **Charter**: an `agents/*.md` file, read on every phase. Missing or malformed
   refuses the run.
 - **Package**: a directory whose `package.json` declares `scripts.verify`. The
@@ -136,9 +140,9 @@ than made launchable against a main without the code it describes.
   transport: every claim, label swap, comment, checkpoint, squash, push, PR,
   follow-up issue, layout discovery, `npm ci` and the fixer's verify run is
   executed there by the orchestrator, never delegated to a model. The merge
-  gate's inputs are counted from ship's structured deferral kinds. The source
-  issue is specification plus append-only run record; generated PR prose is
-  only deterministic technical linkage. Gated by
+  gate's inputs are counted from the final review's structured verdicts. The
+  source issue is specification plus append-only run record; generated PR
+  prose is only deterministic technical linkage. Gated by
   `tests/epic-run.test.sh`.
 - `workflows/lib/usage.mjs` appends one JSON line per agent spawn (step,
   vendor, model, effort, tokens, seconds, cost, and the failure kind/reason when
@@ -274,9 +278,9 @@ than made launchable against a main without the code it describes.
   Gated by `tests/epic-run.test.sh`.
 - One general reviewer always judges the actual diff against the requirement.
   Architecture can request at most one additional reviewer for a concrete risk
-  question. Reviewers stay blind to builder notes; the independent checker
-  receives the original requirement too. Every finding needs a complete verdict:
-  missing or ambiguous evidence cannot become a refutation or merge clearance.
+  question. Reviewers stay blind to builder notes; the final review receives the
+  original requirement too. Every finding needs a complete verdict: missing or
+  ambiguous evidence cannot become a disproof or merge clearance.
   A resumed code checkpoint keeps its review plan, or reconstructs that plan
   read-only when the local artifact is missing, without replaying code.
 - Review repairs apply the smallest correct change and meaningful regression
@@ -284,27 +288,48 @@ than made launchable against a main without the code it describes.
   not mandated for every finding. Follow-up issues are still filed and queued
   for concrete material work with a standalone definition of done; the cap is
   a ceiling, not a target, and filing never clears the current PR's blockers.
-- Fixes-after-review assesses each finding and reports an indexed disposition:
-  fixed, rejected with evidence, or deferred. There is no separate confirmation
-  before repairs. Fix-check independently judges EVERY disposition and the full
-  repair delta, including rejections and deferrals when no code changed. Only a
-  matching, evidenced fixed/rejected verdict clears an item; missing, duplicate,
-  extra or ambiguous evidence never does. Titles are not identities.
-  An epic runs at most two repair rounds. Open non-deferred items and new
-  regressions get the second round; its checker revisits every original finding
-  and earlier regression against the final tree, so earlier clearances cannot
-  survive a later regression unchecked. A dead or malformed check, or a claimed
-  repair with no diff, holds at `ready-to-review` without a second round.
-  Uncertainty always needs a human. Only current independent evidence of an
-  actual remaining defect can authorize the separate defect-fixer queue, and
-  only when every blocker has that evidence. A coder's deferral or no-diff repair
-  claim is not such proof. Manual slug mode checks one assessment/repair round
-  against an in-memory reviewed patch and immutable base, without committing
-  or queueing a merge; open items remain explicit in its summary. Gated by
+- The initial review's findings are actionable as they stand: there is no
+  confirmation pass before repair. Findings spawn ONE fresh fixer, which must
+  account for every finding with an indexed disposition — fixed, disputed with
+  concrete code evidence, or deferred as unsafe to repair. Missing, duplicate,
+  extra or ambiguous coverage blocks the run at `triage`. Titles are not
+  identities. The orchestrator then runs `npm run verify` with the usual single
+  retry; a tree still red after it blocks and never reaches the final review.
+- A final read-only review runs when the fixer changed code or disputed or
+  deferred anything. It receives the original requirement, every original
+  finding with its reported action, the complete diff and the exact fixer
+  delta — never the fixer's explanation, so it judges the code rather than
+  agreeing with the account. It decides each finding resolved, disproved or
+  unresolved, reports what the repair broke, and reports what the requirement
+  still lacks; uncertainty is unresolved, never disproved.
+- Merge readiness is computed from that result alone: every finding resolved or
+  disproved at confidence 75+, no repair regression, no unmet requirement. A
+  dead or malformed final review, a `resolved` verdict on an empty fixer delta,
+  an all-fixed claim that produced no diff (which spawns no final review), or
+  any unresolved item holds the PR at `ready-to-review`. Only an unresolved
+  finding the final review positively showed is still broken, or a regression it
+  found at confidence 75+, may enter the defect-fixer queue, and only when every
+  blocker has that evidence; uncertainty always needs a human. There is no
+  second repair round. Manual slug mode runs the same fixer and final review
+  against an in-memory reviewed patch and immutable base, without committing or
+  queueing a merge; open items remain explicit in its summary. Gated by
   `tests/epic-run.test.sh`.
-- Ship's deferral kinds feed the merge gate only after the skeptic re-judges
-  every item ship did not call a defect; the skeptic can only escalate, and a
-  dead check holds the PR. Gated by `tests/epic-run.test.sh`.
+- A phase that judges a change may not alter it. Reviewer and shipper charters
+  have no shell or write tools; the orchestrator supplies their diff evidence
+  and hashes the shippable worktree (all tracked content, including tracked
+  paths an ignore rule also
+  matches, plus untracked files, `.epics/` excluded) and HEAD around review,
+  final review and ship, including the real index, Git configuration, hooks,
+  replacement refs and grafts, and blocks the run when any moved. Orchestrator
+  Git calls neutralize repository hooks while preserving caller configuration —
+  an edit those phases make is neither reviewed nor verified, and the paths that
+  ship without another gate (an empty review, a cleared final review) are
+  exactly where nothing else would catch it. Gated by `tests/epic-run.test.sh`.
+- Ship's deferrals never gate the merge: `kind` only ranks which items earn a
+  follow-up issue and what the deferred record says. Every model process in the
+  run — architect, code, review, fixer, final review, ship — is a short-lived
+  process that ends when it returns; nothing resumes or continues an earlier
+  one. Gated by `tests/epic-run.test.sh`.
 - Ship rebases the run's checkpoint chain onto current origin/main before the
   squash, because a run takes an hour and its PR is often held for hours more,
   so the base has usually moved. A clean rebase re-runs the verify gate against
@@ -426,7 +451,7 @@ than made launchable against a main without the code it describes.
   add a GitHub call — or a local git cleanup, which has a timeout of its own —
   on the default timeout from a terminal label write onward. No model step runs
   inside that window: `agent()` refuses a spawn once it is open, so ship's
-  deferral check runs before the `ready-to-review` write.
+  PR-description step runs before the `ready-to-review` write.
 - A dead pipeline pane whose issue rests at `ready` is a completed quota hold,
   so reap applies the normal settle window and removes its session. A live
   `ready` pane is still working and a dead `in-progress` pane remains a crash
