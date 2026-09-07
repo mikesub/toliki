@@ -23,6 +23,10 @@ assert_not_contains() {
 }
 assert_eq() { if [[ "$2" == "$3" ]]; then ok_test "$1"; else nok "$1 (want $2, got $3)"; fi; }
 
+printf '\nbase agent tools\n'
+BASE_PACKAGES="$(grep '^apt_install ' "$ROOT/bin/provision.sh" | head -1)"
+assert_contains "provisioning installs ripgrep so agents have rg" "$BASE_PACKAGES" " ripgrep "
+
 mkdir -p "$TMP/bin"
 INSTALL_LOG="$TMP/install.log"
 

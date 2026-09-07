@@ -188,9 +188,10 @@ say "base packages"
 # curl/gnupg/ca-certificates are needed to register the apt sources below, so
 # they go in first; jq checks CLI releases and Claude's interactive gates.
 # Codex uses bubblewrap to enforce the read-only sandbox
-# that fences architect and reviewer phases on Linux. unzip is required by
-# Bun's own installer (it fails outright without it — see provision_bun).
-apt_install git tmux jq curl ca-certificates gnupg bubblewrap unzip
+# that fences architect and reviewer phases on Linux. ripgrep supplies rg for
+# agent code search. unzip is required by Bun's own installer (it fails
+# outright without it — see provision_bun).
+apt_install git tmux jq curl ca-certificates gnupg bubblewrap ripgrep unzip
 
 # --------------------------------------------------------------------- node --
 

@@ -15,7 +15,7 @@ Request: $ARGUMENTS
 
 2. **Discovery.** If the request is unclear, ask what problem it solves, what it should do, and the constraints. Summarize your understanding back.
 
-3. **Explore the relevant surface (read-only).** Launch `spec-explorer` subagents in parallel, each scoped to the area you need to understand for good requirements, not the whole system. Read the key files they flag; do not open broad swaths of code you do not need.
+3. **Explore the relevant surface (read-only).** Launch `spec-explorer` subagents in parallel, each scoped to the area you need to understand for good requirements, not the whole system. Read the key files they flag; do not open broad swaths of code you do not need. An earlier survey in the conversation does not replace this step: a feasibility inventory, a subagent summary or a memory note is a lead, not evidence. Every concrete fact a body will assert (a table or column and its constraints, what a runtime records or drops, whether a counter is a lifetime total or a streak, which component writes a row) is verified by reading the line that establishes it in the current tree before the body names it.
 
 4. **Resolve uncertainties.** Check for missing requirements, edge cases, error handling, integration points, scope boundaries, backward compatibility, performance and design preferences. Ask only questions whose answers are still needed to define the work, and wait for those answers. Use decisions already made in the conversation; when the user delegates a choice, make it. If nothing remains unclear, continue without a confirmation turn.
 
@@ -25,6 +25,7 @@ Request: $ARGUMENTS
    - For multiple issues only, confirm the split before filing: show the proposed titles, with a short scope or dependency explanation only where needed to make the split clear. Once that split is confirmed, proceed without another approval. An unchanged split already confirmed in the conversation needs no repeat confirmation.
 
 6. **Write the spec, one per slice.** Write the bodies internally; the user sees the issue titles, not a draft-body review. If writing exposes a new ambiguity that affects the requirements or split, ask that specific question and then continue. Each body stands on its own as the definition of done, readable against the eventual diff with no other context. The review lenses judge the diff against the issue body alone, barred from `.epics/` and from sibling issues, so never write one big spec and file N issues pointing at it: repeat the shared context in each body.
+   - Before filing, re-read each body as a reviewer with `grep` in hand. Claims of the form "no migration needed", "the table already holds X", or "same as <sibling feature>" are where blockers hide: check each against the code, and where a transferred property does not fit, state what differs instead of inheriting it.
    - **Goal**: one line.
    - **Functional requirements.**
    - **Non-goals / out of scope**, naming the sibling that covers each: "X is out of scope, covered by #44." A sibling's work left unnamed reads as an unmet requirement, and fixes-after-review will then build it into this slice unattended. Ids do not exist yet: write the placeholder now and fill it in at step 7.
