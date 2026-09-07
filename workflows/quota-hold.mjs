@@ -14,6 +14,7 @@ import { execFile } from 'node:child_process'
 import { homedir, tmpdir } from 'node:os'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { realpathSync } from 'node:fs'
 import { readFile, rename, unlink, writeFile } from 'node:fs/promises'
 
 export const QUOTA_HOLD_FILE = process.env.EPIC_PROVIDER_HOLD_FILE || resolve(homedir(), 'epic-provider-hold.json')
@@ -237,7 +238,10 @@ async function cli() {
   return result.code
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === MODULE_FILE) {
+// macOS exposes /tmp and /var through /private symlinks. import.meta.url uses
+// the physical path while argv may retain the logical one, so compare the
+// canonical files or a copied CLI can silently do nothing with exit 0.
+if (process.argv[1] && realpathSync(resolve(process.argv[1])) === realpathSync(MODULE_FILE)) {
   try {
     process.exitCode = await cli()
   } catch (error) {

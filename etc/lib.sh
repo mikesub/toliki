@@ -240,10 +240,17 @@ ts() { date '+%Y-%m-%d %H:%M:%S %Z'; }
 # Render a canonical machine instant for a human in the validated host zone.
 # uutils/GNU date use -d; the fallback keeps the helper usable with BSD date.
 human_ts() {
-  local epoch
+  local epoch bsd_instant
   [[ $# -eq 1 && -n "$1" ]] || return 1
+  bsd_instant="$1"
+  # BSD date's strptime rejects the millisecond form our Node records emit.
+  # Human display is second-granular, so remove exactly that canonical suffix
+  # for the macOS fallback while leaving the machine value untouched.
+  if [[ "$bsd_instant" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$ ]]; then
+    bsd_instant="${bsd_instant%.*}Z"
+  fi
   date -d "$1" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null ||
-    { epoch="$(TZ=UTC date -j -f '%Y-%m-%dT%H:%M:%SZ' "$1" '+%s' 2>/dev/null)" &&
+    { epoch="$(TZ=UTC date -j -f '%Y-%m-%dT%H:%M:%SZ' "$bsd_instant" '+%s' 2>/dev/null)" &&
       date -r "$epoch" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null; }
 }
 

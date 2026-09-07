@@ -18,7 +18,30 @@ const NPM_CI_TIMEOUT_MS = 30 * 60 * 1000
 // legitimately boot a database tier. A run this long is pathological, not slow.
 const VERIFY_TIMEOUT_MS = Number(process.env.EPIC_AGENT_TIMEOUT_MS) || 90 * 60 * 1000
 
-export const git = (args, opts = {}) => sh('git', args, { timeoutMs: GIT_TIMEOUT_MS, ...opts })
+// Model phases never own Git transport. Neutralize repository hooks on every
+// orchestrator Git call so a hook or config mutation cannot execute after the
+// last verify/review and change the bytes a deterministic commit, rebase or
+// push carries. Append our config entry so it wins over inherited entries,
+// while preserving caller-specific environments such as GIT_EDITOR and
+// GIT_INDEX_FILE.
+const hooklessGitEnv = (source = process.env) => {
+  const raw = source.GIT_CONFIG_COUNT
+  const count = raw === undefined ? 0 : Number(raw)
+  if (raw !== undefined && (!Number.isInteger(count) || count < 0 || String(count) !== String(raw))) {
+    throw new Error(`invalid inherited GIT_CONFIG_COUNT: ${String(raw)}`)
+  }
+  return {
+    ...source,
+    GIT_CONFIG_COUNT: String(count + 1),
+    [`GIT_CONFIG_KEY_${count}`]: 'core.hooksPath',
+    [`GIT_CONFIG_VALUE_${count}`]: '/dev/null',
+  }
+}
+
+export const git = (args, opts = {}) => {
+  const { env = process.env, ...rest } = opts
+  return sh('git', args, { timeoutMs: GIT_TIMEOUT_MS, ...rest, env: hooklessGitEnv(env) })
+}
 export async function gitOut(args, what = `git ${args[0]}`) {
   return must(await git(args), what)
 }
@@ -279,26 +302,31 @@ ${d.review.rationale}
   return text
 }
 // The assessment ledger preserves every finding and its index. A coder's
-// rejection is only a claim; only the independent check can mark it cleared.
-// Ship reads final states, including uncertainty, without reconstructing them
-// from builder prose or matching potentially duplicate titles.
-export function renderReview(dir, items, { rounds = 0, note = null } = {}) {
+// dispute is only a claim; only the independent final review can mark an item
+// cleared. Ship reads final states, including uncertainty and what the review
+// found still unmet, without reconstructing them from builder prose or matching
+// potentially duplicate titles.
+export function renderReview(dir, items, { checked = false, note = null, unmet = [] } = {}) {
   let text = '# Review\n\n'
-  if (rounds) {
-    text += '## Post-fix check\n\n'
-    if (rounds > 1) text += 'A second and final fix round ran over open items; every finding was rechecked against the final tree.\n\n'
+  if (checked) {
+    text += '## Final review\n\n'
     if (note) text += `${note}.\n\n`
-    text += `${items.filter(item => item.cleared && item.verdict?.verdict === 'fixed').length} fixes confirmed; ${items.filter(item => item.cleared && item.verdict?.verdict === 'rejected').length} rejections confirmed; ${items.filter(item => !item.cleared).length} open.\n\n`
+    text += `${items.filter(item => item.cleared && item.verdict?.verdict === 'resolved').length} resolved; ${items.filter(item => item.cleared && item.verdict?.verdict === 'disproved').length} disproved; ${items.filter(item => !item.cleared).length} unresolved.\n\n`
+    if (unmet.length) {
+      text += '### Unmet requirements\n\n'
+      for (const u of unmet) text += `- ${u.requirement} — ${u.evidence}\n`
+      text += '\n'
+    }
   }
   text += '## Findings\n\n'
   if (!items.length) text += 'No review findings.\n'
   items.forEach((item, i) => {
     const { finding: f, assessment, verdict } = item
     const state = item.cleared
-      ? `independently ${verdict.verdict}${verdict.verdict === 'rejected' ? ' — not deferred work' : ''}`
-      : verdict?.verdict === 'defect' && verdict.confidence >= 75
-        ? 'OPEN — independently confirmed defect'
-        : 'OPEN — NOT confirmed; requires independent evidence or a human'
+      ? (verdict.verdict === 'disproved' ? 'disproved — not deferred work' : 'resolved')
+      : verdict?.defect === true && verdict.confidence >= 75
+        ? 'OPEN — unresolved, defect still present'
+        : 'OPEN — unresolved; a human decides'
     text += `### Finding ${i + 1}: ${f.title}
 - severity: ${f.severity}
 - confidence: ${f.confidence}
@@ -307,7 +335,7 @@ export function renderReview(dir, items, { rounds = 0, note = null } = {}) {
 - fix: ${f.fix}
 - gate: ${f.gate}
 - assessment: ${assessment ? `${assessment.action} — ${assessment.reason}` : 'pending'}
-- independent verdict: ${verdict ? `${verdict.verdict} (confidence ${verdict.confidence}) — ${verdict.reasoning}` : 'pending'}
+- final verdict: ${verdict ? `${verdict.verdict} (confidence ${verdict.confidence}) — ${verdict.reasoning}` : 'pending'}
 - state: ${state}
 
 `
