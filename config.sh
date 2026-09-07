@@ -16,9 +16,18 @@ if [[ -z "$HOST" ]]; then
 fi
 
 usage() {
-  echo "Usage: $(basename "$0") [--engine <name>] [--max-concurrent <count>]"
+  local name
+  name="$(basename "$0")"
+  printf '%s\n' \
+    "Usage:" \
+    "  $name" \
+    "  $name --engine <name>" \
+    "  $name --max <count>" \
+    "  $name --engine <name> --max <count>"
 }
 
+show_usage=0
+if [[ $# -eq 0 ]]; then show_usage=1; fi
 requested_engine=""
 requested_max=""
 while [[ $# -gt 0 ]]; do
@@ -28,7 +37,7 @@ while [[ $# -gt 0 ]]; do
       requested_engine="$2"
       shift 2
       ;;
-    --max-concurrent)
+    --max)
       [[ $# -ge 2 ]] || { usage >&2; exit 1; }
       requested_max="$2"
       shift 2
@@ -48,17 +57,21 @@ done
 # the machine-local registry in the VM checkout, never either tracked template.
 cron_file="${DEFAULT_ENGINE_CRON:-/etc/cron.d/harness-dispatch}"
 repos_file="${CONFIG_REPOS_FILE:-$HOST_CONTROL_DIR/etc/repos.conf}"
+remote_engine="${requested_engine:-__UNCHANGED__}"
+remote_max="${requested_max:-__UNCHANGED__}"
 
 ssh "$HOST" bash -s -- \
   "$cron_file" "$repos_file" "$HOST_CONTROL_DIR/etc/engines.json" \
-  "$requested_engine" "$requested_max" <<'REMOTE'
+  "$remote_engine" "$remote_max" <<'REMOTE'
 set -euo pipefail
 
 cron_file="$1"
 repos_file="$2"
 engines_file="$3"
-requested_engine="${4:-}"
-requested_max="${5:-}"
+requested_engine="${4:-__UNCHANGED__}"
+requested_max="${5:-__UNCHANGED__}"
+if [[ "$requested_engine" == "__UNCHANGED__" ]]; then requested_engine=""; fi
+if [[ "$requested_max" == "__UNCHANGED__" ]]; then requested_max=""; fi
 
 if [[ ! -r "$engines_file" ]] || ! jq -e 'type == "object" and length > 0' "$engines_file" >/dev/null 2>&1; then
   echo "engines file is missing or invalid: $engines_file" >&2
@@ -162,3 +175,7 @@ fi
 
 printf 'default: %s\navailable: %s\nmax concurrent runs: %s\n' "$current_engine" "$available" "$current_max"
 REMOTE
+
+if (( show_usage )); then
+  usage
+fi

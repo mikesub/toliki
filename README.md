@@ -126,8 +126,9 @@ run on the host's `EPIC_ENGINE` default, read from the installed copy of
 disagrees with the environment refuses to launch anything rather than guess).
 From the laptop, `./config.sh` prints the VM's installed default, available
 engines, and maximum concurrent runs. Use `--engine <name>` or
-`--max-concurrent <count>` (or both together) to change those host settings;
-for example, `./config.sh --engine codex --max-concurrent 3`. An unlabeled
+`--max <count>` (or both together) to change those host settings; a bare
+`./config.sh` reports both and prints the usage keys. For example,
+`./config.sh --engine codex --max 3`. An unlabeled
 issue consults the engine default only for
 its first claim. Once the claim succeeds, the run snapshots its selection as
 the issue's sole `engine:<name>` label and reads it back before any model starts.

@@ -100,6 +100,11 @@ cat > "$TMP/bin/ssh" <<'STUB'
 #!/usr/bin/env bash
 if [[ "${EXEC_SSH_STDIN:-}" == "1" ]]; then
   shift
+  if [[ "${DROP_EMPTY_SSH_ARGS:-}" == "1" ]]; then
+    args=()
+    for arg in "$@"; do [[ -z "$arg" ]] || args+=("$arg"); done
+    set -- "${args[@]}"
+  fi
   exec "$@"
 fi
 printf '%s\n' "$*" > "$SSH_LOG"
@@ -279,12 +284,17 @@ ENGINE_OUT="$(PATH="$TMP/bin:$PATH" EXEC_SSH_STDIN=1 DEFAULT_ENGINE_CRON="$ENGIN
 assert_contains "the current installed default is shown" "$ENGINE_OUT" "default: codex"
 assert_contains "every configured engine is shown" "$ENGINE_OUT" "available: claude codex codex+claude"
 assert_contains "the current concurrent run limit is shown" "$ENGINE_OUT" "max concurrent runs: 2"
-ENGINE_OUT="$(PATH="$TMP/bin:$PATH" EXEC_SSH_STDIN=1 DEFAULT_ENGINE_CRON="$ENGINE_CRON" CONFIG_REPOS_FILE="$CONFIG_REPOS" bash "$HARNESS/config.sh" --engine claude --max-concurrent 3)"
+assert_contains "a bare report reminds the operator how to select an engine" "$ENGINE_OUT" "config.sh --engine <name>"
+assert_contains "a bare report reminds the operator how to set capacity" "$ENGINE_OUT" "config.sh --max <count>"
+ENGINE_OUT="$(PATH="$TMP/bin:$PATH" EXEC_SSH_STDIN=1 DEFAULT_ENGINE_CRON="$ENGINE_CRON" CONFIG_REPOS_FILE="$CONFIG_REPOS" bash "$HARNESS/config.sh" --engine claude --max 3)"
 assert_eq "the selected engine is written once" "EPIC_ENGINE=claude" "$(grep '^EPIC_ENGINE=' "$ENGINE_CRON")"
 assert_contains "the rest of the cron file is preserved" "$(cat "$ENGINE_CRON")" "bin/merge-tick.sh"
 assert_eq "the selected concurrent run limit is written once" "MAX_PARALLEL_EPICS=3" "$(grep '^MAX_PARALLEL_EPICS=' "$CONFIG_REPOS")"
 assert_contains "an update reports the resulting engine" "$ENGINE_OUT" "default: claude"
 assert_contains "an update reports the resulting concurrent run limit" "$ENGINE_OUT" "max concurrent runs: 3"
+ENGINE_OUT="$(PATH="$TMP/bin:$PATH" EXEC_SSH_STDIN=1 DROP_EMPTY_SSH_ARGS=1 DEFAULT_ENGINE_CRON="$ENGINE_CRON" CONFIG_REPOS_FILE="$CONFIG_REPOS" bash "$HARNESS/config.sh" --max 4)"
+assert_contains "a max-only update survives SSH dropping empty arguments" "$ENGINE_OUT" "max concurrent runs: 4"
+assert_eq "a max-only update does not become an engine choice" "EPIC_ENGINE=claude" "$(grep '^EPIC_ENGINE=' "$ENGINE_CRON")"
 set +e
 ENGINE_OUT="$(PATH="$TMP/bin:$PATH" EXEC_SSH_STDIN=1 DEFAULT_ENGINE_CRON="$ENGINE_CRON" CONFIG_REPOS_FILE="$CONFIG_REPOS" bash "$HARNESS/config.sh" --engine missing 2>&1)"
 ENGINE_RC=$?
@@ -293,13 +303,13 @@ assert_rc "an unknown engine is rejected" 1 "$ENGINE_RC"
 assert_contains "the rejection lists valid choices" "$ENGINE_OUT" "available: claude codex codex+claude"
 assert_eq "a rejected engine leaves the default unchanged" "EPIC_ENGINE=claude" "$(grep '^EPIC_ENGINE=' "$ENGINE_CRON")"
 set +e
-ENGINE_OUT="$(PATH="$TMP/bin:$PATH" EXEC_SSH_STDIN=1 DEFAULT_ENGINE_CRON="$ENGINE_CRON" CONFIG_REPOS_FILE="$CONFIG_REPOS" bash "$HARNESS/config.sh" --max-concurrent 0 2>&1)"
+ENGINE_OUT="$(PATH="$TMP/bin:$PATH" EXEC_SSH_STDIN=1 DEFAULT_ENGINE_CRON="$ENGINE_CRON" CONFIG_REPOS_FILE="$CONFIG_REPOS" bash "$HARNESS/config.sh" --max 0 2>&1)"
 ENGINE_RC=$?
 set -e
 assert_rc "a non-positive concurrent run limit is rejected" 1 "$ENGINE_RC"
 assert_contains "the capacity rejection names the constraint" "$ENGINE_OUT" "max concurrent runs must be a positive integer"
-assert_eq "a rejected capacity leaves the limit unchanged" "MAX_PARALLEL_EPICS=3" "$(grep '^MAX_PARALLEL_EPICS=' "$CONFIG_REPOS")"
-printf 'MAX_PARALLEL_EPICS=4\n' >> "$CONFIG_REPOS"
+assert_eq "a rejected capacity leaves the limit unchanged" "MAX_PARALLEL_EPICS=4" "$(grep '^MAX_PARALLEL_EPICS=' "$CONFIG_REPOS")"
+printf 'MAX_PARALLEL_EPICS=5\n' >> "$CONFIG_REPOS"
 set +e
 ENGINE_OUT="$(PATH="$TMP/bin:$PATH" EXEC_SSH_STDIN=1 DEFAULT_ENGINE_CRON="$ENGINE_CRON" CONFIG_REPOS_FILE="$CONFIG_REPOS" bash "$HARNESS/config.sh" 2>&1)"
 ENGINE_RC=$?

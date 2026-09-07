@@ -56,7 +56,7 @@ NAME_MAX_LEN=40
 # An operator can exceed it for one run at a time with
 # `./remote-control.sh epic|fix|ci|defect N [--engine <e>] --over-capacity`.
 # Nothing else can: dispatch never passes the flag, and no environment variable
-# grants it. From the laptop, `./config.sh --max-concurrent <count>` updates
+# grants it. From the laptop, `./config.sh --max <count>` updates
 # this installed value with validation and readback; `./config.sh` reports it
 # alongside the default and available engines.
 MAX_PARALLEL_EPICS=2
