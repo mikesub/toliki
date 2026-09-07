@@ -150,6 +150,10 @@ issue explicitly with `./remote-control.sh defect N -r <repo>`.
 All explicit `remote-control.sh epic|fix|ci|defect` launches bypass an active
 provider hold as a deliberate operator override. A mixed engine waits if any
 vendor it uses is held; admission never reroutes an issue to a different engine.
+Adding `--over-capacity` to one of those four commands (and only those four)
+starts it even when the host is already at `MAX_PARALLEL_EPICS`; it counts as a
+slot once up, so automatic dispatch stays paused until usage drops back below
+the limit.
 
 On the laptop:
 

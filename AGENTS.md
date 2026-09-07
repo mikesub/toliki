@@ -75,7 +75,9 @@ in the same change.
 - **Claim**: the unique commit prepare pushes to `epic/<N>-<slug>`. The ref is
   the lock; labels are reporting.
 - **Slot**: one running tmux session, whoever started it. `MAX_PARALLEL_EPICS`
-  in `etc/repos.conf` is the budget, enforced only in `bin/launch.sh`.
+  in `etc/repos.conf` is the budget, enforced only in `bin/launch.sh`. Its one
+  bypass is `--over-capacity` on a manual epic/fix/ci/defect launch; the
+  session it admits still counts as a slot afterwards.
 
 Lifecycle labels are owned by automation. Do not add or repurpose one.
 
@@ -199,7 +201,10 @@ than made launchable against a main without the code it describes.
   GitHub refuse rather than land on a result it never earned.
 - Session admission is one critical section in `bin/launch.sh`: the capacity
   count and `tmux new-session` run under a lock, so a manual launch racing a
-  cron tick cannot overrun the cap. Every `has-session` target is `=`-pinned;
+  cron tick cannot overrun the cap. `--over-capacity` is the only way past it —
+  manual pipeline launches only, counted under the same lock, never passed by
+  `bin/dispatch.sh` and never carried on a `--route-issue` segment or a probe.
+  Every `has-session` target is `=`-pinned;
   a bare one matches name prefixes, so epic-26 reads a live epic-263 as itself.
 - GitHub artifacts a retry cannot undo — a filed follow-up, the deferred
   record — are created only after the PR exists, and a record already on the
