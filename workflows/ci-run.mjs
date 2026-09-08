@@ -102,9 +102,7 @@ ${evidenceBlock('requirement-issue', renderIssueRecord(prep.issueRecord), `(issu
 Rules:
 1. Fix the CAUSE. Never weaken, skip, delete or loosen a test, an assertion, a type or a lint rule to make a check pass — that is the failure mode this whole step is watched for, and an adversarial reviewer reads your diff for exactly it afterwards. If a test is genuinely wrong, fix the smallest thing and say so explicitly in your summary.
 2. Stay inside the PR's intent. You are repairing a finished change, not extending it: no refactors, no drive-by improvements, no new features. The smallest diff that makes the checks pass is the right one.
-3. Do NOT commit, amend, push, or touch any label or comment — the pipeline does all of that after it has verified and checked your work. Leave your fix in the working tree.
-4. Do NOT open anything under \`.epics/\`: it carries the builder's framing and would anchor you.
-5. **Decline instead of guessing.** Judge each numbered failed check independently. If a check is not something a code change here can fix — an infrastructure or runner problem, a missing secret or credential, a flaky external dependency, or another cause outside this tree — do not change it and mark that check declined with the reason. Continue repairing the other checks. Never claim that a declined check was repaired.
+3. **Decline instead of guessing.** Judge each numbered failed check independently. If a check is not something a code change here can fix — an infrastructure or runner problem, a missing secret or credential, a flaky external dependency, or another cause outside this tree — do not change it and mark that check declined with the reason. Continue repairing the other checks. Never claim that a declined check was repaired.
 
 Return dispositions with exactly one entry for every numbered failed check: index, action ("repaired" or "declined"), and a non-empty reason. Also return cause, summary, and files (each file touched). No missing, duplicate, or extra indexes.`,
 
@@ -135,7 +133,7 @@ ${evidenceBlock('requirement-issue', renderIssueRecord(prep.issueRecord), `(issu
 
 ${evidenceBlock('change-diff', prep.changeDiff, '(the change under repair could not be captured)')}
 
-Use your read-only tools on the source tree for anything further. Do NOT open anything under \`.epics/\` — it carries a builder's framing and would anchor you.
+Use your read-only tools on the source tree for anything further.
 
 ${acceptanceContract({ itemName: 'failed check', itemCount: dispositions.length, boundary: 'The permitted boundary is the captured failing checks and nothing else.' })}`,
 
@@ -188,8 +186,6 @@ The exact correction delta — only what the correction changed:
 <correction-delta>
 ${correction}
 </correction-delta>
-
-Do NOT open anything under \`.epics/\`.
 
 ${confirmationContract({ blockerCount: blockers.length })}`,
 }

@@ -216,7 +216,6 @@ Rules:
 1. Make the smallest correct change that produces each blocker's stated required outcome. Never weaken, skip, delete or loosen a test, assertion, type, lint rule or security guard.
 2. Change nothing outside the permitted boundary and nothing a blocker did not name. An unrelated edit is itself a refutable defect.
 3. Do NOT commit, amend, push, or touch any label or comment. Leave the correction in the working tree; the orchestrator verifies, confirms and publishes it.
-4. Do NOT open anything under \`.epics/\`.
 
 Return exactly one disposition per blocker id above — no missing, duplicate, extra or unknown ids — each with the exact id, an action, and a non-empty reason. Use "corrected" with the concrete change you made. Use "declined" only when the blocker turns out to need a human decision; a decline ends this run at human review, so never use it to avoid work you could do.`
 }

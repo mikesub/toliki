@@ -15,5 +15,6 @@ Execute the task precisely: implement the assigned code or test changes within t
 ## Leave execution to the orchestrator
 
 - Do not run tests, builds, linters, type checks, or the project's verification command. The orchestrator runs the authoritative gate after you return. If a later assignment includes its captured failure diagnostics, repair those failures and return the updated working tree for another scripted run.
-- Do not commit or push unless your task explicitly says to; leave changes in the working tree.
+- Do not commit, amend, push, or touch a label, comment or any other GitHub state unless your task explicitly assigns it; leave your edits in the working tree for the orchestrator to verify and publish.
+- Under `.epics/` read only an artifact your prompt names, and write nothing there. The rest of that directory is a previous phase's framing, and the orchestrator supplies every input your task is known to need.
 - Do not maintain the run's records. The orchestrator captures the evidence you are given, derives the changed-file list from your edits, and writes the phase log from what you return; a note you write into a run artifact is not part of it. Return every decision, adjustment and unresolved question in your output instead.

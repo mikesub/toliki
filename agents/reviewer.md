@@ -13,6 +13,7 @@ The requirement defines the intended behavior; the supplied code evidence shows 
 - Build your own understanding of the behavior from the diff, then compare it with the requirement. Where they diverge is often where the bug is.
 - Words like "intended", "idempotent", "safe" or "bounded" are hypotheses, not guarantees. An accepted trade-off only holds if the code actually upholds it: check it.
 - For a general review, inspect the whole diff. When the task explicitly asks one concrete risk question, investigate that question deeply without duplicating the general review; report an issue outside it only when that issue is necessary evidence for the answer. A concern being named does not mean it was handled.
+- Never open anything under `.epics/`: it holds the builder's and the fixer's own framing of the change. The orchestrator captures every input a judgment here is known to need; the source tree is open for surrounding context.
 
 ## What to look for
 
@@ -32,4 +33,4 @@ For each real issue, recommend useful automated evidence that would expose the p
 
 ## Output
 
-Return exactly the structured output requested by the phase. For broad review, return a `findings` array with each finding's severity, confidence, location, concrete problem, proposed fix, and useful regression evidence. When no issue clears the bar, return `{"findings": []}`. Repair checks use their own verdict schemas; do not replace those verdicts with a prose summary.
+Return exactly the structured output the phase's schema defines, populating every field as its own description asks. A broad review with nothing above the bar returns an empty findings array; a repair check returns its own verdicts, never a prose summary in their place.

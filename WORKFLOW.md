@@ -656,10 +656,12 @@ manual launch stays available.
    it uses the envelope's pinned original requirement rather than mutable issue
    prose.
 3. The fixer may repair only the numbered, gate-confirmed defects and must
-   account for each as repaired or declined without reclassification. Beside
-   the pinned requirement it receives the orchestrator-captured diff of the
-   reviewed change on the captured head, and so does the acceptance check; the
-   PR change is never a Git command either is told to run.
+   account for each as repaired or declined without reclassification. The
+   pinned requirement is rendered once, above the rest of the envelope rather
+   than pasted both inside and outside it. Beside it the fixer receives the
+   orchestrator-captured diff of the reviewed change on the captured head, and
+   so does the acceptance check; the PR change is never a Git command either is
+   told to run.
 4. The orchestrator validates exact coverage and runs `npm run verify`. A red
    result and its captured diagnostics go back to one fresh fixer before the
    full gate runs again; a second red blocks. It intent-adds new files only

@@ -58,17 +58,20 @@ let blockerPosted = false
 let openCandidate = null
 let finalVerify = null
 
+// The tasker charter holds the role's rules; this schema is the only place the
+// shape of its answer is described, so the charter and the prompts do not
+// restate a field list that would then drift from the gate in resultProblem().
 const TASK_SCHEMA = {
   type: 'object', additionalProperties: false,
   required: ['status', 'title', 'summary', 'commitBody', 'tests', 'selfReview', 'unresolved'],
   properties: {
-    status: { enum: ['completed', 'blocked'] },
-    title: { type: 'string', description: 'imperative PR and commit title, at most 72 characters when completed' },
-    summary: { type: 'string', description: 'concise delivery summary' },
-    commitBody: { type: 'string', description: 'non-empty rationale for the durable commit when completed' },
-    tests: { type: 'string', description: 'tests changed, or why no test change was meaningful' },
-    selfReview: { type: 'string', description: 'builder self-review evidence' },
-    unresolved: { type: 'array', items: { type: 'string' } },
+    status: { enum: ['completed', 'blocked'], description: 'completed only when the implementation and the builder self-review are both finished and nothing is unresolved' },
+    title: { type: 'string', description: 'for completed work: the imperative one-line PR and commit title, at most 72 characters' },
+    summary: { type: 'string', description: 'concise delivery summary of what changed and the approach used' },
+    commitBody: { type: 'string', description: 'for completed work: a non-empty rationale for the durable commit — why the change was made and any significant implementation choice or trade-off, never a verification transcript' },
+    tests: { type: 'string', description: 'tests added or updated, or why no test change was meaningful' },
+    selfReview: { type: 'string', description: 'what the builder self-review inspected and any defect it corrected' },
+    unresolved: { type: 'array', items: { type: 'string' }, description: 'empty for completed work; for blocked work, the concrete unresolved conditions' },
   },
 }
 
@@ -81,7 +84,7 @@ Requirement:
 ${prep.requirementBody}
 """
 
-This is the initial writable task process. Follow the tasker charter: inspect the real codebase, implement the complete settled requirement, add meaningful tests and documentation, and perform builder self-review. Do not run verification or perform Git/GitHub transport. Return the required structured task result.`
+This is the initial writable task process, not the verification-driven repair. Implement the complete requirement and self-review it under your charter, then return the structured task result.`
 
 const verifyRepairPrompt = (prep, verified) => `Repair issue #${issue} in the existing lightweight-task worktree after the orchestrator's project verification failed.
 
@@ -99,7 +102,7 @@ Captured failure diagnostics from the exact orchestrator-run verification comman
 ${verified.tail || verified.detail}
 """
 
-This is the one verification-driven repair process. Inspect the existing changes and fix the reported verification failure without weakening, skipping, deleting or loosening a test, assertion, type, lint rule, check or safety guard, and without expanding beyond the original requirement. Inspect for directly related concrete defects and perform builder self-review. Do not run tests or verification yourself, and do not perform Git/GitHub transport. Leave the updated working tree for one final orchestrator verification and return the normal structured task result.`
+This is the one verification-driven repair process. Fix the reported failure without weakening, skipping, deleting or loosening a test, assertion, type, lint rule, check or safety guard, and without expanding beyond the original requirement. Leave the updated working tree for one final orchestrator verification and return the normal structured task result.`
 
 const nonblank = value => typeof value === 'string' && value.trim().length > 0
 

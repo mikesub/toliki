@@ -645,6 +645,14 @@ merely because the code is ready.
 - No npm dependencies.
 - Structured agent output has an explicit schema and a bounded retry or blocker
   path.
+- Runtime instructions live in exactly one layer. A role's standing rules belong
+  in its `agents/*.md` charter, which every phase of that role receives; the
+  shape of an answer belongs in the phase's schema, field by field; a prompt
+  carries only that step's task and the orchestrator's captured evidence.
+  Restating one layer inside another is how the three drift into contradicting
+  each other — which is what happened to the `.epics/` boundary, now stated once
+  per charter. Evidence is rendered once per prompt too: a requirement that also
+  travels inside a captured envelope is printed beside it, not twice.
 - Keep signal forwarding and process-group cleanup intact.
 - Idempotent operations and `--force-with-lease` over unguarded writes.
 - Machine-local values live in `etc/repos.conf`, never in tracked files.
