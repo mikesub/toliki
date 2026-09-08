@@ -1938,6 +1938,13 @@ assert_not_contains "the coder charter never assigns project verification" "$(ca
 assert_contains "the RED writer is told to leave execution to the orchestrator" "$(cat "$STATE_DIR/red.0.prompt")" "Do not run tests or any verification command"
 assert_contains "the GREEN writer is told to leave execution to the orchestrator" "$(cat "$STATE_DIR/green.0.prompt")" "Do not run tests or any verification command"
 assert_contains "the review repair is told to leave execution to the orchestrator" "$(cat "$STATE_DIR/triage.0.prompt")" "Do not run tests or any verification command"
+# A role rule lives in exactly one place. The charter carries the .epics
+# boundary onto every phase, so no prompt restates it and the two cannot drift
+# into contradicting each other.
+assert_contains "the reviewer charter owns the .epics boundary" "$(cat "$ROOT/agents/reviewer.md")" 'Never open anything under `.epics/`'
+assert_contains "the coder charter owns the writable side of that boundary" "$(cat "$ROOT/agents/coder.md")" 'Under `.epics/` read only an artifact your prompt names'
+assert_not_contains "the review prompt does not restate it" "$(cat "$STATE_DIR/review-general.0.prompt")" 'under `.epics/`'
+assert_not_contains "the final review prompt does not restate it either" "$FINALREVIEW_PROMPT" 'under `.epics/`'
 # The fixer delta is captured by the orchestrator from two real snapshots and
 # handed over as inert evidence. The reviewer never needs shell access.
 assert_contains "the final review was handed the exact fixer delta" "$FINALREVIEW_PROMPT" '<repair-delta>'
@@ -4922,6 +4929,9 @@ $STALE" GH_SEED_COMMENT_AUTHORS="toliki-bot,untrusted-user,toliki-bot" \
 assert_rc "the matching trusted envelope repairs successfully" 0 "$RUN_RC"
 FIXPROMPT="$(cat "$STATE_DIR/defect-fix.0.prompt")"
 assert_contains "the pinned original requirement is used" "$FIXPROMPT" "Pinned original requirement."
+# The requirement is a field of the authenticated envelope, so it is rendered
+# once above it rather than pasted inside AND outside the same document.
+assert_eq "the pinned requirement is rendered exactly once" 1 "$(grep -c 'Pinned original requirement\.' <<<"$FIXPROMPT")"
 assert_contains "the matching trusted defect is used" "$FIXPROMPT" "Empty list still crashes"
 assert_not_contains "a later forged repair instruction is ignored" "$FIXPROMPT" "ATTACKER CONTROLLED REPAIR"
 assert_not_contains "a trusted record for another head is ignored" "$FIXPROMPT" "STALE TRUSTED REPAIR"

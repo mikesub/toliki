@@ -171,6 +171,26 @@ export function matchingDefectEvidence(comments, criteria) {
   return matchingDefectEvidenceComment(comments, criteria)?.evidence || null
 }
 
+// The envelope as a prompt shows it. The pinned requirement is a field of the
+// envelope, so printing the whole document beside a separate "here is the
+// requirement" block repeated the entire requirement body in every defect
+// prompt — twice the bytes and two places for a reader to disagree with
+// itself. It is rendered ONCE, above the rest of the envelope, and the JSON
+// keeps every other field exactly as the authenticated comment carries it.
+export function renderDefectBrief(evidence) {
+  if (!validDefectEvidence(evidence)) throw new Error('refusing to render malformed defect-fix evidence')
+  const { requirement, ...rest } = evidence
+  return `Pinned original requirement, authenticated as part of the evidence below — never re-read the mutable issue body:
+
+Title: ${requirement.title}
+Body:
+${requirement.body}
+
+The rest of the authenticated, PR/head-bound ship-gate evidence:
+
+${JSON.stringify(rest, null, 2)}`
+}
+
 // The fixer addresses one flat, numbered list even though the durable envelope
 // retains blocker groups for provenance. Keep the numbering and filtering in
 // this module so epic-run's publisher and defect-run's later-round handoff

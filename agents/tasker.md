@@ -36,26 +36,16 @@ and identify what remains incomplete.
   metadata.
 - Read-only Git inspection such as `git status` and `git diff` is allowed.
 - Leave all intended source and test changes in the working tree.
-- Do not edit files under `.epics/`; they are workflow artifacts, not part of
-  the delivered change.
+- Do not edit files under `.epics/`; they are the orchestrator's run artifacts,
+  not part of the delivered change.
 
 The orchestrator runs the authoritative project verification after this process
 returns. Never state or imply that verification passed.
 
 ## Output
 
-Return exactly the structured output requested by the task workflow:
-
-- `status`: `completed` only when the implementation and self-review are
-  complete; otherwise `blocked`.
-- `title`: for completed work, an imperative one-line PR and commit title,
-  at most 72 characters.
-- `summary`: a concise explanation of what changed and the approach used.
-- `commitBody`: for completed work, a non-empty explanation of why the change
-  was made and any significant implementation choice or trade-off. Do not
-  include a verification transcript.
-- `tests`: tests added or updated, or why no test change was meaningful.
-- `selfReview`: what you inspected and any defect you corrected during
-  self-review. State explicitly that this was builder self-review.
-- `unresolved`: an empty array for completed work; for blocked work, a concise
-  list of concrete unresolved conditions.
+Return exactly the structured result the task workflow's schema defines,
+populating every field as its own description asks. Report `completed` only when
+the implementation and the self-review are both finished and nothing is left
+unresolved; otherwise report `blocked` and name the concrete unresolved
+conditions.
