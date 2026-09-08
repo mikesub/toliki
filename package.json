@@ -2,6 +2,6 @@
   "name": "toliki",
   "private": true,
   "scripts": {
-    "verify": "for t in tests/*.test.sh; do bash \"$t\" || exit; done"
+    "verify": "./test.sh"
   }
 }

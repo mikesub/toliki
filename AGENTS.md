@@ -591,10 +591,11 @@ merely because the code is ready.
 
 ## Tests
 
-All twelve suites are hermetic and need no network or credentials:
+All thirteen suites are hermetic and need no network or credentials. The test
+runner suppresses passing assertion chatter and prints one line per green suite:
 
 ```bash
-for t in tests/*.test.sh; do bash "$t" || exit; done
+./test.sh
 ```
 
 Stub host-facing binaries with fake executables placed first on `PATH` and use
