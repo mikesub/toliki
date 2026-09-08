@@ -456,14 +456,17 @@ fi
 
 if [[ -n "$MODE" ]]; then
   # The pipeline. --session is both the log prefix and the marker
-  # bin/resource-log.sh counts epics by, so it is not decoration.
+  # bin/resource-log.sh counts epics by, so it is not decoration. --repo is the
+  # registry key validated above: usage telemetry records which repository an
+  # issue number belongs to, and the session name is not a structure to mine
+  # that out of — the same number in two repos is two different issues.
   case "$MODE" in
     epic) SCRIPT="$HERE/../workflows/epic-run.mjs" ;;
     fix)  SCRIPT="$HERE/../workflows/fix-run.mjs" ;;
     ci)   SCRIPT="$HERE/../workflows/ci-run.mjs" ;;
     defect) SCRIPT="$HERE/../workflows/defect-run.mjs" ;;
   esac
-  LINE="TZ=$(sq "$HOST_TIMEZONE") HOST_TIMEZONE=$(sq "$HOST_TIMEZONE") node $(sq "$SCRIPT") --issue $ISSUE --session $(sq "$SESSION") --engine $(sq "$ENGINE")"
+  LINE="TZ=$(sq "$HOST_TIMEZONE") HOST_TIMEZONE=$(sq "$HOST_TIMEZONE") node $(sq "$SCRIPT") --issue $ISSUE --session $(sq "$SESSION") --engine $(sq "$ENGINE") --repo $(sq "$REPO")"
 else
   # An interactive session. The name is threaded through --remote-control and
   # --worktree so it's identifiable in the Desktop app and reusable across

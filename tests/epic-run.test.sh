@@ -928,6 +928,7 @@ run_pipeline() { # script fixtures-dir args...   (scenario knobs via GH_* env)
   NPM_LOG="$TMP/npm.$PIPE_N"
   mkdir -p "$state/gh" "$state/tmp"
   [[ "${HOLD_FILE_AS_DIRECTORY:-}" != "1" ]] || mkdir "$state/provider-hold.json"
+  [[ "${USAGE_LOG_AS_DIRECTORY:-}" != "1" ]] || mkdir "$state/usage.jsonl"
   if [[ -n "${SEED_HOLD_RECORD:-}" && "${HOLD_FILE_AS_DIRECTORY:-}" != "1" ]]; then
     printf '%s\n' "$SEED_HOLD_RECORD" > "$state/provider-hold.json"
   fi
@@ -1542,13 +1543,29 @@ assert_not_contains "the fixer is not forced into class-wide hardening" "$(cat "
 assert_contains "follow-up filing treats the cap as a ceiling" "$(cat "$STATE_DIR/ship.0.prompt")" "a ceiling, never a target"
 assert_contains "follow-ups retain dependency-first queueing" "$(cat "$STATE_DIR/ship.0.prompt")" 'records the dependency on this issue, and then queues the follow-up with `ready`'
 assert_contains "review.md carries the final-review section" "$(cat "$WT/.epics/42-add-widget/review.md")" "## Final review"
-# The usage log: one line per spawn, keyed by the engines.json step, never on GitHub.
-assert_eq "one usage record per spawn" 7 "$(usage_log | wc -l | tr -d ' ')"
-assert_eq "records name the engines.json steps" "architect:1 code:2 final-review:1 fixes-after-review:1 review:1 ship:1" "$(usage_log | jq -r .step | sort | uniq -c | awk '{print $2":"$1}' | tr '\n' ' ' | sed 's/ $//')"
+# The usage log: one line per spawn keyed by the engines.json step, plus the two
+# lifecycle lines that bound the whole invocation. Never on GitHub.
+assert_eq "one usage record per spawn" 7 "$(usage_log | jq -r 'select(.type=="spawn") | .runId' | wc -l | tr -d ' ')"
+assert_eq "records name the engines.json steps" "architect:1 code:2 final-review:1 fixes-after-review:1 review:1 ship:1" "$(usage_log | jq -r 'select(.type=="spawn") | .step' | sort | uniq -c | awk '{print $2":"$1}' | tr '\n' ' ' | sed 's/ $//')"
 assert_eq "tokens are what the CLI reported, all four kinds summed" "1600" "$(usage_log | jq -r 'select(.label=="architect:design") | .tokens.total')"
 assert_eq "cost and turns ride along" "0.05 3" "$(usage_log | jq -r 'select(.label=="architect:design") | "\(.costUsd) \(.turns)"')"
-assert_eq "every record carries the run, issue and engine" "7" "$(usage_log | jq -r 'select(.issue==42 and .engine=="claude" and (.runId|length)>0) | .step' | wc -l | tr -d ' ')"
-assert_eq "every usage timestamp stays canonical UTC ISO" "7" "$(usage_log | jq -r 'select(.ts | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$")) | .ts' | wc -l | tr -d ' ')"
+assert_eq "every spawn record carries the run, issue and engine" "7" "$(usage_log | jq -r 'select(.type=="spawn" and .issue==42 and .engine=="claude" and (.runId|length)>0) | .step' | wc -l | tr -d ' ')"
+assert_eq "every usage timestamp stays canonical UTC ISO" "9" "$(usage_log | jq -r 'select(.ts | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$")) | .ts' | wc -l | tr -d ' ')"
+# The invocation's own lifecycle: one start before the work, one finish after the
+# RESULT line, so an operator can read what a run cost in wall time and how it
+# ended without reconstructing either from prose later.
+assert_eq "the run brackets itself with exactly one start and one finish" "1 1" \
+  "$(usage_log | jq -s '[.[] | select(.type=="run-start")] | length') $(usage_log | jq -s '[.[] | select(.type=="run-finish")] | length')"
+assert_eq "every record of the run shares its runId" 1 "$(usage_log | jq -r .runId | sort -u | wc -l | tr -d ' ')"
+assert_eq "the start names the script, engine and issue it was launched for" "epic-run claude 42" \
+  "$(usage_log | jq -r 'select(.type=="run-start") | "\(.script) \(.engine) \(.issue)"')"
+assert_eq "the finish records the verdict the pipeline itself confirmed" "merge-queued false 0" \
+  "$(usage_log | jq -r 'select(.type=="run-finish") | "\(.outcome) \(.handoff) \(.exit)"')"
+assert_eq "the finish measures wall-clock time from the start it names" "true" \
+  "$(usage_log | jq -r 'select(.type=="run-finish") | ((.ms|type) == "number" and (.startedAt|type) == "string")')"
+assert_eq "a hand-run with no --repo records no repository rather than guessing one" "null" \
+  "$(usage_log | jq -r 'select(.type=="run-start") | .repo')"
+assert_contains "RESULT carries the pipeline's own outcome classification" "$RUN_OUT" '"outcome":"merge-queued"'
 assert_not_contains "no usage went to GitHub" "$(cat "$GH_LOG")" "tokens"
 REPORT="$(node "$ROOT/workflows/usage-report.mjs" --log "$STATE_DIR/usage.jsonl")"
 assert_contains "the report groups by script" "$REPORT" "epic-run — 1 run(s): claude 1"
@@ -1656,6 +1673,25 @@ for ship_content_case in empty-body whitespace-body empty-commit-body whitespace
   assert_not_contains "$ship_content_case never pushes the squashed candidate" \
     "$(git -C "$ORIGIN" log -1 --format=%B epic/42-add-widget 2>/dev/null || true)" "Closes #42"
 done
+
+# launch.sh hands every pipeline the registered repository key, because the same
+# issue number in two repositories is two different issues.
+scenario 'epic-run: the registered repository is recorded on every telemetry row'
+run_pipeline "$EPIC_RUN" "$BASE" --issue 42 --repo myapp
+assert_rc "a run launched with its registry key exits 0" 0 "$RUN_RC"
+assert_eq "the lifecycle start is attributed to the repository" "myapp" "$(usage_log | jq -r 'select(.type=="run-start") | .repo')"
+assert_eq "so is the finish that closes it" "myapp" "$(usage_log | jq -r 'select(.type=="run-finish") | .repo')"
+assert_eq "and every spawn it paid for" "myapp" "$(usage_log | jq -r 'select(.type=="spawn") | .repo' | sort -u)"
+assert_contains "and the run itself is unchanged by knowing it" "$RUN_OUT" '"readyToMerge":true'
+
+# Telemetry is analysis, not state: a log the run cannot append to is a gap in
+# the data and nothing else.
+scenario 'epic-run: telemetry that cannot be written never changes the verdict'
+USAGE_LOG_AS_DIRECTORY=1 run_pipeline "$EPIC_RUN" "$BASE" --issue 42
+assert_rc "an unwritable usage log still exits 0" 0 "$RUN_RC"
+assert_contains "the run still ships" "$RUN_OUT" '"readyToMerge":true'
+assert_contains "and still reports the outcome it reached" "$RUN_OUT" '"outcome":"merge-queued"'
+assert_eq "the issue still ends ready-to-merge" "ready-to-merge," "$(gh_labels)"
 
 scenario 'epic-run: an errored delivery-summary write observed on readback is not repeated'
 GH_DELIVERY_COMMENT_ERROR_AFTER_WRITE=1 run_pipeline "$EPIC_RUN" "$BASE" --issue 42
@@ -1801,6 +1837,7 @@ jq 'del(.claude.review)' "$ROOT/etc/engines.json" > "$TMP/engines-broken.json"
 EPIC_ENGINES_FILE="$TMP/engines-broken.json" run_pipeline "$EPIC_RUN" "$BASE" --issue 42
 assert_rc "exits 1" 1 "$RUN_RC"
 assert_contains "and names the hole" "$RUN_OUT" "has no entry for step 'review'"
+assert_eq "a refused engine table records no run at all" "" "$(usage_log)"
 assert_eq "no agent process was spawned" 0 "$(wc -l < "$RUN_LOG" | tr -d ' ')"
 assert_eq "no GitHub call was made" 0 "$(wc -l < "$GH_LOG" | tr -d ' ')"
 assert_eq "no branch was claimed" "" "$(origin_ref epic/42-add-widget)"
@@ -1809,6 +1846,13 @@ scenario 'epic-run: a closed issue is skipped before any side effect'
 GH_ISSUE_STATE=CLOSED run_pipeline "$EPIC_RUN" "$BASE" --issue 42
 assert_rc "exits 2 (skipped)" 2 "$RUN_RC"
 assert_contains "the reason names the state" "$RUN_OUT" 'issue #42 is closed'
+assert_contains "RESULT classifies the refusal" "$RUN_OUT" '"outcome":"skipped"'
+# A run that never woke a model is still a run: it occupied a session and it
+# ended somewhere, so it is recorded like any other.
+assert_eq "a zero-spawn run still records its start and finish" "1 1 0" \
+  "$(usage_log | jq -s '[.[] | select(.type=="run-start")] | length') $(usage_log | jq -s '[.[] | select(.type=="run-finish")] | length') $(usage_log | jq -s '[.[] | select(.type=="spawn")] | length')"
+assert_eq "and the finish agrees it handed nothing to a human" "skipped false" \
+  "$(usage_log | jq -r 'select(.type=="run-finish") | "\(.outcome) \(.handoff)"')"
 assert_eq "no branch was claimed" "" "$(origin_ref epic/42-add-widget)"
 assert_eq "nothing was designed" 0 "$(calls design)"
 assert_eq "a closed pre-claim refusal writes no engine label" "" "$(engine_label_writes)"
@@ -1961,6 +2005,9 @@ run_pipeline "$EPIC_RUN" "$DEADLENS" --issue 42
 assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
 assert_contains "the blocker names the review phase" "$RUN_OUT" '"phase":"review"'
 assert_contains "the reason names the missing reviewer" "$RUN_OUT" 'review:general'
+assert_contains "RESULT classifies a blocked run as a human handoff" "$RUN_OUT" '"outcome":"human-blocked"'
+assert_eq "and the lifecycle finish says so with its exit code" "human-blocked true 3" \
+  "$(usage_log | jq -r 'select(.type=="run-finish") | "\(.outcome) \(.handoff) \(.exit)"')"
 assert_eq "the reviewer was respawned exactly once" 2 "$(calls review-general)"
 assert_contains "the respawn was announced as transient" "$RUN_OUT" "respawning once (transient)"
 assert_contains "a blocker comment was posted" "$(gh_comments)" "🤖 epic-run blocked"
@@ -2062,6 +2109,9 @@ assert_not_contains "it is not queued for merge" "$RUN_OUT" '"readyToMerge":true
 assert_eq "the concrete batch earned exactly one correction and no confirmation" "1 0" "$(calls correction) $(calls narrowconfirm)"
 assert_contains "RESULT records the human-held correction outcome" "$RUN_OUT" '"correction"'
 assert_contains "and says a declined blocker ends the run" "$RUN_OUT" 'declined blocker id(s) blocker-1'
+assert_contains "RESULT classifies the correction handoff explicitly" "$RUN_OUT" '"outcome":"human-review"'
+assert_eq "the recorded lifecycle agrees the held correction is a handoff" "human-review true" \
+  "$(usage_log | jq -r 'select(.type=="run-finish") | "\(.outcome) \(.handoff)"')"
 assert_eq "the issue rests reviewable with no repair queue behind it" "ready-to-review," "$(gh_labels)"
 assert_not_contains "no defect-fixer handoff is created for a corrected-once blocker" "$(gh_comments)" "🤖 defect-fix evidence"
 assert_eq "a deliberate deferral still reaches the final review" 1 "$(calls finalreview)"
@@ -2563,6 +2613,9 @@ assert_rc "a hold is a successful run outcome" 0 "$RUN_RC"
 assert_eq "the rejected step is tried exactly once" 1 "$(calls red)"
 assert_eq "implementation never starts" 0 "$(calls green)"
 assert_contains "RESULT names the hold" "$RUN_OUT" '"held":true'
+assert_contains "RESULT classifies waiting on the provider as automatic" "$RUN_OUT" '"outcome":"quota-held"'
+assert_eq "a quota hold is never counted as a human handoff" "quota-held false" \
+  "$(usage_log | jq -r 'select(.type=="run-finish") | "\(.outcome) \(.handoff)"')"
 assert_contains "RESULT names the issue and failed phase" "$RUN_OUT" '"issue":42'
 assert_contains "RESULT names the failed phase" "$RUN_OUT" '"phase":"code"'
 assert_contains "RESULT names the provider vendor" "$RUN_OUT" '"vendor":"claude"'
@@ -2716,6 +2769,9 @@ assert_rc "exits 0 (the PR is real, just held)" 0 "$RUN_RC"
 assert_contains "the held reason names the unresolved finding" "$RUN_OUT" 'Null deref on empty list'
 assert_not_contains "it is not queued for merge" "$RUN_OUT" '"readyToMerge":true'
 assert_not_contains "an unresolved finding is never a defect the fixer may repair" "$RUN_OUT" '"needsDefectFix":true'
+assert_contains "RESULT classifies the hold as a human handoff" "$RUN_OUT" '"outcome":"human-review"'
+assert_eq "and the lifecycle records the handoff" "human-review true" \
+  "$(usage_log | jq -r 'select(.type=="run-finish") | "\(.outcome) \(.handoff)"')"
 assert_eq "the issue rests at ready-to-review for a human" "ready-to-review," "$(gh_labels)"
 assert_not_contains "and no repair envelope is posted" "$(gh_comments)" "🤖 defect-fix evidence"
 assert_eq "one fixer and one final review is the whole budget" "1 1" "$(calls triage) $(calls finalreview)"
@@ -3369,6 +3425,9 @@ assert_contains "the partial conflict audit names the declined hunk" "$(gh_comme
 assert_contains "the partial conflict audit names the declined hunk and reason" "$(gh_comments)" "the two sides require mutually exclusive c values"
 assert_contains "the partial conflict audit says the branch carries the repairs" "$(gh_comments)" "branch now carries"
 assert_contains "the partial conflict live status is held for review" "$(cat "$GH_LOG")" "held for review"
+assert_contains "RESULT classifies a partial landing as a human handoff" "$RUN_OUT" '"outcome":"human-review"'
+assert_eq "and never as an unspent repair queue" "human-review true" \
+  "$(usage_log | jq -r 'select(.type=="run-finish") | "\(.outcome) \(.handoff)"')"
 assert_contains "the partial conflict live status names the decline" "$(cat "$GH_LOG")" "the two sides require mutually exclusive c values"
 
 scenario 'fix-run: a retained queue cannot redispatch and promote a durable partial conflict head'
@@ -3543,6 +3602,7 @@ EXPECT_HOLD_BEFORE_LABEL=failed run_fix "$FIXQUOTA" --issue 42 --session myapp-e
 assert_rc "the conflict-fixer hold exits successfully" 0 "$RUN_RC"
 assert_held_contract "conflict-fixer hold"
 assert_contains "RESULT retains attempt one" "$RUN_OUT" '"attempt":1'
+assert_contains "RESULT classifies the conflict-fixer hold as automatic waiting" "$RUN_OUT" '"outcome":"quota-held"'
 assert_eq "RESULT names the resolve phase" "resolve" "$(result_json | jq -r '.phase // empty' 2>/dev/null)"
 assert_eq "the quota-hit resolver is not respawned" 1 "$(calls fix-resolve)"
 assert_eq "the issue returns to the conflict queue with no rung spent" "failed,needs-judgment," "$(gh_labels)"
@@ -3581,6 +3641,11 @@ assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
 assert_eq "the worktree is not left mid-rebase" "" "$(cd "$WT" && ls -d .git/rebase-merge .git/rebase-apply 2>/dev/null)"
 assert_contains "the blocker block names the next step" "$(gh_comments)" "- next: This was the first attempt"
 assert_eq "labels: failed, ladder and needs-judgment kept" "failed,fix-attempted,needs-judgment," "$(gh_labels)"
+# The conflict queue is still on the issue and a rung is left, so the next
+# dispatch owns this — a first fixer failure is not a human handoff.
+assert_contains "RESULT classifies the retained queue as automation-owned" "$RUN_OUT" '"outcome":"repair-queued"'
+assert_eq "the lifecycle records an attempt that is not a handoff" "repair-queued false 1" \
+  "$(usage_log | jq -r 'select(.type=="run-finish") | "\(.outcome) \(.handoff) \(.attempt)"')"
 
 scenario 'fix-run: the retry that fails hands the issue to a human'
 seed_conflict
@@ -3589,6 +3654,9 @@ assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
 assert_contains "RESULT records attempt 2" "$RUN_OUT" '"attempt":2'
 assert_contains "the blocker block says the ladder is spent" "$(gh_comments)" "- next: This was the RETRY"
 assert_contains "fix-retried was recorded" "$(gh_labels)" "fix-retried,"
+assert_contains "RESULT classifies the spent ladder as a human handoff" "$RUN_OUT" '"outcome":"human-blocked"'
+assert_eq "the lifecycle records the handoff on the second attempt" "human-blocked true 2" \
+  "$(usage_log | jq -r 'select(.type=="run-finish") | "\(.outcome) \(.handoff) \(.attempt)"')"
 
 scenario 'fix-run: a red verify blocks — the fixer never fixes code'
 seed_conflict
@@ -5327,6 +5395,12 @@ run_fix "$FIXBASE" --issue 42 --session myapp-epic-42
 GH="$(cat "$GH_LOG")"
 assert_contains "the comment names fix-run" "$GH" "fix-run"
 assert_not_contains "and never claims to be epic-run" "$GH" "**epic-run**"
+# The session carries the repo in its name; telemetry must not mine it out of
+# there, because a repository key is given to the pipeline or it is unknown.
+assert_eq "a session name is never split into a repository identity" "null" \
+  "$(usage_log | jq -r 'select(.type=="run-start") | .repo')"
+assert_eq "the start still records the session it ran in" "myapp-epic-42" \
+  "$(usage_log | jq -r 'select(.type=="run-start") | .session')"
 
 exec 2>&3 3>&-
 assert_eq "suite stderr stays clean" "" "$(cat "$SUITE_STDERR")"

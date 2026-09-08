@@ -1,24 +1,48 @@
 #!/usr/bin/env node
-// Per-step token and time report from the usage log lib/usage.mjs writes:
-// which steps of an average run cost what, so etc/engines.json can be tuned
-// from data. Read-only; runs wherever the log is (the host, via
-// `./remote-control.sh usage`, or a laptop that ran /epic).
+// Two read-only views over the usage log lib/usage.mjs writes. Runs wherever
+// the log is (the host, via `./remote-control.sh usage`, or a laptop that ran
+// /epic), reads that one file and nothing else — no GitHub, no network.
 //
-// Usage: usage-report.mjs [--log <file>] [--since <N>d] [--engine <name>] [--script epic-run|fix-run]
+// Usage: usage-report.mjs [--log <file>] [--since <N>d] [--engine <name>] [--script epic-run|fix-run|ci-run|defect-run]
 //
-// "tokens" is everything the model processed (input + output + cache reads +
-// cache writes); "out" is output tokens alone. Percentages are a step's share
-// of the tokens of all runs of that script, which equals its share of the
-// average run. Spawns the CLI reported no usage for count as zero and are
-// listed, so a gap in the data never passes as a cheap step.
+// 1. The per-step tuning view: which steps of an average run cost what, so
+//    etc/engines.json can be tuned from data. "tokens" is everything the model
+//    processed (input + output + cache reads + cache writes); "out" is output
+//    tokens alone. Percentages are a step's share of the tokens of all runs of
+//    that script, which equals its share of the average run. Its time column is
+//    model-active — summed spawn duration — because two steps running in
+//    parallel spend two minutes of it per minute of the run. Its --since,
+//    --engine and --script filters select individual records.
+//
+// 2. The issue-lifetime view: every recorded epic, conflict-fixer, CI-fixer and
+//    defect-fixer invocation for one (repository, issue) pair, across runIds and
+//    engines. Log-known by construction — rotation, deletion or a failed append
+//    make it partial, and it says so rather than claiming a completeness it
+//    cannot prove. Its --since selects a LIFETIME by its latest activity and
+//    then totals every retained record of it, so a recent fixer does not
+//    truncate the epic it repairs; --engine and --script select a lifetime by
+//    its latest completed run and likewise keep its whole totals.
+//
+// A row's `result` is what the pipeline recorded about itself at the end of the
+// invocation — not whether a PR later merged, an issue later closed or a human
+// later changed a label. Nothing here re-derives it from prose or result shape.
+//
+// Spawns the CLI reported no usage for count as zero and are listed, so a gap in
+// the data never passes as a cheap step; a model with no row in lib/prices.mjs
+// is named as missing money rather than as free.
 
 import { readFileSync } from 'node:fs'
-import { USAGE_LOG } from './lib/usage.mjs'
+import { OUTCOMES, USAGE_LOG } from './lib/usage.mjs'
+import { humanTimestamp } from './lib/time.mjs'
+
+const SCRIPTS = ['epic-run', 'fix-run', 'ci-run', 'defect-run']
+const FIXER_SCRIPTS = ['fix-run', 'ci-run', 'defect-run']
+const USAGE = `Usage: usage-report.mjs [--log <file>] [--since <N>d] [--engine <name>] [--script ${SCRIPTS.join('|')}]`
 
 const args = process.argv.slice(2)
 const opt = (name, fallback) => { const i = args.indexOf(name); return i >= 0 && args[i + 1] !== undefined ? args[i + 1] : fallback }
 if (args.includes('-h') || args.includes('--help')) {
-  console.log('Usage: usage-report.mjs [--log <file>] [--since <N>d] [--engine <name>] [--script epic-run|fix-run]')
+  console.log(USAGE)
   process.exit(0)
 }
 const file = opt('--log', USAGE_LOG)
@@ -40,27 +64,82 @@ if (since) {
   cutoff = Date.now() - Number(m[1]) * (m[2] === 'h' ? 3600e3 : 86400e3)
 }
 
-const records = []
-for (const line of raw.split('\n')) {
-  if (!line.trim()) continue
+// ───────────────────────── parsing ─────────────────────────
+// One pass, every line classified. A JSON-invalid FINAL line is the one thing
+// dropped in silence: an appender can be caught mid-write, and that half-line is
+// not lost history. Everything else that does not parse — or that carries a type
+// this version does not know — is counted and reported, because silently
+// omitting historical records is how a report starts lying about its totals.
+// A row with no `type` predates lifecycle records and is read as a spawn.
+const spawns = []
+const starts = []
+const finishes = []
+let malformed = 0
+const lines = raw.split('\n')
+let finalLine = -1
+for (let i = lines.length - 1; i >= 0; i--) { if (lines[i].trim()) { finalLine = i; break } }
+for (let i = 0; i < lines.length; i++) {
+  if (!lines[i].trim()) continue
+  let record
   try {
-    const r = JSON.parse(line)
-    if (cutoff && Date.parse(r.ts) < cutoff) continue
-    if (engineFilter && r.engine !== engineFilter) continue
-    if (scriptFilter && r.script !== scriptFilter) continue
-    records.push(r)
-  } catch { /* a torn line from a concurrent append; skip it */ }
+    record = JSON.parse(lines[i])
+  } catch {
+    if (i !== finalLine) malformed++
+    continue
+  }
+  if (!record || typeof record !== 'object' || Array.isArray(record)) { malformed++; continue }
+  if (record.type === undefined) spawns.push({ ...record, type: 'spawn', legacy: true })
+  else if (record.type === 'spawn') spawns.push(record)
+  else if (record.type === 'run-start') starts.push(record)
+  else if (record.type === 'run-finish') finishes.push(record)
+  else malformed++
 }
+const records = [...spawns, ...starts, ...finishes]
 if (!records.length) {
   console.log(`no usage records in ${file}${since ? ` since ${since}` : ''}${engineFilter ? ` for engine ${engineFilter}` : ''}`)
+  if (malformed) console.log(`malformed records skipped: ${malformed}`)
   process.exit(0)
 }
 
+// ───────────────────────── formatting ─────────────────────────
 const fmt = (n, d = 0) => (n === null || n === undefined || Number.isNaN(n)) ? '-' : Number(n).toLocaleString('en-US', { maximumFractionDigits: d, minimumFractionDigits: d })
 const pad = (s, w, left = false) => { s = String(s); return left ? s.padEnd(w) : s.padStart(w) }
+const money = n => `$${Number(n || 0).toFixed(2)}`
+
+// Durations a human reads at a glance, never rounded into a lie: a run of forty
+// seconds is `<1m`, not `0m`.
+function duration(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return '0m'
+  if (ms < 60000) return '<1m'
+  const minutes = Math.floor(ms / 60000)
+  if (minutes < 60) return `${minutes}m`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours}h ${minutes % 60}m`
+  return `${Math.floor(hours / 24)}d ${hours % 24}h`
+}
+
+const at = record => { const t = Date.parse(record?.ts); return Number.isFinite(t) ? t : null }
+// humanTimestamp() shells out to `date` in HOST_TIMEZONE; the same instant
+// appears on many rows, so each one is rendered once.
+const stamps = new Map()
+const stamp = millis => {
+  if (!stamps.has(millis)) stamps.set(millis, humanTimestamp(millis))
+  return stamps.get(millis)
+}
+
+// ───────────────────────── the per-step tuning view ─────────────────────────
+// Record-level filtering, unchanged: this view answers "what does a step of this
+// script cost", so a window that cuts a run in half is exactly what it wants.
+const tuned = spawns.filter(r => {
+  const t = at(r)
+  if (cutoff && (t === null || t < cutoff)) return false
+  if (engineFilter && r.engine !== engineFilter) return false
+  if (scriptFilter && r.script !== scriptFilter) return false
+  return true
+})
 
 const byScript = new Map()
-for (const r of records) {
+for (const r of tuned) {
   if (!byScript.has(r.script)) byScript.set(r.script, [])
   byScript.get(r.script).push(r)
 }
@@ -105,21 +184,21 @@ for (const [script, recs] of [...byScript.entries()].sort()) {
   }
   const n = runs.size
   console.log(`${script} — ${n} run(s): ${[...engines.entries()].map(([e, c]) => `${e} ${c}`).join(', ')}`)
-  console.log(`avg per run: ${fmt(allTokens / n)} tokens (out ${fmt(allOut / n)}) · ${fmt(allMs / n / 60000, 1)} min${costRuns.size ? ` · $${fmt(allCost / costRuns.size, 2)} (${costRuns.size} run(s) with cost)` : ''}`)
+  console.log(`avg per run: ${fmt(allTokens / n)} tokens (out ${fmt(allOut / n)}) · ${fmt(allMs / n / 60000, 1)} model-active min${costRuns.size ? ` · $${fmt(allCost / costRuns.size, 2)} (${costRuns.size} run(s) with cost)` : ''}`)
   if (estimated) {
     console.log(`  of which $${fmt(estimated / costRuns.size, 2)}/run priced from lib/prices.mjs at short-context rates, not billed by the vendor`)
   }
-  for (const [model, spawns] of [...unpriced.entries()].sort()) {
-    console.log(`  ${spawns} spawn(s) on ${model} have tokens but no price row — their spend is missing from every $ below`)
+  for (const [model, count] of [...unpriced.entries()].sort()) {
+    console.log(`  ${count} spawn(s) on ${model} have tokens but no price row — their spend is missing from every $ below`)
   }
   console.log('')
-  const header = `${pad('step', 20, true)} ${pad('spawns/run', 10)} ${pad('tokens/run', 12)} ${pad('%', 6)} ${pad('out/run', 9)} ${pad('min/run', 8)} ${pad('$/run', 7)}`
+  const header = `${pad('step', 20, true)} ${pad('spawns/run', 10)} ${pad('tokens/run', 12)} ${pad('%', 6)} ${pad('out/run', 9)} ${pad('model-min/run', 13)} ${pad('$/run', 7)}`
   console.log(header)
   console.log('-'.repeat(header.length))
   const rows = [...steps.entries()].sort((a, b) => b[1].tokens - a[1].tokens)
   for (const [step, s] of rows) {
     const share = allTokens ? (100 * s.tokens / allTokens) : 0
-    console.log(`${pad(step, 20, true)} ${pad(fmt(s.spawns / n, 1), 10)} ${pad(fmt(s.tokens / n), 12)} ${pad(fmt(share, 1), 6)} ${pad(fmt(s.out / n), 9)} ${pad(fmt(s.ms / n / 60000, 1), 8)} ${pad(costRuns.size ? fmt(s.cost / costRuns.size, 2) : '-', 7)}${s.unknown ? `   (${s.unknown} spawn(s) without usage)` : ''}`)
+    console.log(`${pad(step, 20, true)} ${pad(fmt(s.spawns / n, 1), 10)} ${pad(fmt(s.tokens / n), 12)} ${pad(fmt(share, 1), 6)} ${pad(fmt(s.out / n), 9)} ${pad(fmt(s.ms / n / 60000, 1), 13)} ${pad(costRuns.size ? fmt(s.cost / costRuns.size, 2) : '-', 7)}${s.unknown ? `   (${s.unknown} spawn(s) without usage)` : ''}`)
   }
   if (unknown.length) {
     const by = new Map()
@@ -128,3 +207,183 @@ for (const [script, recs] of [...byScript.entries()].sort()) {
   }
   console.log('')
 }
+if (byScript.size) {
+  console.log("model-min/run above is summed spawn duration, not wall-clock: parallel steps spend more of it than the run lasts. A run's own wall time is per issue below.")
+  console.log('')
+}
+
+// ───────────────────────── the issue-lifetime view ─────────────────────────
+// A lifetime is keyed by (repository, issue) and by nothing else. A record that
+// cannot state both — a legacy row, a hand-run with no --repo, a slug-mode run
+// with no issue — becomes its own row keyed by runId: coalescing those would
+// invent a shared history out of runs that merely look alike.
+const lifetimes = new Map()
+const orphans = new Map()
+for (const record of records) {
+  const identified = !record.legacy && record.repo != null && record.issue != null
+  const key = identified ? `${record.repo} #${record.issue}` : `run ${record.runId}`
+  const into = identified ? lifetimes : orphans
+  let entry = into.get(key)
+  if (!entry) {
+    entry = { repo: identified ? record.repo : null, issue: identified ? record.issue : null, runId: record.runId, records: [] }
+    into.set(key, entry)
+  }
+  // An unattributed row still shows whatever identity it does have.
+  if (!identified) {
+    if (entry.repo == null && record.repo != null) entry.repo = record.repo
+    if (entry.issue == null && record.issue != null) entry.issue = record.issue
+  }
+  entry.records.push(record)
+}
+
+function summarize(entry) {
+  const own = entry.records
+  const ownStarts = own.filter(r => r.type === 'run-start')
+  const ownFinishes = own.filter(r => r.type === 'run-finish').sort((a, b) => (at(a) ?? 0) - (at(b) ?? 0))
+  const ownSpawns = own.filter(r => r.type === 'spawn')
+  const times = own.map(at).filter(t => t !== null)
+  const startTimes = ownStarts.map(at).filter(t => t !== null)
+  const lastFinish = ownFinishes[ownFinishes.length - 1] || null
+
+  const s = {
+    entry,
+    repo: entry.repo, issue: entry.issue, runId: entry.runId,
+    legacyRows: own.filter(r => r.legacy).length,
+    launches: ownStarts.length,
+    byScript: new Map(),
+    first: startTimes.length ? Math.min(...startTimes) : (times.length ? Math.min(...times) : null),
+    latest: times.length ? Math.max(...times) : null,
+    lastFinish,
+    wallMs: 0, spawns: ownSpawns.length, modelMs: 0,
+    input: 0, cacheRead: 0, cacheCreate: 0, output: 0,
+    billed: 0, estimated: 0, unpriced: 0, noUsage: 0,
+    respawns: 0, retries: 0, relaunches: 0, fixerAttempts: 0,
+    incomplete: Math.max(0, ownStarts.length - ownFinishes.length),
+    hasLifecycle: ownStarts.length > 0 || ownFinishes.length > 0,
+  }
+  for (const r of ownStarts) s.byScript.set(r.script, (s.byScript.get(r.script) || 0) + 1)
+  for (const r of ownFinishes) {
+    if (typeof r.ms === 'number') s.wallMs += r.ms
+    if (FIXER_SCRIPTS.includes(r.script) && typeof r.attempt === 'number' && r.attempt >= 1) s.fixerAttempts++
+  }
+  for (const r of ownSpawns) {
+    s.modelMs += typeof r.ms === 'number' ? r.ms : 0
+    const t = r.tokens || {}
+    const total = typeof t.total === 'number' ? t.total : null
+    s.input += typeof t.input === 'number' ? t.input : 0
+    s.cacheRead += typeof t.cacheRead === 'number' ? t.cacheRead : 0
+    s.cacheCreate += typeof t.cacheCreate === 'number' ? t.cacheCreate : 0
+    s.output += typeof t.output === 'number' ? t.output : 0
+    if (typeof r.costUsd === 'number') {
+      if (r.costSource === 'table') s.estimated += r.costUsd
+      else s.billed += r.costUsd
+    } else if (total !== null) s.unpriced++
+    else s.noUsage++
+    // Four separate things, deliberately never summed: a respawn is one agent()
+    // call trying again inside itself, a retry is the pipeline re-running a step
+    // it already ran, a relaunch is a whole new epic process, and a fixer
+    // attempt is a rung of the conflict/CI/defect ladder.
+    if (typeof r.attempt === 'number' && r.attempt > 1) s.respawns++
+    else if (r.retry) s.retries++
+  }
+  s.relaunches = Math.max(0, (s.byScript.get('epic-run') || 0) - 1)
+  s.result = lastFinish
+    ? (Object.prototype.hasOwnProperty.call(OUTCOMES, lastFinish.outcome) ? lastFinish.outcome : 'unknown')
+    : (s.hasLifecycle ? 'incomplete' : 'unknown')
+  s.handoff = !!OUTCOMES[s.result]?.handoff
+  s.spanMs = (lastFinish && s.first !== null && at(lastFinish) !== null) ? at(lastFinish) - s.first : null
+  return s
+}
+
+const inWindow = s => !cutoff || (s.latest !== null && s.latest >= cutoff)
+const lifetimeRows = [...lifetimes.values()].map(summarize).filter(s => {
+  if (!inWindow(s)) return false
+  // A lifetime is selected by the run that finished it last: filtering its
+  // records instead would report a fraction of an issue's history as the whole.
+  if (engineFilter || scriptFilter) {
+    if (!s.lastFinish) return false
+    if (engineFilter && s.lastFinish.engine !== engineFilter) return false
+    if (scriptFilter && s.lastFinish.script !== scriptFilter) return false
+  }
+  return true
+})
+// An unattributed row is one runId, so its own records are all a filter has to
+// match against — there is no "latest completed run" to select it by.
+const orphanRows = [...orphans.values()].map(summarize).filter(s => {
+  if (!inWindow(s)) return false
+  if (engineFilter && !s.entry.records.some(r => r.engine === engineFilter)) return false
+  if (scriptFilter && !s.entry.records.some(r => r.script === scriptFilter)) return false
+  return true
+})
+
+const byLatest = (a, b) => (b.latest ?? 0) - (a.latest ?? 0)
+const scriptCounts = s => [...s.byScript.entries()]
+  .sort((a, b) => {
+    const rank = name => { const i = SCRIPTS.indexOf(name); return i < 0 ? SCRIPTS.length : i }
+    return rank(a[0]) - rank(b[0]) || String(a[0]).localeCompare(String(b[0]))
+  })
+  .map(([script, count]) => `${script} ${count}`).join(', ')
+const costOf = s => `${money(s.billed)} (+${money(s.estimated)} estimated, ${s.unpriced} unpriced)`
+const tokensOf = s => `in ${fmt(s.input)} · cache-read ${fmt(s.cacheRead)} · cache-create ${fmt(s.cacheCreate)} · out ${fmt(s.output)}`
+const when = t => t === null ? 'unknown' : stamp(t)
+
+if (lifetimeRows.length || orphanRows.length) {
+  console.log('issue lifetimes (log-known)')
+  console.log('')
+}
+
+const groups = new Map()
+for (const s of lifetimeRows) {
+  if (!groups.has(s.repo)) groups.set(s.repo, [])
+  groups.get(s.repo).push(s)
+}
+for (const [repo, rows] of [...groups.entries()].sort((a, b) => String(a[0]).localeCompare(String(b[0])))) {
+  console.log(repo)
+  for (const s of rows.sort(byLatest)) {
+    const counts = s.byScript.size ? ` (${scriptCounts(s)})` : ''
+    console.log(`  #${s.issue}  launches ${s.launches}${counts} · first ${when(s.first)} · latest ${when(s.latest)}` +
+      ` · wall ${duration(s.wallMs)} · span ${s.spanMs === null ? '-' : duration(s.spanMs)}` +
+      ` · result ${s.result} · handoff ${s.handoff ? 'yes' : 'no'}${s.incomplete ? ` · incomplete ${s.incomplete}` : ''}`)
+    console.log(`        spawns ${s.spawns} · model-active ${duration(s.modelMs)} · ${tokensOf(s)} · ${costOf(s)}` +
+      ` · respawns ${s.respawns} · retries ${s.retries} · relaunches ${s.relaunches} · fixer attempts ${s.fixerAttempts}` +
+      (s.noUsage ? ` · partial: ${s.noUsage} spawn(s) reported no usage` : ''))
+  }
+  console.log('')
+}
+
+if (orphanRows.length) {
+  console.log('runs without repository/issue identity (never merged)')
+  for (const s of orphanRows.sort(byLatest)) {
+    console.log(`  ${s.runId} · ${s.issue == null ? 'issue unknown' : `issue ${s.issue}`} · ${s.repo == null ? 'repo unknown' : `repo ${s.repo}`}` +
+      ` · latest ${when(s.latest)} · wall ${s.hasLifecycle ? duration(s.wallMs) : 'unknown'}` +
+      ` · spawns ${s.spawns} · model-active ${duration(s.modelMs)} · ${costOf(s)} · result ${s.result}`)
+  }
+  console.log(`  ${orphanRows.length} run(s) above state no repository or issue and are listed one per runId, never joined to a lifetime.`)
+  const legacyRuns = orphanRows.filter(s => s.legacyRows)
+  if (legacyRuns.length) {
+    const rows = legacyRuns.reduce((total, s) => total + s.legacyRows, 0)
+    console.log(`  ${rows} of those row(s), in ${legacyRuns.length} run(s), predate lifecycle records: tokens and cost are counted, wall time, repository and result unknown.`)
+  }
+  console.log('')
+}
+
+// ───────────────────────── totals and the handoff rate ─────────────────────────
+if (lifetimeRows.length) {
+  const sum = key => lifetimeRows.reduce((total, s) => total + s[key], 0)
+  console.log(`all repositories: ${lifetimeRows.length} issue lifetime(s) · ${sum('launches')} launch(es)` +
+    ` · wall ${duration(sum('wallMs'))} · spawns ${sum('spawns')} · model-active ${duration(sum('modelMs'))}` +
+    ` · ${tokensOf({ input: sum('input'), cacheRead: sum('cacheRead'), cacheCreate: sum('cacheCreate'), output: sum('output') })}` +
+    ` · ${costOf({ billed: sum('billed'), estimated: sum('estimated'), unpriced: sum('unpriced') })}`)
+
+  // The rate answers one question — how often does automation end by handing an
+  // issue to a person — so only lifetimes that answer it are in the denominator.
+  // A queued repair, a quota hold, a refusal or a crash left the issue in
+  // flight: they are named and counted, never folded in either direction.
+  const conclusive = lifetimeRows.filter(s => OUTCOMES[s.result]?.conclusive)
+  const handed = conclusive.filter(s => s.handoff)
+  const percent = conclusive.length ? `${(100 * handed.length / conclusive.length).toFixed(1)}%` : 'n/a'
+  console.log(`human handoff: ${handed.length} of ${conclusive.length} conclusive lifetime(s) (${percent})`)
+  const setAside = ['repair-queued', 'quota-held', 'skipped', 'error', 'manual', 'incomplete', 'unknown']
+  console.log(`not counted: ${setAside.map(name => `${name} ${lifetimeRows.filter(s => s.result === name).length}`).join(', ')}`)
+}
+if (malformed) console.log(`malformed records skipped: ${malformed}`)

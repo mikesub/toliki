@@ -32,10 +32,17 @@ Commands:
                            Refuses on a <repo>-epic-<N> session: use an explicit pipeline command.
   stop-all                 Stop every tmux session on the host.
   ls                       List all sessions with their repo and running/dead status.
-  usage [days] [engine]    Per-step token and time report from the host's
-                           ~/epic-usage.jsonl (read-only): which steps an average
-                           run spends its tokens on. Optional window in days and
-                           engine name, e.g. "usage 7 codex".
+  usage [days] [engine]    Token, time and outcome report from the host's
+                           ~/epic-usage.jsonl (read-only). Two views: which steps
+                           an average run spends its tokens on, and what each
+                           issue's whole lifetime cost. Read the numbers as they
+                           are named: wall time is time inside pipeline runs,
+                           the elapsed span also counts the waiting between them,
+                           and model-active time is summed spawn duration, which
+                           parallel steps make larger than either. A row's result
+                           is what the pipeline itself recorded when it finished
+                           — not whether GitHub later merged the PR. Optional
+                           window in days and engine name, e.g. "usage 7 codex".
   epic <ref> [--engine <e>]
                            Run the epic pipeline on an issue, as session
                            <repo>-epic-<ref>. The manual override for dispatch's
@@ -313,8 +320,11 @@ esac
 
 case "$ACTION" in
   usage)
-    # Read-only: the report script only reads the usage log.
-    REMOTE="node $HOST_CONTROL_DIR/workflows/usage-report.mjs"
+    # Read-only: the report script only reads the usage log. The host's zone
+    # rides along the way bin/launch.sh writes it into a pane: the lifetime view
+    # renders timestamps for a human, and an ssh command carries no zone of its
+    # own, so without this the host's own runs would be dated in UTC.
+    REMOTE="HOST_TIMEZONE=$(sq "$HOST_TIMEZONE") TZ=$(sq "$HOST_TIMEZONE") node $HOST_CONTROL_DIR/workflows/usage-report.mjs"
     [[ -z "$USAGE_DAYS" ]] || REMOTE+=" --since $(sq "${USAGE_DAYS}d")"
     [[ -z "$USAGE_ENGINE" ]] || REMOTE+=" --engine $(sq "$USAGE_ENGINE")"
     ssh "$HOST" "$REMOTE"

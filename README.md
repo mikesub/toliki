@@ -95,8 +95,9 @@ only where a judgment is needed. Claude Code and Codex are both supported.
    claim refs), so the slot budget keeps rotating.
 
 The operator watches from a laptop with `./remote-control.sh ls` (and
-`./remote-control.sh usage` for what the steps cost), and reads a
-completed run from its source issue: the body is the specification, the
+`./remote-control.sh usage` for what the steps cost, what each issue's whole
+lifetime cost and how it ended, and how often automation handed off to a human),
+and reads a completed run from its source issue: the body is the specification, the
 candidate delivery summary is the immutable run snapshot, and later status,
 deferral, blocker, and fixer comments preserve subsequent history. The PR is
 the technical surface for its diff and checks. For a live process,
@@ -215,7 +216,9 @@ load the registration. Node and Codex must be installed for this registration st
   while each entry point keeps its cause-specific preparation, evidence,
   publication and recovery ordering. The surrounding runtime provides the
   engine adapter, git/gh/npm transport, concurrency gate, structured-output
-  validation, and the per-spawn usage log `usage-report.mjs` summarizes.
+  validation, and the usage log `usage-report.mjs` summarizes — per-spawn rows
+  for step tuning, plus the run-start/run-finish records behind its
+  issue-lifetime view of cost, elapsed time, retries and recorded result.
 - **`skills/`, `agents/`** — `/spec` and its `spec-explorer` are exposed to local
   Claude and Codex sessions; pipeline entry contracts and phase charters stay
   internal. Each client gets the same read-only charter in its native format,

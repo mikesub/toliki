@@ -8,6 +8,7 @@
 // `tmux capture-pane` already reads to diagnose a session.
 
 import { engineNames } from './engine.mjs'
+import { recordRunEnd } from './runtime.mjs'
 
 export const EXIT = {
   OK: 0,        // shipped, provider-held, held for review, or a manual-mode summary
@@ -16,15 +17,20 @@ export const EXIT = {
   BLOCKED: 3,   // stopped at a blocker; the pipeline has commented on the issue
 }
 
-// Accepts `--issue N` / `--slug S` / `--session NAME`, plus a bare positional
-// for hand-runs. The positional keeps the old coercion — "81" and "#81" are an
-// issue, anything else is a slug — because that is what people type.
+// Accepts `--issue N` / `--slug S` / `--session NAME` / `--repo KEY`, plus a
+// bare positional for hand-runs. `--repo` is the registered key bin/launch.sh
+// validated against etc/repos.conf before it created the session; it is
+// telemetry identity only, so an absent one is recorded as null rather than
+// mined out of the session name.
+//
+// The positional keeps the old coercion — "81" and "#81" are an issue, anything
+// else is a slug — because that is what people type.
 //
 // Gone with the workflow engine: the "args arrived as a stringified JSON
 // object" branch. argv cannot produce one, so it is not a shape to defend
 // against here.
 export function parseArgs(argv, { allowSlug = false, usage = '' } = {}) {
-  const out = { issue: undefined, slug: undefined, session: '', engine: process.env.EPIC_ENGINE || 'claude' }
+  const out = { issue: undefined, slug: undefined, session: '', repo: null, engine: process.env.EPIC_ENGINE || 'claude' }
   const rest = []
 
   for (let i = 0; i < argv.length; i++) {
@@ -44,6 +50,7 @@ export function parseArgs(argv, { allowSlug = false, usage = '' } = {}) {
       case '--issue': out.issue = take(); break
       case '--slug': out.slug = take(); break
       case '--session': out.session = take(); break
+      case '--repo': out.repo = take() || null; break
       case '--engine': out.engine = take(); break
       default:
         if (flag.startsWith('-')) throw new UsageError(`unknown option ${flag}`, usage)
@@ -90,11 +97,21 @@ export class UsageError extends Error {
 }
 
 // The single line every consumer reads, then the exit code that summarizes it.
+//
+// This is also where the run's own telemetry record closes: every pipeline
+// reaches a structured RESULT here and nowhere else, so the finish record is
+// written from the one place that knows both the result and the exit code.
+// Strictly best effort — a telemetry failure can neither throw nor change the
+// code this returns.
 export function finish(result) {
   const value = result && typeof result === 'object' ? result : { error: String(result ?? 'no result') }
   process.stdout.write(`RESULT ${JSON.stringify(value)}\n`)
-  if (value.error) return EXIT.ERROR
-  if (value.skipped) return EXIT.SKIPPED
-  if (value.blocked) return EXIT.BLOCKED
-  return EXIT.OK
+  const code = value.error ? EXIT.ERROR
+    : value.skipped ? EXIT.SKIPPED
+    : value.blocked ? EXIT.BLOCKED
+    : EXIT.OK
+  try {
+    recordRunEnd(value, code)
+  } catch { /* reporting never fails a run */ }
+  return code
 }

@@ -109,13 +109,14 @@ import {
 } from './lib/repo.mjs'
 import { recordQuotaHold } from './quota-hold.mjs'
 
-const USAGE = `Usage: epic-run.mjs (--issue <N> | --slug <slug>) [--session <name>] [--engine <name>]
+const USAGE = `Usage: epic-run.mjs (--issue <N> | --slug <slug>) [--session <name>] [--engine <name>] [--repo <key>]
 
   --issue <N>    GitHub issue to build: branch, implement, review, open a PR
   --slug <slug>  manual mode: build on the current tree from an existing
                  .epics/<slug>/requirements.md, no git and no PR
   --session      name for log lines (the tmux session bin/launch.sh created)
   --engine       registered coding-agent engine for every phase
+  --repo         registered repository key, for usage telemetry identity only
 
 Exit: 0 shipped, provider-held, or held for review; 1 usage/crash, 2 skipped, 3 blocked.
 The final line is RESULT <json>.`
@@ -565,7 +566,7 @@ try {
   }
   throw e
 }
-initRuntime({ scriptName: 'epic-run', sessionName: ARGS.session, defaultEngine: ARGS.engine, issue: ARGS.issue })
+initRuntime({ scriptName: 'epic-run', sessionName: ARGS.session, defaultEngine: ARGS.engine, issue: ARGS.issue, repo: ARGS.repo })
 // The issue's live status comment mirrors the pane's narration: the label says
 // WHICH state the issue is in, this says whether the run is alive and where it
 // got to. Issue mode only — slug mode has no issue to report on.
@@ -1097,7 +1098,9 @@ async function holdForQuota(phase, failure) {
     if (!flip.ok || !labels.includes('ready') || remove.some(label => labels.includes(label))) {
       throw new Error(flip.ok ? `observed labels: ${labels.join(', ') || 'none'}` : failureReason(flip))
     }
-    return { held: true, issue, slug, phase, ...hostHold, ...trigger }
+    // The hold transition was read back above, so the issue really is waiting
+    // on the provider: automatic waiting, never a human handoff.
+    return { held: true, issue, slug, phase, ...hostHold, ...trigger, outcome: 'quota-held' }
   } catch (error) {
     return { error: error?.message || String(error) }
   }
@@ -1120,9 +1123,9 @@ async function fail(phase, reason, suppliedFailure = undefined) {
         log(`blocked: could not report on GitHub (${e && e.message || e})`)
       }
     }
-    return { blocked: true, issue, slug, phase, reason, prUrl: openPr || undefined }
+    return { blocked: true, issue, slug, phase, reason, prUrl: openPr || undefined, outcome: 'human-blocked' }
   }
-  return { error: `${phase}: ${reason}` }
+  return { error: `${phase}: ${reason}`, outcome: 'error' }
 }
 
 // The issue carries one best-effort live status comment plus append-only durable
@@ -1253,11 +1256,11 @@ try {
     const prep = await prepare(issue)
     if (prep.refused) {
       log(`Prepare refused to start: ${prep.refused}`)
-      return { skipped: true, issue, reason: prep.refused }
+      return { skipped: true, issue, reason: prep.refused, outcome: 'skipped' }
     }
     if (prep.alreadyExists) {
       log(`Prepare: ${prep.note} — skipping to avoid duplicate work.`)
-      return { skipped: true, issue, reason: prep.note }
+      return { skipped: true, issue, reason: prep.note, outcome: 'skipped' }
     }
     const badLayout = applyDiscovery(prep.packages)
     if (badLayout) return await fail('prepare', badLayout)
@@ -1379,7 +1382,7 @@ try {
           : `verify failed, but not with the reported assertion excerpt or a runnable test failure (${gate.detail})`
         log(`Code: RED was not established — respawning the red step once (${rejection}).`)
         red = await agent(PROMPTS.codeRed(dir) + PROMPTS.redRetry(rejection),
-          { label: 'code:red:retry', phase: 'Code', step: 'code', schema: RED_SCHEMA },
+          { label: 'code:red:retry', phase: 'Code', step: 'code', schema: RED_SCHEMA, retry: true },
         )
         if (!validRed(red)) return await fail('code', 'Red step returned no meaningful evidence on its retry — aborting before implementation.')
         gate = await verifyGate('Code: red gate (retry)')
@@ -1404,7 +1407,7 @@ try {
       : PROMPTS.codeGreen(dir, red, pkgList(packages))
     log('Code: verify is red after implementation — respawning implementation once with the failure.')
     green = await agent(implementationPrompt + PROMPTS.verifyRetry(gate),
-      { label: design.verification.mode === 'direct' ? 'code:direct:retry' : 'code:green:retry', phase: 'Code', step: 'code' },
+      { label: design.verification.mode === 'direct' ? 'code:direct:retry' : 'code:green:retry', phase: 'Code', step: 'code', retry: true },
     )
     if (!green) return await fail('code', 'Implementation step failed on its retry — implementation did not complete, aborting before review.')
     gate = await verifyGate('Code: verify gate (retry)')
@@ -1501,7 +1504,7 @@ try {
     if (!fixGate.green) {
       log('Fixes after review: verify is red — respawning once with the failure.')
       assessed = await agent(fixPrompt + PROMPTS.verifyRetry(fixGate),
-        { label: 'fixes-after-review:retry', phase: 'Fixes after review', step: 'fixes-after-review', schema: TRIAGE_SCHEMA })
+        { label: 'fixes-after-review:retry', phase: 'Fixes after review', step: 'fixes-after-review', schema: TRIAGE_SCHEMA, retry: true })
       if (!validAssessments(assessed, items.length)) {
         return await fail('triage', 'fixes-after-review produced no complete assessment on its verify retry — refusing to drop an unassessed finding.')
       }
@@ -1799,7 +1802,7 @@ try {
     if (!s) return await fail('ship', 'the summary was not written.')
     writeFileSync(path.join(dir, 'summary.md'), `${String(s.summary).trim()}\n`)
     updateEpicMd(dir, { phase: 'ship → done', log: 'ship: summary.md written (manual mode, no PR)' })
-    return { slug, approach: design?.approach, greenStatus: green, findingsConfirmed, findingsUnconfirmed: uniqueReviews.length - findingsConfirmed, findingsRejected, findingsPending, triageStatus, summary: s.summary }
+    return { slug, approach: design?.approach, greenStatus: green, findingsConfirmed, findingsUnconfirmed: uniqueReviews.length - findingsConfirmed, findingsRejected, findingsPending, triageStatus, summary: s.summary, outcome: 'manual' }
   }
 
   // ───────────────────────── Rebase onto current origin/main ─────────────────────────
@@ -1942,7 +1945,7 @@ try {
   if (mergeBlockers.length) {
     const why = mergeBlockers.map(b => b.reason).join(' + ')
     log(`Merge gate: held — ${why}. PR stays ready-to-review for a human.`)
-    return { ...result, mergeSkipped: why, ...(correctionNote ? { correction: correctionNote } : {}) }
+    return { ...result, mergeSkipped: why, ...(correctionNote ? { correction: correctionNote } : {}), outcome: 'human-review' }
   }
 
   // Promotion, never demotion: ship already applied the conservative `ready-to-review`, so every way this
@@ -1966,11 +1969,11 @@ try {
   if (!handed.labelled) {
     const why = `merge gate was clear but ready-to-merge could not be applied${handed.summary ? ` (${handed.summary})` : ''} — the PR is complete and stays ready-to-review`
     log(`Merge gate: clear, handoff FAILED — ${why}.`)
-    return { ...result, mergeSkipped: why }
+    return { ...result, mergeSkipped: why, outcome: 'human-review' }
   }
   log(`Merge gate: clear — #${issue} is ready-to-merge (${handed.summary}); bin/merge-worker.sh owns it from here.`)
 
-  return { ...result, readyToMerge: true }
+  return { ...result, readyToMerge: true, outcome: 'merge-queued' }
 } catch (e) {
   return await fail(currentPhase, (e && e.message) || String(e))
 }

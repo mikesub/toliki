@@ -47,11 +47,12 @@ import {
   renderAcceptanceVerdicts, renderBlockerBatch,
 } from './lib/repair-acceptance.mjs'
 
-const USAGE = `Usage: ci-run.mjs --issue <N> [--session <name>] [--engine <name>]
+const USAGE = `Usage: ci-run.mjs --issue <N> [--session <name>] [--engine <name>] [--repo <key>]
 
   --issue <N>  the needs-ci-fix issue whose PR came back red on its checks
   --session    name for log lines (the tmux session bin/launch.sh created)
   --engine     registered coding-agent engine for every phase
+  --repo       registered repository key, for usage telemetry identity only
 
 Exit: 0 fixed or provider-held, 1 usage/crash, 2 skipped, 3 blocked.
 The final line is RESULT <json>.`

@@ -962,6 +962,21 @@ assert_not_contains "host-wide next does not default to the first repo" "$(cat "
 SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/remote-control.sh" next claude -r testrepo
 assert_contains "an explicit repo is forwarded" "$(cat "$TMP/ssh.log")" "--repo 'testrepo'"
 
+# The laptop hands the report only what an operator asked for, and the host's
+# own zone: usage-report.mjs renders lifetime timestamps for a human, so a
+# forwarded command with no zone would date the host's runs in UTC.
+printf '\nremote control: usage forwards the report filters and the host zone\n'
+SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/remote-control.sh" usage 7 codex
+USAGE_CMD="$(cat "$TMP/ssh.log")"
+assert_contains "the window and engine reach the report" "$USAGE_CMD" "usage-report.mjs --since '7d' --engine 'codex'"
+assert_contains "the forwarded usage report renders timestamps in the host's zone" "$USAGE_CMD" "HOST_TIMEZONE='Europe/Amsterdam'"
+assert_matches "the report's clock comes from the registry, not the laptop" "$USAGE_CMD" "(^| )TZ='Europe/Amsterdam'"
+SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/remote-control.sh" usage
+BARE_USAGE="$(cat "$TMP/ssh.log")"
+assert_contains "a bare usage still runs the report" "$BARE_USAGE" "workflows/usage-report.mjs"
+assert_not_contains "an unasked-for window is never invented" "$BARE_USAGE" "--since"
+assert_not_contains "nor an engine filter" "$BARE_USAGE" "--engine"
+
 printf '\nremote control: an omitted engine is inherited, never written back\n'
 reset_state
 printf 'ready,engine:codex' > "$TMP/labels/10"
