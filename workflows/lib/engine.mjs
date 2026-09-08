@@ -240,18 +240,19 @@ const charterCache = new Map()
 
 // Which tool boundary each pipeline step runs under. Fixed by the pipeline,
 // never by etc/engines.json: the file picks a vendor, model and effort per
-// step, not whether the step may write files. architect, review, final-review
-// and ship are read-only under both vendors; task carries the tasker charter,
-// and the remaining writable steps carry coder. Every step here is a judgment call; the
-// run's git, gh and npm work is done by the orchestrator (lib/github.mjs,
-// lib/repo.mjs), never by a model.
+// step, not whether the step may write files. architect, review and
+// final-review are read-only under both vendors; task carries the tasker
+// charter, and the remaining writable steps carry coder. No row buys delivery
+// prose: the phase that made a change returns the record it is published from,
+// so nothing here pays for a second account of work already done. Every step
+// here is a judgment call; the run's git, gh and npm work is done by the
+// orchestrator (lib/github.mjs, lib/repo.mjs), never by a model.
 export const STEPS = {
   task: 'tasker',
   architect: 'architect',
   code: 'coder',
   review: 'reviewer',
   'final-review': 'reviewer',
-  ship: 'shipper',
   'fixes-after-review': 'coder',
   'fix-conflicts': 'coder',
   'fix-ci': 'coder',
@@ -318,7 +319,7 @@ function loadCharter(agentType) {
   try {
     raw = readFileSync(file, 'utf8')
   } catch (e) {
-    throw new Error(`agent charter "${agentType}" could not be read at ${file.pathname}: ${e.message}. Refusing to run the step uncharted — architect, reviewer and shipper rely on this for their tool restrictions.`)
+    throw new Error(`agent charter "${agentType}" could not be read at ${file.pathname}: ${e.message}. Refusing to run the step uncharted — architect and reviewer rely on this for their tool restrictions.`)
   }
   const m = raw.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n([\s\S]*)$/)
   if (!m) throw new Error(`agent charter "${agentType}" has no frontmatter block — refusing to run the step uncharted.`)
@@ -463,7 +464,7 @@ const claudeVendor = {
     //
     // Reading the charter from agents/*.md keeps the SAME two guarantees the
     // --agent path had: the charter body reaches the model, and the tool list
-    // is enforced (architect/reviewer/shipper have no Bash/Write/Edit, so they
+    // is enforced (architect/reviewer have no Bash/Write/Edit, so they
     // cannot inspect by shell or patch what they judge). It also fails LOUDLY
     // on a missing or malformed file
     // instead of running on without the restrictions, which is the only

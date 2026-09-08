@@ -37,20 +37,20 @@ failure behavior.
 | Step | Owner | Primary LLM calls |
 | --- | --- | --- |
 | 1. Prepare | Shell/Node orchestrators | None |
-| 2. Architect | `architect` charter | Usually one; none when a valid resumed plan exists |
-| 3. Code | `coder` charter | One in direct mode, RED + GREEN in test-first mode; a completed checkpoint initially skips both |
+| 2. Architect | `architect` charter | Usually one; none when the resumed artifacts are all valid |
+| 3. Code | `coder` charter | One in direct mode, RED + GREEN in test-first mode; a completed checkpoint initially skips both. The implementing call also returns the delivery record the run is published from |
 | 4. Review | `reviewer` charter | One broad review, and the only broad review of the change |
 | 5. Repair | `coder` charter | One when findings exist |
 | 6. Final review | `reviewer` charter | One when findings need adjudication; it is this repair's exhaustive acceptance check |
 | 7. Correction | `coder` + `reviewer` charters | One correction and one narrow confirmation, only when every blocker is a concrete defect |
-| 8. Ship | `shipper` charter plus orchestrator | One prose/metadata call |
+| 8. Ship | `epic-run.mjs` and transport libraries | None |
 | 9. Merge gate | Node orchestrator | None |
 | 10. Merge worker | Shell scripts | None |
 | Task path | `tasker` charter plus orchestrator | One; at most one fresh diagnostics-driven repair after a genuinely red first verify |
 
 Every LLM call is a new, short-lived process. The selected `engine:<name>` maps
 each step to a vendor, model, and effort in [`etc/engines.json`](etc/engines.json).
-The nine engine step keys and their charters are fixed in
+The eight engine step keys and their charters are fixed in
 [`workflows/lib/engine.mjs`](workflows/lib/engine.mjs):
 
 | Engine step | Charter | May edit the worktree? |
@@ -61,7 +61,6 @@ The nine engine step keys and their charters are fixed in
 | `review` | `reviewer` | No |
 | `fixes-after-review` | `coder` | Yes |
 | `final-review` | `reviewer` | No |
-| `ship` | `shipper` | No |
 | `fix-conflicts` | `coder` | Yes |
 | `fix-ci` | `coder` | Yes |
 
@@ -90,8 +89,8 @@ a conflicting base is left to the merge worker and its conflict fixer. The
 squashed candidate commit includes `Closes #N`, and its issue summary records
 that the delivery was verified but intentionally not independently reviewed.
 
-There is no architect, RED/GREEN split, reviewer, review repair, correction or
-shipper. There is also no transient or invalid-schema model respawn: malformed
+There is no architect, RED/GREEN split, reviewer, review repair or correction.
+There is also no transient or invalid-schema model respawn: malformed
 output, a tasker-declared blocker, a provider/process failure or timeout
 preserves the branch and rests the issue at `failed`. The verification repair
 is started only for a normal nonzero project-gate result, runs with both
@@ -199,9 +198,10 @@ one logical call.
      adds no useful evidence.
 5. A resumed partial implementation is planned as `direct`; the script refuses
    to pretend a dirty tree still has a clean RED baseline.
-6. A resumed code checkpoint first reuses `.epics/<slug>/architecture.json`.
-   If that artifact is missing or invalid, a read-only architect reconstructs
-   the plan from the finished implementation without changing it.
+6. A resumed code checkpoint first reuses `.epics/<slug>/architecture.json` and
+   `.epics/<slug>/delivery.json`. If either artifact is missing or invalid, a
+   read-only architect reconstructs it from the finished implementation without
+   changing it; whichever artifact survived is kept as it stands.
    Both the reconstruction and a resumed partial continuation receive the
    requirement and the orchestrator-captured diff of the existing work inline;
    a capture that fails blocks rather than sending the architect to find it.
@@ -242,12 +242,20 @@ two logical calls, depending on resume state and verification mode.
    command, and may not commit or push. Its scope decisions, plan adjustments
    and unresolved questions come back in its returned status, which the
    orchestrator writes into the phase log.
-8. The orchestrator alone runs `npm run verify` in every discovered package. The exit
+8. The GREEN or direct process also returns the run's **delivery record**: the
+   PR/commit title, the durable commit rationale, this project's own legal
+   marker when its AGENTS.md defines that trigger and the change meets it, and
+   the work it deliberately left undone with the kind of each item and whether
+   one coherent PR could close it. There is no later prose step, so this is the
+   only place that judgment is collected; the orchestrator validates it and
+   writes `.epics/<slug>/delivery.json`. A missing or blank title or commit
+   rationale blocks here, before Review spends anything.
+9. The orchestrator alone runs `npm run verify` in every discovered package. The exit
    codes and bounded, terminal-formatting-free output are the authoritative
    evidence used in prompts, logs, and GitHub comments.
-9. If verification is red, the implementation process is respawned once with
-   the actual failure output. A second red result blocks before Review.
-10. The orchestrator checkpoints all nonignored implementation work as
+10. If verification is red, the implementation process is respawned once with
+    the actual failure output. A second red result blocks before Review.
+11. The orchestrator checkpoints all nonignored implementation work as
     `wip(epic <slug>): code checkpoint`. Manual mode uses intent-to-add instead
     of committing.
 
@@ -300,7 +308,10 @@ logical call, with one verification-driven retry available.
    - `disputed`: leave the code alone and cite concrete evidence that the
      finding is false.
    - `deferred`: explain why it cannot safely be repaired in this bounded
-     round.
+     round, and — only when what is left is concrete material work one coherent
+     PR could close — the follow-up issue to file for it. That is the only
+     place a review-side follow-up is decided; the orchestrator files what the
+     fixer wrote and files nothing for a finding the final review then cleared.
 4. The orchestrator rejects missing, duplicate, extra, out-of-range, or empty
    dispositions. Titles are never used as identities.
 5. The fixer may make only the smallest change required by the findings and
@@ -395,8 +406,10 @@ concrete defect; otherwise one correction and one narrow confirmation.
 
 ## 8. Ship
 
-**Owner:** `shipper` charter for judgmental prose; `epic-run.mjs` and transport
-libraries for every mutation. **LLM calls:** one logical call.
+**Owner:** [`workflows/epic-run.mjs`](workflows/epic-run.mjs) and the transport
+libraries. **LLM calls:** none. Every piece of judgment this phase publishes was
+collected where it was made: the coding phase's delivery record, the review
+ledger's structured final states, and the fixer's own follow-up decisions.
 
 1. The orchestrator stages any loose work into a pre-ship checkpoint and
    fetches current `origin/main`.
@@ -406,39 +419,40 @@ libraries for every mutation. **LLM calls:** one logical call.
      blocks with the resumable chain preserved.
    - A failed fetch or conflicting rebase falls back to the run's original
      base. The merge worker will rebase and re-check it later.
-3. It captures the final diff, the review ledger's final states, the
-   shippable-state snapshot, and opaque IDs for every known structured blocker.
-   Ship receives all of them inline and opens nothing under `.epics/`. Manual
-   `--slug` mode does the same for its summary, and appends the derived
-   changed-file list and the real verify evidence to `summary.md` itself.
-4. One read-only `shipper` process returns schema-checked delivery metadata:
-   PR/commit title, source-issue delivery narrative, non-empty commit rationale,
-   any project-defined legal marker, and the deferred-work ledger.
-5. Ship classifies deferrals as `defect`, `missing-gate`, `scope-cut`, or
-   `other`, and may request a coherent follow-up issue. These classifications
-   record work but do not decide whether this PR may merge.
-6. The orchestrator validates all known blocker IDs and rejects unknown,
-   duplicate, or missing identities before creating external artifacts.
-7. It proves the shipper changed neither the tree nor protected Git metadata.
-8. It folds the checkpoint chain into one commit at the actual merge base. The
-   commit contains the shipper's subject/rationale, optional legal marker, and
-   deterministic `Closes #N` line.
-9. It force-pushes the already-claimed branch with a lease and opens a PR whose
+3. It derives the changed-file list from the same refs the candidate commit is
+   formed at; a capture that fails blocks rather than reporting a list nobody
+   established.
+4. It assembles the remaining-work list from two structured sources and
+   re-judges neither: every item behind a deterministic merge blocker, each
+   carrying the run-local opaque identity assigned to that exact object, and
+   the coding phase's own deferrals. Kinds rank filing order; they never gate
+   the merge.
+5. It folds the checkpoint chain into one commit at the actual merge base. The
+   commit contains the delivery record's subject and rationale, its optional
+   legal marker, and the deterministic `Closes #N` line.
+6. It force-pushes the already-claimed branch with a lease and opens a PR whose
    body contains only deterministic links back to the source issue/run record.
-10. After the PR exists, it posts one candidate-SHA-specific delivery summary
-    to the source issue and reads it back. Missing or duplicate confirmation
-    blocks with the real PR, branch, and SHA recorded for manual recovery.
-11. Only after that summary is confirmed does it record deferrals and file up
-    to three qualified follow-up issues, defects first. When dependency
-    ordering can be written, each follow-up is made `blocked_by` the source
-    issue before receiving `ready`. If ordering cannot be established, the
-    follow-up is left unqueued.
-12. It places the source issue conservatively at `ready-to-review`. The Merge
-    gate may promote it, but Ship itself never decides unattended eligibility.
+7. After the PR exists, it posts one candidate-SHA-specific delivery summary to
+   the source issue and reads it back. That record is rendered here: the durable
+   commit rationale, the architect's chosen approach, one line per finding with
+   its final verdict and confidence, the orchestrator's real verify evidence and
+   changed-file list, the remaining work, and the gate state at capture time.
+   Missing or duplicate confirmation blocks with the real PR, branch, and SHA
+   recorded for manual recovery.
+8. Only after that summary is confirmed does it post the deferred record and
+   file up to three follow-up issues, defects first. A follow-up is filed only
+   where a model wrote one — the fixer's follow-up for a finding it deferred and
+   the final review left open, or a coding-phase deferral marked filable — so
+   nothing is filed from slicing judgment a script made up. When dependency
+   ordering can be written, each follow-up is made `blocked_by` the source issue
+   before receiving `ready`. If ordering cannot be established, the follow-up is
+   left unqueued.
+9. It places the source issue conservatively at `ready-to-review`. The Merge
+   gate may promote it, but this phase never decides unattended eligibility.
 
-Manual `--slug` mode stops here after a `shipper` call writes
-`.epics/<slug>/summary.md`; it does not commit, push, create a PR, or change
-GitHub labels.
+Manual `--slug` mode renders the same record into `.epics/<slug>/summary.md`
+without the candidate identity it has no PR for; it does not commit, push,
+create a PR, or change GitHub labels.
 
 ## 9. Merge gate
 
@@ -448,8 +462,8 @@ GitHub labels.
 1. The gate reads only structured review outcomes produced before Ship:
    unresolved original findings, repair regressions, unmet requirements,
    missing adjudication, and false no-diff repair claims.
-2. Shipper-authored deferrals never enter this calculation; they cannot hold or
-   release their own PR.
+2. Builder-classified deferrals never enter this calculation; they cannot hold
+   or release their own PR.
 3. If no blockers remain, the script changes `ready-to-review` to
    `ready-to-merge` and reads the labels back.
 4. If promotion cannot be confirmed, it issues a compensating transition back
@@ -746,8 +760,9 @@ line is ignored as a possible concurrent append.
 3. Queries fail closed: an unreadable dependency, route, PR head, review result,
    CI conclusion, or write readback is never interpreted as success.
 4. A model phase that judges a change is read-only. The orchestrator hashes the
-   tree and protected Git state around Review, Final review, and Ship and blocks
-   if either moved.
+   tree and protected Git state around Review, Final review, and the narrow
+   confirmation and blocks if either moved. Ship spawns no model at all, so the
+   last process a run starts is one of those judging phases.
 5. Pipeline sessions are not interactive agent sessions. They contain a plain
    Node orchestrator which spawns disposable headless model processes; they
    cannot be steered and may only be inspected or killed.

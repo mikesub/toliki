@@ -364,11 +364,22 @@ ${d.verification.evidence.map(item => `- ${item}`).join('\n')}
   writeFileSync(path.join(dir, 'architecture.json'), `${JSON.stringify(d, null, 2)}\n`)
   return text
 }
+// delivery.json: the run's delivery record, written from what the coding phase
+// returned. It sits beside architecture.json for the same reason — a re-run
+// that still has this scratch directory publishes the checkpoint straight from
+// it, and one that lost it reconstructs the record read-only rather than
+// inventing a rationale for a change nobody in that run made.
+export function renderDelivery(dir, delivery) {
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(path.join(dir, 'delivery.json'), `${JSON.stringify(delivery, null, 2)}\n`)
+  return delivery
+}
+
 // The assessment ledger preserves every finding and its index. A coder's
 // dispute is only a claim; only the independent final review can mark an item
-// cleared. Ship reads final states, including uncertainty and what the review
-// found still unmet, without reconstructing them from builder prose or matching
-// potentially duplicate titles.
+// cleared. The published record is rendered from those same structured verdicts
+// — including uncertainty and what the review found still unmet — never
+// reconstructed from builder prose or matched by potentially duplicate titles.
 export function renderReview(dir, items, { checked = false, note = null, unmet = [] } = {}) {
   let text = '# Review\n\n'
   if (checked) {

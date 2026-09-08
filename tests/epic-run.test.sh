@@ -257,8 +257,6 @@ case "${EPIC_STEP_LABEL:-}" in
   verify:*)                                    key=verify ;;
   final-review)                                key=finalreview ;;
   fixes-after-review|fixes-after-review:retry) key=triage ;;
-  ship:pr)                                     key=ship ;;
-  summary:write)                               key=summary ;;
   resolve|resolve:retry)                       key=fix-resolve ;;
   acceptance)                                  key=fix-check ;;
   fix-ci|fix-ci:retry)                         key=ci-fix ;;
@@ -1011,12 +1009,18 @@ fi
 # ───────────────────────── the happy-path fixture set ─────────────────────────
 BASE="$TMP/fixtures-base"
 mkdir -p "$BASE"
-fixture "$BASE" design '{"approach":"Thin widget module","rationale":"Fits the existing shape.","steps":["one","two"],"files":["src/widget.ts — new"],"contract":"createWidget(): Widget","tradeoffs":"No caching.","verification":{"mode":"test-first","rationale":"The public export can be asserted before implementation.","evidence":["widget test passes"]},"review":{"question":"","rationale":"The change has no narrow high-impact risk beyond general review."}}'
-cp "$BASE/design.json" "$BASE/recover.json"
+DESIGN_BASE='{"approach":"Thin widget module","rationale":"Fits the existing shape.","steps":["one","two"],"files":["src/widget.ts — new"],"contract":"createWidget(): Widget","tradeoffs":"No caching.","verification":{"mode":"test-first","rationale":"The public export can be asserted before implementation.","evidence":["widget test passes"]},"review":{"question":"","rationale":"The change has no narrow high-impact risk beyond general review."}}'
+fixture "$BASE" design "$DESIGN_BASE"
 fixture "$BASE" red '{"testFiles":["frontend/src/widget.test.ts"],"expectedFailure":"missing export createWidget","reason":"The required public export does not exist yet."}'
 fixture_sh "$BASE" red 'printf "test(\"widget\", () => {})\n" > frontend/src/widget.test.ts'
-fixture_text "$BASE" green "frontend verified green"
+# The coding phase returns its account of the work AND the delivery record the
+# scripted ship phase publishes from: there is no shipper call to write either.
+DELIVERY_BASE='{"title":"Add widget","commitBody":"COMMIT_RATIONALE_SENTINEL: Add the widget so callers share one construction path.\n\nCOMMIT_DESIGN_SENTINEL: Keep the module thin and avoid caching because the current shape needs neither state nor invalidation.","deferred":[]}'
+fixture "$BASE" green "{\"status\":\"frontend verified green\",\"delivery\":$DELIVERY_BASE}"
 fixture_sh "$BASE" green 'printf "export const createWidget = () => ({})\n" > frontend/src/widget.ts'
+# A resumed checkpoint whose scratch artifacts died: one read-only architect
+# reconstructs the plan AND the delivery record, because no coding step will run.
+fixture "$BASE" recover "$(jq -cn --argjson design "$DESIGN_BASE" --argjson delivery "$DELIVERY_BASE" '$design + {delivery: $delivery}')"
 fixture "$BASE" review-general '{"findings":[{"title":"Null deref on empty list","severity":"Critical","confidence":90,"location":"src/widget.ts:12","problem":"Crashes when items is empty.","fix":"Guard the access.","gate":"unit test for the empty case"}]}'
 fixture "$BASE" triage '{"status":"Fixed the null deref, verify green.","assessments":[{"index":1,"action":"fixed","reason":"Added the empty-list guard and regression coverage."}]}'
 fixture_sh "$BASE" triage 'printf "export const createWidget = () => ({ items: [] })\n" > frontend/src/widget.ts'
@@ -1027,7 +1031,6 @@ fixture "$BASE" finalreview '{"verdicts":[{"index":1,"verdict":"resolved","confi
 fixture "$BASE" correction '{"summary":"CORRECTION_NARRATIVE_SENTINEL: guarded the empty list the review named.","dispositions":[{"id":"blocker-1","action":"corrected","reason":"Added the empty-list guard and its regression."}]}'
 fixture_sh "$BASE" correction 'printf "export const createWidget = () => ({ items: [], guarded: true })\n" > frontend/src/widget.ts'
 fixture "$BASE" narrowconfirm '{"cleared":true,"confidence":93,"reasoning":"The guard is present in the correction delta and nothing else moved.","blockerVerdicts":[{"id":"blocker-1","verdict":"cleared","reasoning":"the guard is observable in the correction delta"}],"regressions":[]}'
-fixture "$BASE" ship '{"title":"Add widget","body":"ISSUE_NARRATIVE_SENTINEL: Implements widget creation for callers.\n\nDESIGN_NARRATIVE_SENTINEL: Keeps a thin module because that fits the existing shape.\n\nREVIEW_NARRATIVE_SENTINEL: One independently reviewed finding was fixed.","commitBody":"COMMIT_RATIONALE_SENTINEL: Add the widget so callers share one construction path.\n\nCOMMIT_DESIGN_SENTINEL: Keep the module thin and avoid caching because the current shape needs neither state nor invalidation.","deferred":[]}'
 
 make_deadlens_fixture() {
   DEADLENS="$TMP/fixtures-deadlens"
@@ -1039,12 +1042,11 @@ make_deadlens_fixture() {
 make_held_fixture() {
   HELD="$TMP/fixtures-held"
   cp -R "$BASE" "$HELD"
-  fixture "$HELD" triage '{"status":"Left one for a human.","assessments":[{"index":1,"action":"deferred","reason":"The fix needs a product decision."}]}'
+  fixture "$HELD" triage '{"status":"Left one for a human.","assessments":[{"index":1,"action":"deferred","reason":"The fix needs a product decision.","followUp":{"title":"Decide the empty-list contract and guard it","body":"The empty-list access still throws; the guard needs a product decision first."}}]}'
   fixture_sh "$HELD" triage 'true'
   fixture "$HELD" finalreview '{"verdicts":[{"index":1,"verdict":"unresolved","confidence":94,"defect":true,"reasoning":"The empty-list access is still reachable and throws; no guard was added."}],"regressions":[],"unmetRequirements":[]}'
   fixture "$HELD" correction '{"summary":"The empty-list policy is a product decision.","dispositions":[{"id":"blocker-1","action":"declined","reason":"choosing throw-vs-empty is a product decision, not an implementation defect"}]}'
   rm -f "$HELD/correction.sh"
-  fixture "$HELD" ship '{"title":"Add widget","body":"HELD_ISSUE_NARRATIVE_SENTINEL: Implements the guarded widget path, while one empty-list decision remains.\n\nHELD_DESIGN_NARRATIVE_SENTINEL: Preserves the thin-module boundary.","commitBody":"HELD_COMMIT_RATIONALE_SENTINEL: Keep the verified guarded path as one candidate while a human decides the remaining empty-list behavior.","deferred":[{"blockerId":"blocker-1","title":"Null deref on empty list","why":"The fix needs a product decision.","kind":"defect","file":false}]}'
 }
 
 make_rejected_fixture() {
@@ -1058,12 +1060,12 @@ make_rejected_fixture() {
 make_defer_fixture() {
   DEFER="$TMP/fixtures-defer"
   cp -R "$BASE" "$DEFER"
-  fixture "$DEFER" ship '{"title":"Add widget","body":"Adds a widget.","commitBody":"Use the thin widget module so callers share one construction path.","legalMarker":"LEGAL-REVIEW: required","deferred":[
-    {"blockerId":"new","title":"Widget crashes on empty list","why":"Needs a product decision.","kind":"defect","file":true,"issueTitle":"Widget crashes on empty list","issueBody":"Still on main after the merge."},
-    {"blockerId":"new","title":"Second defect","why":"Same.","kind":"defect","file":true},
-    {"blockerId":"new","title":"Third defect","why":"Same.","kind":"defect","file":true},
-    {"blockerId":"new","title":"Fourth defect","why":"Same.","kind":"defect","file":true},
-    {"blockerId":"new","title":"Refactor the helpers","why":"Nice to have.","kind":"other","file":true}]}'
+  fixture "$DEFER" green '{"status":"frontend verified green","delivery":{"title":"Add widget","commitBody":"Use the thin widget module so callers share one construction path.","legalMarker":"LEGAL-REVIEW: required","deferred":[
+    {"title":"Widget crashes on empty list","why":"Needs a product decision.","kind":"defect","file":true,"issueTitle":"Widget crashes on empty list","issueBody":"Still on main after the merge."},
+    {"title":"Second defect","why":"Same.","kind":"defect","file":true},
+    {"title":"Third defect","why":"Same.","kind":"defect","file":true},
+    {"title":"Fourth defect","why":"Same.","kind":"defect","file":true},
+    {"title":"Refactor the helpers","why":"Nice to have.","kind":"other","file":true}]}}'
 }
 
 # ───────────────────────── the runner ─────────────────────────
@@ -1196,6 +1198,13 @@ gh_last_comment() {
   all="${all%$'\n---'}"
   printf '%s' "${all##*$'\n---\n'}"
 }
+gh_deferred_record() {
+  awk '
+    $0 == "🤖 deferred / not done" { found = 1 }
+    found && $0 == "---" { exit }
+    found { print }
+  ' "$STATE_DIR/gh/comments" 2>/dev/null
+}
 gh_evidence_comment() {
   awk '
     $0 == "🤖 defect-fix evidence" { found = 1 }
@@ -1256,7 +1265,8 @@ if [[ "$EPIC_TEST_GROUP" == contracts ]]; then
 # ───────────────────────── blocker identity registry ─────────────────────────
 # Direct coverage for the run-local registry: the end-to-end cases below prove
 # the same IDs survive model handoffs and transport, while this matrix pins the
-# no-text-fallback boundary and every malformed-ledger refusal independently.
+# no-text-fallback boundary — two blockers whose display text is identical must
+# never be able to inherit each other's follow-up.
 cat > "$TMP/blocker-identity-contract.mjs" <<'NODE'
 const api = await import(process.env.BLOCKER_IDENTITY_MODULE)
 const registry = api.createBlockerIdentityRegistry()
@@ -1268,70 +1278,39 @@ const later = {
   title: 'Same displayed blocker', location: 'src/widget.ts:24',
   problem: 'Same displayed reason.',
 }
-const known = registry.catalog([first, later])
-const reversedCatalog = registry.catalog([later, first])
-const reversedDecision = {
-  deferred: [
-    { blockerId: 'blocker-2', title: first.title, why: first.problem, kind: 'defect', file: true },
-    { blockerId: 'blocker-1', title: first.title, why: first.problem, kind: 'defect', file: false },
-  ],
-}
-registry.registerShipDeferrals(reversedDecision, known.ids)
+const ids = [first, later].map(item => registry.ensureId(item))
+// The ledger entry and the gate's own copy of a finding are different objects
+// that mean one blocker: identity resolves through `finding`, never by text.
+const ledgerEntry = { finding: later, verdict: { reasoning: 'still open' } }
+const gateCopy = { finding: later, why: 'rephrased for the record' }
+const reversed = [ledgerEntry, gateCopy, first].map(item => registry.ensureId(item))
 const filedUrl = 'https://github.com/o/r/issues/101'
-const followUps = new Map([[registry.idFor(reversedDecision.deferred[0]), filedUrl]])
-
-function refusal(kind) {
-  const isolated = api.createBlockerIdentityRegistry()
-  const one = { title: 'Duplicate title', why: 'Duplicate reason' }
-  const two = { title: 'Duplicate title', why: 'Duplicate reason' }
-  const catalog = isolated.catalog([one, two])
-  let deferred
-  if (kind === 'incomplete') {
-    deferred = [{ blockerId: 'blocker-2', title: two.title, why: two.why, kind: 'defect', file: true }]
-  } else if (kind === 'unknown') {
-    deferred = [{ blockerId: 'blocker-999', title: one.title, why: one.why, kind: 'defect', file: true }]
-  } else {
-    deferred = [
-      { blockerId: 'blocker-1', title: one.title, why: one.why, kind: 'defect', file: true },
-      { blockerId: 'blocker-1', title: two.title, why: two.why, kind: 'defect', file: false },
-    ]
-  }
-  try {
-    isolated.registerShipDeferrals({ deferred }, catalog.ids)
-    return 'accepted'
-  } catch (error) {
-    return error.message
-  }
-}
+const followUps = new Map([[registry.ensureId(ledgerEntry), filedUrl]])
+let nonObject = 'accepted'
+try { registry.ensureId('blocker-1') } catch (error) { nonObject = error.message }
 
 console.log(JSON.stringify({
   factoryExported: typeof api.createBlockerIdentityRegistry === 'function',
-  distinctIds: registry.idFor(first) === 'blocker-1' && registry.idFor(later) === 'blocker-2',
-  reversedCatalogIds: [...reversedCatalog.ids].join(','),
-  reversedShipIds: reversedDecision.deferred.map(item => registry.idFor(item)).join(','),
-  blockerIdsRemoved: reversedDecision.deferred.every(item => !Object.hasOwn(item, 'blockerId')),
+  distinctIds: ids.join(','),
+  reversedIds: reversed.join(','),
+  stableUnderRepeat: registry.ensureId(first) === 'blocker-1' && registry.ensureId(later) === 'blocker-2',
   unregisteredCopy: registry.idFor({ title: first.title, location: first.location, problem: first.problem }),
-  filedLaterLink: followUps.get(registry.idFor(later)) || null,
+  filedLaterLink: followUps.get(registry.idFor(gateCopy)) || null,
   siblingLink: followUps.get(registry.idFor(first)) || null,
-  incomplete: refusal('incomplete'),
-  unknown: refusal('unknown'),
-  repeated: refusal('repeated'),
+  nonObject,
 }))
 NODE
 
 scenario 'blocker identity registry: exact object identity survives reorder without display-text fallback'
 BLOCKER_IDENTITY_CONTRACT="$(BLOCKER_IDENTITY_MODULE="$ROOT/workflows/lib/blocker-identity.mjs" node "$TMP/blocker-identity-contract.mjs")"
 assert_eq "the factory-backed registry is exported" true "$(jq -r .factoryExported <<<"$BLOCKER_IDENTITY_CONTRACT")"
-assert_eq "same-title blocker objects receive distinct opaque IDs" true "$(jq -r .distinctIds <<<"$BLOCKER_IDENTITY_CONTRACT")"
-assert_eq "reversing known objects retains their original IDs" "blocker-2,blocker-1" "$(jq -r .reversedCatalogIds <<<"$BLOCKER_IDENTITY_CONTRACT")"
-assert_eq "reversed ship copies register against their requested exact IDs" "blocker-2,blocker-1" "$(jq -r .reversedShipIds <<<"$BLOCKER_IDENTITY_CONTRACT")"
-assert_eq "internal blocker IDs stay off registered ship records" true "$(jq -r .blockerIdsRemoved <<<"$BLOCKER_IDENTITY_CONTRACT")"
+assert_eq "same-title blocker objects receive distinct opaque IDs" "blocker-1,blocker-2" "$(jq -r .distinctIds <<<"$BLOCKER_IDENTITY_CONTRACT")"
+assert_eq "a ledger entry and the gate's own copy resolve to their finding's ID" "blocker-2,blocker-2,blocker-1" "$(jq -r .reversedIds <<<"$BLOCKER_IDENTITY_CONTRACT")"
+assert_eq "assigning an ID twice never mints a second one" true "$(jq -r .stableUnderRepeat <<<"$BLOCKER_IDENTITY_CONTRACT")"
 assert_eq "an unregistered same-text copy has no identity" null "$(jq -r .unregisteredCopy <<<"$BLOCKER_IDENTITY_CONTRACT")"
 assert_eq "filing the later duplicate resolves its exact follow-up" "https://github.com/o/r/issues/101" "$(jq -r .filedLaterLink <<<"$BLOCKER_IDENTITY_CONTRACT")"
 assert_eq "the earlier same-text sibling cannot inherit that follow-up" null "$(jq -r .siblingLink <<<"$BLOCKER_IDENTITY_CONTRACT")"
-assert_contains "an incomplete non-empty ledger is refused" "$(jq -r .incomplete <<<"$BLOCKER_IDENTITY_CONTRACT")" "omitted known blocker ID"
-assert_contains "an unknown blocker ID is refused" "$(jq -r .unknown <<<"$BLOCKER_IDENTITY_CONTRACT")" "unknown blocker ID"
-assert_contains "a repeated blocker ID is refused" "$(jq -r .repeated <<<"$BLOCKER_IDENTITY_CONTRACT")" "reused blocker ID"
+assert_contains "a non-object can never be given an identity" "$(jq -r .nonObject <<<"$BLOCKER_IDENTITY_CONTRACT")" "non-object item"
 
 # ───────────────────────── defect evidence document codec ─────────────────────────
 # Unit-level coverage for the public comment codec. The integration scenarios
@@ -1692,7 +1671,7 @@ GH_ISSUE_LABELS=ready,task run_pipeline "$TASK_RUN" "$TASK_BASE" --issue 42
 assert_rc "successful task exits 0" 0 "$RUN_RC"
 assert_contains "successful task claims the merge queue" "$RUN_OUT" '"readyToMerge":true'
 assert_eq "exactly one model process runs" 1 "$(calls task)"
-assert_eq "no epic model step runs" "0|0|0|0|0" "$(calls design)|$(calls direct)|$(calls review-general)|$(calls triage)|$(calls ship)"
+assert_eq "no epic model step runs" "0|0|0|0|0" "$(calls design)|$(calls direct)|$(calls green)|$(calls review-general)|$(calls triage)"
 assert_eq "usage records exactly one successful spawn" 1 "$(usage_log | jq -r 'select(.type=="spawn") | .step' | grep -c '^task$' || true)"
 assert_contains "the task charter reaches the process" "$(cat "$RUN_LOG")" "single agent process"
 assert_contains "the task uses its own Claude model/effort row" "$(cat "$RUN_LOG")" "--model opus --effort high"
@@ -1855,7 +1834,7 @@ assert_contains "RESULT says readyToMerge" "$RUN_OUT" '"readyToMerge":true'
 assert_not_contains "a clear gate never advertises defect repair" "$RUN_OUT" '"needsDefectFix":true'
 assert_contains "RESULT carries the PR url" "$RUN_OUT" '"prUrl":"https://github.com/o/r/pull/7"'
 assert_contains "the review finding remains in the review artifact" "$(cat "$WT/.epics/42-add-widget/review.md")" 'Null deref on empty list'
-assert_eq "exactly seven model steps ran" 7 "$(wc -l < "$RUN_LOG" | tr -d ' ')"
+assert_eq "exactly six model steps ran" 6 "$(wc -l < "$RUN_LOG" | tr -d ' ')"
 assert_eq "no separate pre-repair confirmation ran" 0 "$(calls verify)"
 assert_eq "exactly one fresh fixer ran" 1 "$(calls triage)"
 assert_eq "and exactly one final review" 1 "$(calls finalreview)"
@@ -1872,31 +1851,34 @@ assert_contains "the captured change carries the implementation" "$TRIAGE_PROMPT
 assert_not_contains "the assessor is not sent to fetch the requirement itself" "$TRIAGE_PROMPT_0" ".epics/42-add-widget/requirements.md"
 assert_not_contains "the assessor is not told to run Git" "$TRIAGE_PROMPT_0" 'git diff origin/main...HEAD'
 assert_not_contains "no step is asked to maintain the run record" "$TRIAGE_PROMPT_0" "epic.md's phase log"
-assert_contains "the coder gets the requirement instead of a file to open" "$(cat "$STATE_DIR/green.0.prompt")" "Build a widget."
-assert_not_contains "the coder is not sent to read requirements.md" "$(cat "$STATE_DIR/green.0.prompt")" "requirements.md"
+GREEN_PROMPT_0="$(cat "$STATE_DIR/green.0.prompt")"
+assert_contains "the coder gets the requirement instead of a file to open" "$GREEN_PROMPT_0" "Build a widget."
+assert_not_contains "the coder is not sent to read requirements.md" "$GREEN_PROMPT_0" "requirements.md"
+# The delivery judgment is collected where the change is made: there is no
+# shipper call after it, and a script cannot supply what the record leaves out.
+assert_contains "the coding phase is told its record is what gets published" "$GREEN_PROMPT_0" "There is no later prose step"
+assert_contains "and that the project's own legal trigger is the only one" "$GREEN_PROMPT_0" "legal/compliance review trigger only if its AGENTS.md defines one"
 EPIC_MD="$(cat "$WT/.epics/42-add-widget/epic.md")"
 assert_contains "the orchestrator writes the coder's returned account into the phase log" "$EPIC_MD" "- code: frontend verified green"
 assert_contains "and the repair's returned account too" "$EPIC_MD" "- fixes-after-review: Fixed the null deref, verify green."
-SHIP_PROMPT_0="$(cat "$STATE_DIR/ship.0.prompt")"
-assert_contains "ship receives the final review ledger rather than a path to it" "$SHIP_PROMPT_0" '<review-ledger>'
-assert_contains "the supplied ledger carries the final states" "$SHIP_PROMPT_0" "Null deref on empty list"
-assert_not_contains "ship is not sent into the run's scratch directory" "$SHIP_PROMPT_0" "review.md"
+assert_eq "no delivery-prose step exists to spawn" 0 "$(cat "$STATE_DIR/ship.n" 2>/dev/null || echo 0)"
 assert_contains "the final review receives the pinned requirement" "$FINALREVIEW_PROMPT" "Build a widget."
 assert_contains "the final review receives every original finding" "$FINALREVIEW_PROMPT" "Title: Null deref on empty list"
 assert_not_contains "but never the fixer's own explanation" "$FINALREVIEW_PROMPT" "Added the empty-list guard and regression coverage."
-assert_contains "the fixer is asked for the smallest correct repair" "$(cat "$STATE_DIR/triage.0.prompt")" "smallest correct repair"
-assert_not_contains "the fixer is not forced into class-wide hardening" "$(cat "$STATE_DIR/triage.0.prompt")" "Every review finding is a missing gate"
-assert_contains "follow-up filing treats the cap as a ceiling" "$(cat "$STATE_DIR/ship.0.prompt")" "a ceiling, never a target"
-assert_contains "follow-ups retain dependency-first queueing" "$(cat "$STATE_DIR/ship.0.prompt")" 'records the dependency on this issue, and then queues the follow-up with `ready`'
+assert_contains "the fixer is asked for the smallest correct repair" "$TRIAGE_PROMPT_0" "smallest correct repair"
+assert_not_contains "the fixer is not forced into class-wide hardening" "$TRIAGE_PROMPT_0" "Every review finding is a missing gate"
+# A deferred finding's follow-up is collected from the step that deferred it,
+# and nowhere else: the script files what a model wrote and invents no slicing.
+assert_contains "the fixer owns the follow-up decision for what it defers" "$TRIAGE_PROMPT_0" "only place one is collected"
 assert_contains "review.md carries the final-review section" "$(cat "$WT/.epics/42-add-widget/review.md")" "## Final review"
 # The usage log: one line per spawn keyed by the engines.json step, plus the two
 # lifecycle lines that bound the whole invocation. Never on GitHub.
-assert_eq "one usage record per spawn" 7 "$(usage_log | jq -r 'select(.type=="spawn") | .runId' | wc -l | tr -d ' ')"
-assert_eq "records name the engines.json steps" "architect:1 code:2 final-review:1 fixes-after-review:1 review:1 ship:1" "$(usage_log | jq -r 'select(.type=="spawn") | .step' | sort | uniq -c | awk '{print $2":"$1}' | tr '\n' ' ' | sed 's/ $//')"
+assert_eq "one usage record per spawn" 6 "$(usage_log | jq -r 'select(.type=="spawn") | .runId' | wc -l | tr -d ' ')"
+assert_eq "records name the engines.json steps" "architect:1 code:2 final-review:1 fixes-after-review:1 review:1" "$(usage_log | jq -r 'select(.type=="spawn") | .step' | sort | uniq -c | awk '{print $2":"$1}' | tr '\n' ' ' | sed 's/ $//')"
 assert_eq "tokens are what the CLI reported, all four kinds summed" "1600" "$(usage_log | jq -r 'select(.label=="architect:design") | .tokens.total')"
 assert_eq "cost and turns ride along" "0.05 3" "$(usage_log | jq -r 'select(.label=="architect:design") | "\(.costUsd) \(.turns)"')"
-assert_eq "every spawn record carries the run, issue and engine" "7" "$(usage_log | jq -r 'select(.type=="spawn" and .issue==42 and .engine=="claude" and (.runId|length)>0) | .step' | wc -l | tr -d ' ')"
-assert_eq "every usage timestamp stays canonical UTC ISO" "9" "$(usage_log | jq -r 'select(.ts | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$")) | .ts' | wc -l | tr -d ' ')"
+assert_eq "every spawn record carries the run, issue and engine" "6" "$(usage_log | jq -r 'select(.type=="spawn" and .issue==42 and .engine=="claude" and (.runId|length)>0) | .step' | wc -l | tr -d ' ')"
+assert_eq "every usage timestamp stays canonical UTC ISO" "8" "$(usage_log | jq -r 'select(.ts | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$")) | .ts' | wc -l | tr -d ' ')"
 # The invocation's own lifecycle: one start before the work, one finish after the
 # RESULT line, so an operator can read what a run cost in wall time and how it
 # ended without reconstructing either from prose later.
@@ -1916,7 +1898,7 @@ assert_not_contains "no usage went to GitHub" "$(cat "$GH_LOG")" "tokens"
 REPORT="$(node "$ROOT/workflows/usage-report.mjs" --log "$STATE_DIR/usage.jsonl")"
 assert_contains "the report groups by script" "$REPORT" "epic-run — 1 run(s): claude 1"
 assert_contains "and shows independent review usage" "$REPORT" "review"
-assert_contains "with percentages" "$REPORT" "28.6"
+assert_contains "with percentages" "$REPORT" "33.3"
 assert_eq "the mandatory general reviewer ran once" 1 "$(calls review-general)"
 # What the orchestrator did to the repo and the issue.
 assert_eq "origin holds the branch as ONE commit above main" 1 "$(origin_count epic/42-add-widget)"
@@ -1956,20 +1938,21 @@ assert_contains "the minimal PR body points to the issue specification" "$(print
 assert_contains "the minimal PR body points to the issue run record" "$(printf '%s' "$PR_BODY" | tr '[:upper:]' '[:lower:]')" "run record"
 assert_contains "the minimal PR body retains the closing relationship" "$PR_BODY" "Closes #42"
 assert_eq "the generated PR body has only its pointer and closing line" 2 "$(grep -cve '^$' <<<"$PR_BODY")"
-assert_not_contains "the implementation narrative is absent from the PR" "$PR_BODY" "ISSUE_NARRATIVE_SENTINEL"
-assert_not_contains "the design narrative is absent from the PR" "$PR_BODY" "DESIGN_NARRATIVE_SENTINEL"
-assert_not_contains "the review narrative is absent from the PR" "$PR_BODY" "REVIEW_NARRATIVE_SENTINEL"
-assert_not_contains "the commit-only rationale is absent from the PR" "$PR_BODY" "COMMIT_RATIONALE_SENTINEL"
+assert_not_contains "the durable commit rationale is absent from the PR" "$PR_BODY" "COMMIT_RATIONALE_SENTINEL"
 DELIVERY_SUMMARY="$(gh_delivery_summary)"
 CANDIDATE_SHA="$(origin_ref epic/42-add-widget)"
 assert_eq "one append-only delivery summary identifies this candidate" 1 "$(delivery_summary_count)"
-assert_contains "the issue receives the implementation narrative" "$DELIVERY_SUMMARY" "ISSUE_NARRATIVE_SENTINEL"
-assert_contains "the issue receives the design rationale" "$DELIVERY_SUMMARY" "DESIGN_NARRATIVE_SENTINEL"
-assert_contains "the issue receives the independent review outcome" "$DELIVERY_SUMMARY" "REVIEW_NARRATIVE_SENTINEL"
+# The record is scripted from the coding phase's rationale, the architect's
+# chosen approach and the review ledger's structured verdicts — no model wrote
+# a word of it after the change was made.
+assert_contains "the issue receives the durable implementation rationale" "$DELIVERY_SUMMARY" "COMMIT_RATIONALE_SENTINEL"
+assert_contains "the issue receives the design rationale" "$DELIVERY_SUMMARY" 'Architecture approach — "Thin widget module": Fits the existing shape.'
+assert_contains "the issue receives each finding's final state" "$DELIVERY_SUMMARY" "- Finding 1: Null deref on empty list — resolved (confidence 92)"
 assert_contains "the issue summary links the technical PR" "$DELIVERY_SUMMARY" "https://github.com/o/r/pull/7"
 assert_contains "the issue summary identifies the branch" "$DELIVERY_SUMMARY" "epic/42-add-widget"
 assert_contains "the issue summary identifies the full captured candidate" "$DELIVERY_SUMMARY" "$CANDIDATE_SHA"
 assert_contains "the issue summary uses the orchestrator's actual verify output" "$DELIVERY_SUMMARY" "verify ok"
+assert_contains "the changed-file list is derived, never reported by a step" "$DELIVERY_SUMMARY" "Files changed (2): frontend/src/widget.test.ts, frontend/src/widget.ts"
 assert_contains "the issue summary uses the independently computed review tally" "$DELIVERY_SUMMARY" "1 confirmed, 0 independently disproved, 0 open"
 assert_contains "the pre-handoff issue summary reports a clear candidate deterministically" "$DELIVERY_SUMMARY" "clear-pending-handoff"
 assert_not_contains "the candidate summary does not claim merge readiness early" "$DELIVERY_SUMMARY" "queued for the merge worker"
@@ -1977,6 +1960,7 @@ assert_not_contains "the candidate summary does not claim a merge" "$DELIVERY_SU
 assert_not_contains "the candidate summary does not claim confirmed delivery" "$DELIVERY_SUMMARY" "delivered"
 assert_not_contains "the issue body remains the specification" "$(grep '^issue edit 42 ' "$GH_LOG" 2>/dev/null || true)" "--body"
 assert_contains "architecture.md was rendered from the design" "$(cat "$WT/.epics/42-add-widget/architecture.md")" "Approach: Thin widget module"
+assert_contains "the delivery record is kept for a resumed worktree to publish" "$(cat "$WT/.epics/42-add-widget/delivery.json")" "COMMIT_RATIONALE_SENTINEL"
 assert_contains "review.md was rendered from the verdicts" "$(cat "$WT/.epics/42-add-widget/review.md")" "Null deref on empty list"
 assert_contains "requirements.md carries the issue body verbatim" "$(cat "$WT/.epics/42-add-widget/requirements.md")" "Build a widget."
 # Tiering and charters are invisible in production until they bill; assert them here.
@@ -1994,40 +1978,37 @@ assert_contains "the default tier is pinned to opus" "$ARGV" "--model opus"
 assert_contains "every Claude phase runs at xhigh effort" "$ARGV" "--effort xhigh"
 assert_contains "architect and reviewer cannot write" "$ARGV" "--tools Glob,Grep,Read,"
 assert_contains "the reviewer charter reaches the model" "$ARGV" "Review code against project guidelines"
-assert_contains "the shipper charter reaches the model" "$ARGV" "Write only the structured delivery prose"
+assert_not_contains "no charter for a delivery-prose role is loaded at all" "$ARGV" "Write only the structured delivery prose"
 # Assert the no-shell/no-write boundary per judging spawn; coder rows carry
 # Bash/Edit/Write in the same log. The state snapshot remains defense in depth.
 assert_eq "no Claude review phase is handed a shell or write tool" 0 "$(grep 'Review code against project guidelines' "$RUN_LOG" | grep -cE -- '--tools [^ ]*(Bash|Edit|Write)' || true)"
 assert_eq "and both review phases were checked" 2 "$(grep -c 'Review code against project guidelines' "$RUN_LOG" || true)"
-assert_eq "the Claude ship phase is handed no shell or write tool" 0 "$(grep 'Write only the structured delivery prose' "$RUN_LOG" | grep -cE -- '--tools [^ ]*(Bash|Edit|Write)' || true)"
-assert_eq "and the ship boundary was checked" 1 "$(grep -c 'Write only the structured delivery prose' "$RUN_LOG" || true)"
-SHIP_PROMPT="$(cat "$STATE_DIR/ship.0.prompt")"
-assert_contains "ship receives the captured final change" "$SHIP_PROMPT" '<change-diff>'
-assert_contains "ship sees the implementation path" "$SHIP_PROMPT" 'frontend/src/widget.ts'
-assert_contains "ship sees the new test path" "$SHIP_PROMPT" 'frontend/src/widget.test.ts'
-assert_not_contains "ship is not told to run Git" "$SHIP_PROMPT" 'git diff origin/main...HEAD'
 assert_contains "schemas are enforced by the engine" "$ARGV" "--json-schema"
 assert_contains "permissions are pre-granted for autonomy" "$ARGV" "--dangerously-skip-permissions"
 assert_contains "the general reviewer judges meaningful defects" "$(cat "$STATE_DIR/review-general.0.prompt")" "meaningful defects or regressions"
 assert_not_contains "the reviewer never sees builder architecture" "$(cat "$STATE_DIR/review-general.0.prompt")" "Thin widget module"
 
-for ship_content_case in empty-body whitespace-body empty-commit-body whitespace-commit-body; do
-  INVALID_SHIP="$TMP/fixtures-invalid-ship-$ship_content_case"; cp -R "$BASE" "$INVALID_SHIP"
-  case "$ship_content_case" in
-    empty-body) body=''; commit_body='Durably explain why the widget uses one construction path.' ;;
-    whitespace-body) body=$' \n\t '; commit_body='Durably explain why the widget uses one construction path.' ;;
-    empty-commit-body) body='Explain the implementation and its thin-module design.'; commit_body='' ;;
-    whitespace-commit-body) body='Explain the implementation and its thin-module design.'; commit_body=$' \n\t ' ;;
+# The delivery record is validated where it is produced, before a reviewer, a
+# repair or any transport spends anything on a change nothing can be published
+# from: no later step writes a title or a commit rationale.
+for delivery_case in empty-title whitespace-title empty-commit-body whitespace-commit-body; do
+  INVALID_DELIVERY="$TMP/fixtures-invalid-delivery-$delivery_case"; cp -R "$BASE" "$INVALID_DELIVERY"
+  case "$delivery_case" in
+    empty-title) title=''; commit_body='Durably explain why the widget uses one construction path.' ;;
+    whitespace-title) title=$' \n\t '; commit_body='Durably explain why the widget uses one construction path.' ;;
+    empty-commit-body) title='Add widget'; commit_body='' ;;
+    whitespace-commit-body) title='Add widget'; commit_body=$' \n\t ' ;;
   esac
-  fixture "$INVALID_SHIP" ship "$(jq -cn --arg body "$body" --arg commitBody "$commit_body" \
-    '{title:"Add widget", body:$body, commitBody:$commitBody, deferred:[]}')"
-  scenario "epic-run: $ship_content_case ship prose fails closed before candidate transport"
-  run_pipeline "$EPIC_RUN" "$INVALID_SHIP" --issue 42
-  assert_rc "$ship_content_case is a ship blocker" 3 "$RUN_RC"
-  assert_contains "$ship_content_case names the invalid ship field" "$RUN_OUT" "Ship returned blank"
-  assert_eq "$ship_content_case creates no PR" "" "$(gh_pr_created)"
-  assert_eq "$ship_content_case publishes no candidate summary" 0 "$(delivery_summary_count)"
-  assert_not_contains "$ship_content_case never pushes the squashed candidate" \
+  fixture "$INVALID_DELIVERY" green "$(jq -cn --arg title "$title" --arg commitBody "$commit_body" \
+    '{status:"implemented", delivery:{title:$title, commitBody:$commitBody, deferred:[]}}')"
+  scenario "epic-run: a $delivery_case delivery record fails closed in the coding phase"
+  run_pipeline "$EPIC_RUN" "$INVALID_DELIVERY" --issue 42
+  assert_rc "$delivery_case is a code blocker" 3 "$RUN_RC"
+  assert_contains "$delivery_case names the missing delivery record" "$RUN_OUT" "no usable delivery record"
+  assert_eq "$delivery_case never reaches review" 0 "$(calls review-general)"
+  assert_eq "$delivery_case creates no PR" "" "$(gh_pr_created)"
+  assert_eq "$delivery_case publishes no candidate summary" 0 "$(delivery_summary_count)"
+  assert_not_contains "$delivery_case never pushes the squashed candidate" \
     "$(git -C "$ORIGIN" log -1 --format=%B epic/42-add-widget 2>/dev/null || true)" "Closes #42"
 done
 
@@ -2060,7 +2041,7 @@ assert_eq "an acknowledged write is attempted only once" 1 "$(cat "$STATE_DIR/gh
 scenario 'epic-run: a direct plan uses one implementation pass and mandatory review'
 DIRECT="$TMP/fixtures-direct"; cp -R "$BASE" "$DIRECT"
 fixture "$DIRECT" design '{"approach":"Direct widget edit","rationale":"This small wiring change has no honest pre-implementation regression.","steps":["edit and verify"],"files":["src/widget.ts — new"],"contract":"createWidget(): Widget","tradeoffs":"No artificial RED.","verification":{"mode":"direct","rationale":"The change is verified by its final public behavior.","evidence":["widget export exists"]},"review":{"question":"","rationale":"General review is sufficient."}}'
-fixture_text "$DIRECT" direct "implemented widget and verified frontend"
+fixture "$DIRECT" direct "{\"status\":\"implemented widget and verified frontend\",\"delivery\":$DELIVERY_BASE}"
 fixture_sh "$DIRECT" direct 'printf "export const createWidget = () => ({})\n" > frontend/src/widget.ts'
 fixture "$DIRECT" review-general '{"findings":[]}'
 run_pipeline "$EPIC_RUN" "$DIRECT" --issue 42
@@ -2069,7 +2050,7 @@ assert_eq "direct implementation runs once" 1 "$(calls direct)"
 assert_eq "direct plan never runs RED" 0 "$(calls red)"
 assert_eq "direct plan never runs test-first green" 0 "$(calls green)"
 assert_eq "direct plan still runs final verify" 1 "$(grep -c '^run verify$' "$NPM_LOG")"
-assert_eq "architect, direct coder, reviewer and ship are the four agents" 4 "$(wc -l < "$RUN_LOG" | tr -d ' ')"
+assert_eq "architect, direct coder and reviewer are the three agents" 3 "$(wc -l < "$RUN_LOG" | tr -d ' ')"
 assert_eq "general review remains mandatory on direct work" 1 "$(calls review-general)"
 
 scenario 'epic-run: a red final verify retries direct implementation once'
@@ -2096,13 +2077,10 @@ assert_contains "hidden Codex fan-out is disabled" "$CODEX_ARGV" "--disable mult
 assert_contains "Codex runs are ephemeral" "$CODEX_ARGV" "--ephemeral"
 assert_eq "the mandatory Codex reviewer ran" 1 "$(calls review-general)"
 # Codex has no per-run tool list: each judging charter becomes a read-only
-# sandbox, and every review and ship spawn must land in it.
+# sandbox, and every review spawn must land in it.
 CODEX_REVIEW_SPAWNS="$(grep -c 'Review code against project guidelines' "$CODEX_LOG" || true)"
 assert_eq "both Codex review phases run in a read-only sandbox" "$CODEX_REVIEW_SPAWNS" "$(grep 'Review code against project guidelines' "$CODEX_LOG" | grep -c -- '--sandbox read-only' || true)"
 assert_eq "and there were review spawns to check" 2 "$CODEX_REVIEW_SPAWNS"
-CODEX_SHIP_SPAWNS="$(grep -c 'Write only the structured delivery prose' "$CODEX_LOG" || true)"
-assert_eq "the Codex ship phase runs in a read-only sandbox" "$CODEX_SHIP_SPAWNS" "$(grep 'Write only the structured delivery prose' "$CODEX_LOG" | grep -c -- '--sandbox read-only' || true)"
-assert_eq "and there was a ship spawn to check" 1 "$CODEX_SHIP_SPAWNS"
 assert_eq "no Claude process was spawned" 0 "$(wc -l < "$RUN_LOG" | tr -d ' ')"
 assert_eq "origin holds the squashed branch" 1 "$(origin_count epic/42-add-widget)"
 assert_eq "Codex tokens are parsed from its event stream" "1234 1000 300 234" "$(usage_log | jq -r 'select(.label=="architect:design") | "\(.tokens.total) \(.tokens.input) \(.tokens.cacheRead) \(.tokens.output)"')"
@@ -2284,7 +2262,7 @@ scenario 'epic-run: interrupted red work is preserved and continued directly'
 seed_branch epic/42-add-widget main 'printf "leftover\n" > frontend/src/leftover.ts && printf "test(\"widget\", () => {})\n" > frontend/src/widget.test.ts && git add -A && git commit -qm "wip: epic blocked at architect"'
 PARTIAL="$TMP/fixtures-partial"; cp -R "$BASE" "$PARTIAL"
 fixture "$PARTIAL" design '{"approach":"Continue partial widget","rationale":"Preserves the existing partial edit.","steps":["finish widget"],"files":["src/widget.ts — finish"],"contract":"createWidget(): Widget","tradeoffs":"Continue directly.","verification":{"mode":"direct","rationale":"The baseline already contains partial work.","evidence":["widget test passes"]},"review":{"question":"","rationale":"General review is sufficient."}}'
-fixture_text "$PARTIAL" direct "continued partial widget; frontend verified green"
+fixture "$PARTIAL" direct "{\"status\":\"continued partial widget; frontend verified green\",\"delivery\":$DELIVERY_BASE}"
 fixture_sh "$PARTIAL" direct 'printf "export const createWidget = () => ({})\n" > frontend/src/widget.ts'
 GH_ISSUE_LABELS='ready,engine:claude' run_pipeline "$EPIC_RUN" "$PARTIAL" --issue 42
 assert_rc "exits 0" 0 "$RUN_RC"
@@ -2312,7 +2290,8 @@ assert_contains "the gate still ran on the resumed tree" "$RUN_OUT" "Code: verif
 assert_eq "the recovered plan still runs mandatory review" 1 "$(calls review-general)"
 assert_contains "the run ships" "$RUN_OUT" '"readyToMerge":true'
 assert_eq "as one commit above main" 1 "$(origin_count epic/42-add-widget)"
-assert_contains "the PR body uses the recovered approach" "$(cat "$STATE_DIR/ship.0.prompt")" "Thin widget module"
+assert_contains "the published record uses the recovered approach" "$(gh_delivery_summary)" "Thin widget module"
+assert_contains "and the recovered delivery record is what the candidate commit carries" "$(git -C "$ORIGIN" log -1 --format=%B epic/42-add-widget)" "COMMIT_RATIONALE_SENTINEL"
 
 fi
 
@@ -2322,6 +2301,7 @@ seed_branch epic/42-add-widget main 'printf "test(\"widget\", () => {})\n" > fro
 CACHED="$TMP/fixtures-cached"; cp -R "$BASE" "$CACHED"
 mkdir -p "$CACHED/worktree/.epics/42-add-widget"
 printf '%s\n' '{"approach":"Cached widget plan","rationale":"Matches the checkpoint.","steps":["build widget"],"files":["frontend/src/widget.ts"],"contract":"createWidget(): Widget","tradeoffs":"No caching.","verification":{"mode":"test-first","rationale":"Public behavior is asserted.","evidence":["widget test passes"]},"review":{"question":"Can concurrent callers observe partial state?","rationale":"State construction crosses a boundary."}}' > "$CACHED/worktree/.epics/42-add-widget/architecture.json"
+printf '%s\n' '{"title":"Add cached widget","commitBody":"CACHED_RATIONALE_SENTINEL: the checkpoint already decided why.","deferred":[]}' > "$CACHED/worktree/.epics/42-add-widget/delivery.json"
 GH_ISSUE_LABELS='ready,engine:claude' run_pipeline "$EPIC_RUN" "$CACHED" --issue 42
 assert_rc "valid cached plan resumes" 0 "$RUN_RC"
 assert_eq "cached JSON needs no architect call" 0 "$(( $(calls design) + $(calls recover) ))"
@@ -2329,6 +2309,27 @@ assert_eq "cached checkpoint replays no code" 0 "$(( $(calls red) + $(calls dire
 assert_contains "missing markdown is re-rendered" "$(cat "$WT/.epics/42-add-widget/architecture.md")" "Approach: Cached widget plan"
 assert_not_contains "scratch architecture never enters the shipped tree" "$(git -C "$ORIGIN" ls-tree -r --name-only epic/42-add-widget)" ".epics/"
 assert_eq "the cached plan still runs exactly one broad review" 1 "$(calls review-general)"
+# The checkpoint's own delivery record is published as it stands: no model in
+# this run made the change, so nothing here re-derives why it was made.
+assert_contains "the cached delivery record becomes the candidate commit" "$(git -C "$ORIGIN" log -1 --format=%B epic/42-add-widget)" "CACHED_RATIONALE_SENTINEL"
+assert_eq "and its title is the PR's" "Add cached widget" "$(git -C "$ORIGIN" log -1 --format=%s epic/42-add-widget)"
+
+scenario 'resume: a checkpoint whose delivery record died recovers only that record'
+seed_branch epic/42-add-widget main 'printf "test(\"widget\", () => {})\n" > frontend/src/widget.test.ts && printf "export const createWidget = () => ({})\n" > frontend/src/widget.ts && git add -A && git commit -qm "wip(epic 42-add-widget): code checkpoint"'
+HALFCACHED="$TMP/fixtures-half-cached"; cp -R "$CACHED" "$HALFCACHED"
+rm "$HALFCACHED/worktree/.epics/42-add-widget/delivery.json"
+GH_ISSUE_LABELS='ready,engine:claude' run_pipeline "$EPIC_RUN" "$HALFCACHED" --issue 42
+assert_rc "the half-cached checkpoint resumes" 0 "$RUN_RC"
+assert_eq "one read-only reconstruction runs" 1 "$(calls recover)"
+assert_eq "and no code is replayed for it" 0 "$(( $(calls red) + $(calls direct) + $(calls green) ))"
+assert_contains "the surviving plan is kept rather than re-derived" "$(cat "$WT/.epics/42-add-widget/architecture.md")" "Approach: Cached widget plan"
+assert_contains "the reconstructed record is what the candidate commit carries" "$(git -C "$ORIGIN" log -1 --format=%B epic/42-add-widget)" "COMMIT_RATIONALE_SENTINEL"
+assert_contains "and it is persisted for the next resume" "$(cat "$WT/.epics/42-add-widget/delivery.json")" "COMMIT_RATIONALE_SENTINEL"
+RECOVER_PROMPT="$(cat "$STATE_DIR/recover.0.prompt")"
+assert_contains "the reconstruction is given the completed implementation" "$RECOVER_PROMPT" '<change-diff>'
+assert_contains "it is told the record it returns is what gets published" "$RECOVER_PROMPT" "There is no later prose step"
+assert_contains "and carries the same bare-#N rule as the coding phase" "$RECOVER_PROMPT" "Never write a bare"
+assert_contains "and is told not to replay implementation" "$RECOVER_PROMPT" "do NOT edit files or replay implementation"
 
 scenario 'resume: a red code checkpoint gets one green attempt, then review'
 seed_branch epic/42-add-widget main 'printf "test(\"widget\", () => {})\n" > frontend/src/widget.test.ts && git add -A && git commit -qm "wip(epic 42-add-widget): code checkpoint"'
@@ -2338,6 +2339,10 @@ assert_eq "no red" 0 "$(calls red)"
 assert_eq "green ran once, handed the failure" 1 "$(calls green)"
 assert_contains "the retry prompt carries the verify output" "$(cat "$STATE_DIR/green.0.prompt")" "missing export createWidget"
 assert_contains "the run ships" "$RUN_OUT" '"readyToMerge":true'
+# The retry is a coding call on a resumed checkpoint: its account is what the
+# phase log records, and its delivery record is what the candidate carries.
+assert_contains "the phase log records the retry's own account" "$(cat "$WT/.epics/42-add-widget/epic.md")" "- code: frontend verified green"
+assert_contains "and the retry's delivery record reaches the commit" "$(git -C "$ORIGIN" log -1 --format=%B epic/42-add-widget)" "COMMIT_RATIONALE_SENTINEL"
 
 assert_resume_engine_refusal() { # case initial-engine-labels expected-engine-labels
   local route_case="$1" initial="$2" expected="$3" before
@@ -2475,7 +2480,7 @@ assert_contains "the correction leaves verification to the orchestrator" "$CORRE
 HELD_SUMMARY="$(gh_delivery_summary)"
 HELD_SHA="$(origin_ref epic/42-add-widget)"
 assert_eq "the held candidate gets exactly one delivery summary" 1 "$(delivery_summary_count)"
-assert_contains "the held narrative belongs on the issue" "$HELD_SUMMARY" "HELD_ISSUE_NARRATIVE_SENTINEL"
+assert_contains "the held record carries the coding phase's durable rationale" "$HELD_SUMMARY" "COMMIT_RATIONALE_SENTINEL"
 assert_contains "the held summary identifies the PR" "$HELD_SUMMARY" "https://github.com/o/r/pull/7"
 assert_contains "the held summary identifies the branch" "$HELD_SUMMARY" "epic/42-add-widget"
 assert_contains "the held summary identifies the full candidate" "$HELD_SUMMARY" "$HELD_SHA"
@@ -2484,8 +2489,13 @@ assert_contains "the held summary reports the independently unresolved finding" 
 assert_contains "the held summary reports the computed open count" "$HELD_SUMMARY" "1 open"
 assert_contains "the deterministic candidate gate is held" "$HELD_SUMMARY" "held"
 assert_not_contains "a held summary never claims the clear handoff state" "$HELD_SUMMARY" "clear-pending-handoff"
-assert_not_contains "the held narrative is absent from the technical PR" "$(cat "$WT/.epics/42-add-widget/summary.md")" "HELD_ISSUE_NARRATIVE_SENTINEL"
-assert_contains "the held candidate commit keeps its rationale" "$(git -C "$ORIGIN" log -1 --format=%B epic/42-add-widget)" "HELD_COMMIT_RATIONALE_SENTINEL"
+assert_not_contains "the delivery rationale is absent from the technical PR" "$(cat "$WT/.epics/42-add-widget/summary.md")" "COMMIT_RATIONALE_SENTINEL"
+assert_contains "the held candidate commit keeps its rationale" "$(git -C "$ORIGIN" log -1 --format=%B epic/42-add-widget)" "COMMIT_RATIONALE_SENTINEL"
+# The finding the fixer deferred is the run's remaining work, recorded with the
+# follow-up that same fixer judged worth filing — the only place one is decided.
+assert_contains "the still-open finding is recorded as remaining work" "$(gh_comments)" "- Null deref on empty list (defect)"
+assert_eq "the deferring fixer's own follow-up is filed" "TITLE: Decide the empty-list contract and guard it" "$(grep '^TITLE: ' "$STATE_DIR/gh/issues-created")"
+assert_contains "the filed follow-up links back to the source issue" "$(gh_issues_created)" "Follow-up to #42"
 
 # The pass half of the same batch: one correction, a green second verification,
 # and a narrow confirmation that clears it. The blockers are gone before ship,
@@ -2494,7 +2504,6 @@ scenario 'epic-run: a confirmed correction clears a concrete batch before ship'
 CORRECTED="$TMP/fixtures-corrected"; cp -R "$HELD" "$CORRECTED"
 cp "$BASE/correction.json" "$CORRECTED/correction.json"
 cp "$BASE/correction.sh" "$CORRECTED/correction.sh"
-fixture "$CORRECTED" ship '{"title":"Add widget","body":"CORRECTED_NARRATIVE_SENTINEL: Implements the guarded widget path.","commitBody":"CORRECTED_COMMIT_SENTINEL: Guard the empty list at the one construction path.","deferred":[]}'
 run_pipeline "$EPIC_RUN" "$CORRECTED" --issue 42
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_eq "one correction and one narrow confirmation ran" "1 1" "$(calls correction) $(calls narrowconfirm)"
@@ -2506,6 +2515,8 @@ assert_not_contains "no defect-fixer handoff is created" "$(gh_comments)" "🤖 
 assert_contains "RESULT records what the correction cleared" "$RUN_OUT" 'one scoped correction cleared 1 blocker(s)'
 assert_eq "the correction re-ran the full verify contract" 5 "$(grep -c '^run verify$' "$NPM_LOG")"
 assert_contains "the corrected code is what shipped" "$(git -C "$ORIGIN" show epic/42-add-widget:frontend/src/widget.ts)" "guarded: true"
+assert_eq "a blocker the correction cleared leaves no remaining work to file" 0 "$(grep -c '^TITLE: ' "$STATE_DIR/gh/issues-created" 2>/dev/null || echo 0)"
+assert_not_contains "and no deferred record is posted for a cleared batch" "$(gh_comments)" "deferred / not done"
 CONFIRM_PROMPT="$(cat "$STATE_DIR/narrowconfirm.0.prompt")"
 assert_contains "the confirmer receives the complete cumulative repair delta" "$CONFIRM_PROMPT" "<repair-delta>"
 assert_contains "the confirmer receives the exact correction delta" "$CONFIRM_PROMPT" "<correction-delta>"
@@ -2647,36 +2658,36 @@ POST_TERMINAL="$(
     const gh = await import('$ROOT/workflows/lib/github.mjs')
     rt.initRuntime({ scriptName: 'test', defaultEngine: 'claude' })
     gh.terminalBudget()
-    const out = await rt.agent('x', { label: 'ship:pr', step: 'ship' })
+    const out = await rt.agent('x', { label: 'narrow-confirm', step: 'final-review' })
     console.log('RESOLVED ' + (out === null ? 'null' : JSON.stringify(out)))
     console.log('FAILURE ' + rt.withAgentFailure('blocked.'))
   })()" 2>&1
 )"
 assert_contains "a step requested after the terminal write resolves null, like any dead step" "$POST_TERMINAL" "RESOLVED null"
-assert_contains "the pane says the step was refused" "$POST_TERMINAL" "ship:pr: refused"
+assert_contains "the pane says the step was refused" "$POST_TERMINAL" "narrow-confirm: refused"
 assert_contains "and why — the run's terminal label is already resting" "$POST_TERMINAL" "terminal label"
-assert_contains "the caller's fail-closed branch gets a legible category" "$POST_TERMINAL" "Pipeline ordering fault: ship:pr"
+assert_contains "the caller's fail-closed branch gets a legible category" "$POST_TERMINAL" "Pipeline ordering fault: narrow-confirm"
 assert_contains "which says nothing was spawned" "$POST_TERMINAL" "0 attempts"
 assert_eq "and no vendor process was started" 0 "$(wc -l < "$POST_TERMINAL_LOG" | tr -d ' ')"
 
-# ship:pr is the LAST model step of a run, and its position relative to ship's
-# terminal write is a contract rather than an accident: after the flip the
-# runtime refuses every spawn, so a step moved below the write would be refused
-# and would hold a PR that had nothing wrong with it. With every spawn ahead of
-# the write, a stalled flip costs the label's confirmation and nothing else —
-# the gate still decides, promotes and reports, all inside the one window that
-# write opened.
+# The ship phase spawns nothing at all now, so every model step of a run is
+# ahead of ship's terminal write by construction rather than by ordering luck:
+# after the flip the runtime refuses every spawn, and a step moved below the
+# write would be refused and would hold a PR that had nothing wrong with it.
+# With every spawn ahead of the write, a stalled flip costs the label's
+# confirmation and nothing else — the gate still decides, promotes and reports,
+# all inside the one window that write opened.
 scenario "epic-run: ship's own ready-to-review write is bounded and the gate still decides after it"
 CLEARDEFER="$TMP/fixtures-cleardefer"; cp -R "$BASE" "$CLEARDEFER"
-fixture "$CLEARDEFER" ship '{"title":"Add widget","body":"Adds a widget.","commitBody":"Use the thin widget module so callers share one construction path.","deferred":[{"blockerId":"new","title":"Refactor the helpers","why":"Nice to have.","kind":"other","file":false}]}'
+fixture "$CLEARDEFER" green '{"status":"frontend verified green","delivery":{"title":"Add widget","commitBody":"Use the thin widget module so callers share one construction path.","deferred":[{"title":"Refactor the helpers","why":"Nice to have.","kind":"other","file":false}]}}'
 SHIP_WRITE_START="$(date +%s)"
 EPIC_TERMINAL_REPORT_MS=1500 GH_SLOW_LABEL=ready-to-review:20 run_pipeline "$EPIC_RUN" "$CLEARDEFER" --issue 42
 SHIP_WRITE_ELAPSED=$(( $(date +%s) - SHIP_WRITE_START ))
 SPAWNS_BEFORE_PR="$(wc -l < "$RUN_LOG" | tr -d ' ')"
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_eq "the run gave up on the stalled ready-to-review write" "bounded" "$( (( SHIP_WRITE_ELAPSED < 7 )) && echo bounded || echo "waited ${SHIP_WRITE_ELAPSED}s for a 20s stall" )"
-assert_contains "the last model step ran BEFORE the write that opens the window" "${RUN_OUT%%Ship: PR opened*}" "ship:pr: "
-assert_eq "and no step was spawned after the PR line" 7 "$SPAWNS_BEFORE_PR"
+assert_contains "the last model step ran BEFORE the write that opens the window" "${RUN_OUT%%Ship: PR opened*}" "final-review: "
+assert_eq "and no step was spawned after the PR line" 6 "$SPAWNS_BEFORE_PR"
 assert_contains "the stalled flip is reported, not swallowed" "$RUN_OUT" "label flip to ready-to-review failed"
 assert_eq "the gate still promoted the PR GitHub had already labelled" "ready-to-merge," "$(gh_labels)"
 assert_contains "and the run claims the merge queue it verified" "$RUN_OUT" '"readyToMerge":true'
@@ -2758,22 +2769,22 @@ assert_contains "which records the blocked run" "$RUN_OUT" '"blocked":true'
 fi
 
 if [[ "$EPIC_TEST_GROUP" == epic-c ]]; then
-scenario 'epic-run: ship classifies deferrals; the script counts, files and records them'
+scenario 'epic-run: the coding phase classifies deferrals; the script counts, files and records them'
 make_defer_fixture
 run_pipeline "$EPIC_RUN" "$DEFER" --issue 42
 assert_rc "exits 0" 0 "$RUN_RC"
-# Ship is the builder side. Its classification files follow-ups and writes the
+# The classification is the builder side. It files follow-ups and writes the
 # record; the final review already decided whether this PR may land.
-assert_contains "ship's four deferred defects cannot hold the cleared gate" "$RUN_OUT" '"readyToMerge":true'
+assert_contains "four builder-classified defects cannot hold the cleared gate" "$RUN_OUT" '"readyToMerge":true'
 assert_eq "the issue ends ready-to-merge and nothing else" "ready-to-merge," "$(gh_labels)"
-assert_not_contains "and ship's classification never queues defect repair" "$RUN_OUT" '"needsDefectFix":true'
+assert_not_contains "and a builder classification never queues defect repair" "$RUN_OUT" '"needsDefectFix":true'
 assert_not_contains "no repair envelope is posted for a builder classification" "$(gh_comments)" "🤖 defect-fix evidence"
 assert_contains "the deferred record was posted with the exact first line" "$(gh_comments)" "🤖 deferred / not done"
 assert_contains "it lists every item, kind and why" "$(gh_comments)" "- Refactor the helpers (other): Nice to have."
 assert_eq "at most three follow-ups were filed, defects first" 3 "$(grep -c '^TITLE: ' "$STATE_DIR/gh/issues-created")"
 assert_not_contains "an 'other' item is never filed even when asked" "$(gh_issues_created)" "Refactor the helpers"
 assert_contains "a follow-up links back with the Follow-up line" "$(gh_issues_created)" "Follow-up to #42"
-assert_eq "ship-only deferrals do not create defect-repair evidence" "" "$(gh_evidence_comment)"
+assert_eq "builder-only deferrals do not create defect-repair evidence" "" "$(gh_evidence_comment)"
 assert_not_contains "an item beyond the filing cap gets no invented follow-up" "$(gh_comments)" 'issues/104'
 assert_contains "the record says how many qualified versus filed" "$(gh_comments)" "4 items qualified for a follow-up issue and 3 were filed"
 assert_contains "the PR body points at the record" "$(cat "$WT/.epics/42-add-widget/summary.md")" "Deferred items recorded on #42."
@@ -2790,7 +2801,7 @@ assert_eq "the delivery summary is published after the PR and before durable def
   "$( [[ -n "$PR_EVENT" && -n "$SUMMARY_EVENT" && -n "$DEFERRED_EVENT" && "$PR_EVENT" -lt "$SUMMARY_EVENT" && "$SUMMARY_EVENT" -lt "$DEFERRED_EVENT" ]] && echo ordered || echo not-ordered )"
 assert_eq "the delivery summary is published before any follow-up issue" "ordered" \
   "$( [[ -n "$SUMMARY_EVENT" && -n "$FOLLOWUP_EVENT" && "$SUMMARY_EVENT" -lt "$FOLLOWUP_EVENT" ]] && echo ordered || echo not-ordered )"
-# Ship queues what it files: each follow-up is ordered behind this issue and
+# The run queues what it files: each follow-up is ordered behind this issue and
 # labelled ready, so the pipeline picks it up once this one closes.
 DEPS="$(cat "$STATE_DIR/gh/deps-created" 2>/dev/null || true)"
 assert_eq "every filed follow-up is ordered behind the epic issue" 3 "$(grep -c ' 900042$' <<<"$DEPS")"
@@ -3306,12 +3317,13 @@ fi
 # ───────────────────────── the read-only boundary around judging phases ─────────────────────────
 
 if [[ "$EPIC_TEST_GROUP" == read-only ]]; then
-# Review, final review and ship judge a change and may not alter it. Their
-# Claude charters withhold Bash, Write and Edit, Codex sandboxes them read-only,
-# and the orchestrator independently proves the invariant itself. These
-# scenarios make each phase write while returning perfectly valid output, and
-# every one of them must fail closed rather than ship bytes nothing reviewed or
-# verified.
+# Review, final review and the narrow confirmation judge a change and may not
+# alter it. Their Claude charters withhold Bash, Write and Edit, Codex sandboxes
+# them read-only, and the orchestrator independently proves the invariant
+# itself. These scenarios make each phase write while returning perfectly valid
+# output, and every one of them must fail closed rather than ship bytes nothing
+# reviewed or verified. Ship itself spawns nothing any more: the last model step
+# of a run is a judging one, and it is snapshotted here.
 
 scenario 'read-only: an initial reviewer that edits the tree cannot clear it'
 # The worst case for the no-findings shortcut: an empty review skips the fixer
@@ -3354,20 +3366,6 @@ assert_contains "the reason reports the moved HEAD" "$RUN_OUT" "moved HEAD"
 assert_eq "no PR is opened" "" "$(gh_pr_created)"
 assert_eq "the issue ends failed and nothing else" "failed," "$(gh_labels)"
 
-scenario 'read-only: a ship phase that edits a source file is refused before transport'
-# Ship writes the PR title, body and follow-up prose. It runs after the last
-# verify gate and the last review, so a source edit here would reach an
-# unattended merge without either gate having seen it.
-ROSHIP="$TMP/fixtures-ro-ship"; cp -R "$BASE" "$ROSHIP"
-fixture_sh "$ROSHIP" ship "printf 'export const createWidget = () => ({ items: [], shipped: 1 })\n' > frontend/src/widget.ts"
-run_pipeline "$EPIC_RUN" "$ROSHIP" --issue 42
-assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
-assert_contains "it blocks in the ship phase" "$RUN_OUT" '"phase":"ship"'
-assert_contains "the reason names the edited source file" "$RUN_OUT" "touched frontend/src/widget.ts"
-assert_eq "nothing was pushed to a PR" "" "$(gh_pr_created)"
-assert_not_contains "a valid ship payload cannot carry unreviewed bytes to the merge queue" "$RUN_OUT" '"readyToMerge":true'
-assert_eq "the issue ends failed and nothing else" "failed," "$(gh_labels)"
-
 # A tracked file that an ignore rule also matches — frontend/src/generated.ts in
 # the seed — is the case a naive snapshot misses. `git add -A` skips it when the
 # index it stages into does not already know the path, but the run's real index
@@ -3396,19 +3394,6 @@ assert_contains "it blocks in the final-review phase" "$RUN_OUT" '"phase":"final
 assert_contains "the reason names the tracked-but-ignored file" "$RUN_OUT" "touched frontend/src/generated.ts"
 assert_eq "no PR is opened" "" "$(gh_pr_created)"
 assert_not_contains "the clearing verdicts never reach the merge gate" "$RUN_OUT" '"readyToMerge":true'
-assert_eq "the issue ends failed and nothing else" "failed," "$(gh_labels)"
-
-scenario 'read-only: a ship phase editing a tracked-but-ignored file is refused before transport'
-ROIGNSHIP="$TMP/fixtures-ro-ign-ship"; cp -R "$BASE" "$ROIGNSHIP"
-fixture_sh "$ROIGNSHIP" ship "printf 'export const build = 3 /* sneaked */\n' > frontend/src/generated.ts"
-run_pipeline "$EPIC_RUN" "$ROIGNSHIP" --issue 42
-assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
-assert_contains "it blocks in the ship phase" "$RUN_OUT" '"phase":"ship"'
-assert_contains "the reason names the tracked-but-ignored file" "$RUN_OUT" "touched frontend/src/generated.ts"
-# The blocked branch keeps the loose edit only as preserved, resumable work —
-# transport never ran, so no PR head ever carries it.
-assert_eq "nothing was pushed to a PR" "" "$(gh_pr_created)"
-assert_not_contains "a valid ship payload cannot carry unreviewed bytes to the merge queue" "$RUN_OUT" '"readyToMerge":true'
 assert_eq "the issue ends failed and nothing else" "failed," "$(gh_labels)"
 
 scenario 'read-only: an untouched tree is not mistaken for an edit'
@@ -3452,7 +3437,7 @@ scenario 'ephemeral: every model phase is a fresh, non-resumable process'
 run_pipeline "$EPIC_RUN" "$BASE" --issue 42 --engine codex
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_eq "every Codex spawn is ephemeral" 0 "$(grep -cv -- 'exec --ephemeral' "$CODEX_LOG" || true)"
-assert_eq "and there were spawns to check" 7 "$(wc -l < "$CODEX_LOG" | tr -d ' ')"
+assert_eq "and there were spawns to check" 6 "$(wc -l < "$CODEX_LOG" | tr -d ' ')"
 assert_eq "no spawn resumes or continues an earlier session" 0 "$(grep -c -E 'resume|--continue|--session-id' "$CODEX_LOG" "$RUN_LOG" | awk -F: '{sum += $2} END {print sum + 0}')"
 assert_eq "the fresh fixer still ran exactly once" 1 "$(calls triage)"
 assert_eq "and the fresh final review once" 1 "$(calls finalreview)"
@@ -3488,7 +3473,7 @@ assert_eq "the verify gate ran once more, on the rebased tree" 5 "$(grep -c '^ru
 assert_contains "and that run is the post-rebase gate" "$RUN_OUT" "Ship: verify gate after rebase: verify green"
 assert_contains "the gate outcome is what it is without the move" "$RUN_OUT" '"readyToMerge":true'
 assert_eq "the issue still ends ready-to-merge and nothing else" "ready-to-merge," "$(gh_labels)"
-assert_eq "the rebase costs no model step" 7 "$(wc -l < "$RUN_LOG" | tr -d ' ')"
+assert_eq "the rebase costs no model step" 6 "$(wc -l < "$RUN_LOG" | tr -d ' ')"
 assert_contains "the dep check still runs and finds nothing to do" "$RUN_OUT" "Ship: deps checked after rebase (frontend: deps present)"
 assert_eq "a base with no lockfile move installs nothing extra" 1 "$(grep -c '^ci$' "$NPM_LOG")"
 
@@ -3607,7 +3592,6 @@ assert_eq "the issue ends failed" "failed," "$(gh_labels)"
 
 scenario 'epic-run: manual slug mode touches no git phase and no issue'
 MANUAL="$TMP/fixtures-manual"; cp -R "$BASE" "$MANUAL"
-fixture "$MANUAL" summary '{"summary":"summary.md written"}'
 fixture_sh "$MANUAL" green 'printf "export const createWidget = () => ({})\n" > frontend/src/widget.ts && printf "\nmanual run note\n" >> README.md && git add README.md frontend/src/widget.ts'
 run_manual() {
   MANUAL_WT="$(fresh_clone)"
@@ -3621,8 +3605,18 @@ run_manual() {
 }
 run_manual "$MANUAL"
 assert_rc "exits 0" 0 "$RUN_RC"
-assert_contains "the summary came back" "$RUN_OUT" 'summary.md written'
-assert_contains "summary.md was written to the tree" "$(cat "$MANUAL_WT/.epics/42-add-widget/summary.md")" 'summary.md written'
+MANUAL_SUMMARY="$(cat "$MANUAL_WT/.epics/42-add-widget/summary.md")"
+# Manual mode publishes nothing, but it still gets the same scripted record:
+# the coding phase's rationale, the plan, the review's final states and the
+# orchestrator's own file list and verify evidence. No model writes it.
+assert_eq "manual mode spawns no delivery-prose step either" 0 "$(cat "$STATE_DIR/ship.n" 2>/dev/null || echo 0)"
+assert_contains "summary.md carries the delivery title" "$MANUAL_SUMMARY" '# Add widget'
+assert_contains "summary.md carries the durable rationale" "$MANUAL_SUMMARY" 'COMMIT_RATIONALE_SENTINEL'
+assert_contains "summary.md carries the architecture approach" "$MANUAL_SUMMARY" 'Architecture approach — "Thin widget module"'
+assert_contains "summary.md carries the finding's final state" "$MANUAL_SUMMARY" '- Finding 1: Null deref on empty list — resolved (confidence 92)'
+assert_contains "summary.md carries the orchestrator's own verify evidence" "$MANUAL_SUMMARY" 'Verification:'
+assert_contains "summary.md carries the derived changed-file list" "$MANUAL_SUMMARY" 'frontend/src/widget.ts'
+assert_contains "the RESULT carries the same rendered summary" "$RUN_OUT" 'COMMIT_RATIONALE_SENTINEL'
 assert_eq "no gh calls at all" "0" "$(wc -l < "$GH_LOG" | tr -d ' ')"
 assert_eq "no branch was created on origin" "" "$(origin_ref epic/42-add-widget)"
 assert_eq "manual assessments get one final review" 1 "$(calls finalreview)"
@@ -3635,17 +3629,14 @@ assert_contains "manual review evidence includes a staged new file" "$MANUAL_REV
 MANUAL_FINAL_PROMPT="$(cat "$STATE_DIR/finalreview.0.prompt")"
 assert_contains "manual final review includes the staged tracked path" "$MANUAL_FINAL_PROMPT" 'README.md'
 assert_contains "manual final review includes the staged new path" "$MANUAL_FINAL_PROMPT" 'frontend/src/widget.ts'
-MANUAL_SUMMARY_PROMPT="$(cat "$STATE_DIR/summary.0.prompt")"
-assert_contains "manual ship receives an orchestrator-captured diff stat" "$MANUAL_SUMMARY_PROMPT" '<diff-stat>'
-assert_contains "the manual stat includes a modified tracked file" "$MANUAL_SUMMARY_PROMPT" 'README.md'
-assert_contains "the manual stat includes a new file" "$MANUAL_SUMMARY_PROMPT" 'frontend/src/widget.ts'
-assert_not_contains "manual ship is not told to run Git" "$MANUAL_SUMMARY_PROMPT" 'git diff'
+assert_contains "the manual file list includes a modified tracked file" "$MANUAL_SUMMARY" 'README.md'
+assert_contains "the manual file list includes a new file" "$MANUAL_SUMMARY" 'frontend/src/widget.ts'
 
 scenario 'epic-run: manual no-edit dispute is independently disproved'
 MANUAL_REJECTED="$TMP/fixtures-manual-rejected"; cp -R "$REJECTED" "$MANUAL_REJECTED"
-fixture "$MANUAL_REJECTED" summary '{"summary":"The reported path is already handled; no repair was needed."}'
 run_manual "$MANUAL_REJECTED"
 assert_rc "manual dispute completes" 0 "$RUN_RC"
+assert_contains "the manual record states the independently disproved verdict" "$(cat "$MANUAL_WT/.epics/42-add-widget/summary.md")" "— disproved (confidence 91)"
 assert_eq "the final review runs even without edits" 1 "$(calls finalreview)"
 assert_eq "the result counts the independently disproved finding" "1|0" "$(result_json | jq -r '[.findingsRejected,.findingsPending] | join("|")')"
 assert_eq "manual dispute makes no commit" "$MAIN_INITIAL" "$(git -C "$MANUAL_WT" rev-parse HEAD)"
@@ -3657,6 +3648,7 @@ fixture "$MANUAL_UNCERTAIN" finalreview '{"verdicts":[{"index":1,"verdict":"unre
 run_manual "$MANUAL_UNCERTAIN"
 assert_rc "manual uncertainty returns a summary" 0 "$RUN_RC"
 assert_eq "the result cannot accept an unsupported dispute" "0|1" "$(result_json | jq -r '[.findingsRejected,.findingsPending] | join("|")')"
+assert_contains "the manual record keeps the unresolved item as remaining work" "$(cat "$MANUAL_WT/.epics/42-add-widget/summary.md")" "- Null deref on empty list (unresolved-finding)"
 assert_eq "manual mode still runs exactly one fixer" 1 "$(calls triage)"
 assert_contains "the review artifact preserves the uncertainty" "$(cat "$MANUAL_WT/.epics/42-add-widget/review.md")" "the dismissal cannot be confirmed"
 assert_eq "manual uncertainty makes no commit" "$MAIN_INITIAL" "$(git -C "$MANUAL_WT" rev-parse HEAD)"
@@ -5590,62 +5582,57 @@ assert_eq "the durable evidence renderer is still reachable for older briefs" "1
 IDENTICAL="$TMP/fixtures-identical-blockers"; cp -R "$BASE" "$IDENTICAL"
 fixture "$IDENTICAL" review-general '{"findings":[{"title":"Same displayed blocker","severity":"Important","confidence":90,"location":"src/widget.ts:12","problem":"Same displayed reason.","fix":"Fix the first path.","gate":"first focused test"},{"title":"Same displayed blocker","severity":"Important","confidence":90,"location":"src/widget.ts:24","problem":"Same displayed reason.","fix":"Fix the second path.","gate":"second focused test"}]}'
 fixture "$IDENTICAL" verify '{"verdicts":[{"index":1,"real":true,"confidence":90,"reasoning":"The first path is broken."},{"index":2,"real":true,"confidence":90,"reasoning":"The second path is independently broken."}]}'
-fixture "$IDENTICAL" triage '{"status":"Left both identical-looking blockers for a human.","assessments":[{"index":2,"action":"deferred","reason":"Same displayed reason."},{"index":1,"action":"deferred","reason":"Same displayed reason."}]}'
+# The fixer defers both and files a follow-up for only ONE of them, returning
+# its assessments in reverse index order: a correlation that resolved by display
+# text or by first occurrence would credit the wrong finding.
+fixture "$IDENTICAL" triage '{"status":"Left both identical-looking blockers for a human.","assessments":[{"index":2,"action":"deferred","reason":"Same displayed reason.","followUp":{"title":"Second path still throws","body":"The second path still reaches the unsafe access."}},{"index":1,"action":"deferred","reason":"Same displayed reason."}]}'
 fixture_sh "$IDENTICAL" triage 'true'
 fixture "$IDENTICAL" finalreview '{"verdicts":[{"index":2,"verdict":"unresolved","confidence":92,"defect":true,"reasoning":"Same displayed reason."},{"index":1,"verdict":"unresolved","confidence":92,"defect":true,"reasoning":"Same displayed reason."}],"regressions":[],"unmetRequirements":[]}'
-fixture "$IDENTICAL" ship '{"title":"Add widget","body":"Adds a widget.","commitBody":"Use the thin widget module so callers share one construction path.","deferred":[{"blockerId":"blocker-2","title":"Same displayed blocker","why":"Same displayed reason.","kind":"defect","file":true},{"blockerId":"blocker-1","title":"Same displayed blocker","why":"Same displayed reason.","kind":"defect","file":false}]}'
-scenario 'ship identity: duplicate display text stays correlated when ship reverses the blockers'
+scenario 'deferral identity: duplicate display text stays correlated to the finding that earned the follow-up'
 run_pipeline "$EPIC_RUN" "$IDENTICAL" --issue 42
 assert_rc "reversed identical blockers ship safely" 0 "$RUN_RC"
-assert_contains "ship maps the first opaque ID to its finding location" "$(cat "$STATE_DIR/ship.0.prompt")" "- blocker-1: Same displayed blocker [src/widget.ts:12] — Same displayed reason."
-assert_contains "ship maps the second opaque ID to its finding location" "$(cat "$STATE_DIR/ship.0.prompt")" "- blocker-2: Same displayed blocker [src/widget.ts:24] — Same displayed reason."
-assert_eq "only the selected blocker files a follow-up" 1 "$(grep -c '^TITLE: ' "$STATE_DIR/gh/issues-created")"
+assert_eq "only the finding whose fixer wrote one files a follow-up" 1 "$(grep -c '^TITLE: ' "$STATE_DIR/gh/issues-created")"
+assert_eq "and it is the second finding's, not the first's" "TITLE: Second path still throws" "$(grep '^TITLE: ' "$STATE_DIR/gh/issues-created")"
 assert_eq "exactly one deferred entry carries the URL its own identity filed" 1 "$(grep -c 'filed as https://github.com/o/r/issues/101' <<<"$(gh_comments)")"
 assert_not_contains "no second follow-up is invented for the unfiled identity" "$(gh_comments)" "issues/102"
-assert_eq "the unfiled identity is still listed in the deferred record" 2 "$(grep -c '^- Same displayed blocker (defect)' <<<"$(gh_comments)")"
+assert_eq "the unfiled identity is still listed in the deferred record" 2 "$(grep -c '^- Same displayed blocker (defect)' <<<"$(gh_deferred_record)")"
 assert_eq "the mixed batch of two blockers was corrected once and held" "1 0" "$(calls correction) $(calls narrowconfirm)"
 
-# Both copies filed: the two follow-up URLs are distinguishable, and ship listed
-# the blockers in the reverse of review order, so a correlation that resolved by
+# Both copies filed: the two follow-up URLs are distinguishable, and the fixer
+# answered in the reverse of review order, so a correlation that resolved by
 # display text or by first occurrence would cross the links. Each line's own
 # identity is the only thing that can put #101 and #102 where they belong.
 BOTH_FILED="$TMP/fixtures-both-filed-blockers"; cp -R "$IDENTICAL" "$BOTH_FILED"
-fixture "$BOTH_FILED" ship '{"title":"Add widget","body":"Adds a widget.","commitBody":"Use the thin widget module so callers share one construction path.","deferred":[{"blockerId":"blocker-2","title":"Same displayed blocker","why":"Same displayed reason.","kind":"defect","file":true,"issueTitle":"Second path still throws","issueBody":"The second path still reaches the unsafe access."},{"blockerId":"blocker-1","title":"Same displayed blocker","why":"Same displayed reason.","kind":"defect","file":true,"issueTitle":"First path still throws","issueBody":"The first path still reaches the unsafe access."}]}'
-scenario 'ship identity: two identical blockers each keep their own follow-up across a reversal'
+fixture "$BOTH_FILED" triage '{"status":"Left both identical-looking blockers for a human.","assessments":[{"index":2,"action":"deferred","reason":"Same displayed reason.","followUp":{"title":"Second path still throws","body":"The second path still reaches the unsafe access."}},{"index":1,"action":"deferred","reason":"Same displayed reason.","followUp":{"title":"First path still throws","body":"The first path still reaches the unsafe access."}}]}'
+scenario 'deferral identity: two identical blockers each keep their own follow-up across a reversal'
 run_pipeline "$EPIC_RUN" "$BOTH_FILED" --issue 42
 assert_rc "both identical blockers ship safely" 0 "$RUN_RC"
 assert_eq "the issue stays reviewable with no repair queue behind it" "ready-to-review," "$(gh_labels)"
 assert_eq "both identities file their own follow-up" 2 "$(grep -c '^TITLE: ' "$STATE_DIR/gh/issues-created")"
-assert_eq "filed in ship's ledger order, so #101 is the second finding's" "$(printf 'TITLE: Second path still throws\nTITLE: First path still throws')" "$(grep '^TITLE: ' "$STATE_DIR/gh/issues-created")"
+assert_eq "filed in review-ledger order, so #101 is the first finding's" "$(printf 'TITLE: First path still throws\nTITLE: Second path still throws')" "$(grep '^TITLE: ' "$STATE_DIR/gh/issues-created")"
 assert_eq "the deferred record credits each item with the URL its own identity filed" "$(printf 'https://github.com/o/r/issues/101\nhttps://github.com/o/r/issues/102')" "$(grep -o 'filed as https://github.com/o/r/issues/[0-9]*' <<<"$(gh_comments)" | sed 's/^filed as //')"
 
-SUBSET="$TMP/fixtures-blocker-id-subset"; cp -R "$IDENTICAL" "$SUBSET"
-fixture "$SUBSET" ship '{"title":"Add widget","body":"Adds a widget.","commitBody":"Use the thin widget module so callers share one construction path.","deferred":[{"blockerId":"blocker-2","title":"Same displayed blocker","why":"Same displayed reason.","kind":"defect","file":true}]}'
-scenario 'ship identity: a non-empty subset of known blocker IDs fails closed before transport'
-run_pipeline "$EPIC_RUN" "$SUBSET" --issue 42
-assert_rc "a missing known blocker ID blocks the run" 3 "$RUN_RC"
-assert_contains "the missing ID refusal names blocker identity" "$RUN_OUT" "blocker ID"
-assert_eq "a partial blocker ledger creates no PR" "" "$(gh_pr_created)"
-assert_eq "a partial blocker ledger files no follow-up" 0 "$(grep -c '^TITLE: ' "$STATE_DIR/gh/issues-created" 2>/dev/null || echo 0)"
-assert_eq "a failure before PR creation publishes no candidate summary" 0 "$(delivery_summary_count)"
+# A follow-up is a model's judgment or it does not exist: an assessment that
+# defers without writing one leaves a recorded item and nothing filed, and a
+# fixed or disputed finding cannot smuggle one past the ledger's final states.
+NO_FOLLOWUP="$TMP/fixtures-no-followup"; cp -R "$IDENTICAL" "$NO_FOLLOWUP"
+fixture "$NO_FOLLOWUP" triage '{"status":"Left both identical-looking blockers for a human.","assessments":[{"index":2,"action":"deferred","reason":"Same displayed reason."},{"index":1,"action":"deferred","reason":"Same displayed reason."}]}'
+scenario 'deferral identity: deferrals with no model-written follow-up file nothing'
+run_pipeline "$EPIC_RUN" "$NO_FOLLOWUP" --issue 42
+assert_rc "the held run still completes" 0 "$RUN_RC"
+assert_eq "no follow-up issue is invented for them" 0 "$(grep -c '^TITLE: ' "$STATE_DIR/gh/issues-created" 2>/dev/null || echo 0)"
+assert_eq "both are still recorded as remaining work" 2 "$(grep -c '^- Same displayed blocker (defect)' <<<"$(gh_deferred_record)")"
+assert_eq "and both are in the candidate record's remaining work too" 2 "$(grep -c '^- Same displayed blocker (defect)' <<<"$(gh_delivery_summary)")"
+assert_contains "and the candidate record reports them as held" "$(gh_delivery_summary)" "Candidate gate: **held**"
 
-for blocker_id_case in unknown duplicate known-as-new; do
-  BAD_BLOCKER_ID="$TMP/fixtures-blocker-id-$blocker_id_case"; cp -R "$HELD" "$BAD_BLOCKER_ID"
-  if [[ "$blocker_id_case" == unknown ]]; then
-    deferred='[{"blockerId":"blocker-999","title":"Unknown copy","why":"No registered source.","kind":"defect","file":true}]'
-  elif [[ "$blocker_id_case" == duplicate ]]; then
-    deferred='[{"blockerId":"blocker-1","title":"First copy","why":"Same source.","kind":"defect","file":true},{"blockerId":"blocker-1","title":"Second copy","why":"Same source again.","kind":"defect","file":true}]'
-  else
-    deferred='[{"blockerId":"new","title":"Known blocker called new","why":"Would sever its evidence link.","kind":"defect","file":true}]'
-  fi
-  fixture "$BAD_BLOCKER_ID" ship "{\"title\":\"Add widget\",\"body\":\"Adds a widget.\",\"commitBody\":\"Use the thin widget module so callers share one construction path.\",\"deferred\":$deferred}"
-  scenario "ship identity: $blocker_id_case blocker IDs fail closed before transport"
-  run_pipeline "$EPIC_RUN" "$BAD_BLOCKER_ID" --issue 42
-  assert_rc "$blocker_id_case blocker IDs block the run" 3 "$RUN_RC"
-  assert_contains "$blocker_id_case blocker IDs name the identity refusal" "$RUN_OUT" "blocker ID"
-  assert_eq "$blocker_id_case blocker IDs create no PR" "" "$(gh_pr_created)"
-  assert_eq "$blocker_id_case pre-PR failure creates no delivery summary" 0 "$(delivery_summary_count)"
-done
+CLEARED_FOLLOWUP="$TMP/fixtures-cleared-followup"; cp -R "$BASE" "$CLEARED_FOLLOWUP"
+fixture "$CLEARED_FOLLOWUP" triage '{"status":"Fixed the null deref, verify green.","assessments":[{"index":1,"action":"fixed","reason":"Added the empty-list guard and regression coverage.","followUp":{"title":"Should never be filed","body":"The finding it came from was resolved."}}]}'
+scenario 'deferral identity: a follow-up on a finding the review resolved is never filed'
+run_pipeline "$EPIC_RUN" "$CLEARED_FOLLOWUP" --issue 42
+assert_rc "the resolved finding still ships" 0 "$RUN_RC"
+assert_contains "and reaches the merge queue" "$RUN_OUT" '"readyToMerge":true'
+assert_eq "nothing is filed from a cleared finding" 0 "$(grep -c '^TITLE: ' "$STATE_DIR/gh/issues-created" 2>/dev/null || echo 0)"
+assert_not_contains "and it is not recorded as remaining work" "$(gh_comments)" "Should never be filed"
 
 fi
 
@@ -5890,11 +5877,12 @@ assert_contains "live status retains its concise edit-in-place footer" "$GH" "_L
 assert_not_contains "live status no longer sends the narrative to the PR" "$GH" "The PR carries what was built and the review outcome"
 
 # GitHub renders every bare #N as that issue/PR's TITLE, so numbering findings
-# "#1, #2, #3" in the PR body splices three unrelated PR titles into the review
-# section — which is exactly what shipped on vms#69's PR before this rule.
-SHIP_PROMPT="$(cat "$STATE_DIR/ship.0.prompt")"
-assert_contains "ship is told not to number anything with a bare #N" "$SHIP_PROMPT" "Never write a bare"
-assert_contains "and told what GitHub does with one" "$SHIP_PROMPT" "renders it as that issue or PR"
+# "#1, #2, #3" in published prose splices three unrelated PR titles into the
+# review section — which is exactly what shipped on vms#69's PR before this
+# rule. It now belongs to every step that returns a delivery record.
+DELIVERY_PROMPT="$(cat "$STATE_DIR/green.0.prompt")"
+assert_contains "the coding phase is told not to number anything with a bare #N" "$DELIVERY_PROMPT" "Never write a bare"
+assert_contains "and told what GitHub does with one" "$DELIVERY_PROMPT" "renders it as that issue or PR"
 
 scenario 'status comment: the final outcome lands even with an edit in flight'
 # Every phase change forces a write; a slow edit means one is still in flight

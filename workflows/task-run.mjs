@@ -3,7 +3,7 @@
 // tasker process implements and self-reviews the settled requirement; the
 // orchestrator alone claims, verifies, rebases, commits, pushes, opens the PR,
 // publishes evidence and hands the candidate to the ordinary merge worker.
-// There is no architect, RED step, independent review, correction or shipper.
+// There is no architect, RED step, independent review or correction.
 // Runtime respawns are disabled for every call. The one bounded exception is
 // a fresh tasker given captured diagnostics after the first project verify is
 // genuinely red; its full second verify is final and can never spawn a third.
