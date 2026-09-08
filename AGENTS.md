@@ -97,7 +97,7 @@ Lifecycle labels are owned by automation. Do not add or repurpose one.
 | `failed` | blocked; needs a human |
 | `needs-judgment` | beside `failed`: the merge worker declined a judgment-class conflict; the conflict fixer's queue |
 | `needs-ci-fix` | beside `failed`: checks were red on the rebased head; the CI fixer's queue |
-| `needs-defect-fix` | beside `ready-to-review`: every ship-gate blocker is a concrete defect; the defect fixer's queue |
+| `needs-defect-fix` | beside `ready-to-review`: the defect fixer's queue. Epic-run no longer writes it — a concrete-defect hold now gets one scoped correction inside the run — but defect-run still services evidence older runs published, and a manual launch still works |
 | `fix-attempted` / `fix-retried` | the conflict fixer's attempt ladder (one retry, then a human); never reset by automation |
 | `ci-attempted` / `ci-retried` | the CI fixer's own ladder, same shape |
 | `defect-attempted` / `defect-retried` | the defect fixer's own ladder, same shape — one PR can need all three repairs |
@@ -118,9 +118,11 @@ than made launchable against a main without the code it describes.
   and `workflows/defect-run.mjs`
   are plain Node orchestrators. They must not name a vendor.
 - `workflows/lib/fixer-lifecycle.mjs` owns the three fixers' shared argv/runtime
-  setup, repair → verify → check → publish sequencing, indexed-disposition
-  gate, run state, quota/refund and blocker paths, terminal budget, status and
-  `RESULT`. The entry points remain explicit cause adapters: conflict owns
+  setup, repair → verify → accept → correct → confirm → publish sequencing, the
+  indexed-disposition gate, run state, quota/refund, blocker and human-hold
+  paths, terminal budget, status and `RESULT`. The acceptance, correction and
+  confirmation contract itself lives in `workflows/lib/repair-acceptance.mjs`,
+  shared with epic-run. The entry points remain explicit cause adapters: conflict owns
   rebase/autoresolve and pre-push partial evidence, CI owns failing-check/log
   capture and local reproduction, and defect owns authenticated evidence,
   post-push head/evidence confirmation and landing-only recovery. Pushed
@@ -269,7 +271,8 @@ than made launchable against a main without the code it describes.
   verdict but the decision to take the promotion back off, so it reads once and
   the readback that PROVES the demotion is the bounded one.
 - Architecture returns a proportional plan with a structured verification
-  strategy (`test-first` or `direct`), its rationale and required evidence.
+  strategy (`test-first` or `direct`), its rationale and required evidence. It
+  no longer selects a focused reviewer: there is exactly one broad review.
   Test-first establishes a clean verify baseline before writing tests and
   requires the expected assertion failure in the orchestrator's RED output;
   an unrelated failure or timeout is not RED evidence. Direct skips the RED
@@ -279,13 +282,15 @@ than made launchable against a main without the code it describes.
   `npm run verify`, as do fixes-after-review, with one bounded coding retry
   before a blocker. An agent's report that verify passed is never the gate.
   Gated by `tests/epic-run.test.sh`.
-- One general reviewer always judges the actual diff against the requirement.
-  Architecture can request at most one additional reviewer for a concrete risk
-  question. Reviewers stay blind to builder notes; the final review receives the
-  original requirement too. Every finding needs a complete verdict: missing or
-  ambiguous evidence cannot become a disproof or merge clearance.
-  A resumed code checkpoint keeps its review plan, or reconstructs that plan
-  read-only when the local artifact is missing, without replaying code.
+- ONE broad reviewer judges the actual diff against the requirement, and it is
+  the only broad review of the change: the architect-selected focused reviewer
+  was removed because a second pre-repair opinion bought less than one
+  exhaustive acceptance check after the repair. Reviewers stay blind to builder
+  notes; the final review receives the original requirement too. Every finding
+  needs a complete verdict: missing or ambiguous evidence cannot become a
+  disproof or merge clearance. A resumed code checkpoint keeps its structured
+  plan, or reconstructs it read-only when the local artifact is missing,
+  without replaying code.
 - Review repairs apply the smallest correct change and meaningful regression
   coverage. New abstractions or instruction rules are justified by the repair,
   not mandated for every finding. Follow-up issues are still filed and queued
@@ -309,14 +314,47 @@ than made launchable against a main without the code it describes.
   disproved at confidence 75+, no repair regression, no unmet requirement. A
   dead or malformed final review, a `resolved` verdict on an empty fixer delta,
   an all-fixed claim that produced no diff (which spawns no final review), or
-  any unresolved item holds the PR at `ready-to-review`. Only an unresolved
-  finding the final review positively showed is still broken, or a regression it
-  found at confidence 75+, may enter the defect-fixer queue, and only when every
-  blocker has that evidence; uncertainty always needs a human. There is no
-  second repair round. Manual slug mode runs the same fixer and final review
-  against an in-memory reviewed patch and immutable base, without committing or
-  queueing a merge; open items remain explicit in its summary. Gated by
+  any unresolved item holds the PR at `ready-to-review`. When the hold is made
+  ENTIRELY of remaining defects the final review positively showed at
+  confidence 75+, the run takes one scoped correction before ship (see the
+  bounded repair contract below) instead of queueing a separate fixer session;
+  epic-run therefore never writes `needs-defect-fix`. Uncertainty, a mixed
+  batch and a failed correction always need a human. There is no second repair
+  round and no second correction batch. Manual slug mode runs the same fixer,
+  final review and correction against an in-memory reviewed patch and immutable
+  base, without committing or queueing a merge; open items remain explicit in
+  its summary. Gated by `tests/epic-run.test.sh`.
+- The bounded repair contract (`workflows/lib/repair-acceptance.mjs`) is shared
+  by every place Toliki independently checks a model-written repair: epic-run's
+  post-review repair and the conflict, CI and defect fixers. A checker examines
+  every original disposition and the complete orchestrator-captured repair delta
+  — new and untracked files included — keeps going after the first refutation,
+  and returns an exact verdict per item plus the COMPLETE blocker batch, never
+  one sufficient counterexample. Each blocker has a run-local id, a kind
+  (`original-defect`, `repair-regression`, `out-of-scope`, `human-judgment`),
+  the original item when it names one, a location, concrete code evidence and
+  the observable outcome that clears it. The outcome is `clear`,
+  `correction-required` (every blocker is a concrete implementation defect) or
+  `human`. Malformed, incomplete, duplicate, extra, unknown, ambiguous or
+  low-confidence evidence authorizes nothing. On `correction-required` the
+  unpushed repair is preserved exactly as it is and ONE fresh writable
+  correction runs in the same invocation over the whole batch — no cleanup, no
+  restored queue, no consumed retry rung, no second whole fixer — then the full
+  verify contract again and ONE narrow read-only confirmation that receives the
+  complete cumulative delta and the exact correction delta but never the
+  correction's narrative. A missing or declined blocker disposition, no relevant
+  change, a red second verify, or a refused, dead or malformed confirmation ends
+  human-held; there is no second correction batch. Distinct usage labels record
+  the initial repair, the acceptance check, the correction and the confirmation,
+  so a correction is never counted as a pipeline relaunch. Gated by
   `tests/epic-run.test.sh`.
+- Semantic completion and operational relaunch are separate. A semantic human
+  outcome in a fixer removes that fixer's queue label and verifies the
+  human-held resting state, so dispatch cannot launch another complete fixer at
+  work a correction already had its one chance at — and it never manufactures a
+  spent retry label to get there. Provider quota, process interruption,
+  transport failure and landing-only recovery keep their existing refund, retry
+  and durable-recovery behavior.
 - A phase that judges a change may not alter it. Reviewer and shipper charters
   have no shell or write tools; the orchestrator supplies their diff evidence
   and hashes the shippable worktree (all tracked content, including tracked
@@ -386,8 +424,9 @@ than made launchable against a main without the code it describes.
   `tests/epic-run.test.sh`.
 - The defect fixer has the same verified-push safety argument as the CI fixer,
   but repairs only defects already named by the durable ship-gate evidence. It
-  is a separate two-attempt session, and epic-run queues it only when no mixed
-  or missing blocker evidence exists. It cannot weaken a test or reclassify a
+  is a separate two-attempt session. Epic-run no longer queues it — that hold
+  takes one scoped correction inside the run instead — so it exists for durable
+  evidence older runs published and for an explicit manual launch. It cannot weaken a test or reclassify a
   defect. A complete repair rejoins `ready-to-merge` only after
   orchestrator-run verify plus a blind adversarial check of the complete delta,
   including intent-added new files. A verified partial repair is pushed to

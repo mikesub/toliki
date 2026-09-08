@@ -8,7 +8,8 @@
 // stale the moment the repo changed shape — and it is read here, in code, so
 // a package cannot be missed by a model that did not look.
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, appendFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync, appendFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { sh, must } from './proc.mjs'
 
@@ -194,6 +195,46 @@ export async function intentToAdd() {
 // a blocker.
 export const pushRejected = (r) => /rejected|non-fast-forward|stale info|fetch first/i.test(`${r.err}\n${r.out}`)
 
+// ───────────────────────── evidence capture ─────────────────────────
+// Judging phases have no shell under Claude and only a read-only sandbox under
+// Codex, so the orchestrator captures the diff they judge. Disable external
+// diff/textconv drivers: repository configuration is untrusted input here, and
+// capturing evidence must not execute project code. Returns null when the
+// capture failed, which every caller treats as missing evidence rather than as
+// an empty change.
+export async function captureDiff(refs = [], { stat = false, paths = [] } = {}) {
+  const args = ['diff', '--no-ext-diff', '--no-textconv', stat ? '--stat' : '--binary', ...refs]
+  if (paths.length) args.push('--', ...paths)
+  const result = await git(args)
+  return result.ok ? result.out : null
+}
+
+// A tree object for the whole worktree — tracked content whether staged or not,
+// plus untracked files — written through a THROWAWAY index so neither the run's
+// index nor a user's index is disturbed. It exists so a delta can be taken
+// ACROSS an uncommitted edit: a correction leaves its work in the working tree,
+// and `git diff HEAD` cannot separate it from the repair that preceded it.
+//
+// The index is seeded from HEAD before staging. An index that starts empty
+// knows no path as tracked, so `git add -A` applies the ignore rules to all of
+// them and a file that is tracked but ALSO matched by an ignore rule (a
+// committed build artifact, a checked-in config) is missing from the snapshot.
+// read-tree makes it see every path git itself would ship. Untracked files are
+// therefore included, which is what makes a new file part of the delta a
+// checker receives.
+export async function worktreeTree() {
+  const work = mkdtempSync(path.join(tmpdir(), 'toliki-tree-'))
+  try {
+    const env = { ...process.env, GIT_INDEX_FILE: path.join(work, 'index') }
+    if (!(await git(['read-tree', 'HEAD'], { env })).ok) return null
+    if (!(await git(['add', '-A'], { env })).ok) return null
+    const tree = await git(['write-tree'], { env })
+    return tree.ok ? tree.out : null
+  } finally {
+    rmSync(work, { recursive: true, force: true })
+  }
+}
+
 // ───────────────────────── slugs ─────────────────────────
 // "<issue>-<2-4 word kebab gist of the title>", whole slug ≤ 40 chars. Derived
 // mechanically: a resume adopts the branch's own slug anyway, so nothing
@@ -289,12 +330,6 @@ Mode: ${d.verification.mode}
 ${d.verification.rationale}
 
 ${d.verification.evidence.map(item => `- ${item}`).join('\n')}
-
-## Focused review
-
-Question: ${d.review.question || '(none — broad review only)'}
-
-${d.review.rationale}
 `
   mkdirSync(dir, { recursive: true })
   writeFileSync(path.join(dir, 'architecture.md'), text)

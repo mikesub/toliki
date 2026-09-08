@@ -139,7 +139,7 @@ export const LABELS = {
   'needs-ci-fix':    { color: 'D93F0B', description: 'checks were red on the rebased head — queued for an automated CI fixer session' },
   'ci-attempted':    { color: 'FEF2C0', description: 'a CI fixer session has attempted this red check once' },
   'ci-retried':      { color: 'F9D0C4', description: 'the CI fixer retry is spent — the next failure waits for a human' },
-  'needs-defect-fix': { color: 'D93F0B', description: 'ship gate held on concrete defects — queued for an automated defect fixer session' },
+  'needs-defect-fix': { color: 'D93F0B', description: 'concrete ship-gate defects from an earlier run — queued for an automated defect fixer session' },
   'defect-attempted': { color: 'FEF2C0', description: 'a defect fixer session has attempted this ship-gate repair once' },
   'defect-retried':   { color: 'F9D0C4', description: 'the defect fixer retry is spent — the next failure waits for a human' },
 }

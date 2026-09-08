@@ -48,12 +48,12 @@ don't get re-litigated from memory.
   GitHub label persistence and readback a hard gate: refusing an unavailable or
   ambiguous route is safer than silently retiering an existing change after a
   default changes.
-- **Review** — blind and adversarial. One general reviewer judges the diff
-  against the issue body, barred from the builder's notes. Architecture may
-  request one additional reviewer for a concrete risk question, such as whether
-  a migration preserves existing records; it cannot disable the general review
-  or request an unbounded fan-out. Both review actual behavior and evidence,
-  without the builder's conclusions. Judging is read-only, and that is enforced
+- **Review** — blind and adversarial. ONE broad reviewer judges the diff
+  against the issue body, barred from the builder's notes, and it is the only
+  broad review the change gets. An architect-selected focused reviewer used to
+  run beside it and was removed: a second pre-repair opinion bought less than
+  one exhaustive acceptance check after the repair, and two broad passes over
+  one diff mostly re-litigated each other. Judging is read-only, and that is enforced
   rather than trusted: Claude's reviewer and shipper charters withhold shell and
   write tools, Codex runs them in a read-only sandbox, and the orchestrator
   supplies inert diff evidence. It also snapshots the shippable worktree, index,
@@ -75,10 +75,8 @@ don't get re-litigated from memory.
   an indexed disposition and verdict; disproved findings remain in the audit
   record. There is no second repair round: what the final review leaves open
   ends the epic at a human, because another round is a round that is not
-  converging. A hold made entirely of remaining defects the final review
-  positively showed may enter a separate, label-bounded defect-fixer session in
-  repositories that explicitly opt in; uncertainty still goes directly to a
-  human. Both the fixer and the final reviewer are fresh processes that
+  converging. What it may earn instead is ONE scoped correction — see the
+  bounded repair contract below. Both the fixer and the final reviewer are fresh processes that
   reconstruct their context and end when they return, which repeats some
   exploration and buys an adjudication that owes the previous process nothing.
   The strong model goes to design and adjudication, where being wrong is
@@ -107,6 +105,47 @@ don't get re-litigated from memory.
   retry. An epic already rebases onto current `main` at ship, so this rebase
   usually finds nothing left to do and a conflict here means `main` moved in
   the window between ship and merge.
+- **A repair checker returns the whole worklist, and automation gets exactly one
+  correction over it.** A checker that answered a global `survives` boolean and
+  stopped at the first sufficient counterexample produced something automation
+  could not act on: "no" is not a worklist, so every refutation cost a fresh
+  whole repair that re-read the requirement, re-derived the fix and produced a
+  new answer to check. The alternative is not a loop but one exhaustive answer.
+  Every place Toliki independently checks a model-written repair — epic-run's
+  post-review repair and the conflict, CI and defect fixers — now shares one
+  contract: keep examining every original disposition and the complete repair
+  delta after a refutation is found, return an exact verdict for each, and
+  return the COMPLETE blocker batch. Each blocker carries a run-local identity,
+  its kind, its location, concrete code evidence and the observable outcome that
+  clears it, and the outcome is `clear`, `correction-required` (every blocker is
+  a concrete implementation defect) or `human` (anything uncertain, unsupported,
+  unsafe, or a decision rather than an implementation). Malformed, incomplete,
+  duplicate, extra, ambiguous or low-confidence evidence authorizes nothing.
+  On `correction-required` the current unpushed repair is preserved exactly as
+  it is and one fresh writable correction runs over the whole batch inside the
+  same invocation — no cleanup, no restored queue, no consumed retry rung, no
+  second whole fixer — followed by the full verification contract again and one
+  narrow read-only confirmation that receives both deltas but not the
+  correction's narrative. There is no second correction batch. The accepted
+  trade-off is that one correction may still leave concrete work for a human:
+  exhaustive batching buys automation one informed opportunity without
+  recreating the hours-long review/fix loop, and exhaustive checking costs more
+  than producing one refutation but replaces repeated full preparation, repair,
+  verification and checker invocations.
+  Semantic completion and operational relaunch are separate, and the difference
+  is where the run rests. A semantic dead end — `human`, a declined or empty
+  correction, a red second verification, a refused or malformed confirmation —
+  removes that fixer's queue label and verifies the human-held state, so
+  dispatch cannot send another complete fixer at work a correction already had
+  its chance at; no spent retry label is manufactured to achieve that. Provider
+  quota, process interruption, transport failure and landing-only recovery keep
+  their existing refund, retry and durable-recovery behavior.
+  In the epic this is why nothing queues `needs-defect-fix` any more: a hold
+  made entirely of concrete defects the final review positively showed is
+  exactly the case the correction takes, in the run that still has the context,
+  before the PR exists. Mixed or uncertain holds never earned an automated
+  repair and still go straight to a human. `defect-run` remains so durable
+  evidence older runs already published stays serviceable.
 - **Repair is bounded: one repair round inside the epic, then a new bounded
   session, never an unbounded loop.** Conflict, CI and ship-gate defect repair
   each have an independent two-attempt ladder in GitHub labels. The defect rung
@@ -115,8 +154,8 @@ don't get re-litigated from memory.
   named-defect envelope authored by the automation identity and bound to the
   selected PR head. Epic-run verifies the envelope before queueing; the fixer
   rejects mutable issue prose, stale heads and fork PRs before spending an
-  attempt. After the project verify gate and a blind adversarial check over the
-  complete delta, the merge worker still rebases and re-runs the real checks
+  attempt. After the project verify gate and the exhaustive acceptance check
+  over the complete delta, the merge worker still rebases and re-runs the real checks
   before landing it. What a rung may repeat is bounded the same way: an attempt
   that pushed a verified and checked repair and could not confirm the label
   swap left work to finish, but it is the LANDING, not the repair, so the next
@@ -124,7 +163,7 @@ don't get re-litigated from memory.
   sending a second repair at defects that are already repaired.
   Each fixer also preserves a verified partial round instead of throwing its
   safe work away: exact indexed repaired/declined claims pass through the same
-  project verify and adversarial delta check, then the amended branch rests at
+  project verify and acceptance check, then the amended branch rests at
   `ready-to-review` with its fixer queue removed. That spends the rung and
   requires a human because a decline is still unresolved; it does not erase
   repairs the human would otherwise have to repeat. Partial conflict evidence
@@ -136,7 +175,7 @@ don't get re-litigated from memory.
   the authenticated evidence on the amended head with only declined items, so
   a human-granted later round cannot repair completed work again.
   These three sessions use one fixed-purpose lifecycle runner for the common
-  repair, verify, adversarial-check, failure/refund and reporting path. They are
+  repair, verify, accept, correct, confirm, failure/refund and reporting path. They are
   adapters rather than rows in a generic workflow framework: conflict evidence
   must exist before its prospective partial head is pushed, defect evidence can
   be refreshed only after the pushed head is observed, and defect landing-only

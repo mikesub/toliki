@@ -1,10 +1,10 @@
 ---
 name: fix-conflict
-description: "Autonomous judgment-conflict fixer: `/fix-conflict #N` takes a `needs-judgment` issue (a finished epic whose PR the merge worker declined on a judgment-class rebase conflict), rebases the PR onto current main, resolves the judgment hunks under an adversarial check, re-verifies, force-pushes, and lands the issue ready-to-merge. An issue number is required; on the host, dispatch launches it."
+description: "Autonomous judgment-conflict fixer: `/fix-conflict #N` takes a `needs-judgment` issue (a finished epic whose PR the merge worker declined on a judgment-class rebase conflict), rebases the PR onto current main, resolves the judgment hunks under an exhaustive acceptance check with at most one scoped correction, re-verifies, force-pushes, and lands the issue ready-to-merge. An issue number is required; on the host, dispatch launches it."
 disable-model-invocation: true
 ---
 
-Launch the autonomous `fix-run` pipeline for a `needs-judgment` issue and report what it returned. It exits at `ready-to-merge` or at a blocker comment. It never merges: it puts the issue back in the merge worker's queue, and the merge worker rebases the PR and re-runs the real checks before anything lands. It escalates instead of guessing and never fixes code: a resolution that cannot show both sides' intent surviving, a red `npm run verify`, or a refuted check leaves the issue `failed` with the reason.
+Launch the autonomous `fix-run` pipeline for a `needs-judgment` issue and report what it returned. It exits at `ready-to-merge` or at a blocker comment. It never merges: it puts the issue back in the merge worker's queue, and the merge worker rebases the PR and re-runs the real checks before anything lands. It escalates instead of guessing and never fixes code: a resolution that cannot show both sides' intent surviving, or a red `npm run verify`, leaves the issue `failed` with the reason. Its acceptance check returns every blocker at once; when all of them are concrete implementation defects it takes exactly one scoped correction inside the same attempt, whose edits join the same amended commit. Anything the correction cannot settle leaves the issue `failed` with `needs-judgment` removed, so no second fixer is launched at it.
 
 Request: $ARGUMENTS
 

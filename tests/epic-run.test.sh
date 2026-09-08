@@ -162,18 +162,23 @@ case "${EPIC_STEP_LABEL:-}" in
   code:direct|code:direct:retry)                key=direct ;;
   code:green|code:green:retry)                 key=green ;;
   review:general)                              key=review-general ;;
-  review:focus)                                key=review-focus ;;
+  correction)                                  key=correction ;;
+  narrow-confirm)                              key=narrowconfirm ;;
   verify:*)                                    key=verify ;;
   final-review)                                key=finalreview ;;
   fixes-after-review|fixes-after-review:retry) key=triage ;;
   ship:pr)                                     key=ship ;;
   summary:write)                               key=summary ;;
   resolve)                                     key=fix-resolve ;;
-  check)                                       key=fix-check ;;
+  acceptance)                                  key=fix-check ;;
   fix-ci)                                      key=ci-fix ;;
-  ci-check)                                    key=ci-check ;;
+  ci-acceptance)                               key=ci-check ;;
+  ci-correction)                               key=ci-correction ;;
+  ci-confirm)                                  key=ci-confirm ;;
   fix-defect)                                  key=defect-fix ;;
-  defect-check)                                key=defect-check ;;
+  defect-acceptance)                           key=defect-check ;;
+  defect-correction)                           key=defect-correction ;;
+  defect-confirm)                              key=defect-confirm ;;
 esac
 
 n="$(cat "$STUB_STATE/$key.n" 2>/dev/null || echo 0)"
@@ -677,6 +682,35 @@ fixture_sh() { # dir key script
   printf '%s\n' "$3" > "$1/$2.sh"
 }
 
+# ── the bounded repair contract's answers (lib/repair-acceptance.mjs) ──
+# An acceptance answer is EXHAUSTIVE: one verdict per numbered item plus the
+# complete blocker batch. These helpers take the item count for that reason —
+# a fixture cannot hand back one sufficient refutation and still validate.
+verdicts_json() { # count blocked-index (0 = every item upheld) [confidence]
+  local n="$1" blocked="$2" confidence="${3:-90}" i=1 out="" verdict
+  while [[ "$i" -le "$n" ]]; do
+    if [[ "$i" == "$blocked" ]]; then verdict=blocked; else verdict=upheld; fi
+    out+="{\"index\":$i,\"verdict\":\"$verdict\",\"confidence\":$confidence,\"reasoning\":\"item $i judged from the captured delta\"},"
+    i=$((i + 1))
+  done
+  printf '[%s]' "${out%,}"
+}
+accept_clear() { # dir key count [confidence]
+  fixture "$1" "$2" "{\"outcome\":\"clear\",\"verdicts\":$(verdicts_json "$3" 0 "${4:-90}"),\"blockers\":[]}"
+}
+accept_human() { # dir key count evidence
+  fixture "$1" "$2" "{\"outcome\":\"human\",\"verdicts\":$(verdicts_json "$3" 1),\"blockers\":[{\"id\":\"b1\",\"kind\":\"human-judgment\",\"item\":1,\"location\":\"frontend/src/index.ts:1\",\"evidence\":$(printf '%s' "$4" | jq -Rs .),\"required\":\"a human decides this\",\"confidence\":90}]}"
+}
+accept_correction() { # dir key count evidence required [kind]
+  fixture "$1" "$2" "{\"outcome\":\"correction-required\",\"verdicts\":$(verdicts_json "$3" 1),\"blockers\":[{\"id\":\"b1\",\"kind\":\"${6:-original-defect}\",\"item\":1,\"location\":\"frontend/src/index.ts:1\",\"evidence\":$(printf '%s' "$4" | jq -Rs .),\"required\":$(printf '%s' "$5" | jq -Rs .),\"confidence\":90}]}"
+}
+correction_json() { # blocker-id reason -> json
+  printf '{"summary":"one scoped correction","dispositions":[{"id":"%s","action":"corrected","reason":%s}]}' "$1" "$(printf '%s' "$2" | jq -Rs .)"
+}
+confirm_json() { # blocker-id [cleared] [confidence]
+  printf '{"cleared":%s,"confidence":%s,"reasoning":"the required outcome is observable in the correction delta","blockerVerdicts":[{"id":"%s","verdict":"cleared","reasoning":"observed in the correction delta"}],"regressions":[]}' "${2:-true}" "${3:-93}" "$1"
+}
+
 # ───────────────────────── provider quota hold: pure/shared contracts ─────────────────────────
 # Keep the clock injected through the public functions: none of these waits for
 # a wall-clock boundary, and the IANA case proves this is not a UTC-only parser.
@@ -870,6 +904,12 @@ fixture "$BASE" review-general '{"findings":[{"title":"Null deref on empty list"
 fixture "$BASE" triage '{"status":"Fixed the null deref, verify green.","assessments":[{"index":1,"action":"fixed","reason":"Added the empty-list guard and regression coverage."}]}'
 fixture_sh "$BASE" triage 'printf "export const createWidget = () => ({ items: [] })\n" > frontend/src/widget.ts'
 fixture "$BASE" finalreview '{"verdicts":[{"index":1,"verdict":"resolved","confidence":92,"defect":false,"reasoning":"The guard is in place and the empty case is tested."}],"regressions":[],"unmetRequirements":[]}'
+# The bounded repair contract's last two steps. The happy path never reaches
+# them (its one finding is resolved, so the batch is empty); a derived set whose
+# final review leaves a concrete defect does, and inherits these.
+fixture "$BASE" correction '{"summary":"CORRECTION_NARRATIVE_SENTINEL: guarded the empty list the review named.","dispositions":[{"id":"blocker-1","action":"corrected","reason":"Added the empty-list guard and its regression."}]}'
+fixture_sh "$BASE" correction 'printf "export const createWidget = () => ({ items: [], guarded: true })\n" > frontend/src/widget.ts'
+fixture "$BASE" narrowconfirm '{"cleared":true,"confidence":93,"reasoning":"The guard is present in the correction delta and nothing else moved.","blockerVerdicts":[{"id":"blocker-1","verdict":"cleared","reasoning":"the guard is observable in the correction delta"}],"regressions":[]}'
 fixture "$BASE" ship '{"title":"Add widget","body":"ISSUE_NARRATIVE_SENTINEL: Implements widget creation for callers.\n\nDESIGN_NARRATIVE_SENTINEL: Keeps a thin module because that fits the existing shape.\n\nREVIEW_NARRATIVE_SENTINEL: One independently reviewed finding was fixed.","commitBody":"COMMIT_RATIONALE_SENTINEL: Add the widget so callers share one construction path.\n\nCOMMIT_DESIGN_SENTINEL: Keep the module thin and avoid caching because the current shape needs neither state nor invalidation.","deferred":[]}'
 
 # ───────────────────────── the runner ─────────────────────────
@@ -1515,7 +1555,6 @@ assert_contains "the report groups by script" "$REPORT" "epic-run — 1 run(s): 
 assert_contains "and shows independent review usage" "$REPORT" "review"
 assert_contains "with percentages" "$REPORT" "28.6"
 assert_eq "the mandatory general reviewer ran once" 1 "$(calls review-general)"
-assert_eq "an empty review question does not add a focused reviewer" 0 "$(calls review-focus)"
 # What the orchestrator did to the repo and the issue.
 assert_eq "origin holds the branch as ONE commit above main" 1 "$(origin_count epic/42-add-widget)"
 assert_eq "the squashed commit's subject is the PR title" "Add widget" "$(git -C "$ORIGIN" log -1 --format=%s epic/42-add-widget)"
@@ -1877,7 +1916,6 @@ assert_contains "the PR body uses the recovered approach" "$(cat "$STATE_DIR/shi
 scenario 'resume: cached structured plan re-renders markdown and preserves focused review'
 seed_branch epic/42-add-widget main 'printf "test(\"widget\", () => {})\n" > frontend/src/widget.test.ts && printf "export const createWidget = () => ({})\n" > frontend/src/widget.ts && git add -A && git commit -qm "wip(epic 42-add-widget): code checkpoint"'
 CACHED="$TMP/fixtures-cached"; cp -R "$BASE" "$CACHED"
-fixture "$CACHED" review-focus '{"findings":[]}'
 mkdir -p "$CACHED/worktree/.epics/42-add-widget"
 printf '%s\n' '{"approach":"Cached widget plan","rationale":"Matches the checkpoint.","steps":["build widget"],"files":["frontend/src/widget.ts"],"contract":"createWidget(): Widget","tradeoffs":"No caching.","verification":{"mode":"test-first","rationale":"Public behavior is asserted.","evidence":["widget test passes"]},"review":{"question":"Can concurrent callers observe partial state?","rationale":"State construction crosses a boundary."}}' > "$CACHED/worktree/.epics/42-add-widget/architecture.json"
 GH_ISSUE_LABELS='ready,engine:claude' run_pipeline "$EPIC_RUN" "$CACHED" --issue 42
@@ -1886,8 +1924,7 @@ assert_eq "cached JSON needs no architect call" 0 "$(( $(calls design) + $(calls
 assert_eq "cached checkpoint replays no code" 0 "$(( $(calls red) + $(calls direct) + $(calls green) ))"
 assert_contains "missing markdown is re-rendered" "$(cat "$WT/.epics/42-add-widget/architecture.md")" "Approach: Cached widget plan"
 assert_not_contains "scratch architecture never enters the shipped tree" "$(git -C "$ORIGIN" ls-tree -r --name-only epic/42-add-widget)" ".epics/"
-assert_eq "cached optional focus is preserved" 1 "$(calls review-focus)"
-assert_contains "focused review gets the cached question" "$(cat "$STATE_DIR/review-focus.0.prompt")" "Can concurrent callers observe partial state?"
+assert_eq "the cached plan still runs exactly one broad review" 1 "$(calls review-general)"
 
 scenario 'resume: a red code checkpoint gets one green attempt, then review'
 seed_branch epic/42-add-widget main 'printf "test(\"widget\", () => {})\n" > frontend/src/widget.test.ts && git add -A && git commit -qm "wip(epic 42-add-widget): code checkpoint"'
@@ -1936,27 +1973,6 @@ assert_eq "the checkpoint was pushed so a re-run resumes it" 2 "$(origin_count e
 assert_contains "the pushed checkpoint holds the implementation" "$(git -C "$ORIGIN" ls-tree -r --name-only epic/42-add-widget)" "frontend/src/widget.ts"
 assert_not_contains "the WIP never carries a Closes line" "$(git -C "$ORIGIN" log --format=%B main..epic/42-add-widget)" "Closes #"
 
-scenario 'epic-run: a selected focused reviewer runs narrowly and is mandatory'
-FOCUSED="$TMP/fixtures-focused"; cp -R "$BASE" "$FOCUSED"
-fixture "$FOCUSED" design '{"approach":"Thin widget module","rationale":"Fits the existing shape.","steps":["one","two"],"files":["src/widget.ts — new"],"contract":"createWidget(): Widget","tradeoffs":"No caching.","verification":{"mode":"test-first","rationale":"The public export can be asserted before implementation.","evidence":["widget test passes"]},"review":{"question":"Can concurrent callers observe a partial widget?","rationale":"Construction crosses a state boundary."}}'
-fixture "$FOCUSED" review-focus '{"findings":[]}'
-run_pipeline "$EPIC_RUN" "$FOCUSED" --issue 42
-assert_rc "the focused review ships when it completes" 0 "$RUN_RC"
-assert_eq "general review remains mandatory" 1 "$(calls review-general)"
-assert_eq "exactly one focused reviewer is added" 1 "$(calls review-focus)"
-assert_contains "the focused prompt asks only the selected question" "$(cat "$STATE_DIR/review-focus.0.prompt")" "Can concurrent callers observe a partial widget?"
-assert_contains "the focused prompt avoids duplicate general review" "$(cat "$STATE_DIR/review-focus.0.prompt")" "Do not repeat a general review"
-assert_not_contains "the architect rationale does not anchor the reviewer" "$(cat "$STATE_DIR/review-focus.0.prompt")" "Construction crosses a state boundary"
-
-printf '1' > "$FOCUSED/review-focus.0.rc"; printf '1' > "$FOCUSED/review-focus.1.rc"
-scenario 'epic-run: a dead selected focused reviewer blocks'
-run_pipeline "$EPIC_RUN" "$FOCUSED" --issue 42
-assert_rc "a dead selected reviewer blocks" 3 "$RUN_RC"
-assert_contains "the missing focused reviewer is named" "$RUN_OUT" "review:focus"
-assert_eq "nothing ships without requested focused review" "" "$(gh_pr_created)"
-
-# A dispute needs no repair to be settled: the final review establishes the
-# false positive from the code itself, on a tree the fixer never touched.
 scenario 'review assessment: a disputed false positive is disproved without a code delta'
 REJECTED="$TMP/fixtures-rejected"; cp -R "$BASE" "$REJECTED"
 fixture "$REJECTED" triage '{"status":"The report is a false positive.","assessments":[{"index":1,"action":"disputed","reason":"The caller normalizes missing lists before the access."}]}'
@@ -2024,21 +2040,38 @@ for verdict_case in missing duplicate out-of-range fractional empty-evidence mis
   assert_eq "$verdict_case evidence starts no second repair round" 1 "$(calls triage)"
 done
 
-scenario 'epic-run: a deferred finding holds the merge gate'
+scenario 'epic-run: a declined correction blocker holds the merge gate for a human'
+# The final review IS this repair's exhaustive acceptance check, and the batch
+# it leaves here is one concrete defect — so the run takes its ONE scoped
+# correction rather than shipping the hold to a separate fixer session. This is
+# the stop half: the correction declines the blocker, which is a judgment call,
+# so the PR is held for a human with no repair queue behind it and no second
+# correction batch.
 HELD="$TMP/fixtures-held"; cp -R "$BASE" "$HELD"
 fixture "$HELD" triage '{"status":"Left one for a human.","assessments":[{"index":1,"action":"deferred","reason":"The fix needs a product decision."}]}'
 fixture_sh "$HELD" triage 'true'
 fixture "$HELD" finalreview '{"verdicts":[{"index":1,"verdict":"unresolved","confidence":94,"defect":true,"reasoning":"The empty-list access is still reachable and throws; no guard was added."}],"regressions":[],"unmetRequirements":[]}'
+fixture "$HELD" correction '{"summary":"The empty-list policy is a product decision.","dispositions":[{"id":"blocker-1","action":"declined","reason":"choosing throw-vs-empty is a product decision, not an implementation defect"}]}'
+rm -f "$HELD/correction.sh"
 fixture "$HELD" ship '{"title":"Add widget","body":"HELD_ISSUE_NARRATIVE_SENTINEL: Implements the guarded widget path, while one empty-list decision remains.\n\nHELD_DESIGN_NARRATIVE_SENTINEL: Preserves the thin-module boundary.","commitBody":"HELD_COMMIT_RATIONALE_SENTINEL: Keep the verified guarded path as one candidate while a human decides the remaining empty-list behavior.","deferred":[{"blockerId":"blocker-1","title":"Null deref on empty list","why":"The fix needs a product decision.","kind":"defect","file":false}]}'
 run_pipeline "$EPIC_RUN" "$HELD" --issue 42
 assert_rc "exits 0 (the PR is real, just held)" 0 "$RUN_RC"
 assert_contains "RESULT records why the gate held" "$RUN_OUT" '"mergeSkipped"'
 assert_contains "the held reason names the finding" "$RUN_OUT" 'Critical: Null deref on empty list'
 assert_not_contains "it is not queued for merge" "$RUN_OUT" '"readyToMerge":true'
-assert_contains "RESULT marks an exclusively defect-class hold repairable" "$RUN_OUT" '"needsDefectFix":true'
-assert_eq "the issue stays reviewable and enters the defect-fixer queue" "needs-defect-fix,ready-to-review," "$(gh_labels)"
+assert_eq "the concrete batch earned exactly one correction and no confirmation" "1 0" "$(calls correction) $(calls narrowconfirm)"
+assert_contains "RESULT records the human-held correction outcome" "$RUN_OUT" '"correction"'
+assert_contains "and says a declined blocker ends the run" "$RUN_OUT" 'declined blocker id(s) blocker-1'
+assert_eq "the issue rests reviewable with no repair queue behind it" "ready-to-review," "$(gh_labels)"
+assert_not_contains "no defect-fixer handoff is created for a corrected-once blocker" "$(gh_comments)" "🤖 defect-fix evidence"
 assert_eq "a deliberate deferral still reaches the final review" 1 "$(calls finalreview)"
 assert_eq "a deliberate deferral spends exactly one fixer" 1 "$(calls triage)"
+CORRECTION_PROMPT="$(cat "$STATE_DIR/correction.0.prompt")"
+assert_contains "the correction is given the blocker's run-local identity" "$CORRECTION_PROMPT" "id: blocker-1"
+assert_contains "the correction is given the required observable outcome" "$CORRECTION_PROMPT" "required to clear: Guard the access."
+assert_contains "the correction is given the successful verification evidence" "$CORRECTION_PROMPT" "verify gate was GREEN"
+assert_contains "the correction is given the exact repair delta" "$CORRECTION_PROMPT" "<repair-delta>"
+assert_contains "the correction is told there is no second round" "$CORRECTION_PROMPT" "there is no second correction round"
 HELD_SUMMARY="$(gh_delivery_summary)"
 HELD_SHA="$(origin_ref epic/42-add-widget)"
 assert_eq "the held candidate gets exactly one delivery summary" 1 "$(delivery_summary_count)"
@@ -2053,15 +2086,92 @@ assert_contains "the deterministic candidate gate is held" "$HELD_SUMMARY" "held
 assert_not_contains "a held summary never claims the clear handoff state" "$HELD_SUMMARY" "clear-pending-handoff"
 assert_not_contains "the held narrative is absent from the technical PR" "$(cat "$WT/.epics/42-add-widget/summary.md")" "HELD_ISSUE_NARRATIVE_SENTINEL"
 assert_contains "the held candidate commit keeps its rationale" "$(git -C "$ORIGIN" log -1 --format=%B epic/42-add-widget)" "HELD_COMMIT_RATIONALE_SENTINEL"
-EVIDENCE_COMMENT="$(gh_evidence_comment)"
-assert_eq "the evidence selection marker is the comment's first line" "🤖 defect-fix evidence" "$(head -n 1 <<<"$EVIDENCE_COMMENT")"
-SHORT_HEAD="$(origin_ref epic/42-add-widget | cut -c1-7)"
-assert_contains "the evidence summary links the PR, short head, and branch" "$EVIDENCE_COMMENT" "PR: [#7](https://github.com/o/r/pull/7) — \`$SHORT_HEAD\` on \`epic/42-add-widget\`"
-assert_contains "the evidence summary names the pinned requirement" "$EVIDENCE_COMMENT" "Pinned requirement: Add widget"
-assert_contains "the evidence summary shows blocker source and reason" "$EVIDENCE_COMMENT" '- `post-review-defect` — 1 independently confirmed review defect(s) left unfixed'
-assert_contains "the evidence summary gives each blocker item a readable title and why" "$EVIDENCE_COMMENT" '  - Null deref on empty list — The empty-list access is still reachable and throws; no guard was added&#46;'
-assert_contains "the complete envelope is hidden in an unopened details block" "$EVIDENCE_COMMENT" $'<details>\n<summary>machine-readable evidence</summary>\n\n```json'
-assert_contains "the evidence envelope is pretty-printed rather than raw one-line JSON" "$EVIDENCE_COMMENT" $'```json\n{\n  "version": 1,'
+
+# The pass half of the same batch: one correction, a green second verification,
+# and a narrow confirmation that clears it. The blockers are gone before ship,
+# so the ordinary complete landing applies and nothing is handed to a fixer.
+scenario 'epic-run: a confirmed correction clears a concrete batch before ship'
+CORRECTED="$TMP/fixtures-corrected"; cp -R "$HELD" "$CORRECTED"
+cp "$BASE/correction.json" "$CORRECTED/correction.json"
+cp "$BASE/correction.sh" "$CORRECTED/correction.sh"
+fixture "$CORRECTED" ship '{"title":"Add widget","body":"CORRECTED_NARRATIVE_SENTINEL: Implements the guarded widget path.","commitBody":"CORRECTED_COMMIT_SENTINEL: Guard the empty list at the one construction path.","deferred":[]}'
+run_pipeline "$EPIC_RUN" "$CORRECTED" --issue 42
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_eq "one correction and one narrow confirmation ran" "1 1" "$(calls correction) $(calls narrowconfirm)"
+assert_contains "the confirmed correction reaches the merge queue" "$RUN_OUT" '"readyToMerge":true'
+assert_eq "the issue ends ready-to-merge with no repair queue" "ready-to-merge," "$(gh_labels)"
+assert_not_contains "no defect-fixer handoff is created" "$(gh_comments)" "🤖 defect-fix evidence"
+assert_contains "RESULT records what the correction cleared" "$RUN_OUT" 'one scoped correction cleared 1 blocker(s)'
+assert_eq "the correction re-ran the full verify contract" 5 "$(grep -c '^run verify$' "$NPM_LOG")"
+assert_contains "the corrected code is what shipped" "$(git -C "$ORIGIN" show epic/42-add-widget:frontend/src/widget.ts)" "guarded: true"
+CONFIRM_PROMPT="$(cat "$STATE_DIR/narrowconfirm.0.prompt")"
+assert_contains "the confirmer receives the complete cumulative repair delta" "$CONFIRM_PROMPT" "<repair-delta>"
+assert_contains "the confirmer receives the exact correction delta" "$CONFIRM_PROMPT" "<correction-delta>"
+assert_contains "the correction delta carries the corrected bytes" "$CONFIRM_PROMPT" "guarded: true"
+assert_contains "the confirmer receives the acceptance verdict per original finding" "$CONFIRM_PROMPT" "item 1: blocked"
+assert_contains "the confirmer receives every blocker identity" "$CONFIRM_PROMPT" "id: blocker-1"
+assert_not_contains "the confirmer never sees the correction's own narrative" "$CONFIRM_PROMPT" "CORRECTION_NARRATIVE_SENTINEL"
+assert_contains "the confirmer is told not to restart a broad review" "$CONFIRM_PROMPT" "Do NOT restart a broad architectural review"
+assert_eq "telemetry separates the four steps of the repair path" "correction,final-review,fixes-after-review,narrow-confirm" \
+  "$(usage_log | jq -r .label | grep -E '^(fixes-after-review|final-review|correction|narrow-confirm)$' | sort -u | paste -sd, -)"
+assert_eq "the correction runs on the writable step and the confirmation on the read-only one" "fixes-after-review|final-review" \
+  "$(usage_log | jq -r 'select(.label=="correction") | .step')|$(usage_log | jq -r 'select(.label=="narrow-confirm") | .step')"
+assert_eq "and a correction is one spawn, never a counted pipeline relaunch" "1" "$(usage_log | jq -r 'select(.label=="correction") | .attempt')"
+
+scenario 'epic-run: a correction that changes no file is held, never retried'
+NODIFFCORRECT="$TMP/fixtures-correction-nodiff"; cp -R "$CORRECTED" "$NODIFFCORRECT"; rm -f "$NODIFFCORRECT/correction.sh"
+run_pipeline "$EPIC_RUN" "$NODIFFCORRECT" --issue 42
+assert_rc "the no-diff correction still leaves a reviewable PR" 0 "$RUN_RC"
+assert_contains "the run says the correction changed no file" "$RUN_OUT" 'changed no file'
+assert_eq "no narrow confirmation and no second correction ran" "1 0" "$(calls correction) $(calls narrowconfirm)"
+assert_eq "the issue rests reviewable with no repair queue" "ready-to-review," "$(gh_labels)"
+
+scenario 'epic-run: an unknown correction blocker id fails closed'
+BADIDCORRECT="$TMP/fixtures-correction-bad-id"; cp -R "$CORRECTED" "$BADIDCORRECT"
+fixture "$BADIDCORRECT" correction '{"summary":"guessed at the identity","dispositions":[{"id":"blocker-9","action":"corrected","reason":"guarded something"}]}'
+run_pipeline "$EPIC_RUN" "$BADIDCORRECT" --issue 42
+assert_rc "an unknown blocker id still leaves a reviewable PR" 0 "$RUN_RC"
+assert_contains "the unknown identity is named" "$RUN_OUT" 'unknown blocker id blocker-9'
+assert_eq "no narrow confirmation ran on unverified coverage" 0 "$(calls narrowconfirm)"
+assert_eq "the issue rests reviewable with no repair queue" "ready-to-review," "$(gh_labels)"
+
+scenario 'epic-run: a red second verification blocks the correction rather than shipping it'
+REDCORRECT="$TMP/fixtures-correction-red"; cp -R "$CORRECTED" "$REDCORRECT"
+fixture_sh "$REDCORRECT" correction 'printf "test(\"widget\", () => {})\n" > frontend/src/broken.test.ts; printf "1" > "$STUB_FIXTURES/verify.rc"'
+run_pipeline "$EPIC_RUN" "$REDCORRECT" --issue 42
+assert_rc "a red correction blocks rather than opening a PR" 3 "$RUN_RC"
+assert_contains "the blocker names the red second verification" "$RUN_OUT" 'npm run verify is red after the scoped correction'
+assert_eq "no narrow confirmation ran on a red tree" 0 "$(calls narrowconfirm)"
+assert_eq "and no second correction was started" 1 "$(calls correction)"
+assert_eq "the issue rests failed with no repair queue" "failed," "$(gh_labels)"
+rm -f "$REDCORRECT/verify.rc"
+
+scenario 'epic-run: a narrow confirmation that leaves a blocker is held, never corrected again'
+REMAINCORRECT="$TMP/fixtures-correction-remaining"; cp -R "$CORRECTED" "$REMAINCORRECT"
+fixture "$REMAINCORRECT" narrowconfirm '{"cleared":false,"confidence":91,"reasoning":"The guard still misses the empty case.","blockerVerdicts":[{"id":"blocker-1","verdict":"remaining","reasoning":"the empty branch is still unguarded"}],"regressions":[]}'
+run_pipeline "$EPIC_RUN" "$REMAINCORRECT" --issue 42
+assert_rc "an unconfirmed correction still leaves a reviewable PR" 0 "$RUN_RC"
+assert_contains "the remaining blocker is named" "$RUN_OUT" 'blocker-1'
+assert_contains "and the run says there is no second batch" "$RUN_OUT" 'no second correction batch'
+assert_eq "exactly one correction and one confirmation ran" "1 1" "$(calls correction) $(calls narrowconfirm)"
+assert_eq "the issue rests reviewable with no repair queue" "ready-to-review," "$(gh_labels)"
+
+scenario 'epic-run: a correction regression the confirmation found is held'
+REGRESSCORRECT="$TMP/fixtures-correction-regression"; cp -R "$CORRECTED" "$REGRESSCORRECT"
+fixture "$REGRESSCORRECT" narrowconfirm '{"cleared":true,"confidence":95,"reasoning":"The blocker is cleared.","blockerVerdicts":[{"id":"blocker-1","verdict":"cleared","reasoning":"the guard is present"}],"regressions":[{"location":"frontend/src/index.ts:3","problem":"the correction dropped the exported items array"}]}'
+run_pipeline "$EPIC_RUN" "$REGRESSCORRECT" --issue 42
+assert_rc "a regressing correction still leaves a reviewable PR" 0 "$RUN_RC"
+assert_contains "the regression is reported" "$RUN_OUT" 'dropped the exported items array'
+assert_eq "the issue rests reviewable with no repair queue" "ready-to-review," "$(gh_labels)"
+
+scenario 'epic-run: a dead narrow confirmation is held for a human'
+DEADCONFIRM="$TMP/fixtures-correction-dead-confirm"; cp -R "$CORRECTED" "$DEADCONFIRM"
+fixture "$DEADCONFIRM" narrowconfirm '{}'
+run_pipeline "$EPIC_RUN" "$DEADCONFIRM" --issue 42
+assert_rc "a malformed confirmation still leaves a reviewable PR" 0 "$RUN_RC"
+assert_contains "the run says the confirmation produced no result" "$RUN_OUT" 'narrow confirmation produced no result'
+assert_eq "the malformed confirmer gets only the runtime's bounded retry" 2 "$(calls narrowconfirm)"
+assert_eq "the issue rests reviewable with no repair queue" "ready-to-review," "$(gh_labels)"
 
 scenario 'review assessment: a deferred allegation is not a confirmed defect'
 UNCERTAIN_DEFER="$TMP/fixtures-uncertain-defer"; cp -R "$HELD" "$UNCERTAIN_DEFER"
@@ -2079,64 +2189,26 @@ fixture "$MIXED_ASSESS" triage '{"status":"Fixed one, disputed one, deferred one
 fixture "$MIXED_ASSESS" finalreview '{"verdicts":[{"index":2,"verdict":"disproved","confidence":90,"defect":false,"reasoning":"Normalization precedes the second caller on every path."},{"index":3,"verdict":"unresolved","confidence":91,"defect":true,"reasoning":"The third caller still dereferences an empty list."},{"index":1,"verdict":"resolved","confidence":92,"defect":false,"reasoning":"The first caller has a guard and its regression exercises the crash."}],"regressions":[],"unmetRequirements":[]}'
 run_pipeline "$EPIC_RUN" "$MIXED_ASSESS" --issue 42
 assert_rc "the mixed assessment leaves a reviewable PR" 0 "$RUN_RC"
-assert_eq "only the independently confirmed deferral blocks" "needs-defect-fix,ready-to-review," "$(gh_labels)"
+assert_eq "the one proved deferral is corrected in-process rather than queued for a fixer" "ready-to-merge," "$(gh_labels)"
+assert_not_contains "and no defect-fixer handoff is created" "$(gh_comments)" "🤖 defect-fix evidence"
 assert_eq "mixed outcomes still cost one fixer and one final review" "1 1" "$(calls triage) $(calls finalreview)"
+assert_eq "and exactly one correction with one confirmation" "1 1" "$(calls correction) $(calls narrowconfirm)"
 assert_contains "the artifact keeps the first report location" "$(cat "$WT/.epics/42-add-widget/review.md")" "src/widget.ts:10"
 assert_contains "the artifact keeps the rejected report location" "$(cat "$WT/.epics/42-add-widget/review.md")" "src/widget.ts:20"
 assert_contains "the artifact keeps the deferred report location" "$(cat "$WT/.epics/42-add-widget/review.md")" "src/widget.ts:30"
 
-scenario 'epic-run: repairability is reported only after the queue label is observed'
-GH_DROP_LABEL=needs-defect-fix run_pipeline "$EPIC_RUN" "$HELD" --issue 42
-assert_rc "the completed PR is still a clean held result" 0 "$RUN_RC"
-assert_contains "the original gate reason is preserved" "$RUN_OUT" 'Critical: Null deref on empty list'
-assert_not_contains "RESULT cannot claim an unobserved queue handoff" "$RUN_OUT" '"needsDefectFix":true'
-assert_eq "the conservative review label remains" "ready-to-review," "$(gh_labels)"
-
-scenario 'epic-run: an unpersisted repair brief cannot enter the defect queue'
-GH_EVIDENCE_COMMENT_FAIL=1 run_pipeline "$EPIC_RUN" "$HELD" --issue 42
-assert_rc "the completed PR remains a held result" 0 "$RUN_RC"
-assert_not_contains "a failed evidence write prevents queueing" "$RUN_OUT" '"needsDefectFix":true'
-assert_eq "only the review label remains" "ready-to-review," "$(gh_labels)"
-
-scenario 'epic-run: an unreadable repair brief cannot enter the defect queue'
-GH_EVIDENCE_READ_FAIL=1 run_pipeline "$EPIC_RUN" "$HELD" --issue 42
-assert_rc "the completed PR remains a held result" 0 "$RUN_RC"
-assert_not_contains "a failed evidence readback prevents queueing" "$RUN_OUT" '"needsDefectFix":true'
-assert_eq "only the review label remains" "ready-to-review," "$(gh_labels)"
-
-# GitHub shows a comment it accepted seconds after the write returns, and this
-# readback decides whether a repairable PR reaches the bounded fixer at all. One
-# immediate read hands it to a human for a lag; the read is repeated instead,
-# inside the same terminal window, and stops at the first read that sees it.
-scenario 'epic-run: an evidence comment GitHub has not shown yet is read back, not given up on'
-GH_EVIDENCE_STALE_READS=1 run_pipeline "$EPIC_RUN" "$HELD" --issue 42
-assert_rc "the completed PR is still a clean held result" 0 "$RUN_RC"
-assert_contains "the lagging readback still queues the repair" "$RUN_OUT" '"needsDefectFix":true'
-assert_eq "the issue enters the defect-fixer queue" "needs-defect-fix,ready-to-review," "$(gh_labels)"
-assert_eq "exactly one evidence comment was posted" 1 "$(grep -c '^🤖 defect-fix evidence$' "$STATE_DIR/gh/comments")"
-
-# The stop half: a comment that never becomes visible is still a failure. The
-# retries changed the timing, not the verdict.
-scenario 'epic-run: an evidence comment that never appears still keeps the PR with a human'
-GH_EVIDENCE_STALE_READS=99 run_pipeline "$EPIC_RUN" "$HELD" --issue 42
-assert_rc "the completed PR remains a held result" 0 "$RUN_RC"
-assert_not_contains "an unobserved brief never queues the repair" "$RUN_OUT" '"needsDefectFix":true'
-assert_eq "only the review label remains" "ready-to-review," "$(gh_labels)"
-
-# Ship applies ready-to-review and the merge gate runs AFTER it: the evidence
-# comment, its readback, the queue label edit. bin/reap.sh starts the settle
-# clock at that first terminal label, so every one of those calls is racing the
-# sweep and they spend ONE window opened at the write — not a five-minute gh
-# timeout each, which is longer than the shortest window reap will honour.
+# Ship applies ready-to-review and the merge gate runs AFTER it: the promotion
+# swap and its readback. bin/reap.sh starts the settle clock at that first
+# terminal label, so every one of those calls is racing the sweep and they spend
+# ONE window opened at the write — not a five-minute gh timeout each, which is
+# longer than the shortest window reap will honour.
 scenario 'epic-run: the merge gate after ready-to-review is bounded, not left to the gh timeout'
 GATE_START="$(date +%s)"
-EPIC_TERMINAL_REPORT_MS=3000 GH_SLOW_LABEL=needs-defect-fix:20 run_pipeline "$EPIC_RUN" "$HELD" --issue 42
+EPIC_TERMINAL_REPORT_MS=3000 GH_SLOW_LABEL=ready-to-merge:20 run_pipeline "$EPIC_RUN" "$BASE" --issue 42
 GATE_ELAPSED=$(( $(date +%s) - GATE_START ))
-assert_rc "the completed PR is still a clean held result" 0 "$RUN_RC"
-assert_eq "the gate gave up on the stalled queue label" "bounded" "$( (( GATE_ELAPSED < 15 )) && echo bounded || echo "waited ${GATE_ELAPSED}s for a 20s stall" )"
-assert_eq "the label GitHub applied before the stall is on the issue" "needs-defect-fix,ready-to-review," "$(gh_labels)"
-assert_not_contains "but an unverified handoff is never claimed" "$RUN_OUT" '"needsDefectFix":true'
-assert_contains "and the run still reports why the gate held" "$RUN_OUT" 'Critical: Null deref on empty list'
+assert_eq "the gate gave up on the stalled promotion" "bounded" "$( (( GATE_ELAPSED < 15 )) && echo bounded || echo "waited ${GATE_ELAPSED}s for a 20s stall" )"
+assert_eq "the label GitHub applied before the stall is on the issue" "ready-to-merge," "$(gh_labels)"
+assert_contains "and the run still gets its RESULT line" "$RUN_OUT" "RESULT "
 
 # The merge gate is not the only terminal write epic-run makes. A run that blocks
 # BEFORE ship lands `failed` with no window open yet, and that write starts the
@@ -2303,7 +2375,7 @@ assert_eq "at most three follow-ups were filed, defects first" 3 "$(grep -c '^TI
 assert_not_contains "an 'other' item is never filed even when asked" "$(gh_issues_created)" "Refactor the helpers"
 assert_contains "a follow-up links back with the Follow-up line" "$(gh_issues_created)" "Follow-up to #42"
 assert_eq "ship-only deferrals do not create defect-repair evidence" "" "$(gh_evidence_comment)"
-assert_not_contains "an item beyond the filing cap gets no invented follow-up" "$(gh_evidence_comment)" '[follow-up #104]'
+assert_not_contains "an item beyond the filing cap gets no invented follow-up" "$(gh_comments)" 'issues/104'
 assert_contains "the record says how many qualified versus filed" "$(gh_comments)" "4 items qualified for a follow-up issue and 3 were filed"
 assert_contains "the PR body points at the record" "$(cat "$WT/.epics/42-add-widget/summary.md")" "Deferred items recorded on #42."
 assert_contains "the legal marker reaches the PR body" "$(cat "$WT/.epics/42-add-widget/summary.md")" "LEGAL-REVIEW: required"
@@ -2599,16 +2671,11 @@ fixture "$QUOTA_REVIEW" design '{"approach":"Thin widget module","rationale":"Fi
 fixture_error "$QUOTA_REVIEW" review-general '{"type":"result","subtype":"success","is_error":true,"terminal_reason":"api_error","api_error_status":429,"result":"You have hit your usage limit; resets 7:50pm (UTC)","duration_ms":386,"num_turns":1,"total_cost_usd":0,"usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
 # This sibling finishes later with an ordinary failure. The latched quota must
 # still take precedence when the parallel batch reaches its fail-closed branch.
-printf '1' > "$QUOTA_REVIEW/review-focus.0.rc"
-printf '1' > "$QUOTA_REVIEW/review-focus.1.rc"
-printf '1' > "$QUOTA_REVIEW/review-focus.0.sleep"
-printf '1' > "$QUOTA_REVIEW/review-focus.1.sleep"
 EXPECT_HOLD_BEFORE_LABEL=ready run_pipeline "$EPIC_RUN" "$QUOTA_REVIEW" --issue 42
 assert_rc "the parallel quota becomes a hold" 0 "$RUN_RC"
 assert_held_contract "parallel review hold"
 assert_eq "the held result wins with the review phase" "review" "$(result_json | jq -r '.phase // empty' 2>/dev/null)"
 assert_eq "the quota reviewer is never respawned" 1 "$(calls review-general)"
-assert_eq "the ordinary dead sibling retains its one respawn" 2 "$(calls review-focus)"
 assert_eq "the held issue rests ready" "ready," "$(gh_labels)"
 assert_eq "the code checkpoint is pushed above the claim" 2 "$(origin_count epic/42-add-widget)"
 assert_contains "the checkpoint contains the completed implementation" "$(git -C "$ORIGIN" ls-tree -r --name-only epic/42-add-widget)" "frontend/src/widget.ts"
@@ -2671,18 +2738,19 @@ assert_not_contains "mixed evidence cannot enter autonomous repair" "$RUN_OUT" '
 assert_eq "the issue remains only ready-to-review" "ready-to-review," "$(gh_labels)"
 assert_not_contains "and no repair envelope is posted" "$(gh_comments)" "🤖 defect-fix evidence"
 
-scenario 'final review: a repair regression holds the PR and is repairable'
+scenario 'final review: a proved repair regression is corrected in-process, never queued'
 REGRESS="$TMP/fixtures-regress"; cp -R "$BASE" "$REGRESS"
 fixture "$REGRESS" finalreview '{"verdicts":[{"index":1,"verdict":"resolved","confidence":95,"defect":false,"reasoning":"The empty-list guard is present and covered."}],"regressions":[{"title":"Guard breaks the non-empty path","severity":"Important","confidence":85,"location":"src/widget.ts:14","problem":"Returns early for every list.","fix":"Check length, not truthiness.","gate":"unit test for a non-empty list"}],"unmetRequirements":[]}'
 run_pipeline "$EPIC_RUN" "$REGRESS" --issue 42
 assert_rc "exits 0" 0 "$RUN_RC"
-assert_contains "the gate names the regression" "$RUN_OUT" 'Guard breaks the non-empty path'
-assert_not_contains "it is not queued for merge" "$RUN_OUT" '"readyToMerge":true'
-assert_contains "RESULT marks the concrete regression repairable" "$RUN_OUT" '"needsDefectFix":true'
-assert_eq "the issue stays reviewable and enters the defect-fixer queue" "needs-defect-fix,ready-to-review," "$(gh_labels)"
-assert_contains "the repair envelope names the regression" "$(gh_comments)" "Guard breaks the non-empty path"
+assert_contains "the correction batch names the regression" "$(cat "$STATE_DIR/correction.0.prompt")" 'Returns early for every list.'
+assert_contains "and classes it as something the repair broke" "$(cat "$STATE_DIR/correction.0.prompt")" 'kind: repair-regression'
+assert_contains "the confirmed correction reaches the merge queue" "$RUN_OUT" '"readyToMerge":true'
+assert_eq "the issue lands without any repair queue behind it" "ready-to-merge," "$(gh_labels)"
+assert_not_contains "no repair envelope is posted for a corrected-once regression" "$(gh_comments)" "🤖 defect-fix evidence"
 assert_contains "review.md retains the regression evidence" "$(cat "$WT/.epics/42-add-widget/review.md")" "Returns early for every list."
 assert_eq "a regression starts no second repair round" "1 1" "$(calls triage) $(calls finalreview)"
+assert_eq "and exactly one correction with one confirmation" "1 1" "$(calls correction) $(calls narrowconfirm)"
 
 scenario 'final review: a low-confidence regression still holds, for a human'
 WEAKREGRESS="$TMP/fixtures-weak-regression"; cp -R "$BASE" "$WEAKREGRESS"
@@ -2800,6 +2868,7 @@ run_pipeline "$EPIC_RUN" "$CLEANREV" --issue 42
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_eq "no fixer ran" 0 "$(calls triage)"
 assert_eq "no final review ran" 0 "$(calls finalreview)"
+assert_eq "no acceptance-driven correction or confirmation ran either" "0 0" "$(calls correction) $(calls narrowconfirm)"
 assert_contains "the run ships" "$RUN_OUT" '"readyToMerge":true'
 assert_eq "the issue ends ready-to-merge" "ready-to-merge," "$(gh_labels)"
 
@@ -3194,7 +3263,7 @@ mkdir -p "$FIXBASE"
 fixture "$FIXBASE" fix-resolve '{"completed":true,"resolutions":[{"file":"frontend/src/index.ts","hunk":1,"mainIntent":"main renamed the helper","prIntent":"the PR added a guard","resolution":"Keeps the rename and the guard."}]}'
 # What the resolver does to the tree: settle the marked block, stage, continue.
 fixture_sh "$FIXBASE" fix-resolve 'printf "export const items = [] // main-rename pr-guard\n" > frontend/src/index.ts && git add frontend/src/index.ts && GIT_EDITOR=true git rebase --continue >/dev/null'
-fixture "$FIXBASE" fix-check '{"survives":true,"confidence":88,"reasoning":"Both changes are present at HEAD."}'
+accept_clear "$FIXBASE" fix-check 1
 run_fix() {
   GH_ISSUE_LABELS="${FIX_LABELS:-failed,needs-judgment},${FIX_ENGINE_LABELS-engine:claude}" \
     GH_OPEN_PR_BRANCH=epic/42-add-widget run_pipeline "$FIX_RUN" "$@"
@@ -3233,7 +3302,7 @@ assert_contains "it records one judgment hunk" "$RUN_OUT" '"resolvedHunks":1'
 assert_not_contains "and never rests for a human instead" "$RUN_OUT" 'readyToReview'
 assert_contains "the resolver was handed the rung's classification" "$(cat "$STATE_DIR/fix-resolve.0.prompt")" 'needs judgment'
 assert_contains "the resolver may carry an intent outside a marker block" "$(cat "$STATE_DIR/fix-resolve.0.prompt")" "carries one side's intent to lines the other side moved"
-assert_contains "the skeptic is told to trace every out-of-block change" "$(cat "$STATE_DIR/fix-check.0.prompt")" 'sits outside a resolved block'
+assert_contains "the skeptic is told to trace every out-of-block change" "$(cat "$STATE_DIR/fix-check.0.prompt")" 'trace every out-of-block change back to what one side'
 assert_eq "the branch on origin was rewritten" "$(git -C "$WT" rev-parse HEAD)" "$(origin_ref epic/42-add-widget)"
 assert_not_contains "and is not what it was" "$(origin_ref epic/42-add-widget)" "$BEFORE"
 assert_eq "it is exactly one commit above the new main" 1 "$(origin_count epic/42-add-widget)"
@@ -3242,7 +3311,7 @@ assert_contains "both intents are in the shipped file" "$(git -C "$ORIGIN" show 
 assert_contains "verify ran in the discovered package" "$(cat "$NPM_LOG")" "run verify"
 assert_contains "the audit comment states main's intent" "$(gh_comments)" "origin/main intended: main renamed the helper"
 assert_contains "the audit comment states the PR's intent" "$(gh_comments)" "the PR intended: the PR added a guard"
-assert_contains "the audit comment records the adversarial check" "$(gh_comments)" "confidence 88/100"
+assert_contains "the audit comment records the exhaustive acceptance check" "$(gh_comments)" "returned 0 blocker(s) (confidence floor 90/100)"
 assert_contains "and says the merge worker re-runs the checks before anything lands" "$(gh_comments)" "re-runs the real checks before anything lands"
 assert_eq "the labels: ready-to-merge, ladder kept, needs-judgment cleared" "fix-attempted,ready-to-merge," "$(gh_labels)"
 
@@ -3252,7 +3321,7 @@ MISSING_FIX_CHECK="$TMP/fixtures-fix-missing-check"; cp -R "$FIXBASE" "$MISSING_
 BEFORE="$(origin_ref epic/42-add-widget)"
 run_fix "$MISSING_FIX_CHECK" --issue 42
 assert_rc "a missing conflict checker result blocks" 3 "$RUN_RC"
-assert_contains "the conflict refusal names the missing checker" "$RUN_OUT" "checker produced no result"
+assert_contains "the conflict refusal names the missing acceptance check" "$RUN_OUT" "acceptance check produced no result"
 assert_eq "the missing checker gets only the runtime's bounded retry" 2 "$(calls fix-check)"
 assert_eq "the unchecked conflict resolution is not pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
 assert_not_contains "the unchecked conflict resolution is never promoted" "$(gh_labels)" "ready-to-merge"
@@ -3270,6 +3339,7 @@ assert_not_contains "the rejected conflict lease never exposes merge" "$(gh_labe
 scenario 'fix-run: two repaired judgment hunks survive one declined hunk and are held for review'
 seed_conflict_three
 PARTIALFIX="$TMP/fixtures-fix-partial"; cp -R "$FIXBASE" "$PARTIALFIX"; rm -f "$PARTIALFIX/fix-resolve.sh"
+accept_clear "$PARTIALFIX" fix-check 3
 fixture "$PARTIALFIX" fix-resolve '{"dispositions":[{"index":1,"action":"repaired","reason":"kept the main rename and the PR guard","mainIntent":"main renamed a","prIntent":"the PR guarded a","resolution":"Both intents survive in a."},{"index":2,"action":"repaired","reason":"kept the main rename and the PR guard","mainIntent":"main renamed b","prIntent":"the PR guarded b","resolution":"Both intents survive in b."},{"index":3,"action":"declined","reason":"the two sides require mutually exclusive c values"}],"summary":"Resolved a and b; retained the PR-side c text for human review."}'
 fixture_sh "$PARTIALFIX" fix-resolve 'printf "export const a = \"main-a pr-a\"\n" > frontend/src/a.ts; printf "export const b = \"main-b pr-b\"\n" > frontend/src/b.ts; printf "export const c = \"pr-c\"\n" > frontend/src/c.ts; git add frontend/src/a.ts frontend/src/b.ts frontend/src/c.ts; rebase_dir="$(git rev-parse --git-path rebase-merge)"; rebase_apply="$(git rev-parse --git-path rebase-apply)"; if [[ -d "$rebase_dir" || -d "$rebase_apply" ]]; then GIT_EDITOR=true git rebase --continue >/dev/null; fi'
 BEFORE="$(origin_ref epic/42-add-widget)"
@@ -3286,10 +3356,10 @@ assert_eq "the declined conflict hunk keeps the exact PR-side text" 'export cons
 assert_eq "a mixed conflict round still runs verify and its skeptic" "1 1" "$(grep -c '^run verify$' "$NPM_LOG" || true) $(calls fix-check)"
 CONFLICT_CHECK_PROMPT="$(cat "$STATE_DIR/fix-check.0.prompt" 2>/dev/null || true)"
 assert_contains "the conflict skeptic receives the declined-hunk claim" "$CONFLICT_CHECK_PROMPT" "the two sides require mutually exclusive c values"
-assert_contains "the conflict skeptic applies the repaired-hunk contract" "$CONFLICT_CHECK_PROMPT" "For every repaired item, refute if both intents do not demonstrably survive"
-assert_contains "the conflict skeptic applies the declined-hunk contract" "$CONFLICT_CHECK_PROMPT" "For every declined item, compare the original PR side with HEAD"
+assert_contains "the conflict skeptic applies the repaired-hunk contract" "$CONFLICT_CHECK_PROMPT" "Uphold a repaired hunk only when both intents demonstrably survive"
+assert_contains "the conflict skeptic applies the declined-hunk contract" "$CONFLICT_CHECK_PROMPT" "For a declined hunk, compare the original PR side with the delta"
 assert_not_contains "the conflict skeptic does not require both intents in a deliberately declined hunk" "$CONFLICT_CHECK_PROMPT" 'in every one of those hunks, both what origin/main changed and what the PR changed survive'
-assert_contains "the conflict-check schema states the per-disposition verdict" "$(cat "$RUN_LOG")" "every repaired hunk preserves both sides' intents, every declined hunk is unchanged from its original PR-side text, and the complete delta has no other changes"
+assert_contains "the acceptance schema states the three-way outcome" "$(cat "$RUN_LOG")" "correction-required only when EVERY blocker is a concrete implementation defect"
 assert_not_contains "the conflict-check schema does not make every declined hunk preserve main too" "$(cat "$RUN_LOG")" "both sides' intents demonstrably survive in every judgment hunk"
 assert_eq "the partial conflict is human-held with its rung spent and queue removed" "fix-attempted,ready-to-review," "$(gh_labels)"
 assert_not_contains "a partial conflict never claims unattended merge" "$RUN_OUT$(gh_labels)" "readyToMerge"
@@ -3325,6 +3395,7 @@ run_fix "$GRANTBASE" --issue 42
 GRANTED_COMMENTS="$(gh_comments)"
 GRANTED_BEFORE="$(origin_ref epic/42-add-widget)"
 GRANTED="$TMP/fixtures-fix-granted"; cp -R "$GRANTBASE" "$GRANTED"
+accept_clear "$GRANTED" fix-check 2
 fixture "$GRANTED" fix-resolve '{"dispositions":[{"index":1,"action":"repaired","reason":"b now safely composes","mainIntent":"main changed b","prIntent":"the PR changed b","resolution":"Both b intents survive."},{"index":2,"action":"declined","reason":"c still needs a human"}],"summary":"Repaired b; retained c for review."}'
 fixture_sh "$GRANTED" fix-resolve 'printf "export const b = \"main-b pr-b\"\n" > frontend/src/b.ts'
 FIX_LABELS="failed,needs-judgment" SEED_COMMENTS="$GRANTED_COMMENTS" run_fix "$GRANTED" --issue 42
@@ -3352,6 +3423,7 @@ assert_contains "the granted partial audit says the branch carries its repair" "
 GRANTED_PARTIAL_COMMENTS="$(gh_comments)"
 GRANTED_PARTIAL_HEAD="$GRANTED_AFTER"
 GRANTED_ALL="$TMP/fixtures-fix-granted-all"; cp -R "$GRANTED" "$GRANTED_ALL"
+accept_clear "$GRANTED_ALL" fix-check 1
 fixture "$GRANTED_ALL" fix-resolve '{"dispositions":[{"index":1,"action":"repaired","reason":"c now safely composes","mainIntent":"main changed c","prIntent":"the PR changed c","resolution":"Both c intents survive."}],"summary":"Repaired the final declined c hunk."}'
 fixture_sh "$GRANTED_ALL" fix-resolve 'printf "export const c = \"main-c pr-c\"\n" > frontend/src/c.ts'
 FIX_LABELS="ready-to-review,needs-judgment" SEED_COMMENTS="$GRANTED_PARTIAL_COMMENTS" run_fix "$GRANTED_ALL" --issue 42
@@ -3533,11 +3605,14 @@ scenario 'fix-run: a refuted resolution blocks'
 seed_conflict
 BEFORE="$(origin_ref epic/42-add-widget)"
 REFUTED="$TMP/fixtures-refuted"; cp -R "$FIXBASE" "$REFUTED"
-fixture "$REFUTED" fix-check '{"survives":false,"confidence":20,"reasoning":"The rename was dropped from the guarded branch."}'
+accept_human "$REFUTED" fix-check 1 "The rename was dropped from the guarded branch."
 run_fix "$REFUTED" --issue 42
 assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
-assert_contains "the refutation reaches the blocker" "$RUN_OUT" 'the adversarial check refuted the resolution'
+assert_contains "the human-held batch reaches the blocker" "$RUN_OUT" 'the acceptance check held 1 blocker(s) for a human'
+assert_contains "and names the blocking evidence" "$RUN_OUT" 'The rename was dropped from the guarded branch'
 assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+assert_eq "a semantic human hold removes the fixer queue without a spent retry rung" "failed,fix-attempted," "$(gh_labels)"
+assert_eq "and runs no correction" "0 0" "$(calls correction) $(calls narrowconfirm)"
 
 scenario 'fix-run: a resolver that claims completion mid-rebase is caught'
 seed_conflict
@@ -3704,7 +3779,7 @@ CIBASE="$TMP/fixtures-ci"
 mkdir -p "$CIBASE"
 fixture "$CIBASE" ci-fix '{"completed":true,"cause":"createWidget was never exported","summary":"Exports createWidget from the widget module.","files":["frontend/src/widget.ts"]}'
 fixture_sh "$CIBASE" ci-fix 'printf "export const createWidget = () => ({})\n" > frontend/src/widget.ts'
-fixture "$CIBASE" ci-check '{"survives":true,"confidence":91,"reasoning":"The export is added and nothing else changed."}'
+accept_clear "$CIBASE" ci-check 1
 run_ci() {
   GH_ISSUE_LABELS="${CI_LABELS:-failed,needs-ci-fix},${CI_ENGINE_LABELS-engine:claude}" \
     GH_OPEN_PR_BRANCH=epic/42-add-widget GH_RED_CHECKS="${CI_RED-build}" run_pipeline "$@"
@@ -3747,7 +3822,7 @@ assert_eq "the CI repair keeps the complete candidate message" "$BEFORE_MESSAGE"
 assert_contains "the fix is in the pushed tree" "$(git -C "$ORIGIN" ls-tree -r --name-only epic/42-add-widget)" "frontend/src/widget.ts"
 assert_eq "the issue is back on ready-to-merge, ladder kept" "ci-attempted,ready-to-merge," "$(gh_labels)"
 assert_contains "the audit comment names the cause" "$(gh_comments)" "Cause: createWidget was never exported"
-assert_contains "and records the adversarial check" "$(gh_comments)" "confidence 91/100"
+assert_contains "and records the exhaustive acceptance check" "$(gh_comments)" "returned 0 blocker(s) (confidence floor 90/100)"
 assert_contains "and says the merge worker re-runs the real checks" "$(gh_comments)" "re-runs the real checks before anything lands"
 FIXPROMPT="$(cat "$STATE_DIR/ci-fix.0.prompt")"
 assert_contains "the fixer is told which checks failed" "$FIXPROMPT" "Checks that failed: build"
@@ -3763,7 +3838,7 @@ fixture "$BAD_CI_CHECK" ci-check '{}'
 BEFORE="$(origin_ref epic/42-add-widget)"
 run_ci "$CI_RUN" "$BAD_CI_CHECK" --issue 42
 assert_rc "malformed CI checker output blocks" 3 "$RUN_RC"
-assert_contains "the malformed CI checker ends at the missing-result gate" "$RUN_OUT" "checker produced no result"
+assert_contains "the malformed CI checker ends at the missing-result gate" "$RUN_OUT" "acceptance check produced no result"
 assert_eq "the malformed CI checker is respawned once and no more" 2 "$(calls ci-check)"
 assert_eq "the unchecked CI repair is not pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
 assert_not_contains "the unchecked CI repair is never promoted" "$(gh_labels)" "ready-to-merge"
@@ -3782,6 +3857,7 @@ scenario 'ci-run: two repaired checks survive one declined check and are held fo
 seed_ci_pr
 BEFORE_MESSAGE="$(git -C "$ORIGIN" log -1 --format=%B epic/42-add-widget)"
 PARTIALCI="$TMP/fixtures-ci-partial"; cp -R "$CIBASE" "$PARTIALCI"; rm -f "$PARTIALCI/ci-fix.sh"
+accept_clear "$PARTIALCI" ci-check 3
 fixture "$PARTIALCI" ci-fix '{"dispositions":[{"index":1,"action":"repaired","reason":"restored the missing build export"},{"index":2,"action":"repaired","reason":"removed the type error without widening the type"},{"index":3,"action":"declined","reason":"the security failure needs a missing repository secret, not a code change"}],"cause":"Two failures are code defects; the third is external configuration.","summary":"Repairs build and typecheck while leaving security unchanged.","files":["frontend/src/widget.ts","frontend/src/types.ts"]}'
 fixture_sh "$PARTIALCI" ci-fix 'printf "export const createWidget = () => ({})\n" > frontend/src/widget.ts; printf "export const widgetType = \"safe\"\n" > frontend/src/types.ts'
 BEFORE="$(origin_ref epic/42-add-widget)"
@@ -3809,7 +3885,7 @@ seed_ci_pr
 NEWFILECI="$TMP/fixtures-ci-new-files"; cp -R "$PARTIALCI" "$NEWFILECI"
 fixture_sh "$NEWFILECI" ci-fix 'printf "export const createWidget = () => ({})\n" > frontend/src/widget.ts; printf "export const widgetType = \"safe\"\n" > frontend/src/types.ts'
 fixture_sh "$NEWFILECI" ci-check 'git diff --name-only "$(git rev-parse refs/remotes/origin/epic/42-add-widget)" > "$STUB_STATE/check-names"; git diff "$(git rev-parse refs/remotes/origin/epic/42-add-widget)" > "$STUB_STATE/check-diff"'
-fixture "$NEWFILECI" ci-check '{"survives":false,"confidence":20,"reasoning":"The new files do not establish the repair."}'
+accept_human "$NEWFILECI" ci-check 3 "The new files do not establish the repair."
 BEFORE="$(origin_ref epic/42-add-widget)"
 CI_RED=build,typecheck,security run_ci "$CI_RUN" "$NEWFILECI" --issue 42
 assert_rc "the CI adversarial refutation blocks" 3 "$RUN_RC"
@@ -3938,14 +4014,16 @@ assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
 scenario 'ci-run: a refuted fix blocks — a weakened test must not reach the queue'
 seed_ci_pr
 REF="$TMP/fixtures-ci-refuted"; cp -R "$CIBASE" "$REF"
-fixture "$REF" ci-check '{"survives":false,"confidence":15,"reasoning":"The assertion was deleted rather than satisfied."}'
+accept_human "$REF" ci-check 1 "The assertion was deleted rather than satisfied."
 BEFORE="$(origin_ref epic/42-add-widget)"
 run_ci "$CI_RUN" "$REF" --issue 42
 assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
-assert_contains "the refutation reaches the blocker" "$RUN_OUT" 'the adversarial check refuted the fix'
-assert_contains "and quotes its reasoning" "$RUN_OUT" 'assertion was deleted'
+assert_contains "the human-held batch reaches the blocker" "$RUN_OUT" 'the acceptance check held 1 blocker(s) for a human'
+assert_contains "and quotes its evidence" "$RUN_OUT" 'assertion was deleted'
 assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
 assert_not_contains "the issue never reaches the merge queue" "$(gh_labels)" "ready-to-merge"
+assert_eq "a semantic human hold removes the CI queue without a spent retry rung" "ci-attempted,failed," "$(gh_labels)"
+assert_eq "and runs no correction" "0 0" "$(calls ci-correction) $(calls ci-confirm)"
 
 scenario 'ci-run: checks that are green again are refused without a model'
 seed_ci_pr
@@ -4077,7 +4155,7 @@ DEFECTBASE="$TMP/fixtures-defect"
 mkdir -p "$DEFECTBASE"
 fixture "$DEFECTBASE" defect-fix '{"completed":true,"summary":"Adds the missing empty-list guard (PRIVATE_FIXER_EXPLANATION).","files":["frontend/src/widget.ts"]}'
 fixture_sh "$DEFECTBASE" defect-fix 'printf "export const firstItem = items => items.length ? items[0].name : null\n" > frontend/src/widget.ts'
-fixture "$DEFECTBASE" defect-check '{"survives":true,"confidence":91,"reasoning":"The exact delta guards the named empty-list dereference and changes no other path."}'
+accept_clear "$DEFECTBASE" defect-check 1
 run_defect() {
   local comments
   if [[ -n "${DEFECT_COMMENTS+x}" ]]; then comments="$DEFECT_COMMENTS"
@@ -4142,7 +4220,8 @@ assert_contains "the fixer receives the pinned original requirement" "$FIXPROMPT
 assert_contains "the fixer is told to ignore non-defect deferrals" "$FIXPROMPT" "ignore non-defect"
 assert_contains "the fixer is forbidden to weaken tests" "$FIXPROMPT" "Never weaken"
 assert_contains "the skeptic sees the durable named defect" "$CHECKPROMPT" "Empty list still crashes"
-assert_contains "the skeptic is pointed at the exact captured-head delta" "$CHECKPROMPT" "git diff $BEFORE"
+assert_contains "the skeptic is handed the captured delta rather than told to fetch it" "$CHECKPROMPT" "<repair-delta>"
+assert_not_contains "and is never asked to run git for its own evidence" "$CHECKPROMPT" "git diff $BEFORE"
 assert_not_contains "the skeptic is blind to the fixer's explanation" "$CHECKPROMPT" "PRIVATE_FIXER_EXPLANATION"
 assert_eq "verify runs once after the edit" 1 "$(grep -c '^run verify$' "$NPM_LOG")"
 
@@ -4153,7 +4232,7 @@ fixture "$BAD_DEFECT_CHECK" defect-check '{}'
 BEFORE="$(origin_ref epic/42-add-widget)"
 run_defect "$DEFECT_RUN" "$BAD_DEFECT_CHECK" --issue 42
 assert_rc "malformed defect checker output blocks" 3 "$RUN_RC"
-assert_contains "the malformed defect checker ends at the missing-result gate" "$RUN_OUT" "checker produced no result"
+assert_contains "the malformed defect checker ends at the missing-result gate" "$RUN_OUT" "acceptance check produced no result"
 assert_eq "the malformed defect checker is respawned once and no more" 2 "$(calls defect-check)"
 assert_eq "the unchecked defect repair is not pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
 assert_not_contains "the unchecked defect repair is never promoted" "$(gh_labels)" "ready-to-merge"
@@ -4174,7 +4253,7 @@ BEFORE_MESSAGE="$(git -C "$ORIGIN" log -1 --format=%B epic/42-add-widget)"
 PARTIALDEFECT="$TMP/fixtures-defect-partial"; cp -R "$DEFECTBASE" "$PARTIALDEFECT"; rm -f "$PARTIALDEFECT/defect-fix.sh"
 fixture "$PARTIALDEFECT" defect-fix '{"dispositions":[{"index":1,"action":"repaired","reason":"guarded the empty list"},{"index":2,"action":"repaired","reason":"guarded a null first member"},{"index":3,"action":"declined","reason":"the requested tie-breaker would introduce an unstable-order regression"}],"summary":"Repairs the two safe dereferences and leaves stable ordering unchanged.","files":["frontend/src/widget.ts","frontend/src/null-guard.test.ts"]}'
 fixture_sh "$PARTIALDEFECT" defect-fix 'printf "export const firstItem = items => items.length && items[0] ? items[0].name : null\n" > frontend/src/widget.ts; printf "empty and null are guarded\n" > frontend/src/null-guard.test.ts'
-fixture "$PARTIALDEFECT" defect-check '{"survives":true,"confidence":93,"reasoning":"The exact delta repairs defects 1 and 2, leaves declined defect 3 unchanged, weakens no gate, and introduces no unrelated behavior."}'
+accept_clear "$PARTIALDEFECT" defect-check 3
 BEFORE="$(origin_ref epic/42-add-widget)"
 DEFECT_COMMENTS="$(make_three_defect_evidence "$BEFORE")" run_defect "$DEFECT_RUN" "$PARTIALDEFECT" --issue 42
 AFTER="$(origin_ref epic/42-add-widget)"
@@ -4240,14 +4319,14 @@ assert_not_contains "out-of-range defect dispositions never expose the merge que
 scenario 'defect-run: a skeptic refutation discards a mixed partial repair'
 seed_defect_pr
 REFUTEDPARTIALDEFECT="$TMP/fixtures-defect-partial-refuted"; cp -R "$PARTIALDEFECT" "$REFUTEDPARTIALDEFECT"
-fixture "$REFUTEDPARTIALDEFECT" defect-check '{"survives":false,"confidence":94,"reasoning":"Defect two is still reachable through a null member."}'
+accept_human "$REFUTEDPARTIALDEFECT" defect-check 3 "Defect two is still reachable through a null member."
 BEFORE="$(origin_ref epic/42-add-widget)"
 DEFECT_COMMENTS="$(make_three_defect_evidence "$BEFORE")" run_defect "$DEFECT_RUN" "$REFUTEDPARTIALDEFECT" --issue 42
 assert_rc "a refuted partial defect repair follows the refusal path" 3 "$RUN_RC"
 assert_eq "a refuted partial defect repair still ran verify and check" "1 1" "$(grep -c '^run verify$' "$NPM_LOG" || true) $(calls defect-check)"
 assert_contains "the partial refutation reason reaches the refusal" "$RUN_OUT$(gh_comments)" "Defect two is still reachable"
 assert_eq "a refuted partial defect repair does not push" "$BEFORE" "$(origin_ref epic/42-add-widget)"
-assert_eq "a refuted partial defect repair restores its review queue" "defect-attempted,needs-defect-fix,ready-to-review," "$(gh_labels)"
+assert_eq "a refuted partial defect repair rests human-held with the defect queue removed" "defect-attempted,ready-to-review," "$(gh_labels)"
 
 scenario 'defect-run: red verification discards a mixed partial repair before checking'
 seed_defect_pr
@@ -4402,21 +4481,22 @@ assert_eq "it rests at ready-to-review, never failed" "defect-attempted,needs-de
 scenario 'defect-run: an adversarial refutation blocks a weakened fix'
 seed_defect_pr
 REFUTEDEFECT="$TMP/fixtures-defect-refuted"; cp -R "$DEFECTBASE" "$REFUTEDEFECT"
-fixture "$REFUTEDEFECT" defect-check '{"survives":false,"confidence":15,"reasoning":"The test was deleted instead of the empty-list defect being fixed."}'
+accept_human "$REFUTEDEFECT" defect-check 1 "The test was deleted instead of the empty-list defect being fixed."
 BEFORE="$(origin_ref epic/42-add-widget)"
 run_defect "$DEFECT_RUN" "$REFUTEDEFECT" --issue 42
 assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
-assert_contains "the skeptic reasoning reaches the blocker" "$RUN_OUT" "test was deleted"
+assert_contains "the blocking evidence reaches the blocker" "$RUN_OUT" "test was deleted"
 assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
 assert_not_contains "a refuted fix never reaches the merge queue" "$(gh_labels)" "ready-to-merge"
-assert_eq "it rests at ready-to-review, never failed" "defect-attempted,needs-defect-fix,ready-to-review," "$(gh_labels)"
+assert_eq "a semantic human hold rests at ready-to-review with the defect queue removed" "defect-attempted,ready-to-review," "$(gh_labels)"
+assert_eq "and runs no correction" "0 0" "$(calls defect-correction) $(calls defect-confirm)"
 
 scenario 'defect-run: new files are visible in the exact adversarial delta and cleaned after refutation'
 seed_defect_pr
 NEWFILE="$TMP/fixtures-defect-new-file"; cp -R "$DEFECTBASE" "$NEWFILE"
 fixture_sh "$NEWFILE" defect-fix 'printf "test new guard\n" > frontend/src/empty-list.test.ts'
 fixture_sh "$NEWFILE" defect-check 'git diff --name-only HEAD > "$STUB_STATE/check-names"; git diff HEAD > "$STUB_STATE/check-diff"'
-fixture "$NEWFILE" defect-check '{"survives":false,"confidence":20,"reasoning":"The new regression test does not repair the implementation."}'
+accept_human "$NEWFILE" defect-check 1 "The new regression test does not repair the implementation."
 BEFORE="$(origin_ref epic/42-add-widget)"
 run_defect "$DEFECT_RUN" "$NEWFILE" --issue 42
 assert_rc "the adversarial refutation blocks" 3 "$RUN_RC"
@@ -4425,14 +4505,14 @@ assert_contains "the checker sees the new file content" "$(cat "$STATE_DIR/check
 assert_eq "the refuted intent-to-add tree and index are clean" "" "$(git -C "$WT" status --porcelain)"
 assert_eq "the unseen file was never pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
 
-scenario 'defect-run: confidence below 75 blocks even when survives is true'
+scenario 'defect-run: a low-confidence acceptance verdict authorizes nothing'
 seed_defect_pr
 LOWDEFECT="$TMP/fixtures-defect-low-confidence"; cp -R "$DEFECTBASE" "$LOWDEFECT"
-fixture "$LOWDEFECT" defect-check '{"survives":true,"confidence":74,"reasoning":"The guard looks plausible, but the adjacent path could not be confirmed."}'
+accept_clear "$LOWDEFECT" defect-check 1 74
 BEFORE="$(origin_ref epic/42-add-widget)"
 run_defect "$DEFECT_RUN" "$LOWDEFECT" --issue 42
 assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
-assert_contains "the below-threshold confidence is reported" "$RUN_OUT" "confidence 74"
+assert_contains "the below-threshold confidence is reported" "$RUN_OUT" "below the 75 confidence bar (74)"
 assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
 assert_not_contains "an uncertain fix never reaches the merge queue" "$(gh_labels)" "ready-to-merge"
 
@@ -4914,70 +4994,17 @@ assert_eq "reap floors its settle window" 3 "$SETTLE_FLOOR_MIN"
 assert_eq "post-terminal reporting finishes well inside that floor" "fits" \
   "$( (( FINALIZE_BUDGET_MS + STATUS_BUDGET_MS < SETTLE_FLOOR_MIN * 60000 / 2 )) && echo fits || echo "budget $(( FINALIZE_BUDGET_MS + STATUS_BUDGET_MS ))ms against a ${SETTLE_FLOOR_MIN}m floor" )"
 
-# The queue label and its canonical evidence are one invariant. Carry the real
-# comments and labels produced by epic-run into a fresh defect-run process;
-# never seed a hand-written replacement brief for these handoff scenarios.
-assert_defect_handoff() { # name epic-fixtures expected blocker text [expected linked copies] [linked item text] [ship's rephrasing]
-  local name="$1" epic_fixtures="$2" expected="$3" linked_copies="${4:-0}" linked_item="${5:-$3}" ship_copy="${6:-}" comments labels evidence_summary repaired original_json repaired_json link defect_items
-  scenario "epic-run -> defect-run: $name carries its complete durable repair brief"
-  run_pipeline "$EPIC_RUN" "$epic_fixtures" --issue 42
-  assert_rc "$name epic finishes held" 0 "$RUN_RC"
-  assert_contains "$name enters the bounded repair queue" "$(gh_labels)" "needs-defect-fix"
-  comments="$(gh_comments)"; labels="$(gh_labels)"; labels="${labels%,}"
-  evidence_summary="$(printf '%s\n' "$comments" | awk '
-    $0 == "🤖 defect-fix evidence" { found = 1; next }
-    found && $0 == "<details>" { exit }
-    found { print }
-  ')"
-  evidence_summary="${evidence_summary%$'\n'}"
-  assert_contains "$name posts the canonical collapsed evidence document" "$comments" $'<details>\n<summary>machine-readable evidence</summary>\n\n```json'
-  assert_contains "$name evidence summary names the pinned requirement" "$evidence_summary" 'Pinned requirement: Add widget'
-  assert_contains "$name evidence summary includes the durable blocker" "$evidence_summary" "$expected"
-  assert_contains "$name evidence summary formats its blocker as a readable bullet" "$evidence_summary" $'\n- `'
-  if (( linked_copies > 0 )); then
-    link=" — [follow-up #101](https://github.com/o/r/issues/101)"
-    assert_eq "$name links every blocker copy to the filed follow-up" "$linked_copies" "$(grep -F -c "$linked_item$link" <<<"$evidence_summary")"
-    defect_items="$(awk '/^- `post-review-defect`/{found=1; next} found && /^- `/{exit} found' <<<"$evidence_summary")"
-    assert_contains "$name links the blocker the review evidenced" "$defect_items" "$linked_item$link"
-    # Ship rephrased the same item into the follow-up it filed. Only the opaque
-    # ID can correlate them, and ship's own prose is not gate evidence.
-    [[ -z "$ship_copy" ]] || assert_not_contains "$name never takes ship's rephrasing as evidence" "$evidence_summary" "$ship_copy"
-  fi
-  original_json="$(printf '%s\n' "$comments" | awk '$0 == "```json" { found = 1; next } found && $0 == "```" { exit } found { print }')"
-  assert_contains "$name evidence details retain the complete pretty envelope" "$original_json" '"version": 1'
-  assert_not_contains "$name internal blocker IDs never enter the v1 envelope" "$original_json" "blockerId"
-  DEFECT_LABELS="$labels" DEFECT_COMMENTS="$comments" run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
-  assert_rc "$name evidence is accepted without synthetic comments" 0 "$RUN_RC"
-  assert_contains "$name blocker reaches the fixer" "$(cat "$STATE_DIR/defect-fix.0.prompt")" "$expected"
-  repaired="$(gh_last_comment)"
-  assert_contains "$name repaired audit reuses the selected evidence summary verbatim" "$repaired" "$evidence_summary"
-  if (( linked_copies > 0 )); then
-    assert_eq "$name repaired audit retains every correlated follow-up link" "$linked_copies" "$(grep -F -c "$link" <<<"$repaired")"
-  fi
-  assert_contains "$name repaired audit folds the same authoritative envelope" "$repaired" $'Gate evidence:\n'
-  assert_contains "$name repaired audit labels the machine copy exactly" "$repaired" '<summary>machine-readable evidence</summary>'
-  repaired_json="$(printf '%s\n' "$repaired" | awk '$0 == "```json" { found = 1; next } found && $0 == "```" { exit } found { print }')"
-  assert_eq "$name repaired audit preserves the authoritative JSON byte-for-byte" "$original_json" "$repaired_json"
-}
-# An unconfirmed fix is deliberately absent: it is uncertainty, not a named
-# defect, so it holds the PR for a human and never reaches this handoff.
-assert_defect_handoff "triage deferral" "$HELD" "Null deref on empty list"
-assert_defect_handoff "repair regression" "$REGRESS" "Guard breaks the non-empty path"
-COPIED_BLOCKER="$TMP/fixtures-copied-blocker"; cp -R "$HELD" "$COPIED_BLOCKER"
-fixture "$COPIED_BLOCKER" ship '{"title":"Add widget","body":"Adds a widget.","commitBody":"Use the thin widget module so callers share one construction path.","deferred":[{"blockerId":"blocker-1","title":"Empty collections still throw","why":"The remaining path reaches an unsafe access.","kind":"defect","file":true}]}'
-assert_defect_handoff "copied blocker follow-up" "$COPIED_BLOCKER" "Null deref on empty list" 1 "Null deref on empty list — The empty-list access is still reachable and throws; no guard was added&#46;" "Empty collections still throw"
-
-# Counting linked lines cannot tell a correct correlation from a first-occurrence
-# one when several items display identical text: both produce the same totals.
-# Read the Nth item line of a named blocker group instead, so an assertion names
-# the exact copy whose own blocker ID must have filed the link it carries.
-evidence_group_line() { # summary group position
-  awk -v head="- \`$2\` — " -v want="$3" '
-    index($0, head) == 1 { found = 1; next }
-    found && /^- `/ { exit }
-    found { if (++n == want) { print; exit } }
-  ' <<<"$1"
-}
+# Epic-run no longer hands a repair brief to defect-run: a hold made entirely of
+# concrete defects takes its one scoped correction inside the run instead, and
+# every other hold rests with a human. The defect fixer's own trust model is
+# unchanged and still gated above, against evidence an older run published.
+scenario 'epic-run: a concrete-defect hold publishes no repair brief and opens no queue'
+run_pipeline "$EPIC_RUN" "$HELD" --issue 42
+assert_rc "the corrected-once hold finishes held" 0 "$RUN_RC"
+assert_eq "no repair queue is opened" "ready-to-review," "$(gh_labels)"
+assert_not_contains "and no repair brief is published" "$(gh_comments)" "🤖 defect-fix evidence"
+assert_eq "the durable evidence renderer is still reachable for older briefs" "1" \
+  "$(node -e "import('$ROOT/workflows/lib/defect-evidence.mjs').then(m => console.log(typeof m.publishDefectEvidence === 'function' ? 1 : 0))")"
 
 IDENTICAL="$TMP/fixtures-identical-blockers"; cp -R "$BASE" "$IDENTICAL"
 fixture "$IDENTICAL" review-general '{"findings":[{"title":"Same displayed blocker","severity":"Important","confidence":90,"location":"src/widget.ts:12","problem":"Same displayed reason.","fix":"Fix the first path.","gate":"first focused test"},{"title":"Same displayed blocker","severity":"Important","confidence":90,"location":"src/widget.ts:24","problem":"Same displayed reason.","fix":"Fix the second path.","gate":"second focused test"}]}'
@@ -4992,14 +5019,10 @@ assert_rc "reversed identical blockers ship safely" 0 "$RUN_RC"
 assert_contains "ship maps the first opaque ID to its finding location" "$(cat "$STATE_DIR/ship.0.prompt")" "- blocker-1: Same displayed blocker [src/widget.ts:12] — Same displayed reason."
 assert_contains "ship maps the second opaque ID to its finding location" "$(cat "$STATE_DIR/ship.0.prompt")" "- blocker-2: Same displayed blocker [src/widget.ts:24] — Same displayed reason."
 assert_eq "only the selected blocker files a follow-up" 1 "$(grep -c '^TITLE: ' "$STATE_DIR/gh/issues-created")"
-IDENTICAL_SUMMARY="$(gh_evidence_comment)"
-assert_eq "the filed identity links its evidence copy" 1 "$(grep -F -c 'Same displayed blocker — Same displayed reason&#46; — [follow-up #101](https://github.com/o/r/issues/101)' <<<"$IDENTICAL_SUMMARY")"
-assert_eq "the other identical identity is listed and never steals that link" 2 "$(grep -F -c 'Same displayed blocker — Same displayed reason&#46;' <<<"$IDENTICAL_SUMMARY")"
-assert_not_contains "no second follow-up is invented for the unfiled identity" "$IDENTICAL_SUMMARY" "follow-up #102"
-IDENTICAL_LINK=' — [follow-up #101](https://github.com/o/r/issues/101)'
-assert_eq "ship's rephrased ledger is not an evidence group of its own" "" "$(evidence_group_line "$IDENTICAL_SUMMARY" ship-deferral 1)"
-assert_eq "the link sits on the review copy at the second position, the one ship filed" "  - Same displayed blocker — Same displayed reason&#46;$IDENTICAL_LINK" "$(evidence_group_line "$IDENTICAL_SUMMARY" post-review-defect 2)"
-assert_eq "the first review copy, which ship did not file, stays bare" "  - Same displayed blocker — Same displayed reason&#46;" "$(evidence_group_line "$IDENTICAL_SUMMARY" post-review-defect 1)"
+assert_eq "exactly one deferred entry carries the URL its own identity filed" 1 "$(grep -c 'filed as https://github.com/o/r/issues/101' <<<"$(gh_comments)")"
+assert_not_contains "no second follow-up is invented for the unfiled identity" "$(gh_comments)" "issues/102"
+assert_eq "the unfiled identity is still listed in the deferred record" 2 "$(grep -c '^- Same displayed blocker (defect)' <<<"$(gh_comments)")"
+assert_eq "the mixed batch of two blockers was corrected once and held" "1 0" "$(calls correction) $(calls narrowconfirm)"
 
 # Both copies filed: the two follow-up URLs are distinguishable, and ship listed
 # the blockers in the reverse of review order, so a correlation that resolved by
@@ -5010,16 +5033,10 @@ fixture "$BOTH_FILED" ship '{"title":"Add widget","body":"Adds a widget.","commi
 scenario 'ship identity: two identical blockers each keep their own follow-up across a reversal'
 run_pipeline "$EPIC_RUN" "$BOTH_FILED" --issue 42
 assert_rc "both identical blockers ship safely" 0 "$RUN_RC"
-assert_eq "the issue stays reviewable and enters the defect-fixer queue" "needs-defect-fix,ready-to-review," "$(gh_labels)"
+assert_eq "the issue stays reviewable with no repair queue behind it" "ready-to-review," "$(gh_labels)"
 assert_eq "both identities file their own follow-up" 2 "$(grep -c '^TITLE: ' "$STATE_DIR/gh/issues-created")"
 assert_eq "filed in ship's ledger order, so #101 is the second finding's" "$(printf 'TITLE: Second path still throws\nTITLE: First path still throws')" "$(grep '^TITLE: ' "$STATE_DIR/gh/issues-created")"
-BOTH_SUMMARY="$(gh_evidence_comment)"
-BOTH_LINE='  - Same displayed blocker — Same displayed reason&#46; — [follow-up #'
-assert_eq "ship's rephrased ledger is not an evidence group of its own" "" "$(evidence_group_line "$BOTH_SUMMARY" ship-deferral 1)"
-assert_eq "the first review copy links what its own identity filed, not what its position did" "${BOTH_LINE}102](https://github.com/o/r/issues/102)" "$(evidence_group_line "$BOTH_SUMMARY" post-review-defect 1)"
-assert_eq "the second review copy links the other, crossed against ship's order" "${BOTH_LINE}101](https://github.com/o/r/issues/101)" "$(evidence_group_line "$BOTH_SUMMARY" post-review-defect 2)"
 assert_eq "the deferred record credits each item with the URL its own identity filed" "$(printf 'https://github.com/o/r/issues/101\nhttps://github.com/o/r/issues/102')" "$(grep -o 'filed as https://github.com/o/r/issues/[0-9]*' <<<"$(gh_comments)" | sed 's/^filed as //')"
-assert_not_contains "internal blocker IDs still never enter the v1 envelope" "$(printf '%s\n' "$BOTH_SUMMARY" | evidence_json)" "blockerId"
 
 SUBSET="$TMP/fixtures-blocker-id-subset"; cp -R "$IDENTICAL" "$SUBSET"
 fixture "$SUBSET" ship '{"title":"Add widget","body":"Adds a widget.","commitBody":"Use the thin widget module so callers share one construction path.","deferred":[{"blockerId":"blocker-2","title":"Same displayed blocker","why":"Same displayed reason.","kind":"defect","file":true}]}'
@@ -5049,15 +5066,185 @@ for blocker_id_case in unknown duplicate known-as-new; do
   assert_eq "$blocker_id_case pre-PR failure creates no delivery summary" 0 "$(delivery_summary_count)"
 done
 
+# ───────────────── the bounded repair contract inside a fixer ─────────────────
+# One exhaustive acceptance answer, ONE scoped correction over the whole batch
+# inside the same invocation, one narrow confirmation, then the ordinary
+# publication path. A semantic dead end here removes the fixer's queue instead
+# of restoring it, and never manufactures a spent rung to stop a relaunch.
+accept_batch() { # dir key count — one original-defect blocker plus one repair regression
+  fixture "$1" "$2" "{\"outcome\":\"correction-required\",\"verdicts\":$(verdicts_json "$3" 1),\"blockers\":[{\"id\":\"b1\",\"kind\":\"original-defect\",\"item\":1,\"location\":\"frontend/src/widget.ts:1\",\"evidence\":\"the named cause is still reachable\",\"required\":\"the guarded export exists\",\"confidence\":90},{\"id\":\"b2\",\"kind\":\"repair-regression\",\"location\":\"frontend/src/types.ts:1\",\"evidence\":\"the repair dropped a neighbouring export\",\"required\":\"the neighbouring export is restored\",\"confidence\":88}]}"
+}
+
+scenario 'ci-run: one scoped correction clears a whole blocker batch and lands'
+seed_ci_pr
+CICORRECT="$TMP/fixtures-ci-correction"; cp -R "$CIBASE" "$CICORRECT"
+accept_batch "$CICORRECT" ci-check 1
+fixture "$CICORRECT" ci-correction '{"summary":"CI_CORRECTION_NARRATIVE_SENTINEL: restored both exports.","dispositions":[{"id":"b1","action":"corrected","reason":"guarded the widget export"},{"id":"b2","action":"corrected","reason":"restored the neighbouring type export"}]}'
+fixture_sh "$CICORRECT" ci-correction 'printf "export const createWidget = () => ({ guarded: true })\n" > frontend/src/widget.ts; printf "export const widgetType = \"safe\"\n" > frontend/src/types.ts'
+fixture "$CICORRECT" ci-confirm '{"cleared":true,"confidence":90,"reasoning":"Both required outcomes are observable and nothing else moved.","blockerVerdicts":[{"id":"b1","verdict":"cleared","reasoning":"the guarded export is present"},{"id":"b2","verdict":"cleared","reasoning":"the neighbouring export is back"}],"regressions":[]}'
+run_ci "$CI_RUN" "$CICORRECT" --issue 42
+assert_rc "a corrected CI repair lands" 0 "$RUN_RC"
+assert_contains "RESULT names every corrected blocker" "$RUN_OUT" '"correctedBlockers":["b1","b2"]'
+assert_eq "one repair, one acceptance, one correction, one confirmation" "1 1 1 1" "$(calls ci-fix) $(calls ci-check) $(calls ci-correction) $(calls ci-confirm)"
+assert_eq "the correction re-ran the full verify contract" 3 "$(grep -c '^run verify$' "$NPM_LOG")"
+assert_eq "the corrected branch is still one commit above main" 1 "$(origin_count epic/42-add-widget)"
+assert_contains "the correction's own new file is in the amended commit" "$(git -C "$ORIGIN" show epic/42-add-widget:frontend/src/types.ts)" "widgetType"
+assert_eq "an in-process correction does not escalate the ladder" "ci-attempted,ready-to-merge," "$(gh_labels)"
+assert_contains "the audit records the exhaustive batch" "$(gh_comments)" "returned 2 blocker(s)"
+assert_contains "and names each corrected blocker" "$(gh_comments)" "- b2: corrected"
+assert_contains "and says no second fixer was launched for it" "$(gh_comments)" "no second fixer was launched"
+CI_CORRECTION_PROMPT="$(cat "$STATE_DIR/ci-correction.0.prompt")"
+assert_contains "the CI correction receives the whole batch" "$CI_CORRECTION_PROMPT" "id: b2"
+assert_contains "and each blocker's required observable outcome" "$CI_CORRECTION_PROMPT" "required to clear: the neighbouring export is restored"
+assert_contains "and the successful verification evidence" "$CI_CORRECTION_PROMPT" "it was GREEN"
+assert_contains "the CI correction stays bounded to the captured failing checks" "$CI_CORRECTION_PROMPT" "Stay inside the captured failing checks"
+assert_contains "and may not weaken a gate to clear a blocker" "$CI_CORRECTION_PROMPT" "never weaken a test, assertion, type, lint rule or other gate"
+CI_CONFIRM_PROMPT="$(cat "$STATE_DIR/ci-confirm.0.prompt")"
+assert_contains "the CI confirmer receives the complete cumulative delta" "$CI_CONFIRM_PROMPT" "<repair-delta>"
+assert_contains "and the exact correction delta" "$CI_CONFIRM_PROMPT" "<correction-delta>"
+assert_contains "which carries the correction's own new file" "$CI_CONFIRM_PROMPT" "widgetType"
+assert_not_contains "and never the correction's own narrative" "$CI_CONFIRM_PROMPT" "CI_CORRECTION_NARRATIVE_SENTINEL"
+
+scenario 'ci-run: a declined correction blocker removes the queue without spending a rung'
+seed_ci_pr
+CIDECLINE="$TMP/fixtures-ci-correction-declined"; cp -R "$CICORRECT" "$CIDECLINE"
+fixture "$CIDECLINE" ci-correction '{"summary":"one of them needs a person","dispositions":[{"id":"b1","action":"corrected","reason":"guarded the export"},{"id":"b2","action":"declined","reason":"restoring that export is a product decision"}]}'
+BEFORE="$(origin_ref epic/42-add-widget)"
+run_ci "$CI_RUN" "$CIDECLINE" --issue 42
+assert_rc "a declined blocker blocks" 3 "$RUN_RC"
+assert_contains "the decline is named" "$RUN_OUT" "declined blocker id(s) b2"
+assert_eq "no narrow confirmation and no second correction ran" "0 1" "$(calls ci-confirm) $(calls ci-correction)"
+assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+assert_eq "the CI queue is removed and the rung is not escalated" "ci-attempted,failed," "$(gh_labels)"
+assert_contains "the human-held comment says the queue is gone" "$(gh_comments)" "needs-ci-fix has been removed"
+assert_contains "and that no rung was spent to stop a relaunch" "$(gh_comments)" "attempt ladder: untouched"
+assert_eq "the unpushed correction is cleaned" "" "$(git -C "$WT" status --porcelain)"
+
+scenario 'ci-run: a red second verification is human-held, never another attempt'
+seed_ci_pr
+CIREDCORRECT="$TMP/fixtures-ci-correction-red"; cp -R "$CICORRECT" "$CIREDCORRECT"
+fixture_sh "$CIREDCORRECT" ci-correction 'printf "export const guardedWidget = 1\n" > frontend/src/guard.ts; printf "1" > "$STUB_FIXTURES/verify.rc"'
+BEFORE="$(origin_ref epic/42-add-widget)"
+run_ci "$CI_RUN" "$CIREDCORRECT" --issue 42
+assert_rc "a red second verification blocks" 3 "$RUN_RC"
+assert_contains "the reason names the correction's own red verify" "$RUN_OUT" "npm run verify is red after the scoped correction"
+assert_eq "no narrow confirmation ran on a red tree" 0 "$(calls ci-confirm)"
+assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+assert_eq "the CI queue is removed rather than restored for another fixer" "ci-attempted,failed," "$(gh_labels)"
+rm -f "$CIREDCORRECT/verify.rc"
+
+scenario 'ci-run: provider quota during a scoped correction refunds the rung and restores the queue'
+seed_ci_pr
+CIQUOTA="$TMP/fixtures-ci-correction-quota"; cp -R "$CICORRECT" "$CIQUOTA"
+fixture_error "$CIQUOTA" ci-correction '{"type":"result","subtype":"success","is_error":true,"terminal_reason":"api_error","api_error_status":429,"result":"You have hit your usage limit; resets 7:50pm (UTC)","duration_ms":386,"num_turns":1,"total_cost_usd":0,"usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
+BEFORE="$(origin_ref epic/42-add-widget)"
+run_ci "$CI_RUN" "$CIQUOTA" --issue 42
+assert_rc "a quota death during correction is a held outcome" 0 "$RUN_RC"
+assert_contains "RESULT reports the hold" "$RUN_OUT" '"held":true'
+assert_eq "the hard quota is never respawned" 1 "$(calls ci-correction)"
+assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+assert_eq "the rung is refunded and the automatic queue restored" "failed,needs-ci-fix," "$(gh_labels)"
+assert_eq "the unpushed correction is cleaned" "" "$(git -C "$WT" status --porcelain)"
+
+scenario 'fix-run: a scoped correction joins the same amended commit and keeps both intents'
+seed_conflict
+FIXCORRECT="$TMP/fixtures-fix-correction"; cp -R "$FIXBASE" "$FIXCORRECT"
+accept_correction "$FIXCORRECT" fix-check 1 "main rename is not carried to the line the PR moved" "both the rename and the guard are present on the moved line"
+fixture "$FIXCORRECT" correction '{"summary":"carried the rename across","dispositions":[{"id":"b1","action":"corrected","reason":"carried the rename to the line the PR moved"}]}'
+fixture_sh "$FIXCORRECT" correction 'printf "export const items = [] // main-rename pr-guard corrected\n" > frontend/src/index.ts'
+fixture "$FIXCORRECT" narrowconfirm "$(confirm_json b1)"
+BEFORE="$(origin_ref epic/42-add-widget)"
+BEFORE_MESSAGE="$(git -C "$ORIGIN" log -1 --format=%B epic/42-add-widget)"
+run_fix "$FIXCORRECT" --issue 42
+assert_rc "a corrected conflict resolution lands" 0 "$RUN_RC"
+assert_contains "RESULT names the corrected blocker" "$RUN_OUT" '"correctedBlockers":["b1"]'
+assert_eq "the corrected resolution is still exactly one commit above main" 1 "$(origin_count epic/42-add-widget)"
+assert_contains "the correction's edit is inside the amended commit" "$(git -C "$ORIGIN" show epic/42-add-widget:frontend/src/index.ts)" "main-rename pr-guard corrected"
+assert_eq "the corrected resolution preserves the candidate message" "$BEFORE_MESSAGE" "$(git -C "$ORIGIN" log -1 --format=%B epic/42-add-widget)"
+assert_eq "and returns to unattended merge on its first rung" "fix-attempted,ready-to-merge," "$(gh_labels)"
+assert_contains "the audit says the correction joined the amended commit" "$(gh_comments)" "Its edits are part of the amended commit."
+assert_contains "the conflict correction must keep both sides' intent" "$(cat "$STATE_DIR/correction.0.prompt")" "BOTH surviving"
+
+scenario 'defect-run: a scoped correction stays bound to the authenticated evidence'
+seed_defect_pr
+DEFECTCORRECT="$TMP/fixtures-defect-correction"; cp -R "$DEFECTBASE" "$DEFECTCORRECT"
+accept_correction "$DEFECTCORRECT" defect-check 1 "the guard misses a null first member" "the null member is guarded too"
+fixture "$DEFECTCORRECT" defect-correction '{"summary":"DEFECT_CORRECTION_NARRATIVE_SENTINEL: guarded the null member.","dispositions":[{"id":"b1","action":"corrected","reason":"guarded the null first member"}]}'
+fixture_sh "$DEFECTCORRECT" defect-correction 'printf "export const firstItem = items => (items && items[0] ? items[0].name : undefined)\n" > frontend/src/widget.ts'
+fixture "$DEFECTCORRECT" defect-confirm "$(confirm_json b1)"
+BEFORE="$(origin_ref epic/42-add-widget)"
+DEFECT_COMMENTS="$(make_defect_evidence "$BEFORE")" run_defect "$DEFECT_RUN" "$DEFECTCORRECT" --issue 42
+assert_rc "a corrected defect repair lands" 0 "$RUN_RC"
+assert_contains "RESULT names the corrected blocker" "$RUN_OUT" '"correctedBlockers":["b1"]'
+assert_eq "one repair, one acceptance, one correction, one confirmation" "1 1 1 1" "$(calls defect-fix) $(calls defect-check) $(calls defect-correction) $(calls defect-confirm)"
+assert_eq "an in-process correction does not escalate the ladder" "defect-attempted,ready-to-merge," "$(gh_labels)"
+assert_contains "the corrected code is what shipped" "$(git -C "$ORIGIN" show epic/42-add-widget:frontend/src/widget.ts)" "items && items[0]"
+DEFECT_CORRECTION_PROMPT="$(cat "$STATE_DIR/defect-correction.0.prompt")"
+assert_contains "the defect correction keeps the pinned requirement" "$DEFECT_CORRECTION_PROMPT" "Pinned original requirement"
+assert_contains "and stays bound to the authenticated evidence" "$DEFECT_CORRECTION_PROMPT" "Stay bound to the authenticated evidence above"
+assert_contains "and may never reclassify a named defect" "$DEFECT_CORRECTION_PROMPT" "never reclassify or dismiss a named defect"
+DEFECT_CONFIRM_PROMPT="$(cat "$STATE_DIR/defect-confirm.0.prompt")"
+assert_contains "the defect confirmer receives the exact correction delta" "$DEFECT_CONFIRM_PROMPT" "<correction-delta>"
+assert_not_contains "and never the correction's own narrative" "$DEFECT_CONFIRM_PROMPT" "DEFECT_CORRECTION_NARRATIVE_SENTINEL"
+
+scenario 'defect-run: provider quota during the narrow confirmation refunds and restores the queue'
+seed_defect_pr
+DEFECTQUOTA="$TMP/fixtures-defect-confirm-quota"; cp -R "$DEFECTCORRECT" "$DEFECTQUOTA"
+fixture_error "$DEFECTQUOTA" defect-confirm '{"type":"result","subtype":"success","is_error":true,"terminal_reason":"api_error","api_error_status":429,"result":"You have hit your usage limit; resets 7:50pm (UTC)","duration_ms":386,"num_turns":1,"total_cost_usd":0,"usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
+BEFORE="$(origin_ref epic/42-add-widget)"
+DEFECT_COMMENTS="$(make_defect_evidence "$BEFORE")" run_defect "$DEFECT_RUN" "$DEFECTQUOTA" --issue 42
+assert_rc "a quota death during the confirmation is a held outcome" 0 "$RUN_RC"
+assert_contains "RESULT reports the hold" "$RUN_OUT" '"held":true'
+assert_eq "the hard quota is never respawned" 1 "$(calls defect-confirm)"
+assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+assert_eq "the rung is refunded and the automatic queue restored" "needs-defect-fix,ready-to-review," "$(gh_labels)"
+assert_eq "the unpushed correction is cleaned" "" "$(git -C "$WT" status --porcelain)"
+
+scenario 'defect-run: a malformed narrow confirmation is human-held, never another fixer'
+seed_defect_pr
+DEFECTBADCONFIRM="$TMP/fixtures-defect-confirm-bad"; cp -R "$DEFECTCORRECT" "$DEFECTBADCONFIRM"
+fixture "$DEFECTBADCONFIRM" defect-confirm '{}'
+BEFORE="$(origin_ref epic/42-add-widget)"
+DEFECT_COMMENTS="$(make_defect_evidence "$BEFORE")" run_defect "$DEFECT_RUN" "$DEFECTBADCONFIRM" --issue 42
+assert_rc "a malformed confirmation blocks" 3 "$RUN_RC"
+assert_contains "the reason names the missing confirmation" "$RUN_OUT" "narrow confirmation produced no result"
+assert_eq "the malformed confirmer gets only the runtime's bounded retry" 2 "$(calls defect-confirm)"
+assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+assert_eq "the defect queue is removed rather than left for another fixer" "defect-attempted,ready-to-review," "$(gh_labels)"
+assert_contains "the human-held comment says the queue is gone" "$(gh_comments)" "needs-defect-fix has been removed"
+
+for acceptance_case in missing-verdict duplicate-verdict extra-verdict unknown-kind duplicate-id blocked-without-blocker clear-with-blockers correction-with-judgment; do
+  scenario "acceptance evidence: a $acceptance_case answer authorizes nothing"
+  seed_ci_pr
+  BADACCEPT="$TMP/fixtures-accept-$acceptance_case"; cp -R "$CIBASE" "$BADACCEPT"
+  ok_blocker='{"id":"b1","kind":"original-defect","item":1,"location":"frontend/src/widget.ts:1","evidence":"still reachable","required":"the export exists","confidence":90}'
+  case "$acceptance_case" in
+    missing-verdict)   answer='{"outcome":"clear","verdicts":[],"blockers":[]}' ;;
+    duplicate-verdict) answer='{"outcome":"clear","verdicts":[{"index":1,"verdict":"upheld","confidence":90,"reasoning":"a"},{"index":1,"verdict":"upheld","confidence":90,"reasoning":"b"}],"blockers":[]}' ;;
+    extra-verdict)     answer='{"outcome":"clear","verdicts":[{"index":1,"verdict":"upheld","confidence":90,"reasoning":"a"},{"index":2,"verdict":"upheld","confidence":90,"reasoning":"b"}],"blockers":[]}' ;;
+    unknown-kind)      answer="{\"outcome\":\"human\",\"verdicts\":$(verdicts_json 1 1),\"blockers\":[{\"id\":\"b1\",\"kind\":\"mystery\",\"item\":1,\"location\":\"l\",\"evidence\":\"e\",\"required\":\"r\",\"confidence\":90}]}" ;;
+    duplicate-id)      answer="{\"outcome\":\"human\",\"verdicts\":$(verdicts_json 1 1),\"blockers\":[$ok_blocker,$ok_blocker]}" ;;
+    blocked-without-blocker) answer="{\"outcome\":\"human\",\"verdicts\":$(verdicts_json 1 1),\"blockers\":[{\"id\":\"b9\",\"kind\":\"human-judgment\",\"location\":\"l\",\"evidence\":\"e\",\"required\":\"r\",\"confidence\":90}]}" ;;
+    clear-with-blockers) answer="{\"outcome\":\"clear\",\"verdicts\":$(verdicts_json 1 0),\"blockers\":[$ok_blocker]}" ;;
+    correction-with-judgment) answer="{\"outcome\":\"correction-required\",\"verdicts\":$(verdicts_json 1 1),\"blockers\":[{\"id\":\"b1\",\"kind\":\"human-judgment\",\"item\":1,\"location\":\"l\",\"evidence\":\"e\",\"required\":\"r\",\"confidence\":90}]}" ;;
+  esac
+  fixture "$BADACCEPT" ci-check "$answer"
+  BEFORE="$(origin_ref epic/42-add-widget)"
+  run_ci "$CI_RUN" "$BADACCEPT" --issue 42
+  assert_rc "$acceptance_case acceptance evidence blocks" 3 "$RUN_RC"
+  assert_matches "$acceptance_case acceptance evidence decides nothing" "$RUN_OUT" "acceptance evidence that decides nothing|acceptance check produced no result"
+  assert_eq "$acceptance_case acceptance evidence starts no correction" "0 0" "$(calls ci-correction) $(calls ci-confirm)"
+  assert_eq "$acceptance_case acceptance evidence pushes nothing" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+  assert_not_contains "$acceptance_case acceptance evidence never exposes merge" "$(gh_labels)" "ready-to-merge"
+done
+
 # ───────────────────── exact deduplication without semantic grouping ─────────────────────
 # Related reports still need individual dispositions and independent evidence.
 # Only identical normalized title+location reports can share a finding index.
 scenario 'review coverage: three related reports are all assessed and adjudicated'
 GROUP="$TMP/fixtures-group"
 cp -R "$BASE" "$GROUP"
-fixture "$GROUP" design '{"approach":"Thin widget module","rationale":"Fits the existing shape.","steps":["one","two"],"files":["src/widget.ts — new"],"contract":"createWidget(): Widget","tradeoffs":"No caching.","verification":{"mode":"test-first","rationale":"The public export can be asserted before implementation.","evidence":["widget test passes"]},"review":{"question":"Can an unusable schedule still permit submit?","rationale":"The validation crosses several modules."}}'
-fixture "$GROUP" review-general '{"findings":[{"title":"Unusable schedule does not block submit","severity":"Critical","confidence":90,"location":"src/dialog.tsx:40","problem":"Submit stays enabled.","fix":"Block it.","gate":"unit test"},{"title":"Block gate tests the wrong condition","severity":"Important","confidence":85,"location":"src/gate.ts:12","problem":"Checks null, not empty.","fix":"Check emptiness.","gate":"unit test"}]}'
-fixture "$GROUP" review-focus '{"findings":[{"title":"Test asserts the wrong guard","severity":"Important","confidence":80,"location":"src/gate.test.ts:8","problem":"Encodes the wrong rule.","fix":"Assert emptiness.","gate":"unit test"}]}'
+fixture "$GROUP" review-general '{"findings":[{"title":"Unusable schedule does not block submit","severity":"Critical","confidence":90,"location":"src/dialog.tsx:40","problem":"Submit stays enabled.","fix":"Block it.","gate":"unit test"},{"title":"Block gate tests the wrong condition","severity":"Important","confidence":85,"location":"src/gate.ts:12","problem":"Checks null, not empty.","fix":"Check emptiness.","gate":"unit test"},{"title":"Test asserts the wrong guard","severity":"Important","confidence":80,"location":"src/gate.test.ts:8","problem":"Encodes the wrong rule.","fix":"Assert emptiness.","gate":"unit test"}]}'
 fixture "$GROUP" triage '{"status":"Repaired all three reports.","assessments":[
   {"index":1,"action":"fixed","reason":"Submit now blocks an unusable schedule."},
   {"index":2,"action":"fixed","reason":"The gate now tests emptiness."},
@@ -5085,9 +5272,8 @@ assert_rc "equal counts with a missing index fail closed" 3 "$RUN_RC"
 assert_eq "duplicate coverage cannot open a PR" "" "$(gh_pr_created)"
 
 scenario 'review coverage: exact duplicate title and location shares one disposition'
-EXACTDUP="$TMP/fixtures-exact-duplicate"; cp -R "$FOCUSED" "$EXACTDUP"
-rm -f "$EXACTDUP/review-focus.0.rc" "$EXACTDUP/review-focus.1.rc"
-fixture "$EXACTDUP" review-focus '{"findings":[{"title":"  NULL DEREF ON EMPTY LIST  ","severity":"Critical","confidence":88,"location":" src/widget.ts:12 ","problem":"Same reported crash.","fix":"Guard access.","gate":"empty-list test"}]}'
+EXACTDUP="$TMP/fixtures-exact-duplicate"; cp -R "$BASE" "$EXACTDUP"
+fixture "$EXACTDUP" review-general '{"findings":[{"title":"Null deref on empty list","severity":"Critical","confidence":90,"location":"src/widget.ts:12","problem":"Crashes when items is empty.","fix":"Guard the access.","gate":"unit test for the empty case"},{"title":"  NULL DEREF ON EMPTY LIST  ","severity":"Critical","confidence":88,"location":" src/widget.ts:12 ","problem":"Same reported crash.","fix":"Guard access.","gate":"empty-list test"}]}'
 run_pipeline "$EPIC_RUN" "$EXACTDUP" --issue 42
 assert_rc "an exact normalized duplicate is assessed once" 0 "$RUN_RC"
 assert_contains "one complete assessment and check can ship" "$RUN_OUT" '"readyToMerge":true'

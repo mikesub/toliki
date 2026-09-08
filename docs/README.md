@@ -14,6 +14,7 @@ ready issue
   -> Review
   -> Repair + verify, when findings exist
   -> Final review, when adjudication is needed
+  -> Correction + verify + narrow confirmation, when every blocker is concrete
   -> Ship PR
   -> Merge gate
   -> Merge worker
@@ -29,12 +30,13 @@ failure behavior.
 | 1. Prepare | Shell/Node orchestrators | None |
 | 2. Architect | `architect` charter | Usually one; none when a valid resumed plan exists |
 | 3. Code | `coder` charter | One in direct mode, RED + GREEN in test-first mode; a completed checkpoint initially skips both |
-| 4. Review | `reviewer` charter | One general review, optionally one focused review |
+| 4. Review | `reviewer` charter | One broad review, and the only broad review of the change |
 | 5. Repair | `coder` charter | One when findings exist |
-| 6. Final review | `reviewer` charter | One when findings need adjudication |
-| 7. Ship | `shipper` charter plus orchestrator | One prose/metadata call |
-| 8. Merge gate | Node orchestrator | None |
-| 9. Merge worker | Shell scripts | None |
+| 6. Final review | `reviewer` charter | One when findings need adjudication; it is this repair's exhaustive acceptance check |
+| 7. Correction | `coder` + `reviewer` charters | One correction and one narrow confirmation, only when every blocker is a concrete defect |
+| 8. Ship | `shipper` charter plus orchestrator | One prose/metadata call |
+| 9. Merge gate | Node orchestrator | None |
+| 10. Merge worker | Shell scripts | None |
 
 Every LLM call is a new, short-lived process. The selected `engine:<name>` maps
 each step to a vendor, model, and effort in [`etc/engines.json`](../etc/engines.json).
@@ -141,17 +143,14 @@ one logical call.
      confidence.
    - `direct` for a small or low-risk change where a manufactured RED phase
      adds no useful evidence.
-5. It may request one concrete focused-review question for a narrow, material
-   risk. Otherwise the later review plan contains only the mandatory general
-   review.
-6. A resumed partial implementation is planned as `direct`; the script refuses
+5. A resumed partial implementation is planned as `direct`; the script refuses
    to pretend a dirty tree still has a clean RED baseline.
-7. A resumed code checkpoint first reuses `.epics/<slug>/architecture.json`.
+6. A resumed code checkpoint first reuses `.epics/<slug>/architecture.json`.
    If that artifact is missing or invalid, a read-only architect reconstructs
    the plan from the finished implementation without changing it.
-8. The orchestrator validates the complete structure and non-empty verification
+7. The orchestrator validates the complete structure and non-empty verification
    evidence. Invalid architecture blocks before Code.
-9. Deterministic rendering writes `architecture.json` and `architecture.md`;
+8. Deterministic rendering writes `architecture.json` and `architecture.md`;
    the latter is the contract the coder and any RED test writer receive.
 
 ## 3. Code
@@ -189,34 +188,33 @@ two logical calls, depending on resume state and verification mode.
 ## 4. Review
 
 **Owner:** `reviewer` charter plus the review coordinator in
-[`workflows/epic-run.mjs`](../workflows/epic-run.mjs). **LLM calls:** one or two
-logical calls.
+[`workflows/epic-run.mjs`](../workflows/epic-run.mjs). **LLM calls:** exactly
+one.
 
-1. The review plan always contains `review:general`. It adds `review:focus`
-   only when Architect supplied a concrete focused-risk question.
+1. One broad `review:general` process runs, and it is the only broad review of
+   this change. The architect-selected focused reviewer is gone: a second
+   pre-repair opinion bought less than the exhaustive acceptance check that now
+   runs after the repair, and two broad passes over one diff mostly
+   re-litigated each other.
 2. The orchestrator snapshots the shippable tree, Git/index/config metadata,
-   and the complete change diff before any reviewer starts.
-3. The general and optional focused reviewers run independently and in
-   parallel, subject to the runtime's concurrency cap.
-4. Reviewers receive the original requirement and captured diff. They are
-   deliberately denied `.epics/` builder notes and do not see coder claims.
-5. The general reviewer checks requirement coverage, meaningful defects or
-   regressions, and whether verification proves the changed behavior. The
-   focused reviewer investigates only its named risk unless another issue is
-   necessary evidence.
-6. Each finding must include title, severity, confidence, location, concrete
+   and the complete change diff before the reviewer starts.
+3. The reviewer receives the original requirement and captured diff. It is
+   deliberately denied `.epics/` builder notes and does not see coder claims.
+4. It checks requirement coverage, meaningful defects or regressions, and
+   whether verification proves the changed behavior, across the whole diff.
+5. Each finding must include title, severity, confidence, location, concrete
    problem, proposed fix, and useful regression evidence. The reviewer charter
    instructs the agent to return only `Critical` or `Important` findings at
    confidence 75 or above.
-7. A dead reviewer is different from a reviewer returning no findings. If any
-   requested reviewer produces no valid result after bounded runtime recovery,
-   the run blocks.
-8. The orchestrator proves the read-only review processes did not change the
+6. A dead reviewer is different from a reviewer returning no findings. If it
+   produces no valid result after bounded runtime recovery, the run blocks.
+7. The orchestrator proves the read-only review process did not change the
    tree or protected Git metadata. Any drift blocks.
-9. Exact duplicate findings with the same normalized title and location are
+8. Exact duplicate findings with the same normalized title and location are
    collapsed; related findings remain independently indexed.
-10. The orchestrator writes the numbered finding ledger to
-    `.epics/<slug>/review.md`. No findings skips both Repair and Final review.
+9. The orchestrator writes the numbered finding ledger to
+   `.epics/<slug>/review.md`. No findings skips Repair, Final review and
+   Correction, and makes no acceptance or confirmation call.
 
 ## 5. Repair
 
@@ -271,7 +269,7 @@ call.
    any parts of the original requirement the complete change still misses.
 7. An unresolved finding may set `defect: true` only when the reviewer
    positively proves the bug remains at confidence 75 or above. That narrow
-   classification is the authority for the later defect-fixer queue.
+   classification is what authorizes the scoped correction in step 7.
 8. The orchestrator proves Final review changed neither the tree nor protected
    Git metadata. Drift blocks because no later review would see those bytes.
 9. A malformed or missing final result clears nothing. Except for a provider
@@ -280,7 +278,53 @@ call.
 10. Regressions become new open findings; unmet requirements become explicit
     non-defect blockers. There is no second repair or third opinion.
 
-## 7. Ship
+Final review is this repair's **exhaustive acceptance check**: it examines every
+original disposition and the complete repair delta, and returns a verdict for
+each plus the complete batch of what still blocks — never one sufficient
+refutation. That batch is what the next step can act on.
+
+## 7. Correction
+
+**Owner:** a fresh `coder` process using the `fixes-after-review` step and a
+fresh `reviewer` process using the `final-review` step, plus the orchestrator's
+verify contract. **LLM calls:** none unless every remaining blocker is a
+concrete defect; otherwise one correction and one narrow confirmation.
+
+1. The stage runs only when the merge gate's blockers exist and **every** one of
+   them is a concrete defect Final review positively established. A mixed batch,
+   an unmet requirement, uncertainty, a no-diff repair claim, or a missing
+   adjudication never earned an automated repair and goes straight to a human.
+2. Each blocker gets a run-local opaque identity, its kind (`original-defect` or
+   `repair-regression`), location, concrete code evidence, and the observable
+   outcome required to clear it. Titles are never identities.
+3. The orchestrator snapshots the pre-correction tree, then starts ONE fresh
+   writable `coder` process with the pinned requirement, the exact repair delta
+   Final review judged, the successful verification evidence, and the complete
+   blocker batch. The existing repair is preserved exactly as it is: nothing is
+   cleaned, rebuilt, or re-reviewed.
+4. The correction may address only those blockers and must return exactly one
+   disposition per blocker id — no missing, duplicate, extra, or unknown ids.
+   A declined blocker is a judgment call and ends the stage human-held.
+5. A correction that changed no file has repaired nothing; the blockers stand
+   and the stage ends human-held.
+6. The orchestrator checkpoints the correction and runs the full `npm run
+   verify` contract again. Red blocks the run with the resumable chain intact
+   and starts neither another correction nor any automated repair queue.
+7. One fresh read-only `reviewer` process narrowly confirms the correction. It
+   receives the requirement, the blocker batch, Final review's verdict per
+   original finding, the complete cumulative change and the exact correction
+   delta — never the correction's own explanation.
+8. It proves exactly four things: every blocker cleared, every previously
+   upheld finding still clear, declined items unchanged, and no regression,
+   gate weakening or unrelated behavior. It never restarts a broad review.
+9. A complete, high-confidence confirmation clears those blockers, and the run
+   takes the ordinary complete landing path. Anything else — a remaining
+   blocker, a new regression, a missing verdict, a dead or malformed result, or
+   low confidence — leaves the blockers standing and the PR held for a human.
+10. There is exactly one correction batch. The orchestrator proves the
+    confirmation changed neither the tree nor protected Git metadata.
+
+## 8. Ship
 
 **Owner:** `shipper` charter for judgmental prose; `epic-run.mjs` and transport
 libraries for every mutation. **LLM calls:** one logical call.
@@ -324,7 +368,7 @@ Manual `--slug` mode stops here after a `shipper` call writes
 `.epics/<slug>/summary.md`; it does not commit, push, create a PR, or change
 GitHub labels.
 
-## 8. Merge gate
+## 9. Merge gate
 
 **Owner:** structured calculations and GitHub transport in
 [`workflows/epic-run.mjs`](../workflows/epic-run.mjs). **LLM calls:** none.
@@ -340,15 +384,13 @@ GitHub labels.
    to `ready-to-review` and proves that demotion with bounded readback.
 5. If neither promotion nor demotion can be proved, it moves to the ordinary
    blocker path rather than leave an unaccounted `ready-to-merge` label.
-6. If any blocker remains, the PR stays `ready-to-review` for a human.
-7. If every blocker is a concrete defect positively established by Final
-   review, the script first publishes authenticated evidence bound to the
-   issue, same-repository PR, captured head, and original requirement. Only a
-   confirmed envelope allows adding `needs-defect-fix` beside
-   `ready-to-review`.
-8. Mixed blockers, uncertainty, unmet requirements, or incomplete evidence
-   never enter the defect queue.
-9. A normally completed or blocked run finishes at exactly one terminal state:
+6. If any blocker remains, the PR stays `ready-to-review` for a human and no
+   repair queue is opened. Epic-run no longer writes `needs-defect-fix`: the
+   only hold that ever qualified for it — one made entirely of concrete
+   defects — now gets its one scoped correction in step 7, inside the run that
+   still has the context. `defect-run` remains for evidence older runs already
+   published, and a re-run still strips a stale `needs-defect-fix`.
+7. A normally completed or blocked run finishes at exactly one terminal state:
    `ready-to-merge`, `ready-to-review`, or `failed`. A verified provider-quota
    hold instead restores `ready` for a resumable run. Every path emits a final
    `RESULT <json>` line.
@@ -356,7 +398,7 @@ GitHub labels.
 The first terminal label write opens one bounded reporting window shared by all
 remaining GitHub calls. No new model may start after that window opens.
 
-## 9. Merge worker
+## 10. Merge worker
 
 **Owner:** [`bin/merge-tick.sh`](../bin/merge-tick.sh),
 [`bin/merge-worker.sh`](../bin/merge-worker.sh), and
@@ -409,13 +451,49 @@ session name and durable engine pin. Each has a two-rung attempt ladder: first
 attempt, one retry, then human intervention. Their common sequence lives in
 [`workflows/lib/fixer-lifecycle.mjs`](../workflows/lib/fixer-lifecycle.mjs):
 Prepare evidence, run one writable repair agent, run orchestrator verification,
-run one blind adversarial checker, then publish.
+run one exhaustive acceptance check, then publish.
+
+All three share the **bounded repair contract** in
+[`workflows/lib/repair-acceptance.mjs`](../workflows/lib/repair-acceptance.mjs),
+the same contract epic-run's Final review and Correction use:
+
+- The acceptance check replaces a global `survives` boolean and a free-form
+  reason. It keeps examining every original disposition and the complete repair
+  delta after it finds a refutation, returns an exact verdict per item, and
+  returns the COMPLETE blocker batch rather than one sufficient counterexample.
+- Every blocker carries a run-local identity, its kind (`original-defect`,
+  `repair-regression`, `out-of-scope`, `human-judgment`), the original item when
+  it names one, a location, concrete code evidence, and the observable outcome
+  that clears it.
+- The outcome is one of `clear`, `correction-required` (every blocker is a
+  concrete implementation defect), or `human` (anything uncertain, unsupported,
+  unsafe to change, or a decision rather than an implementation).
+- Malformed, incomplete, duplicate, extra, unknown, ambiguous or low-confidence
+  evidence authorizes nothing: it can neither start a correction nor release an
+  unattended merge.
+- On `correction-required` the current unpushed repair is preserved in place and
+  ONE fresh writable correction runs in the same invocation over the whole
+  batch. Nothing is cleaned, no queue is restored, no retry rung is consumed,
+  and no second whole fixer is launched. The correction may address only those
+  blockers, returns one indexed disposition per blocker id, and must produce a
+  relevant delta; a decline, a missing disposition, or no change ends human-held.
+- The full `npm run verify` contract then runs again, followed by ONE narrow
+  read-only confirmation that receives the complete cumulative repair delta and
+  the exact correction delta but never the correction's narrative. There is no
+  second correction batch.
+- A semantic dead end — `human`, a failed correction, a red second verify, a
+  refused or malformed confirmation — REMOVES that fixer's queue label and
+  verifies the human-held resting state, so dispatch cannot launch another
+  complete fixer. No spent retry label is manufactured to achieve that. Only
+  operational failures (provider quota, a dead process, transport) keep the
+  existing refund, ladder and durable-recovery behavior.
 
 ### Judgment-conflict fixer
 
 **Entry:** `failed` + `needs-judgment`. **Script:**
-[`workflows/fix-run.mjs`](../workflows/fix-run.mjs). **LLM calls:** normally two:
-`fix-conflicts`, then `final-review` as the skeptic.
+[`workflows/fix-run.mjs`](../workflows/fix-run.mjs). **LLM calls:** normally two
+(`fix-conflicts`, then `final-review` as the acceptance check), and up to four
+when a correction runs.
 
 1. Dispatch moves the resting issue to `in-progress` before launching and the
    fixer verifies the exact engine pin, queue evidence, unique PR, and available
@@ -427,20 +505,24 @@ run one blind adversarial checker, then publish.
    guessing.
 4. The orchestrator validates every indexed disposition, completed rebase
    shape, marker cleanup, and allowed edit boundary.
-5. It runs `npm run verify`, then a blind adversarial reviewer tries to refute
-   every repaired hunk and prove every declined hunk retained the exact PR-side
-   text.
-6. A complete surviving repair is force-pushed and returns to
+5. It runs `npm run verify`, then the acceptance check tries to refute every
+   repaired hunk and prove every declined hunk retained the exact PR-side text,
+   returning the complete blocker batch rather than the first refutation.
+6. A `correction-required` batch gets one scoped correction that must keep both
+   sides' authenticated intent; its edits go into the same amended commit, and
+   the verify contract and narrow confirmation run again before any push.
+7. A complete surviving repair is force-pushed and returns to
    `ready-to-merge`; the merge worker rebases and checks it again.
-7. A verified partial repair is preserved, but authenticated head-bound evidence
+8. A verified partial repair is preserved, but authenticated head-bound evidence
    names the declined hunks and the issue rests at `ready-to-review` with the
    fixer queue removed.
 
 ### CI fixer
 
 **Entry:** `failed` + `needs-ci-fix`. **Script:**
-[`workflows/ci-run.mjs`](../workflows/ci-run.mjs). **LLM calls:** normally two:
-`fix-ci`, then `final-review` as the skeptic.
+[`workflows/ci-run.mjs`](../workflows/ci-run.mjs). **LLM calls:** normally two
+(`fix-ci`, then `final-review` as the acceptance check), and up to four when a
+correction runs.
 
 1. It verifies routing, queue state, unique PR/head, and its independent CI
    attempt ladder.
@@ -452,12 +534,15 @@ run one blind adversarial checker, then publish.
    a test, type, lint rule, assertion, or check.
 4. The orchestrator validates the indexed dispositions and runs the full
    `npm run verify` contract.
-5. A blind adversarial checker inspects the exact fixer delta and refutes by
-   default if the cause remains, a gate was weakened, a decline changed, or
-   unrelated behavior moved.
-6. A complete surviving repair amends and force-pushes the PR, then restores
+5. The acceptance check inspects the orchestrator-captured repair delta and
+   refutes by default if a cause remains, a gate was weakened, a decline
+   changed, or unrelated behavior moved.
+6. A `correction-required` batch gets one scoped correction bounded to the
+   captured failing checks, which may not weaken a gate to clear a blocker, and
+   the verify contract and narrow confirmation run again before any push.
+7. A complete surviving repair amends and force-pushes the PR, then restores
    `ready-to-merge` for a fresh merge-worker rebase and CI run.
-7. A verified partial repair is pushed but rests at `ready-to-review` with
+8. A verified partial repair is pushed but rests at `ready-to-review` with
    `needs-ci-fix` removed for human judgment.
 
 ### Defect fixer
@@ -465,7 +550,13 @@ run one blind adversarial checker, then publish.
 **Entry:** `ready-to-review` + `needs-defect-fix`, and only in repos opted into
 automatic defect repair. Manual launch remains possible. **Script:**
 [`workflows/defect-run.mjs`](../workflows/defect-run.mjs). **LLM calls:** normally
-two: `fixes-after-review`, then `final-review` as the skeptic.
+two (`fixes-after-review`, then `final-review` as the acceptance check), and up
+to four when a correction runs.
+
+Epic-run no longer publishes new defect evidence or writes `needs-defect-fix`:
+that hold now gets its one scoped correction inside the epic. This fixer remains
+so durable evidence older runs already published is still serviceable, and so a
+manual launch stays available.
 
 1. It verifies the exact route, queue state, unique same-repository PR, attempt
    rung, and authenticated evidence authored by the automation identity.
@@ -476,15 +567,20 @@ two: `fixes-after-review`, then `final-review` as the skeptic.
    account for each as repaired or declined without reclassification.
 4. The orchestrator validates exact coverage, runs `npm run verify`, and
    intent-adds new files so the complete delta reaches the checker.
-5. A blind adversarial checker tries to refute each repair, prove declines were
-   untouched, detect weakened gates, and reject unrelated behavior.
-6. A surviving repair is amended and force-pushed with a lease. The script
+5. The acceptance check tries to refute each repair, prove declines were
+   untouched, detect weakened gates, and reject unrelated behavior, returning
+   the complete blocker batch rather than the first refutation.
+6. A `correction-required` batch gets one scoped correction bound to the same
+   authenticated evidence, which may not reclassify a named defect or weaken a
+   gate, and the verify contract and narrow confirmation run again before any
+   push.
+7. A surviving repair is amended and force-pushed with a lease. The script
    confirms the PR advanced to that head over a bounded readback window and
    immediately publishes a landing audit record.
-7. A complete repair returns to `ready-to-merge`. A partial repair stays
+8. A complete repair returns to `ready-to-merge`. A partial repair stays
    `ready-to-review`, removes the defect queue, and publishes fresh evidence on
    the amended head containing only declined defects.
-8. If a verified repair was pushed but landing confirmation failed, a trusted
+9. If a verified repair was pushed but landing confirmation failed, a trusted
    audit record allows the next attempt to redo only the label landing; it does
    not edit already-repaired defects a second time.
 

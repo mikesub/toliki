@@ -1,10 +1,10 @@
 ---
 name: fix-ci
-description: "Autonomous red-check fixer: `/fix-ci #N` takes a `needs-ci-fix` issue (a finished epic whose PR came back red on its checks after the merge worker rebased it), reads the failing job logs, repairs the cause, re-verifies, adversarially checks the fix, amends the branch and lands the issue back on ready-to-merge. An issue number is required; on the host, dispatch launches it."
+description: "Autonomous red-check fixer: `/fix-ci #N` takes a `needs-ci-fix` issue (a finished epic whose PR came back red on its checks after the merge worker rebased it), reads the failing job logs, repairs the cause, re-verifies, runs an exhaustive acceptance check with at most one scoped correction, amends the branch and lands the issue back on ready-to-merge. An issue number is required; on the host, dispatch launches it."
 disable-model-invocation: true
 ---
 
-Launch the autonomous `ci-run` pipeline for a `needs-ci-fix` issue and report what it returned. It exits at `ready-to-merge` or at a blocker comment. It never merges: the merge worker rebases the PR onto current main and re-runs the real checks before anything lands, which is what makes returning it to the unattended queue safe — a fix that is still red cannot merge. It escalates instead of guessing: a failure no code change here can fix (infrastructure, a missing secret, a flake), a red `npm run verify` after the fix, or a refuted adversarial check leaves the issue `failed` with the reason.
+Launch the autonomous `ci-run` pipeline for a `needs-ci-fix` issue and report what it returned. It exits at `ready-to-merge` or at a blocker comment. It never merges: the merge worker rebases the PR onto current main and re-runs the real checks before anything lands, which is what makes returning it to the unattended queue safe — a fix that is still red cannot merge. It escalates instead of guessing: a failure no code change here can fix (infrastructure, a missing secret, a flake), or a red `npm run verify` after the fix, leaves the issue `failed` with the reason. Its acceptance check returns every blocker at once; when all of them are concrete implementation defects it takes exactly one scoped correction inside the same attempt, re-verifies and confirms it. Anything the correction cannot settle leaves the issue `failed` with `needs-ci-fix` removed, so no second fixer is launched at it.
 
 Request: $ARGUMENTS
 
@@ -19,9 +19,9 @@ Request: $ARGUMENTS
 
    Its last line is `RESULT <json>`. Exit codes: `0` fixed, `2` skipped, `3` blocked, `1` usage error or crash.
 3. **Report the outcome and exit.** From the `RESULT` JSON:
-   - **Fixed** (`readyToMerge: true`): report the PR URL, which checks had been red (`failedChecks`), the `cause` the fixer named, `checkConfidence`, and that the issue is back on `ready-to-merge` for the merge worker. Do not merge anything yourself.
+   - **Fixed** (`readyToMerge: true`): report the PR URL, which checks had been red (`failedChecks`), the `cause` the fixer named, `checkConfidence`, any `correctedBlockers`, and that the issue is back on `ready-to-merge` for the merge worker. Do not merge anything yourself.
    - **Skipped** (`skipped: true`): nothing ran. Relay the reason. `refusalFinal: true` means the refusal is already commented on the issue, which stays `failed` for a human.
-   - **Blocked** (`blocked: true`): report the phase and reason, already commented on the issue. `attempt: 1` means dispatch retries once on its own after the session is reaped; `attempt: 2` means the ladder is exhausted and a human decides. Do not retry from here.
+   - **Blocked** (`blocked: true`): report the phase and reason, already commented on the issue. `humanHeld: true` means the acceptance check or its one correction ended with a human: `needs-ci-fix` is removed, no rung was spent to achieve that, and nothing will relaunch. Otherwise `attempt: 1` means dispatch retries once on its own after the session is reaped; `attempt: 2` means the ladder is exhausted and a human decides. Do not retry from here.
 
 ## Recovery
 

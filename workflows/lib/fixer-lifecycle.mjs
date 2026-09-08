@@ -11,6 +11,22 @@
 // capture and local reproduction, and defect evidence binding, head readback,
 // evidence refresh and landing-only recovery. Once a partial push is observed,
 // state is monotonic: no exception can reach the ordinary requeueing blocker.
+//
+// The check stage is the bounded repair contract (see lib/repair-acceptance.mjs):
+// ONE exhaustive acceptance check over every original disposition and the
+// complete repair delta, then — only when every blocker it returns is a
+// concrete implementation defect — ONE scoped correction inside this same
+// invocation, the orchestrator's full verify contract again, and ONE narrow
+// read-only confirmation. There is no second correction batch.
+//
+// Semantic completion and operational relaunch are separate here, and the
+// difference is which terminal state the run comes to rest at. A semantic
+// human outcome — acceptance chose `human`, the correction declined or changed
+// nothing, the second verify was red, the confirmation refused — REMOVES this
+// fixer's queue label so dispatch cannot launch another complete fixer at work
+// that already had its one correction, and it spends no extra ladder rung to
+// achieve that. An operational failure — provider quota, a dead process,
+// transport — keeps the historical blocker path, its refund and its ladder.
 
 import { agent, phase, log, initRuntime, onPhase, onLog, takeAgentFailure, withAgentFailure } from './runtime.mjs'
 import { parseArgs, finish, UsageError, EXIT } from './cli.mjs'
@@ -25,8 +41,14 @@ import {
   terminalTimeout,
   verifyIssueEngine,
 } from './github.mjs'
-import { runVerify } from './repo.mjs'
+import { captureDiff, runVerify, worktreeTree } from './repo.mjs'
 import { finalizeFixerIssue, finalizeFixerQuotaHold } from './fixer-finalize.mjs'
+import {
+  ACCEPTANCE_CONFIDENCE,
+  validateAcceptance,
+  validateConfirmation,
+  validateCorrection,
+} from './repair-acceptance.mjs'
 import { recordQuotaHold } from '../quota-hold.mjs'
 
 const message = error => error?.message || String(error)
@@ -219,9 +241,48 @@ export async function runFixerLifecycle(spec) {
     }
   }
 
-  async function fail(failedPhase, originalReason) {
-    let reason = originalReason
+  // A semantic dead end inside the bounded repair contract. It differs from
+  // fail() in exactly one way that matters: the fixer's own queue label comes
+  // OFF and the human-held resting state is verified, so dispatch cannot send a
+  // second complete fixer at blockers a correction was already given its one
+  // chance at. No ladder rung is manufactured to obtain that — the queue removal
+  // is the mechanism, not a spent retry label.
+  async function humanHold(failedPhase, reason) {
+    state.blockerPosted = true
+    try {
+      await spec.cleanup?.(ctx, terminalTimeout)
+      const transition = spec.humanHold.transition(ctx)
+      const settled = await ctx.finalizeIssue({
+        issue: ctx.issue,
+        body: labelState => spec.humanHold.body(ctx, { phase: failedPhase, reason }, {
+          ...labelState,
+          resting: transition.add?.[0],
+        }),
+        ...transition,
+        budget: state.terminalWindow || undefined,
+      })
+      noteFinalization(settled, 'quarantine')
+    } catch (error) {
+      log(`blocked: could not report the human-held result on GitHub (${message(error)})`)
+    }
+    log(`Check: held for a human — ${reason}`)
+    return { ...blockedResult(failedPhase, reason), humanHeld: true }
+  }
+
+  // A narrow confirmation that died or came back malformed confirmed nothing,
+  // and relaunching a whole fixer would repeat a correction this repair already
+  // had its one chance at — so that is a semantic dead end. A provider quota is
+  // the exception: it keeps the refund, the hold and the durable recovery.
+  const quotaOrHuman = (failedPhase, reason) => {
     const failure = takeAgentFailure()
+    return failure?.kind === 'quota-exhausted'
+      ? fail(failedPhase, reason, failure)
+      : humanHold(failedPhase, reason)
+  }
+
+  async function fail(failedPhase, originalReason, suppliedFailure = undefined) {
+    let reason = originalReason
+    const failure = suppliedFailure === undefined ? takeAgentFailure() : suppliedFailure
     if (failure?.kind === 'quota-exhausted' && !state.partialPushed) {
       const held = await holdForQuota(failedPhase, failure, reason)
       if (!held.error) return held
@@ -244,6 +305,92 @@ export async function runFixerLifecycle(spec) {
     return blockedResult(failedPhase, reason)
   }
   ctx.fail = fail
+
+  // The one scoped correction, run inside this invocation on the repair that is
+  // still unpushed. Nothing about the run is rewound first: the worktree is not
+  // cleaned, the queue is not restored, the ladder rung is not consumed and no
+  // second whole fixer is launched. The correction sees the pinned requirement
+  // and cause evidence its adapter supplies, every original disposition, the
+  // complete cumulative repair delta, the exhaustive blocker batch and the
+  // successful verification evidence, and may address only those blockers.
+  //
+  // Every way this can end short of a clean narrow confirmation is a human-held
+  // result. That is the whole point of batching: automation gets ONE informed
+  // correction opportunity, never the hours-long review/fix loop that repeated
+  // whole repairs turned into.
+  async function runCorrection(ctx, prep, dispositions, accepted, cumulative, verified) {
+    const stop = async result => ({ stopped: true, result: await result })
+    const before = await worktreeTree()
+    if (before === null) {
+      return stop(fail('check', 'the pre-correction tree could not be captured — refusing to run a correction whose exact delta could not be shown.'))
+    }
+
+    log(`Check: ${accepted.blockers.length} concrete blocker(s) — running one scoped correction (${accepted.blockers.map(blocker => blocker.id).join(', ')}).`)
+    const raw = await agent(
+      spec.check.correction.prompt(ctx, prep, dispositions, {
+        blockers: accepted.blockers, verdicts: accepted.verdicts, cumulative, verified,
+      }),
+      spec.check.correction.agent)
+    // The correction is a writable repair step: a death here is operational and
+    // keeps the historical refund, ladder and blocker behavior.
+    if (!raw) return stop(fail('check', spec.check.correction.noResult))
+    const validated = validateCorrection(raw, accepted.blockers)
+    if (validated.problem) return stop(humanHold('check', `${validated.problem}.`))
+
+    // A correction that reported success and produced nothing has repaired
+    // nothing: the blockers stand exactly as the acceptance check found them.
+    const after = await worktreeTree()
+    if (after === null) {
+      return stop(fail('check', 'the corrected tree could not be captured — refusing to confirm a correction whose exact delta could not be shown.'))
+    }
+    if (after === before) {
+      return stop(humanHold('check', `the scoped correction reported ${validated.dispositions.length} corrected blocker(s) but changed no file — every blocker stands exactly as the acceptance check found it.`))
+    }
+    const correctionDelta = await captureDiff([before, after])
+    if (correctionDelta === null) {
+      return stop(fail('check', 'the exact correction delta could not be captured — refusing to confirm a correction on incomplete evidence.'))
+    }
+
+    // The full orchestrator verification contract again, never a lighter one: a
+    // correction edits code nothing has run since. Red ends the run for a human
+    // and starts neither another correction nor another autonomous whole fixer.
+    ctx.enter('verify', 'Verify')
+    const reverified = await runVerify(spec.verify.packages(prep))
+    spec.verify.log(ctx, prep, reverified)
+    if (!reverified.green) {
+      return stop(humanHold('verify', `npm run verify is red after the scoped correction (${reverified.detail}) — the correction is not pushed, and no further correction or fixer attempt runs.`))
+    }
+
+    ctx.enter('check', 'Check')
+    const cumulativeAfter = await spec.check.delta(ctx, prep)
+    if (cumulativeAfter === null) {
+      return stop(fail('check', 'the cumulative repair delta could not be recaptured after the correction.'))
+    }
+    // Read-only, blind to the correction's own account, and narrow: it proves
+    // the batch cleared and nothing else broke, and it never restarts a broad
+    // review of work that was already accepted.
+    const confirmRaw = await agent(
+      spec.check.confirm.prompt(ctx, prep, dispositions, {
+        blockers: accepted.blockers,
+        verdicts: accepted.verdicts,
+        cumulative: cumulativeAfter,
+        correction: correctionDelta,
+      }),
+      spec.check.confirm.agent)
+    if (!confirmRaw) return stop(quotaOrHuman('check', spec.check.confirm.noResult))
+    const confirmed = validateConfirmation(confirmRaw, accepted.blockers)
+    if (confirmed.problem) return stop(humanHold('check', `${confirmed.problem} — there is no second correction batch.`))
+
+    log(`Check: the scoped correction cleared every blocker and a narrow confirmation proved it at confidence ${confirmed.confirmation.confidence} (bar ${ACCEPTANCE_CONFIDENCE}).`)
+    return {
+      stopped: false,
+      blockers: accepted.blockers,
+      dispositions: validated.dispositions,
+      confirmation: confirmed.confirmation,
+      delta: correctionDelta,
+      verified: reverified,
+    }
+  }
 
   async function main() {
     try {
@@ -295,20 +442,48 @@ export async function runFixerLifecycle(spec) {
       if (!verified.green) return fail('verify', spec.verify.failure(prep, verified))
 
       let check = null
+      let corrected = null
+      let finalVerified = verified
       if (spec.check.needed(prep, dispositions)) {
         ctx.enter('check', 'Check')
-        await spec.check.before?.(ctx, prep, dispositions)
-        check = await agent(spec.check.prompt(ctx, prep, dispositions), spec.check.agent)
-        if (!check) return fail('check', spec.check.noResult)
-        if (!check.survives || check.confidence < 75) return fail('check', spec.check.refuted(check))
+        // Orchestrator-captured, never a command the checker is asked to run:
+        // a judging step has no shell under Claude and only a read-only sandbox
+        // under Codex, and evidence a step gathered for itself is evidence
+        // nothing proved it received. New and untracked files are included.
+        const cumulative = await spec.check.delta(ctx, prep)
+        if (cumulative === null) {
+          return fail('check', 'the complete repair delta could not be captured — refusing to check a repair on incomplete evidence.')
+        }
+
+        const raw = await agent(spec.check.prompt(ctx, prep, dispositions, { cumulative }), spec.check.agent)
+        if (!raw) return fail('check', spec.check.noResult)
+        const accepted = validateAcceptance(raw, dispositions.length)
+        // Malformed, incomplete, duplicate, extra or low-confidence evidence
+        // authorizes nothing — neither a correction nor an unattended merge —
+        // and it is a checker that misbehaved rather than a repair judged
+        // wanting, so it keeps the ordinary blocker path.
+        if (accepted.problem) return fail('check', `${accepted.problem} — refusing to act on acceptance evidence that decides nothing.`)
+        const floor = Math.min(...accepted.verdicts.map(verdict => verdict.confidence))
+        check = { ...accepted, confidence: floor, reasoning: accepted.verdicts.map(v => `item ${v.index}: ${v.reasoning}`).join(' ') }
         spec.check.log(ctx, prep, check)
+
+        if (accepted.outcome === 'human') {
+          return humanHold('check', `the acceptance check held ${accepted.blockers.length} blocker(s) for a human: ${accepted.blockers.map(b => `${b.id} (${b.kind}) ${b.location}: ${b.evidence}`).join('; ')}`)
+        }
+        if (accepted.outcome === 'correction-required') {
+          const applied = await runCorrection(ctx, prep, dispositions, accepted, cumulative, verified)
+          if (applied.stopped) return applied.result
+          corrected = applied
+          check = { ...check, corrected: applied.dispositions, confidence: Math.min(floor, applied.confirmation.confidence) }
+          finalVerified = applied.verified
+        }
       }
 
       ctx.enter('ship', 'Ship')
       const declined = dispositions.filter(item => item.action === 'declined')
       const partial = declined.length > 0
       const shipped = await spec.ship(ctx, {
-        prep, repairResult, dispositions, declined, verified, check, partial,
+        prep, repairResult, dispositions, declined, verified: finalVerified, check, corrected, partial,
       })
       if (!shipped.pushed) return fail('ship', spec.shipFailure(shipped))
       if (partial) state.partialPushed = true
@@ -317,7 +492,7 @@ export async function runFixerLifecycle(spec) {
       }
       if (!shipped.labelled) return fail('ship', spec.landingFailure(shipped))
       spec.shipLog(ctx, prep, declined, partial)
-      return spec.result(ctx, { prep, repairResult, dispositions, declined, verified, check, partial, shipped })
+      return spec.result(ctx, { prep, repairResult, dispositions, declined, verified: finalVerified, check, corrected, partial, shipped })
     } catch (error) {
       return fail(state.phase, message(error))
     }

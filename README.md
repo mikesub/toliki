@@ -27,14 +27,18 @@ only where a judgment is needed. Claude Code and Codex are both supported.
 3. **`workflows/epic-run.mjs`** (the session's pane) — claims the issue,
    makes a proportional architecture plan, then implements through either
    test-first red/green or a direct coding step. Both paths pass the project's
-   verify gate run by the orchestrator. One general reviewer always runs; the
-   plan may request one additional review for a concrete risk question.
+   verify gate run by the orchestrator. ONE broad reviewer runs, and it is the
+   only broad review of the change.
    Findings go to one fresh fixer, which repairs, disputes or defers each one;
    the orchestrator then re-runs the verify gate. One fresh read-only final
    review decides every finding against the final tree, the complete diff and
    the exact repair delta, and names any repair regression or unmet
-   requirement. There is no second repair round: anything it leaves unresolved,
-   including missing evidence, holds the PR for a human. Ship then
+   requirement — one exhaustive answer, not the first refutation it finds.
+   There is no second repair round. When everything it leaves open is a
+   concrete defect it positively showed, the run takes ONE scoped correction
+   over that whole batch, re-runs verify, and has a narrow read-only
+   confirmation prove it; anything else, and any correction that does not
+   confirm, holds the PR for a human. Ship then
    rebases the run's checkpoint chain onto current `main` and re-runs verify
    before squashing, so a base that moved during the run is met here rather
    than by the merge worker; a conflict or a failed fetch ships on the run's
@@ -64,11 +68,18 @@ only where a judgment is needed. Claude Code and Codex are both supported.
    for **`ci-run.mjs`**, which reads the failing job logs, repairs the cause
    under its own adversarial check, and puts the PR back in the merge queue —
    where its checks are re-run before anything lands.
-   A PR held only on concrete ship-gate defects is marked for
-   **`defect-run.mjs`**, a separate two-attempt fixer. Epic-run first persists
-   and reads back one automation-authored repair envelope bound to the PR head;
-   the fixer accepts only that envelope, verifies and adversarially checks its
-   exact delta, then returns a complete repair to that same merge queue. Any of
+   **`defect-run.mjs`** is the third fixer, working from one
+   automation-authored repair envelope bound to the PR head. Epic-run no longer
+   creates that envelope — a concrete-defect hold takes its one scoped
+   correction inside the run instead — so this fixer now services evidence
+   older runs published and explicit manual launches. All three fixers share
+   one bounded repair contract: their checker returns an exact verdict per item
+   and the COMPLETE blocker batch rather than one refutation, and when every
+   blocker is a concrete implementation defect the run takes ONE scoped
+   correction in the same invocation, re-verifies, and has a narrow
+   confirmation prove it. A semantic dead end removes that fixer's queue and
+   rests with a human without spending a retry rung; only operational failures
+   relaunch a whole fixer. Any of
    the three fixers that repairs some named items and declines others still
    verifies and checks the exact delta, then pushes the repairs and holds the PR
    at `ready-to-review` with its fixer queue removed. A partial defect repair
