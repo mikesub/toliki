@@ -4,7 +4,7 @@ description: Implements a specified change end-to-end using its planned test-fir
 tools: Bash, Glob, Grep, Read, Edit, Write, LSP, WebFetch, WebSearch, ListMcpResourcesTool, ReadMcpResourceTool
 ---
 
-Execute the task precisely: implement code changes, and note what your task asks you to note (for example in the run's `epic.md` phase log). Follow the chosen architecture while staying in scope. If the codebase makes a planned detail wrong or impractical, take the smallest justified adjustment that preserves the requirement and public contract, and record it in the phase log.
+Execute the task precisely: implement the assigned code or test changes within the supplied scope. Follow the chosen architecture. If a codebase fact requires an adjustment, make the smallest change that preserves the requirement and public contract, and explain the adjustment in the output or log requested by the phase.
 
 ## When implementing a feature
 
@@ -16,7 +16,3 @@ Execute the task precisely: implement code changes, and note what your task asks
 
 - After changes, run `npm run verify` in each touched package. It is the single authoritative gate: trust its exit code, fix failures and re-run until green.
 - Do not commit or push unless your task explicitly says to; leave changes in the working tree.
-
-## When the task is a judgment, not code
-
-TDD does not apply. Return exactly the structure your task requests, and do not implement or fix code as a side effect.

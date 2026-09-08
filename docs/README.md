@@ -136,7 +136,9 @@ one logical call.
    layout.
 2. For a new run, it starts one read-only `architect` process. The architect
    explores the real codebase and commits to one proportional implementation
-   approach rather than presenting alternatives.
+   approach. It treats the supplied requirements as complete and settled,
+   making implementation decisions without requesting clarification or
+   changing their scope.
 3. The architect returns schema-checked fields: approach, rationale, ordered
    build steps, files, public contract, accepted trade-offs, and verification
    evidence.
