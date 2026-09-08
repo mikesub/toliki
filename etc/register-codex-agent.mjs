@@ -16,6 +16,8 @@ import { dirname, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 
 const [configArg, charterArg] = process.argv.slice(2);
+const testDeadline = Number(process.env.TOLIKI_TEST_CODEX_REGISTRATION_TIMEOUT_MS);
+const deadlineMs = Number.isFinite(testDeadline) && testDeadline > 0 ? testDeadline : 15_000;
 let child;
 let deadline;
 let lines;
@@ -64,9 +66,9 @@ try {
     child.stdin.write(`${JSON.stringify({ id, method, params })}\n`);
   });
   deadline = setTimeout(() => {
-    fail(new Error('Codex config registration timed out after 15 seconds'));
+    fail(new Error(`Codex config registration timed out after ${deadlineMs / 1000} seconds`));
     child.kill('SIGKILL');
-  }, 15_000);
+  }, deadlineMs);
 
   await request('initialize', { clientInfo: { name: 'toliki-setup', version: '1' } });
   child.stdin.write(`${JSON.stringify({ method: 'initialized' })}\n`);

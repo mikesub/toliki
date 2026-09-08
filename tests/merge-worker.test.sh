@@ -136,6 +136,10 @@ MAX_PARALLEL_EPICS=3
 CONF
 
 WORKER="$HARNESS/bin/merge-worker.sh"
+STANDARD_EPIC_CONTENT=$'one\ntwo\nthree\nepic'
+STANDARD_HEAD=""
+STANDARD_MAIN=""
+STANDARD_REBASED=""
 
 # Rebuild origin to a known state: main at its first commit, no epic branches.
 reset_origin() {
@@ -148,6 +152,13 @@ reset_origin() {
 }
 # An epic branch with one commit, as ship leaves it.
 seed_epic() { # branch file content
+  if [[ -n "$STANDARD_HEAD" && "$1" == epic/42-change && "$2" == app.txt &&
+        "$3" == "$STANDARD_EPIC_CONTENT" &&
+        "$(git -C "$ORIGIN" rev-parse refs/heads/main)" == "$MAIN0" ]]; then
+    git -C "$ORIGIN" update-ref "refs/heads/$1" "$STANDARD_HEAD"
+    printf '%s\n' "$STANDARD_HEAD"
+    return
+  fi
   local dir="$TMP/seeder"
   rm -rf "$dir"; git clone -q "$ORIGIN" "$dir"
   git -C "$dir" switch -q -c "$1" origin/main
@@ -175,6 +186,11 @@ blank_epic_message() { # branch
 }
 # Move main so the epic branch must actually rebase.
 advance_main() { # file content
+  if [[ -n "$STANDARD_MAIN" && "$1" == other.txt && "$2" == 'main moved' &&
+        "$(git -C "$ORIGIN" rev-parse refs/heads/main)" == "$MAIN0" ]]; then
+    git -C "$ORIGIN" update-ref refs/heads/main "$STANDARD_MAIN"
+    return
+  fi
   local dir="$TMP/mover"
   rm -rf "$dir"; git clone -q "$ORIGIN" "$dir"
   printf '%s\n' "$2" > "$dir/$1"
@@ -188,6 +204,7 @@ run_worker() {
   GH_DIR="$TMP/gh.$RANDOM$RANDOM"
   GH_LOG="$GH_DIR/log"
   mkdir -p "$GH_DIR"
+  printf '0\n' > "$GH_DIR/ci-clock"
   : > "$GH_LOG"
   # The queue is one issue unless a scenario says otherwise.
   [[ -f "$GH_DIR/issue-list" ]] || printf '[{"number":42}]\n' > "$GH_DIR/issue-list"
@@ -198,6 +215,7 @@ run_worker() {
     MERGE_WORKTREE_ROOT="$TMP/wt" \
     MERGE_CI_TIMEOUT="${MERGE_CI_TIMEOUT:-2}" MERGE_CI_POLL="${MERGE_CI_POLL:-1}" \
     MERGE_CI_REGISTRATION_GRACE="${MERGE_CI_REGISTRATION_GRACE:-1}" \
+    TOLIKI_TEST_MERGE_CI_CLOCK_FILE="$GH_DIR/ci-clock" \
     GH_ORIGIN="$ORIGIN" GH_FAKE_SQUASH="${GH_FAKE_SQUASH:-}" \
     GH_REPOSITORY_DEFAULT_SUBJECT="${GH_REPOSITORY_DEFAULT_SUBJECT:-}" \
     GH_REPOSITORY_DEFAULT_BODY="${GH_REPOSITORY_DEFAULT_BODY:-}" \
@@ -214,6 +232,7 @@ gh_set() { printf '%s' "$2" > "$GH_DIR_PENDING/$1"; }
 prep() { GH_DIR_PENDING="$TMP/pending.$RANDOM$RANDOM"; mkdir -p "$GH_DIR_PENDING"; }
 run_prepared() {
   GH_DIR="$GH_DIR_PENDING"; GH_LOG="$GH_DIR/log"
+  printf '0\n' > "$GH_DIR/ci-clock"
   [[ -f "$GH_DIR/issue-list" ]] || printf '[{"number":42}]\n' > "$GH_DIR/issue-list"
   : > "$GH_LOG"
   RUN_RC=0
@@ -223,6 +242,7 @@ run_prepared() {
     MERGE_WORKTREE_ROOT="$TMP/wt" \
     MERGE_CI_TIMEOUT="${MERGE_CI_TIMEOUT:-2}" MERGE_CI_POLL="${MERGE_CI_POLL:-1}" \
     MERGE_CI_REGISTRATION_GRACE="${MERGE_CI_REGISTRATION_GRACE:-1}" \
+    TOLIKI_TEST_MERGE_CI_CLOCK_FILE="$GH_DIR/ci-clock" \
     GH_ORIGIN="$ORIGIN" GH_FAKE_SQUASH="${GH_FAKE_SQUASH:-}" \
     GH_REPOSITORY_DEFAULT_SUBJECT="${GH_REPOSITORY_DEFAULT_SUBJECT:-}" \
     GH_REPOSITORY_DEFAULT_BODY="${GH_REPOSITORY_DEFAULT_BODY:-}" \
@@ -243,12 +263,29 @@ green_checks() { # sha
 scenario() { printf '\n%s\n' "$1"; reset_origin; prep; }
 # The sha the worker will rebase to, computed the way the worker does.
 rebased_sha() { # branch
+  if [[ -n "$STANDARD_REBASED" && "$1" == epic/42-change &&
+        "$(git -C "$ORIGIN" rev-parse refs/heads/main)" == "$STANDARD_MAIN" &&
+        "$(git -C "$ORIGIN" rev-parse "refs/heads/$1")" == "$STANDARD_HEAD" ]]; then
+    printf '%s\n' "$STANDARD_REBASED"
+    return
+  fi
   local dir="$TMP/rebaser"
   rm -rf "$dir"; git clone -q "$ORIGIN" "$dir"
   git -C "$dir" checkout -q --detach "refs/remotes/origin/$1"
   git -C "$dir" rebase origin/main >/dev/null 2>&1 || { echo CONFLICT; return; }
   git -C "$dir" rev-parse HEAD
 }
+
+# Most state-machine scenarios begin from these exact commits. Construct the
+# immutable objects once, then reset refs to them; fixture setup is not the
+# behavior under test, while the worker still performs its own real rebase and
+# push in every scenario that reaches those operations.
+reset_origin
+STANDARD_HEAD="$(seed_epic epic/42-change app.txt "$STANDARD_EPIC_CONTENT")"
+advance_main other.txt 'main moved'
+STANDARD_MAIN="$(git -C "$ORIGIN" rev-parse refs/heads/main)"
+STANDARD_REBASED="$(rebased_sha epic/42-change)"
+reset_origin
 
 # ───────────────────────── scenarios ─────────────────────────
 

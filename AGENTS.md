@@ -592,7 +592,8 @@ merely because the code is ready.
 ## Tests
 
 All thirteen suites are hermetic and need no network or credentials. The test
-runner suppresses passing assertion chatter and prints one line per green suite:
+runner runs up to four suites together, suppresses passing assertion chatter
+and prints one line per green suite. Set `TEST_JOBS=1` for a serial run:
 
 ```bash
 ./test.sh

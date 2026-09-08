@@ -7,6 +7,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+REAL_NODE="$(command -v node)"
+export REAL_NODE
 unset EPIC_ENGINE   # a host default must not leak in; the scenarios that need it export their own
 
 # The host default is read from the INSTALLED cron file, which on a real box is
@@ -110,6 +112,20 @@ fi
 printf '%s\n' "$*" > "$SSH_LOG"
 STUB
 
+# Most dispatch scenarios have no provider-hold file. The real CLI's ENOENT
+# contract is covered once below; after that, returning its documented status
+# directly avoids starting Node dozens of times for the same fixture. Existing,
+# expired and malformed records still execute the real module.
+cat > "$TMP/bin/node" <<'STUB'
+#!/usr/bin/env bash
+if [[ "${1:-}" == */workflows/quota-hold.mjs && "${2:-}" == status &&
+      ! -e "${EPIC_PROVIDER_HOLD_FILE:-}" &&
+      "${TOLIKI_TEST_REAL_QUOTA_STATUS:-}" != "1" ]]; then
+  exit 1
+fi
+exec "$REAL_NODE" "$@"
+STUB
+
 cat > "$TMP/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -183,7 +199,7 @@ case "${1:-} ${2:-}" in
     ;;
 esac
 STUB
-chmod +x "$TMP/bin/flock" "$TMP/bin/tmux" "$TMP/bin/ssh" "$TMP/bin/gh"
+chmod +x "$TMP/bin/flock" "$TMP/bin/tmux" "$TMP/bin/ssh" "$TMP/bin/node" "$TMP/bin/gh"
 
 DISPATCH="$HARNESS/bin/dispatch.sh"
 RUN_OUT=""
@@ -213,6 +229,7 @@ run_dispatch() {
     FLOCK_BUSY="${FLOCK_BUSY:-}" STUB_SESSION_NAME="${STUB_SESSION_NAME:-}" \
     CAPACITY_RC="${CAPACITY_RC:-}" LAUNCH_RC="${LAUNCH_RC:-}" \
     EPIC_PROVIDER_HOLD_FILE="$TMP/provider-hold.json" \
+    TOLIKI_TEST_REAL_QUOTA_STATUS="${TOLIKI_TEST_REAL_QUOTA_STATUS:-}" \
     CLOSED_ISSUE="${CLOSED_ISSUE:-}" \
     HOST_TIMEZONE="Pacific/Honolulu" TZ="Pacific/Honolulu" \
     bash "$DISPATCH" "$@" >"$TMP/dispatch.out" 2>"$TMP/dispatch.err"
@@ -480,7 +497,7 @@ printf '\ndispatch: unlabeled ready work defaults to Claude\n'
 reset_state
 READY_QUEUE=1
 printf 'ready' > "$TMP/labels/1"
-run_dispatch
+TOLIKI_TEST_REAL_QUOTA_STATUS=1 run_dispatch
 assert_rc "tick exits 0" 0 "$RUN_RC"
 assert_contains "Claude is passed to launch" "$(cat "$TMP/launch.log")" '--epic 1 --repo testrepo --engine claude'
 assert_matches "human dispatch logs use the configured zone" "$RUN_OUT" '[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} (CET|CEST) \[dispatch\]'

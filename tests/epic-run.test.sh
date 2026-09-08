@@ -15,14 +15,102 @@ set -uo pipefail
 # label state are what let it assert what the run actually did.
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# This file is intentionally the public suite entry point and its own shard
+# worker. Each worker builds an independent bare origin and stub state, so the
+# process-heavy end-to-end scenarios can run concurrently without sharing any
+# mutable Git or GitHub fixture state. Set EPIC_TEST_GROUP to debug one shard;
+# set EPIC_TEST_JOBS=1 to retain the former serial execution shape.
+if [[ -z "${EPIC_TEST_GROUP:-}" ]]; then
+  EPIC_TEST_GROUPS=(contracts epic-a epic-b epic-c final-review read-only ship fix ci defect-a defect-b identity tail)
+  EPIC_TEST_JOBS="${EPIC_TEST_JOBS:-4}"
+  if [[ ! "$EPIC_TEST_JOBS" =~ ^[1-9][0-9]*$ ]]; then
+    printf 'EPIC_TEST_JOBS must be a positive integer, got %s\n' "$EPIC_TEST_JOBS" >&2
+    exit 2
+  fi
+
+  SHARD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/toliki-epic-test.XXXXXX")"
+  SHARD_PIDS=()
+  cleanup_shards() {
+    local pid
+    trap - EXIT
+    for pid in ${SHARD_PIDS[*]-}; do kill "$pid" 2>/dev/null || true; done
+    for pid in ${SHARD_PIDS[*]-}; do wait "$pid" 2>/dev/null || true; done
+    rm -rf "$SHARD_DIR"
+  }
+  trap cleanup_shards EXIT
+  trap 'exit 130' INT TERM
+
+  SHARD_FIFO="$SHARD_DIR/completed"
+  mkfifo "$SHARD_FIFO"
+  exec 8<>"$SHARD_FIFO"
+  rm "$SHARD_FIFO"
+
+  start_shard() {
+    local index="$1" group="${EPIC_TEST_GROUPS[$1]}"
+    (
+      local shard_rc=0
+      EPIC_TEST_GROUP="$group" bash "${BASH_SOURCE[0]}" >"$SHARD_DIR/$index.output" 2>&1 || shard_rc=$?
+      printf '%s\n' "$shard_rc" >"$SHARD_DIR/$index.status"
+      printf '%s\n' "$index" >&8
+    ) &
+    SHARD_PIDS[$index]=$!
+  }
+
+  shard_next=0
+  shard_active=0
+  shard_total=${#EPIC_TEST_GROUPS[@]}
+  shard_failure=0
+  while (( shard_next < shard_total && shard_active < EPIC_TEST_JOBS )); do
+    start_shard "$shard_next"
+    shard_next=$((shard_next + 1))
+    shard_active=$((shard_active + 1))
+  done
+  while (( shard_active > 0 )); do
+    IFS= read -r shard_finished <&8
+    wait "${SHARD_PIDS[$shard_finished]}" 2>/dev/null || true
+    unset 'SHARD_PIDS[$shard_finished]'
+    shard_active=$((shard_active - 1))
+    shard_group="${EPIC_TEST_GROUPS[$shard_finished]}"
+    shard_rc="$(cat "$SHARD_DIR/$shard_finished.status")"
+    if [[ "$shard_rc" == 0 ]]; then
+      printf 'epic-run [%s] OK\n' "$shard_group"
+    else
+      printf 'epic-run [%s] FAILED\n' "$shard_group"
+      sed '/^[[:space:]]*ok[[:space:]]/d' "$SHARD_DIR/$shard_finished.output"
+      (( shard_failure == 0 )) && shard_failure="$shard_rc"
+    fi
+    if (( shard_next < shard_total )); then
+      start_shard "$shard_next"
+      shard_next=$((shard_next + 1))
+      shard_active=$((shard_active + 1))
+    fi
+  done
+  exit "$shard_failure"
+fi
+
+case "$EPIC_TEST_GROUP" in
+  contracts|epic-a|epic-b|epic-c|final-review|read-only|ship|fix|ci|defect-a|defect-b|identity|tail) ;;
+  *) printf 'unknown EPIC_TEST_GROUP: %s\n' "$EPIC_TEST_GROUP" >&2; exit 2 ;;
+esac
+
 EPIC_RUN="$ROOT/workflows/epic-run.mjs"
 FIX_RUN="$ROOT/workflows/fix-run.mjs"
 CI_RUN="$ROOT/workflows/ci-run.mjs"
 DEFECT_RUN="$ROOT/workflows/defect-run.mjs"
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
 SUITE_STDERR="$TMP/suite.stderr"
 exec 3>&2 2>"$SUITE_STDERR"
+cleanup_suite() {
+  local rc=$?
+  trap - EXIT
+  if (( rc != 0 )) && [[ -s "$SUITE_STDERR" ]]; then
+    cat "$SUITE_STDERR" >&3
+  fi
+  rm -rf "$TMP"
+  exit "$rc"
+}
+trap cleanup_suite EXIT
 
 PASS=0
 FAIL=0
@@ -98,7 +186,7 @@ reset_origin() {
 # substitution, so an increment would never leave the subshell.
 fresh_clone() { # -> path; detached at origin/main, like launch.sh's worktree
   local dir; dir="$(mktemp -d "$TMP/run-XXXXXXXX")"
-  git clone -q "$ORIGIN" "$dir"
+  git clone -q --shared "$ORIGIN" "$dir"
   git -C "$dir" checkout -q --detach main
   printf '%s' "$dir"
 }
@@ -113,7 +201,7 @@ seed_branch() {
   SEED_N=$((SEED_N + 1))
   local dir="$TMP/seeder-$SEED_N"
   rm -rf "$dir"
-  git clone -q "$ORIGIN" "$dir"
+  git clone -q --shared "$ORIGIN" "$dir"
   git -C "$dir" switch -q -C "$branch" "origin/$base"
   (cd "$dir" && bash -c "$script")
   git -C "$dir" push -q origin "HEAD:refs/heads/$branch"
@@ -124,7 +212,7 @@ seed_branch() {
 # for fixture_sh, so it runs inside a model spawn — after the run's last
 # checkpoint and before ship — with nothing but $STUB_ORIGIN to reach.
 land_on_main() { # path content -> snippet
-  printf 'd="$(mktemp -d)" && git clone -q "$STUB_ORIGIN" "$d" && printf "%%s\\n" %s > "$d/%s" && git -C "$d" add -A && git -C "$d" commit -qm "another PR landed" && git -C "$d" push -q origin HEAD:main && rm -rf "$d"' "$(printf '%q' "$2")" "$1"
+  printf 'd="$(mktemp -d)" && git clone -q --shared "$STUB_ORIGIN" "$d" && printf "%%s\\n" %s > "$d/%s" && git -C "$d" add -A && git -C "$d" commit -qm "another PR landed" && git -C "$d" push -q origin HEAD:main && rm -rf "$d"' "$(printf '%q' "$2")" "$1"
 }
 ancestor_of() { # ref descendant -> yes|no
   git -C "$ORIGIN" merge-base --is-ancestor "$1" "$2" >/dev/null 2>&1 && printf 'yes' || printf 'no'
@@ -140,7 +228,7 @@ scenario() { printf '\n%s\n' "$1"; reset_origin; }
 # side-effect script when the fixture set carries one (<key>.sh — the files a
 # real step would have written to the worktree), and logs its own argv so the
 # tiering assertions have something to read.
-mkdir -p "$TMP/bin"
+mkdir -p "$TMP/bin" "$TMP/git-bin"
 # The real git, resolved BEFORE anything shadows it on PATH: the git wrapper
 # below execs this, and the suite's own seeding runs unshadowed either way.
 REAL_GIT="$(command -v git)"
@@ -513,9 +601,9 @@ chmod +x "$TMP/bin/gh"
 # opened the window. `ready-to-merge` in the label file IS that window: the gh
 # stub writes it the moment GitHub applies the swap, and the blocker path's
 # demotion strips it again, so an armed call stalls on the fallback path and
-# nowhere else. Unarmed — every other scenario in this suite — the wrapper is
-# a plain exec and changes nothing.
-cat > "$TMP/bin/git" <<'STUB'
+# nowhere else. The wrapper is prepended to PATH only for scenarios that arm
+# one of those knobs; ordinary runs reach Git directly.
+cat > "$TMP/git-bin/git" <<'STUB'
 #!/usr/bin/env bash
 if [[ "${GIT_REJECT_FIXER_PUSH:-}" == "1" && "${1:-}" == push && " $* " == *" --force-with-lease="* ]]; then
   printf '%s\n' 'rejected: stale info' >&2
@@ -527,7 +615,7 @@ if [[ -n "${GIT_SLOW_AFTER_LANDING:-}" && "${1:-}" == "${GIT_SLOW_AFTER_LANDING%
 fi
 exec "$STUB_REAL_GIT" "$@"
 STUB
-chmod +x "$TMP/bin/git"
+chmod +x "$TMP/git-bin/git"
 
 # npm stub: `ci` makes node_modules appear, `run verify` passes unless the
 # fixture set carries verify.rc. Logs argv.
@@ -735,6 +823,7 @@ confirm_json() { # blocker-id [cleared] [confidence]
   printf '{"cleared":%s,"confidence":%s,"reasoning":"the required outcome is observable in the correction delta","blockerVerdicts":[{"id":"%s","verdict":"cleared","reasoning":"observed in the correction delta"}],"regressions":[]}' "${2:-true}" "${3:-93}" "$1"
 }
 
+if [[ "$EPIC_TEST_GROUP" == contracts ]]; then
 # ───────────────────────── provider quota hold: pure/shared contracts ─────────────────────────
 # Keep the clock injected through the public functions: none of these waits for
 # a wall-clock boundary, and the IANA case proves this is not a UTC-only parser.
@@ -915,6 +1004,8 @@ NODE
 FORMAT_OUT="$(RUNTIME_MODULE="$ROOT/workflows/lib/runtime.mjs" node "$TMP/runtime-format-probe.mjs")"
 assert_contains "an already-consumed ordinary failure can still format a blocker" "$FORMAT_OUT" "review:2 failed after 2 attempts"
 
+fi
+
 # ───────────────────────── the happy-path fixture set ─────────────────────────
 BASE="$TMP/fixtures-base"
 mkdir -p "$BASE"
@@ -936,6 +1027,43 @@ fixture_sh "$BASE" correction 'printf "export const createWidget = () => ({ item
 fixture "$BASE" narrowconfirm '{"cleared":true,"confidence":93,"reasoning":"The guard is present in the correction delta and nothing else moved.","blockerVerdicts":[{"id":"blocker-1","verdict":"cleared","reasoning":"the guard is observable in the correction delta"}],"regressions":[]}'
 fixture "$BASE" ship '{"title":"Add widget","body":"ISSUE_NARRATIVE_SENTINEL: Implements widget creation for callers.\n\nDESIGN_NARRATIVE_SENTINEL: Keeps a thin module because that fits the existing shape.\n\nREVIEW_NARRATIVE_SENTINEL: One independently reviewed finding was fixed.","commitBody":"COMMIT_RATIONALE_SENTINEL: Add the widget so callers share one construction path.\n\nCOMMIT_DESIGN_SENTINEL: Keep the module thin and avoid caching because the current shape needs neither state nor invalidation.","deferred":[]}'
 
+make_deadlens_fixture() {
+  DEADLENS="$TMP/fixtures-deadlens"
+  cp -R "$BASE" "$DEADLENS"
+  printf '1' > "$DEADLENS/review-general.0.rc"
+  printf '1' > "$DEADLENS/review-general.1.rc"
+}
+
+make_held_fixture() {
+  HELD="$TMP/fixtures-held"
+  cp -R "$BASE" "$HELD"
+  fixture "$HELD" triage '{"status":"Left one for a human.","assessments":[{"index":1,"action":"deferred","reason":"The fix needs a product decision."}]}'
+  fixture_sh "$HELD" triage 'true'
+  fixture "$HELD" finalreview '{"verdicts":[{"index":1,"verdict":"unresolved","confidence":94,"defect":true,"reasoning":"The empty-list access is still reachable and throws; no guard was added."}],"regressions":[],"unmetRequirements":[]}'
+  fixture "$HELD" correction '{"summary":"The empty-list policy is a product decision.","dispositions":[{"id":"blocker-1","action":"declined","reason":"choosing throw-vs-empty is a product decision, not an implementation defect"}]}'
+  rm -f "$HELD/correction.sh"
+  fixture "$HELD" ship '{"title":"Add widget","body":"HELD_ISSUE_NARRATIVE_SENTINEL: Implements the guarded widget path, while one empty-list decision remains.\n\nHELD_DESIGN_NARRATIVE_SENTINEL: Preserves the thin-module boundary.","commitBody":"HELD_COMMIT_RATIONALE_SENTINEL: Keep the verified guarded path as one candidate while a human decides the remaining empty-list behavior.","deferred":[{"blockerId":"blocker-1","title":"Null deref on empty list","why":"The fix needs a product decision.","kind":"defect","file":false}]}'
+}
+
+make_rejected_fixture() {
+  REJECTED="$TMP/fixtures-rejected"
+  cp -R "$BASE" "$REJECTED"
+  fixture "$REJECTED" triage '{"status":"The report is a false positive.","assessments":[{"index":1,"action":"disputed","reason":"The caller normalizes missing lists before the access."}]}'
+  fixture_sh "$REJECTED" triage 'true'
+  fixture "$REJECTED" finalreview '{"verdicts":[{"index":1,"verdict":"disproved","confidence":91,"defect":false,"reasoning":"The only caller initializes items before invoking createWidget; the reported path cannot occur."}],"regressions":[],"unmetRequirements":[]}'
+}
+
+make_defer_fixture() {
+  DEFER="$TMP/fixtures-defer"
+  cp -R "$BASE" "$DEFER"
+  fixture "$DEFER" ship '{"title":"Add widget","body":"Adds a widget.","commitBody":"Use the thin widget module so callers share one construction path.","legalMarker":"LEGAL-REVIEW: required","deferred":[
+    {"blockerId":"new","title":"Widget crashes on empty list","why":"Needs a product decision.","kind":"defect","file":true,"issueTitle":"Widget crashes on empty list","issueBody":"Still on main after the merge."},
+    {"blockerId":"new","title":"Second defect","why":"Same.","kind":"defect","file":true},
+    {"blockerId":"new","title":"Third defect","why":"Same.","kind":"defect","file":true},
+    {"blockerId":"new","title":"Fourth defect","why":"Same.","kind":"defect","file":true},
+    {"blockerId":"new","title":"Refactor the helpers","why":"Nice to have.","kind":"other","file":true}]}'
+}
+
 # ───────────────────────── the runner ─────────────────────────
 RUN_OUT=""
 RUN_RC=0
@@ -944,6 +1072,14 @@ WT=""
 PIPE_N=0
 run_pipeline() { # script fixtures-dir args...   (scenario knobs via GH_* env)
   local script="$1" fixtures="$2"; shift 2
+  local runtime_path="$TMP/bin:$PATH"
+  # Production's 60-second default is asserted directly below. End-to-end
+  # fixtures use a short ceiling so an intentionally stuck status child proves
+  # the same ordering contract without turning one failure into minutes.
+  local terminal_report_ms="${EPIC_TERMINAL_REPORT_MS:-2000}"
+  if [[ -n "${GIT_REJECT_FIXER_PUSH:-}" || -n "${GIT_SLOW_AFTER_LANDING:-}" ]]; then
+    runtime_path="$TMP/git-bin:$runtime_path"
+  fi
   PIPE_N=$((PIPE_N + 1))
   local state="$TMP/state.$PIPE_N"
   RUN_LOG="$TMP/argv.$PIPE_N"
@@ -965,7 +1101,7 @@ run_pipeline() { # script fixtures-dir args...   (scenario knobs via GH_* env)
   RUN_RC=0
   RUN_OUT="$(
     cd "$WT" && \
-    PATH="$TMP/bin:$PATH" \
+    PATH="$runtime_path" \
     CLAUDE_BIN="$TMP/bin/claude" \
     CODEX_BIN="$TMP/bin/codex" \
     STUB_CLAUDE="$TMP/bin/claude" \
@@ -997,7 +1133,7 @@ run_pipeline() { # script fixtures-dir args...   (scenario knobs via GH_* env)
     GH_LATE_LABEL="${GH_LATE_LABEL:-}" \
     GH_SLOW_COMMENT="${GH_SLOW_COMMENT:-}" \
     GH_SLOW_LABEL="${GH_SLOW_LABEL:-}" \
-    EPIC_TERMINAL_REPORT_MS="${EPIC_TERMINAL_REPORT_MS:-}" \
+    EPIC_TERMINAL_REPORT_MS="$terminal_report_ms" \
     GH_LABEL_READ_FAIL_AT="${GH_LABEL_READ_FAIL_AT:-}" \
     GH_BODY_FILE_COMMENT_FAIL="${GH_BODY_FILE_COMMENT_FAIL:-}" \
     GH_DELIVERY_COMMENT_FAIL="${GH_DELIVERY_COMMENT_FAIL:-}" \
@@ -1114,6 +1250,7 @@ assert_merge_label_agrees() {
   assert_eq "invariant: ready-to-merge is on the issue iff RESULT claims the merge queue" "$labelled" "$claimed"
 }
 
+if [[ "$EPIC_TEST_GROUP" == contracts ]]; then
 # ───────────────────────── blocker identity registry ─────────────────────────
 # Direct coverage for the run-local registry: the end-to-end cases below prove
 # the same IDs survive model handoffs and transport, while this matrix pins the
@@ -1535,7 +1672,10 @@ assert_eq "a follow-up URL outside the evidence PR repository is never linked" t
 assert_eq "an invalid PR URL is never placed in a Markdown destination" true "$(jq -r .invalidPrUrlRejected <<<"$EVIDENCE_CONTRACT")"
 assert_eq "escaping the summary does not alter the authoritative evidence envelope" true "$(jq -r .hostileEnvelopeRoundTripsExactly <<<"$EVIDENCE_CONTRACT")"
 
+fi
+
 # ───────────────────────── epic-run ─────────────────────────
+if [[ "$EPIC_TEST_GROUP" == epic-a ]]; then
 scenario 'epic-run: happy path ships and queues for merge'
 run_pipeline "$EPIC_RUN" "$BASE" --issue 42
 assert_eq "successful default claim snapshots engine:claude" "engine:claude," "$(gh_engine_labels)"
@@ -1910,7 +2050,7 @@ git -C "$BROKEN_WT" remote set-url origin "$TMP/no-such-origin.git"
 fresh_clone() { printf '%s' "$BROKEN_WT"; }
 run_pipeline "$EPIC_RUN" "$BASE" --issue 42
 unset -f fresh_clone
-fresh_clone() { local dir; dir="$(mktemp -d "$TMP/run-XXXXXXXX")"; git clone -q "$ORIGIN" "$dir"; git -C "$dir" checkout -q --detach main; printf '%s' "$dir"; }
+fresh_clone() { local dir; dir="$(mktemp -d "$TMP/run-XXXXXXXX")"; git clone -q --shared "$ORIGIN" "$dir"; git -C "$dir" checkout -q --detach main; printf '%s' "$dir"; }
 assert_rc "exits 2 (skipped)" 2 "$RUN_RC"
 assert_contains "the reason names the unconfirmed base" "$RUN_OUT" 'refusing to build against an unconfirmed base'
 assert_eq "nothing was designed" 0 "$(calls design)"
@@ -1985,6 +2125,9 @@ assert_contains "the run ships" "$RUN_OUT" '"readyToMerge":true'
 assert_eq "as one commit above main" 1 "$(origin_count epic/42-add-widget)"
 assert_contains "the PR body uses the recovered approach" "$(cat "$STATE_DIR/ship.0.prompt")" "Thin widget module"
 
+fi
+
+if [[ "$EPIC_TEST_GROUP" == epic-b ]]; then
 scenario 'resume: cached structured plan re-renders markdown and preserves focused review'
 seed_branch epic/42-add-widget main 'printf "test(\"widget\", () => {})\n" > frontend/src/widget.test.ts && printf "export const createWidget = () => ({})\n" > frontend/src/widget.ts && git add -A && git commit -qm "wip(epic 42-add-widget): code checkpoint"'
 CACHED="$TMP/fixtures-cached"; cp -R "$BASE" "$CACHED"
@@ -2026,9 +2169,7 @@ assert_resume_engine_refusal "conflicting" "engine:claude,engine:codex" "engine:
 assert_resume_engine_refusal "mismatched" "engine:codex" "engine:codex,"
 
 scenario 'epic-run: a dead mandatory reviewer fails the run closed and preserves the work'
-DEADLENS="$TMP/fixtures-deadlens"; cp -R "$BASE" "$DEADLENS"
-printf '1' > "$DEADLENS/review-general.0.rc"   # first attempt dies
-printf '1' > "$DEADLENS/review-general.1.rc"   # and so does the retry
+make_deadlens_fixture
 run_pipeline "$EPIC_RUN" "$DEADLENS" --issue 42
 assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
 assert_contains "the blocker names the review phase" "$RUN_OUT" '"phase":"review"'
@@ -2049,10 +2190,7 @@ assert_contains "the pushed checkpoint holds the implementation" "$(git -C "$ORI
 assert_not_contains "the WIP never carries a Closes line" "$(git -C "$ORIGIN" log --format=%B main..epic/42-add-widget)" "Closes #"
 
 scenario 'review assessment: a disputed false positive is disproved without a code delta'
-REJECTED="$TMP/fixtures-rejected"; cp -R "$BASE" "$REJECTED"
-fixture "$REJECTED" triage '{"status":"The report is a false positive.","assessments":[{"index":1,"action":"disputed","reason":"The caller normalizes missing lists before the access."}]}'
-fixture_sh "$REJECTED" triage 'true'
-fixture "$REJECTED" finalreview '{"verdicts":[{"index":1,"verdict":"disproved","confidence":91,"defect":false,"reasoning":"The only caller initializes items before invoking createWidget; the reported path cannot occur."}],"regressions":[],"unmetRequirements":[]}'
+make_rejected_fixture
 run_pipeline "$EPIC_RUN" "$REJECTED" --issue 42
 assert_rc "an independently disproved false positive ships" 0 "$RUN_RC"
 assert_contains "the disproof clears the gate" "$RUN_OUT" '"readyToMerge":true'
@@ -2122,13 +2260,7 @@ scenario 'epic-run: a declined correction blocker holds the merge gate for a hum
 # the stop half: the correction declines the blocker, which is a judgment call,
 # so the PR is held for a human with no repair queue behind it and no second
 # correction batch.
-HELD="$TMP/fixtures-held"; cp -R "$BASE" "$HELD"
-fixture "$HELD" triage '{"status":"Left one for a human.","assessments":[{"index":1,"action":"deferred","reason":"The fix needs a product decision."}]}'
-fixture_sh "$HELD" triage 'true'
-fixture "$HELD" finalreview '{"verdicts":[{"index":1,"verdict":"unresolved","confidence":94,"defect":true,"reasoning":"The empty-list access is still reachable and throws; no guard was added."}],"regressions":[],"unmetRequirements":[]}'
-fixture "$HELD" correction '{"summary":"The empty-list policy is a product decision.","dispositions":[{"id":"blocker-1","action":"declined","reason":"choosing throw-vs-empty is a product decision, not an implementation defect"}]}'
-rm -f "$HELD/correction.sh"
-fixture "$HELD" ship '{"title":"Add widget","body":"HELD_ISSUE_NARRATIVE_SENTINEL: Implements the guarded widget path, while one empty-list decision remains.\n\nHELD_DESIGN_NARRATIVE_SENTINEL: Preserves the thin-module boundary.","commitBody":"HELD_COMMIT_RATIONALE_SENTINEL: Keep the verified guarded path as one candidate while a human decides the remaining empty-list behavior.","deferred":[{"blockerId":"blocker-1","title":"Null deref on empty list","why":"The fix needs a product decision.","kind":"defect","file":false}]}'
+make_held_fixture
 run_pipeline "$EPIC_RUN" "$HELD" --issue 42
 assert_rc "exits 0 (the PR is real, just held)" 0 "$RUN_RC"
 assert_contains "RESULT records why the gate held" "$RUN_OUT" '"mergeSkipped"'
@@ -2285,9 +2417,9 @@ assert_contains "the artifact keeps the deferred report location" "$(cat "$WT/.e
 # longer than the shortest window reap will honour.
 scenario 'epic-run: the merge gate after ready-to-review is bounded, not left to the gh timeout'
 GATE_START="$(date +%s)"
-EPIC_TERMINAL_REPORT_MS=3000 GH_SLOW_LABEL=ready-to-merge:20 run_pipeline "$EPIC_RUN" "$BASE" --issue 42
+EPIC_TERMINAL_REPORT_MS=1500 GH_SLOW_LABEL=ready-to-merge:20 run_pipeline "$EPIC_RUN" "$BASE" --issue 42
 GATE_ELAPSED=$(( $(date +%s) - GATE_START ))
-assert_eq "the gate gave up on the stalled promotion" "bounded" "$( (( GATE_ELAPSED < 15 )) && echo bounded || echo "waited ${GATE_ELAPSED}s for a 20s stall" )"
+assert_eq "the gate gave up on the stalled promotion" "bounded" "$( (( GATE_ELAPSED < 7 )) && echo bounded || echo "waited ${GATE_ELAPSED}s for a 20s stall" )"
 assert_eq "the label GitHub applied before the stall is on the issue" "ready-to-merge," "$(gh_labels)"
 assert_contains "and the run still gets its RESULT line" "$RUN_OUT" "RESULT "
 
@@ -2298,10 +2430,10 @@ assert_contains "and the run still gets its RESULT line" "$RUN_OUT" "RESULT "
 # session between the label and the record of what stopped the run.
 scenario 'epic-run: the pre-ship blocker write to failed is bounded, not left to the gh timeout'
 BLOCKER_START="$(date +%s)"
-EPIC_TERMINAL_REPORT_MS=3000 GH_SLOW_LABEL=failed:20 run_pipeline "$EPIC_RUN" "$DEADLENS" --issue 42
+EPIC_TERMINAL_REPORT_MS=1500 GH_SLOW_LABEL=failed:20 run_pipeline "$EPIC_RUN" "$DEADLENS" --issue 42
 BLOCKER_ELAPSED=$(( $(date +%s) - BLOCKER_START ))
 assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
-assert_eq "the run gave up on the stalled failed write" "bounded" "$( (( BLOCKER_ELAPSED < 15 )) && echo bounded || echo "waited ${BLOCKER_ELAPSED}s for a 20s stall" )"
+assert_eq "the run gave up on the stalled failed write" "bounded" "$( (( BLOCKER_ELAPSED < 7 )) && echo bounded || echo "waited ${BLOCKER_ELAPSED}s for a 20s stall" )"
 assert_eq "the label GitHub applied before the stall is on the issue" "failed," "$(gh_labels)"
 assert_contains "the blocker comment still reached the issue" "$(gh_comments)" "🤖 epic-run blocked"
 assert_contains "it still names the phase that stopped" "$(gh_comments)" "- phase: review"
@@ -2349,11 +2481,11 @@ scenario "epic-run: ship's own ready-to-review write is bounded and the gate sti
 CLEARDEFER="$TMP/fixtures-cleardefer"; cp -R "$BASE" "$CLEARDEFER"
 fixture "$CLEARDEFER" ship '{"title":"Add widget","body":"Adds a widget.","commitBody":"Use the thin widget module so callers share one construction path.","deferred":[{"blockerId":"new","title":"Refactor the helpers","why":"Nice to have.","kind":"other","file":false}]}'
 SHIP_WRITE_START="$(date +%s)"
-EPIC_TERMINAL_REPORT_MS=3000 GH_SLOW_LABEL=ready-to-review:20 run_pipeline "$EPIC_RUN" "$CLEARDEFER" --issue 42
+EPIC_TERMINAL_REPORT_MS=1500 GH_SLOW_LABEL=ready-to-review:20 run_pipeline "$EPIC_RUN" "$CLEARDEFER" --issue 42
 SHIP_WRITE_ELAPSED=$(( $(date +%s) - SHIP_WRITE_START ))
 SPAWNS_BEFORE_PR="$(wc -l < "$RUN_LOG" | tr -d ' ')"
 assert_rc "exits 0" 0 "$RUN_RC"
-assert_eq "the run gave up on the stalled ready-to-review write" "bounded" "$( (( SHIP_WRITE_ELAPSED < 15 )) && echo bounded || echo "waited ${SHIP_WRITE_ELAPSED}s for a 20s stall" )"
+assert_eq "the run gave up on the stalled ready-to-review write" "bounded" "$( (( SHIP_WRITE_ELAPSED < 7 )) && echo bounded || echo "waited ${SHIP_WRITE_ELAPSED}s for a 20s stall" )"
 assert_contains "the last model step ran BEFORE the write that opens the window" "${RUN_OUT%%Ship: PR opened*}" "ship:pr: "
 assert_eq "and no step was spawned after the PR line" 7 "$SPAWNS_BEFORE_PR"
 assert_contains "the stalled flip is reported, not swallowed" "$RUN_OUT" "label flip to ready-to-review failed"
@@ -2371,10 +2503,10 @@ assert_eq "the status comment's final edit still landed" "yes" "$(grep -q 'api -
 # the merge queue it really is, inside what is LEFT of the window ship opened.
 scenario 'epic-run: a promotion the write never confirmed is claimed once the label itself is read back'
 PROMOTE_START="$(date +%s)"
-EPIC_TERMINAL_REPORT_MS=3000 GH_SLOW_LABEL=ready-to-merge:20 run_pipeline "$EPIC_RUN" "$BASE" --issue 42
+EPIC_TERMINAL_REPORT_MS=1500 GH_SLOW_LABEL=ready-to-merge:20 run_pipeline "$EPIC_RUN" "$BASE" --issue 42
 PROMOTE_ELAPSED=$(( $(date +%s) - PROMOTE_START ))
 assert_rc "exits 0 (the PR is real)" 0 "$RUN_RC"
-assert_eq "the run gave up on the stalled promotion" "bounded" "$( (( PROMOTE_ELAPSED < 15 )) && echo bounded || echo "waited ${PROMOTE_ELAPSED}s for a 20s stall" )"
+assert_eq "the run gave up on the stalled promotion" "bounded" "$( (( PROMOTE_ELAPSED < 7 )) && echo bounded || echo "waited ${PROMOTE_ELAPSED}s for a 20s stall" )"
 assert_eq "the label GitHub applied before the stall is on the issue" "ready-to-merge," "$(gh_labels)"
 assert_contains "and RESULT reports the queue that label really puts the PR in" "$RUN_OUT" '"readyToMerge":true'
 assert_contains "the unconfirmed write is still named in the pane" "$RUN_OUT" "the write itself was not confirmed"
@@ -2422,11 +2554,11 @@ assert_contains "the pane still gets its RESULT line" "$RUN_OUT" "RESULT "
 # failure path becomes an unattended merge.
 scenario 'epic-run: a promotion it can neither confirm nor prove undone blocks instead of resting'
 UNVERIFIED_START="$(date +%s)"
-EPIC_TERMINAL_REPORT_MS=3000 GH_SLOW_LABEL=ready-to-merge:20 GH_LABEL_READ_FAIL_AT=3,4 \
+EPIC_TERMINAL_REPORT_MS=1500 GH_SLOW_LABEL=ready-to-merge:20 GH_LABEL_READ_FAIL_AT=3,4 \
   run_pipeline "$EPIC_RUN" "$BASE" --issue 42
 UNVERIFIED_ELAPSED=$(( $(date +%s) - UNVERIFIED_START ))
 assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
-assert_eq "the whole fallback fits the window ship's write opened" "bounded" "$( (( UNVERIFIED_ELAPSED < 15 )) && echo bounded || echo "waited ${UNVERIFIED_ELAPSED}s for a 20s stall" )"
+assert_eq "the whole fallback fits the window ship's write opened" "bounded" "$( (( UNVERIFIED_ELAPSED < 7 )) && echo bounded || echo "waited ${UNVERIFIED_ELAPSED}s for a 20s stall" )"
 assert_contains "the blocker names the unverifiable promotion" "$RUN_OUT" "could not be verified"
 assert_eq "it rests at failed alone" "failed," "$(gh_labels)"
 assert_not_contains "the merge worker has nothing to select" "$(gh_labels)" "ready-to-merge"
@@ -2434,14 +2566,11 @@ assert_contains "the blocker comment still reached the issue" "$(gh_comments)" "
 assert_contains "and the pane still gets its RESULT line" "$RUN_OUT" "RESULT "
 assert_contains "which records the blocked run" "$RUN_OUT" '"blocked":true'
 
+fi
+
+if [[ "$EPIC_TEST_GROUP" == epic-c ]]; then
 scenario 'epic-run: ship classifies deferrals; the script counts, files and records them'
-DEFER="$TMP/fixtures-defer"; cp -R "$BASE" "$DEFER"
-fixture "$DEFER" ship '{"title":"Add widget","body":"Adds a widget.","commitBody":"Use the thin widget module so callers share one construction path.","legalMarker":"LEGAL-REVIEW: required","deferred":[
-  {"blockerId":"new","title":"Widget crashes on empty list","why":"Needs a product decision.","kind":"defect","file":true,"issueTitle":"Widget crashes on empty list","issueBody":"Still on main after the merge."},
-  {"blockerId":"new","title":"Second defect","why":"Same.","kind":"defect","file":true},
-  {"blockerId":"new","title":"Third defect","why":"Same.","kind":"defect","file":true},
-  {"blockerId":"new","title":"Fourth defect","why":"Same.","kind":"defect","file":true},
-  {"blockerId":"new","title":"Refactor the helpers","why":"Nice to have.","kind":"other","file":true}]}'
+make_defer_fixture
 run_pipeline "$EPIC_RUN" "$DEFER" --issue 42
 assert_rc "exits 0" 0 "$RUN_RC"
 # Ship is the builder side. Its classification files follow-ups and writes the
@@ -2800,14 +2929,17 @@ assert_contains "the resumed run reaches the merge queue" "$RUN_OUT" '"readyToMe
 
 scenario 'transient retry: a timeout is never retried'
 SLOW="$TMP/fixtures-slow"; cp -R "$BASE" "$SLOW"
-printf '3' > "$SLOW/design.0.sleep"        # outlives a 1-second ceiling
-EPIC_AGENT_TIMEOUT_MS=1000 run_pipeline "$EPIC_RUN" "$SLOW" --issue 42
+printf '3' > "$SLOW/design.0.sleep"        # outlives the injected short ceiling
+EPIC_AGENT_TIMEOUT_MS=250 run_pipeline "$EPIC_RUN" "$SLOW" --issue 42
 assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
 assert_eq "one attempt only" 1 "$(calls design)"
 assert_contains "the reason says it timed out" "$RUN_OUT" "timed out"
 assert_not_contains "no respawn on a timeout" "$RUN_OUT" "respawning once (transient)"
 
+fi
+
 # ───────────────────────── the single final review ─────────────────────────
+if [[ "$EPIC_TEST_GROUP" == final-review ]]; then
 # One fixer, then one read-only adjudication over every original finding, the
 # complete diff and the exact repair delta. There is no second repair round:
 # what the final review does not resolve or disprove ends the epic at a human,
@@ -2980,7 +3112,11 @@ assert_eq "no acceptance-driven correction or confirmation ran either" "0 0" "$(
 assert_contains "the run ships" "$RUN_OUT" '"readyToMerge":true'
 assert_eq "the issue ends ready-to-merge" "ready-to-merge," "$(gh_labels)"
 
+fi
+
 # ───────────────────────── the read-only boundary around judging phases ─────────────────────────
+
+if [[ "$EPIC_TEST_GROUP" == read-only ]]; then
 # Review, final review and ship judge a change and may not alter it. Their
 # Claude charters withhold Bash, Write and Edit, Codex sandboxes them read-only,
 # and the orchestrator independently proves the invariant itself. These
@@ -3132,7 +3268,13 @@ assert_eq "no spawn resumes or continues an earlier session" 0 "$(grep -c -E 're
 assert_eq "the fresh fixer still ran exactly once" 1 "$(calls triage)"
 assert_eq "and the fresh final review once" 1 "$(calls finalreview)"
 
+fi
+
 # ───────────────────────── ship: rebase onto current origin/main ─────────────────────────
+
+if [[ "$EPIC_TEST_GROUP" == ship ]]; then
+make_defer_fixture
+make_rejected_fixture
 # Base drift is the normal case, not the exception: a run takes an hour and its
 # PR is often held for hours more. Ship rebases the checkpoint chain onto what
 # actually landed and re-verifies, so the collision is met by the run that still
@@ -3286,7 +3428,7 @@ run_manual() {
   fresh_clone() { printf '%s' "$MANUAL_WT"; }
   run_pipeline "$EPIC_RUN" "$1" --slug 42-add-widget
   unset -f fresh_clone
-  fresh_clone() { local dir; dir="$(mktemp -d "$TMP/run-XXXXXXXX")"; git clone -q "$ORIGIN" "$dir"; git -C "$dir" checkout -q --detach main; printf '%s' "$dir"; }
+  fresh_clone() { local dir; dir="$(mktemp -d "$TMP/run-XXXXXXXX")"; git clone -q --shared "$ORIGIN" "$dir"; git -C "$dir" checkout -q --detach main; printf '%s' "$dir"; }
 }
 run_manual "$MANUAL"
 assert_rc "exits 0" 0 "$RUN_RC"
@@ -3331,7 +3473,12 @@ assert_contains "the review artifact preserves the uncertainty" "$(cat "$MANUAL_
 assert_eq "manual uncertainty makes no commit" "$MAIN_INITIAL" "$(git -C "$MANUAL_WT" rev-parse HEAD)"
 assert_eq "manual uncertainty makes no GitHub call" 0 "$(wc -l < "$GH_LOG" | tr -d ' ')"
 
+fi
+
 # ───────────────────────── fix-run ─────────────────────────
+
+# Fixer fixture builders remain outside the guard because the tail shard uses
+# the same base fixtures to exercise the shared bounded-repair contract.
 # A finished epic PR (one commit, Closes #42) whose line conflicts with a
 # commit that landed on main since: both sides edited the same base line, which
 # the deterministic rung classifies as needing judgment and hands to the model.
@@ -3392,6 +3539,7 @@ assert_fix_engine_refusal() { # case engine-labels expected-engine-labels
   assert_eq "$route_case conflict-fixer leaves routing unchanged" "$expected" "$(gh_engine_labels)"
   assert_eq "$route_case conflict-fixer leaves the PR branch untouched" "$before" "$(origin_ref epic/42-add-widget)"
 }
+if [[ "$EPIC_TEST_GROUP" == fix ]]; then
 assert_fix_engine_refusal "missing" "" ""
 assert_fix_engine_refusal "conflicting" "engine:claude,engine:codex" "engine:claude,engine:codex,"
 assert_fix_engine_refusal "mismatched" "engine:codex" "engine:codex,"
@@ -3784,7 +3932,7 @@ scenario 'fix-run: unreadable conflict evidence is a human-only final refusal'
 seed_conflict
 BEFORE="$(origin_ref epic/42-add-widget)"
 EVIDENCE_REFUSAL_START="$(date +%s)"
-EPIC_STATUS_INTERVAL_MS=1 EPIC_TERMINAL_REPORT_MS=1200 GH_SLOW_PATCH=5 GH_AUTH_READ_FAIL=1 run_fix "$FIXBASE" --issue 42
+EPIC_STATUS_INTERVAL_MS=1 EPIC_TERMINAL_REPORT_MS=300 GH_SLOW_PATCH=5 GH_AUTH_READ_FAIL=1 run_fix "$FIXBASE" --issue 42
 EVIDENCE_REFUSAL_ELAPSED=$(( $(date +%s) - EVIDENCE_REFUSAL_START ))
 assert_rc "exits 2 (skipped/refused before work)" 2 "$RUN_RC"
 assert_eq "the elapsed status throttle cannot enqueue a default-timeout refusal note" "1" "$(grep -c 'api --method PATCH' "$GH_LOG" || true)"
@@ -3809,7 +3957,7 @@ run_fix "$GRANTBASE" --issue 42
 SPENT_PARTIAL_COMMENTS="$(gh_comments)"
 SPENT_PARTIAL_HEAD="$(origin_ref epic/42-add-widget)"
 SPENT_PARTIAL_START="$(date +%s)"
-EPIC_STATUS_INTERVAL_MS=1 EPIC_TERMINAL_REPORT_MS=1200 GH_SLOW_PATCH=5 \
+EPIC_STATUS_INTERVAL_MS=1 EPIC_TERMINAL_REPORT_MS=300 GH_SLOW_PATCH=5 \
   FIX_LABELS="failed,needs-judgment,fix-attempted" SEED_COMMENTS="$SPENT_PARTIAL_COMMENTS" \
   run_fix "$PARTIALFIX" --issue 42
 SPENT_PARTIAL_ELAPSED=$(( $(date +%s) - SPENT_PARTIAL_START ))
@@ -3860,10 +4008,10 @@ assert_eq "the wholly mechanical result reaches the merge queue" "fix-attempted,
 scenario 'fix-run: the ready-to-merge landing write is bounded, not left to the gh timeout'
 seed_conflict
 LAND_START="$(date +%s)"
-EPIC_TERMINAL_REPORT_MS=3000 GH_SLOW_LABEL=ready-to-merge:20 run_fix "$FIXBASE" --issue 42 --session myapp-epic-42
+EPIC_TERMINAL_REPORT_MS=1500 GH_SLOW_LABEL=ready-to-merge:20 run_fix "$FIXBASE" --issue 42 --session myapp-epic-42
 LAND_ELAPSED=$(( $(date +%s) - LAND_START ))
 assert_rc "exits 0" 0 "$RUN_RC"
-assert_eq "the run gave up on the stalled landing write" "bounded" "$( (( LAND_ELAPSED < 15 )) && echo bounded || echo "waited ${LAND_ELAPSED}s for a 20s stall" )"
+assert_eq "the run gave up on the stalled landing write" "bounded" "$( (( LAND_ELAPSED < 7 )) && echo bounded || echo "waited ${LAND_ELAPSED}s for a 20s stall" )"
 assert_eq "the label GitHub applied before the stall is on the issue, ladder kept" "fix-attempted,ready-to-merge," "$(gh_labels)"
 assert_contains "the readback inside the window still confirmed the landing" "$RUN_OUT" '"readyToMerge":true'
 assert_contains "and the audit comment written before it is on the issue" "$(gh_comments)" "origin/main intended: main renamed the helper"
@@ -3878,12 +4026,12 @@ assert_contains "and the audit comment written before it is on the issue" "$(gh_
 scenario 'fix-run: a landing it could not verify is demoted and put back in its queue'
 seed_conflict
 UNVERIFIED_START="$(date +%s)"
-EPIC_TERMINAL_REPORT_MS=3000 GH_SLOW_LABEL=ready-to-merge:20 GH_LABEL_READ_FAIL_AT=3 \
+EPIC_TERMINAL_REPORT_MS=1500 GH_SLOW_LABEL=ready-to-merge:20 GH_LABEL_READ_FAIL_AT=3 \
   run_fix "$FIXBASE" --issue 42 --session myapp-epic-42
 UNVERIFIED_ELAPSED=$(( $(date +%s) - UNVERIFIED_START ))
 assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
 assert_contains "the blocker names the unverified swap" "$RUN_OUT" "label swap could not be verified"
-assert_eq "the whole fallback fits the window the landing opened" "bounded" "$( (( UNVERIFIED_ELAPSED < 15 )) && echo bounded || echo "waited ${UNVERIFIED_ELAPSED}s for a 20s stall" )"
+assert_eq "the whole fallback fits the window the landing opened" "bounded" "$( (( UNVERIFIED_ELAPSED < 7 )) && echo bounded || echo "waited ${UNVERIFIED_ELAPSED}s for a 20s stall" )"
 assert_eq "it rests at failed, back in the conflict fixer queue, ladder kept" "failed,fix-attempted,needs-judgment," "$(gh_labels)"
 assert_not_contains "the merge worker has nothing to select" "$(gh_labels)" "ready-to-merge"
 assert_contains "the blocker comment still reached the issue" "$(gh_comments)" "🤖 fix-conflict blocked"
@@ -3901,18 +4049,22 @@ assert_contains "which records the blocked run" "$RUN_OUT" '"blocked":true'
 scenario 'fix-run: the blocker path'"'"'s rebase probe is bounded by the window the landing opened'
 seed_conflict
 SLOWGIT_START="$(date +%s)"
-EPIC_TERMINAL_REPORT_MS=3000 GIT_SLOW_AFTER_LANDING=rev-parse:20 GH_LABEL_READ_FAIL_AT=3 \
+EPIC_TERMINAL_REPORT_MS=1500 GIT_SLOW_AFTER_LANDING=rev-parse:20 GH_LABEL_READ_FAIL_AT=3 \
   run_fix "$FIXBASE" --issue 42 --session myapp-epic-42
 SLOWGIT_ELAPSED=$(( $(date +%s) - SLOWGIT_START ))
 assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
-assert_eq "the whole fallback fits the window the landing opened" "bounded" "$( (( SLOWGIT_ELAPSED < 15 )) && echo bounded || echo "waited ${SLOWGIT_ELAPSED}s for a 20s stall" )"
+assert_eq "the whole fallback fits the window the landing opened" "bounded" "$( (( SLOWGIT_ELAPSED < 7 )) && echo bounded || echo "waited ${SLOWGIT_ELAPSED}s for a 20s stall" )"
 assert_eq "it rests at failed, back in the conflict fixer queue, ladder kept" "failed,fix-attempted,needs-judgment," "$(gh_labels)"
 assert_not_contains "the merge worker has nothing to select" "$(gh_labels)" "ready-to-merge"
 assert_contains "the blocker comment still reached the issue" "$(gh_comments)" "🤖 fix-conflict blocked"
 assert_contains "and the pane still gets its RESULT line" "$RUN_OUT" "RESULT "
 assert_contains "which records the blocked run" "$RUN_OUT" '"blocked":true'
 
+fi
+
 # ───────────────────────── ci-run ─────────────────────────
+
+# As above, keep the common CI fixture constructors available to tail.
 # A finished epic PR the merge worker rebased and re-ran: its checks came back
 # red. The seed leaves the branch's single commit holding a test with no
 # implementation, so `npm run verify` is red locally too and the fixer's fixture
@@ -3945,6 +4097,7 @@ assert_ci_engine_refusal() { # case engine-labels expected-engine-labels
   assert_eq "$route_case CI-fixer leaves routing unchanged" "$expected" "$(gh_engine_labels)"
   assert_eq "$route_case CI-fixer leaves the PR branch untouched" "$before" "$(origin_ref epic/42-add-widget)"
 }
+if [[ "$EPIC_TEST_GROUP" == ci ]]; then
 assert_ci_engine_refusal "missing" "" ""
 assert_ci_engine_refusal "conflicting" "engine:claude,engine:codex" "engine:claude,engine:codex,"
 assert_ci_engine_refusal "mismatched" "engine:codex" "engine:codex,"
@@ -4106,12 +4259,12 @@ scenario 'ci-run: hold failure and blocker fallback share one terminal deadline'
 seed_ci_pr
 HOLD_FALLBACK_START_MS="$(node -e 'console.log(Date.now())')"
 CI_LABELS="failed,needs-ci-fix,ci-attempted" GH_FAIL_READ_AFTER_REMOVE=ci-retried \
-  GH_TERMINAL_STALL_SECONDS=20 EPIC_TERMINAL_REPORT_MS=6000 \
+  GH_TERMINAL_STALL_SECONDS=20 EPIC_TERMINAL_REPORT_MS=1000 \
   run_ci "$CI_RUN" "$CIQUOTA" --issue 42 --session myapp-epic-42
 HOLD_FALLBACK_ELAPSED_MS="$(( $(node -e 'console.log(Date.now())') - HOLD_FALLBACK_START_MS ))"
 assert_rc "the stalled unverified hold still blocks" 3 "$RUN_RC"
 assert_eq "hold and fallback cannot each spend a fresh terminal window" "bounded" \
-  "$( (( HOLD_FALLBACK_ELAPSED_MS < 8000 )) && echo bounded || echo "spent ${HOLD_FALLBACK_ELAPSED_MS}ms" )"
+  "$( (( HOLD_FALLBACK_ELAPSED_MS < 4000 )) && echo bounded || echo "spent ${HOLD_FALLBACK_ELAPSED_MS}ms" )"
 
 scenario 'ci-run: a failure that does not reproduce locally says so'
 GREENLOCAL="$TMP/fixtures-ci-green"; cp -R "$CIBASE" "$GREENLOCAL"
@@ -4225,10 +4378,10 @@ assert_eq "no fixer was woken" 0 "$(calls ci-fix)"
 scenario 'ci-run: the ready-to-merge landing write is bounded, not left to the gh timeout'
 seed_ci_pr
 LAND_START="$(date +%s)"
-EPIC_TERMINAL_REPORT_MS=3000 GH_SLOW_LABEL=ready-to-merge:20 run_ci "$CI_RUN" "$CIBASE" --issue 42 --session myapp-epic-42
+EPIC_TERMINAL_REPORT_MS=1500 GH_SLOW_LABEL=ready-to-merge:20 run_ci "$CI_RUN" "$CIBASE" --issue 42 --session myapp-epic-42
 LAND_ELAPSED=$(( $(date +%s) - LAND_START ))
 assert_rc "exits 0" 0 "$RUN_RC"
-assert_eq "the run gave up on the stalled landing write" "bounded" "$( (( LAND_ELAPSED < 15 )) && echo bounded || echo "waited ${LAND_ELAPSED}s for a 20s stall" )"
+assert_eq "the run gave up on the stalled landing write" "bounded" "$( (( LAND_ELAPSED < 7 )) && echo bounded || echo "waited ${LAND_ELAPSED}s for a 20s stall" )"
 assert_eq "the label GitHub applied before the stall is on the issue, ladder kept" "ci-attempted,ready-to-merge," "$(gh_labels)"
 assert_contains "the readback inside the window still confirmed the landing" "$RUN_OUT" '"readyToMerge":true'
 assert_contains "and the audit comment written before it is on the issue" "$(gh_comments)" "Cause: createWidget was never exported"
@@ -4242,12 +4395,12 @@ assert_contains "and the audit comment written before it is on the issue" "$(gh_
 scenario 'ci-run: a landing it could not verify is demoted, never left for the merge worker'
 seed_ci_pr
 UNVERIFIED_START="$(date +%s)"
-EPIC_TERMINAL_REPORT_MS=3000 GH_SLOW_LABEL=ready-to-merge:20 GH_LABEL_READ_FAIL_AT=3 \
+EPIC_TERMINAL_REPORT_MS=1500 GH_SLOW_LABEL=ready-to-merge:20 GH_LABEL_READ_FAIL_AT=3 \
   run_ci "$CI_RUN" "$CIBASE" --issue 42 --session myapp-epic-42
 UNVERIFIED_ELAPSED=$(( $(date +%s) - UNVERIFIED_START ))
 assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
 assert_contains "the blocker names the unverified swap" "$RUN_OUT" "label swap could not be verified"
-assert_eq "the whole fallback fits the window the landing opened" "bounded" "$( (( UNVERIFIED_ELAPSED < 15 )) && echo bounded || echo "waited ${UNVERIFIED_ELAPSED}s for a 20s stall" )"
+assert_eq "the whole fallback fits the window the landing opened" "bounded" "$( (( UNVERIFIED_ELAPSED < 7 )) && echo bounded || echo "waited ${UNVERIFIED_ELAPSED}s for a 20s stall" )"
 assert_eq "it rests at failed, back in the CI fixer queue, ladder kept" "ci-attempted,failed,needs-ci-fix," "$(gh_labels)"
 assert_not_contains "the merge worker has nothing to select" "$(gh_labels)" "ready-to-merge"
 assert_contains "the blocker comment still reached the issue" "$(gh_comments)" "🤖 fix-ci blocked"
@@ -4255,7 +4408,11 @@ assert_contains "and names what happens next" "$(gh_comments)" "- next: This was
 assert_contains "and the pane still gets its RESULT line" "$RUN_OUT" "RESULT "
 assert_contains "which records the blocked run" "$RUN_OUT" '"blocked":true'
 
+fi
+
 # ───────────────────────── defect-run ─────────────────────────
+
+# The defect helpers and base fixture are also inputs to tail.
 # A finished epic PR whose deterministic merge gate held only on concrete
 # defects. Unlike ci-run, the durable input is one authenticated, PR/head-bound
 # evidence envelope: .epics and the mutable live issue body are deliberately
@@ -4307,6 +4464,10 @@ mkdir -p "$DEFECTBASE"
 fixture "$DEFECTBASE" defect-fix '{"completed":true,"summary":"Adds the missing empty-list guard (PRIVATE_FIXER_EXPLANATION).","files":["frontend/src/widget.ts"]}'
 fixture_sh "$DEFECTBASE" defect-fix 'printf "export const firstItem = items => items.length ? items[0].name : null\n" > frontend/src/widget.ts'
 accept_clear "$DEFECTBASE" defect-check 1
+DECLINE="$TMP/fixtures-defect-decline"
+cp -R "$DEFECTBASE" "$DECLINE"
+rm -f "$DECLINE/defect-fix.sh"
+fixture "$DECLINE" defect-fix '{"completed":false,"escalate":"the durable record does not identify a safe code change."}'
 run_defect() {
   local comments
   if [[ -n "${DEFECT_COMMENTS+x}" ]]; then comments="$DEFECT_COMMENTS"
@@ -4333,6 +4494,7 @@ assert_defect_engine_refusal() { # case engine-labels expected-engine-labels
   assert_eq "$route_case defect-fixer leaves routing unchanged" "$expected" "$(gh_engine_labels)"
   assert_eq "$route_case defect-fixer leaves the PR branch untouched" "$before" "$(origin_ref epic/42-add-widget)"
 }
+if [[ "$EPIC_TEST_GROUP" == defect-a ]]; then
 assert_defect_engine_refusal "missing" "" ""
 assert_defect_engine_refusal "conflicting" "engine:claude,engine:codex" "engine:claude,engine:codex,"
 assert_defect_engine_refusal "mismatched" "engine:codex" "engine:codex,"
@@ -4588,8 +4750,6 @@ assert_eq "the stale queue entry is left for review, not redispatch" "ready-to-r
 
 scenario 'defect-run: a fixer that declines leaves the review queue intact'
 seed_defect_pr
-DECLINE="$TMP/fixtures-defect-decline"; cp -R "$DEFECTBASE" "$DECLINE"; rm -f "$DECLINE/defect-fix.sh"
-fixture "$DECLINE" defect-fix '{"completed":false,"escalate":"the durable record does not identify a safe code change."}'
 BEFORE="$(origin_ref epic/42-add-widget)"
 run_defect "$DEFECT_RUN" "$DECLINE" --issue 42
 assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
@@ -4686,11 +4846,11 @@ assert_eq "ready-to-merge is removed during review restoration" "defect-attempte
 scenario 'defect-run: the blocker path'"'"'s worktree scrub is bounded by the window the landing opened'
 seed_defect_pr
 SLOWGIT_START="$(date +%s)"
-EPIC_TERMINAL_REPORT_MS=3000 GIT_SLOW_AFTER_LANDING=reset:20 GH_LABEL_READ_FAIL_AT=3 \
+EPIC_TERMINAL_REPORT_MS=1500 GIT_SLOW_AFTER_LANDING=reset:20 GH_LABEL_READ_FAIL_AT=3 \
   run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
 SLOWGIT_ELAPSED=$(( $(date +%s) - SLOWGIT_START ))
 assert_rc "the unverified handoff blocks" 3 "$RUN_RC"
-assert_eq "the whole fallback fits the window the landing opened" "bounded" "$( (( SLOWGIT_ELAPSED < 15 )) && echo bounded || echo "waited ${SLOWGIT_ELAPSED}s for a 20s stall" )"
+assert_eq "the whole fallback fits the window the landing opened" "bounded" "$( (( SLOWGIT_ELAPSED < 7 )) && echo bounded || echo "waited ${SLOWGIT_ELAPSED}s for a 20s stall" )"
 assert_eq "ready-to-merge is removed during review restoration" "defect-attempted,ready-to-review," "$(gh_labels)"
 assert_contains "the blocker comment still reached the issue" "$(gh_comments)" "🤖 fix-defect blocked"
 assert_contains "and the pane still gets its RESULT line" "$RUN_OUT" "RESULT "
@@ -4776,6 +4936,9 @@ run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_eq "the PR is read exactly once" 1 "$(grep -c '^pr view' "$GH_LOG")"
 
+fi
+
+if [[ "$EPIC_TEST_GROUP" == defect-b ]]; then
 scenario 'defect-run: a stale PR head after push blocks label promotion'
 seed_defect_pr
 BEFORE="$(origin_ref epic/42-add-widget)"
@@ -4815,7 +4978,7 @@ seed_amended_defect_pr() { # -> PRIOR_HEAD is the pre-amend head, origin carries
   SEED_N=$((SEED_N + 1))
   local dir="$TMP/seeder-$SEED_N"
   rm -rf "$dir"
-  git clone -q "$ORIGIN" "$dir"
+  git clone -q --shared "$ORIGIN" "$dir"
   git -C "$dir" checkout -q --detach "origin/epic/42-add-widget"
   (cd "$dir" && printf "export const firstItem = items => items.length ? items[0].name : null\n" > frontend/src/widget.ts && git add -A && git commit -q --amend --no-edit)
   git -C "$dir" push -qf origin "HEAD:refs/heads/epic/42-add-widget"
@@ -5067,10 +5230,10 @@ assert_contains "the structural action still follows" "$UNREAD_COMMENT" "Then: r
 # gets its guidance. The budget is injected short here; the stall is not.
 scenario 'fixer finalize: post-terminal reporting is bounded, not left to the gh timeout'
 FINALIZE_START="$(date +%s)"
-DEFECT_BRANCH= EPIC_TERMINAL_REPORT_MS=3000 GH_SLOW_COMMENT=20 run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+DEFECT_BRANCH= EPIC_TERMINAL_REPORT_MS=1500 GH_SLOW_COMMENT=20 run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
 FINALIZE_ELAPSED=$(( $(date +%s) - FINALIZE_START ))
 assert_rc "exits 2 (skipped/refused)" 2 "$RUN_RC"
-assert_eq "the run gave up on the stalled comment" "bounded" "$( (( FINALIZE_ELAPSED < 15 )) && echo bounded || echo "waited ${FINALIZE_ELAPSED}s for a 20s stall" )"
+assert_eq "the run gave up on the stalled comment" "bounded" "$( (( FINALIZE_ELAPSED < 7 )) && echo bounded || echo "waited ${FINALIZE_ELAPSED}s for a 20s stall" )"
 assert_eq "the terminal transition still settled" "failed," "$(gh_labels)"
 assert_contains "the abandoned report is on the run's log" "$RUN_OUT" "blocked: GitHub report failed"
 assert_contains "and names the bound it hit" "$RUN_OUT" "timed out"
@@ -5081,10 +5244,10 @@ assert_contains "and names the bound it hit" "$RUN_OUT" "timed out"
 # readback the guidance is composed from has even been made.
 scenario 'fixer finalize: the terminal label write is bounded, not only the report after it'
 WRITE_START="$(date +%s)"
-DEFECT_BRANCH= EPIC_TERMINAL_REPORT_MS=3000 GH_SLOW_LABEL=failed:20 run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
+DEFECT_BRANCH= EPIC_TERMINAL_REPORT_MS=1500 GH_SLOW_LABEL=failed:20 run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
 WRITE_ELAPSED=$(( $(date +%s) - WRITE_START ))
 assert_rc "exits 2 (skipped/refused)" 2 "$RUN_RC"
-assert_eq "the run gave up on the stalled write" "bounded" "$( (( WRITE_ELAPSED < 15 )) && echo bounded || echo "waited ${WRITE_ELAPSED}s for a 20s stall" )"
+assert_eq "the run gave up on the stalled write" "bounded" "$( (( WRITE_ELAPSED < 7 )) && echo bounded || echo "waited ${WRITE_ELAPSED}s for a 20s stall" )"
 assert_eq "the label GitHub had already applied is still observed" "failed," "$(gh_labels)"
 assert_contains "the refusal still reached the issue" "$(gh_comments)" "🤖 fix-defect refused: no open PR"
 assert_contains "with the guidance the stall could have cost" "$(gh_comments)" "needs-defect-fix has been removed automatically"
@@ -5150,6 +5313,11 @@ assert_eq "the status comment's final edit is bounded too" 20000 "$STATUS_BUDGET
 assert_eq "reap floors its settle window" 3 "$SETTLE_FLOOR_MIN"
 assert_eq "post-terminal reporting finishes well inside that floor" "fits" \
   "$( (( FINALIZE_BUDGET_MS + STATUS_BUDGET_MS < SETTLE_FLOOR_MIN * 60000 / 2 )) && echo fits || echo "budget $(( FINALIZE_BUDGET_MS + STATUS_BUDGET_MS ))ms against a ${SETTLE_FLOOR_MIN}m floor" )"
+
+fi
+
+if [[ "$EPIC_TEST_GROUP" == identity ]]; then
+make_held_fixture
 
 # Epic-run no longer hands a repair brief to defect-run: a hold made entirely of
 # concrete defects takes its one scoped correction inside the run instead, and
@@ -5223,7 +5391,12 @@ for blocker_id_case in unknown duplicate known-as-new; do
   assert_eq "$blocker_id_case pre-PR failure creates no delivery summary" 0 "$(delivery_summary_count)"
 done
 
+fi
+
 # ───────────────── the bounded repair contract inside a fixer ─────────────────
+if [[ "$EPIC_TEST_GROUP" == tail ]]; then
+make_deadlens_fixture
+
 # One exhaustive acceptance answer, ONE scoped correction over the whole batch
 # inside the same invocation, one narrow confirmation, then the ordinary
 # publication path. A semantic dead end here removes the fixer's queue instead
@@ -5492,6 +5665,8 @@ assert_eq "a session name is never split into a repository identity" "null" \
   "$(usage_log | jq -r 'select(.type=="run-start") | .repo')"
 assert_eq "the start still records the session it ran in" "myapp-epic-42" \
   "$(usage_log | jq -r 'select(.type=="run-start") | .session')"
+
+fi
 
 exec 2>&3 3>&-
 assert_eq "suite stderr stays clean" "" "$(cat "$SUITE_STDERR")"

@@ -70,6 +70,10 @@ CI_POLL="${MERGE_CI_POLL:-20}"
 # with CI. Only treat the empty rollup as a no-CI repo once the exact rebased
 # head has stayed visible for this long.
 CI_REGISTRATION_GRACE="${MERGE_CI_REGISTRATION_GRACE:-60}"
+# Hermetic tests advance this file instead of spending wall-clock seconds in
+# polling scenarios. It is deliberately test-prefixed; production uses Bash's
+# monotonic SECONDS clock and real sleep below.
+CI_TEST_CLOCK_FILE="${TOLIKI_TEST_MERGE_CI_CLOCK_FILE:-}"
 # Backstop only. The loop terminates on its own (merging closes the issue,
 # failing strips the label, so either way it leaves the queue) — this bounds a
 # bug, and a run that hits it says so rather than looking like a clean drain.
@@ -80,6 +84,32 @@ MAX_DRAIN=20
 say()  { printf '%s [merge] %s\n' "$(ts)" "$*"; }
 # Infrastructure died: stop the whole drain, label nothing, let cron retry.
 die()  { printf '%s [merge] %s\n' "$(ts)" "$*" >&2; exit 1; }
+
+ci_now() {
+  local now
+  if [[ -z "$CI_TEST_CLOCK_FILE" ]]; then
+    printf '%s' "$SECONDS"
+    return
+  fi
+  if ! IFS= read -r now < "$CI_TEST_CLOCK_FILE" || [[ ! "$now" =~ ^[0-9]+$ ]]; then
+    die "test CI clock is unreadable"
+  fi
+  printf '%s' "$now"
+}
+
+ci_pause() {
+  local now
+  if [[ -z "$CI_TEST_CLOCK_FILE" ]]; then
+    sleep "$CI_POLL"
+    return
+  fi
+  if [[ ! "$CI_POLL" =~ ^[1-9][0-9]*$ ]]; then
+    die "test CI poll interval must be a positive integer"
+  fi
+  now="$(ci_now)"
+  printf '%s\n' "$((now + CI_POLL))" > "$CI_TEST_CLOCK_FILE" \
+    || die "test CI clock could not advance"
+}
 
 # Every other gh call here fails closed by aborting, because a query that
 # errors carries no verdict. The write calls cannot do that blindly — a merge
@@ -268,20 +298,24 @@ EOF
 # having no CI and the gate clears without fabricating a check result.
 wait_for_ci() {
   local pr="$1" want="$2"
-  local deadline=$(( SECONDS + CI_TIMEOUT )) saw_any=0 head_visible_at=-1
+  local now deadline saw_any=0 head_visible_at=-1
+  now="$(ci_now)"
+  deadline=$(( now + CI_TIMEOUT ))
   # `bad` rather than `failed` on purpose — the drain loop below counts into a
   # global of that name, and a local would quietly shadow it.
   local json head total pending bad
 
-  while (( SECONDS < deadline )); do
+  while :; do
+    now="$(ci_now)"
+    (( now < deadline )) || break
     json="$(gh pr view "$pr" -R "$ORIGIN" --json headRefOid,statusCheckRollup 2>/dev/null)" \
       || die "$REPO: gh pr view #$pr failed while watching checks — aborting the run"
 
     head="$(jq -r '.headRefOid' <<<"$json")"
     if [[ "$head" != "$want" ]]; then
-      sleep "$CI_POLL"; continue          # the force-push has not registered yet
+      ci_pause; continue                   # the force-push has not registered yet
     fi
-    if (( head_visible_at < 0 )); then head_visible_at=$SECONDS; fi
+    if (( head_visible_at < 0 )); then head_visible_at=$now; fi
 
     total="$(jq '(.statusCheckRollup // []) | length' <<<"$json")"
     if (( total == 0 )); then
@@ -289,10 +323,10 @@ wait_for_ci() {
       # a no-CI repo. Keep waiting so a disappearing or incomplete API view
       # cannot erase a real gate.
       if (( saw_any )); then
-        sleep "$CI_POLL"; continue
+        ci_pause; continue
       fi
-      if (( SECONDS - head_visible_at < CI_REGISTRATION_GRACE )); then
-        sleep "$CI_POLL"; continue        # give asynchronous workflows time to register
+      if (( now - head_visible_at < CI_REGISTRATION_GRACE )); then
+        ci_pause; continue                 # give asynchronous workflows time to register
       fi
       say "$REPO: PR #$pr has no checks after ${CI_REGISTRATION_GRACE}s on $want — treating it as a no-CI repo"
       return 0
@@ -304,7 +338,7 @@ wait_for_ci() {
         (.__typename == "StatusContext" and (.state == "PENDING" or .state == "EXPECTED"))
       )] | length' <<<"$json")"
     if (( pending > 0 )); then
-      sleep "$CI_POLL"; continue
+      ci_pause; continue
     fi
 
     # Skipped and neutral count as success — this repo's deploy jobs are skipped

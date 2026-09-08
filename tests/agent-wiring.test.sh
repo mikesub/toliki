@@ -295,6 +295,11 @@ for mode in read-error malformed missing-user missing-config write-error concurr
   CHANGES=""
   BLOCKERS=""
   export WIRING_CODEX_MODE="$mode"
+  if [[ "$mode" == timeout ]]; then
+    export TOLIKI_TEST_CODEX_REGISTRATION_TIMEOUT_MS=50
+  else
+    unset TOLIKI_TEST_CODEX_REGISTRATION_TIMEOUT_MS
+  fi
   mkdir -p "$HOME/.codex/agents"
   ln -s "$ROOT/agents/spec-explorer.toml" "$HOME/.codex/agents/spec-explorer.toml"
   wire_codex_content "$ROOT"
@@ -303,6 +308,7 @@ for mode in read-error malformed missing-user missing-config write-error concurr
   assert_link "$mode preserves the old link until registration succeeds" "$HOME/.codex/agents/spec-explorer.toml" "$ROOT/agents/spec-explorer.toml"
 done
 unset WIRING_CODEX_MODE
+unset TOLIKI_TEST_CODEX_REGISTRATION_TIMEOUT_MS
 
 printf '\nCodex skill-directory symlink refuses safely\n'
 HOME="$TMP/codex-linked-home"
