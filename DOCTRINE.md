@@ -195,13 +195,17 @@ don't get re-litigated from memory.
   a human-granted later round cannot repair completed work again.
   These three sessions use one fixed-purpose lifecycle runner for the common
   repair, verify, accept, correct, confirm, failure/refund and reporting path. They are
-  adapters rather than rows in a generic workflow framework: conflict evidence
-  must exist before its prospective partial head is pushed, defect evidence can
-  be refreshed only after the pushed head is observed, and defect landing-only
-  recovery intentionally bypasses model and verification work. Keeping those
-  cause-specific operations local makes their ordering visible while ensuring
-  a common failure fix is maintained once. A pushed partial is monotonic shared
-  state, so no later error can restore its autonomous queue.
+  adapters rather than rows in a generic workflow framework: the conflict stop
+  is finished by that adapter's own scripted step — markers checked, exactly
+  the judgment files staged, the rebase continued once — rather than by the
+  model that rewrote the text, so a claim of completion cannot advance the
+  branch and a further stop blocks instead of passing as a repair; conflict
+  evidence must exist before its prospective partial head is pushed, defect
+  evidence can be refreshed only after the pushed head is observed, and defect
+  landing-only recovery intentionally bypasses model and verification work.
+  Keeping those cause-specific operations local makes their ordering visible
+  while ensuring a common failure fix is maintained once. A pushed partial is
+  monotonic shared state, so no later error can restore its autonomous queue.
 - **Crons watch, models act.** Dispatch, reap and merge ticks are plain shell
   reading labels; the first model to run is the epic that got launched.
 - **Exhausted allowance pauses admission, not work.** A provider's hard quota

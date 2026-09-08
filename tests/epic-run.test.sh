@@ -3679,6 +3679,13 @@ seed_clean() {
   seed_branch epic/42-add-widget main 'printf "export const items = [] // pr-guard\n" > frontend/src/index.ts && git commit -qam "feat: add guard" -m "Closes #42"'
   seed_branch main main 'printf "# app\n\nmoved on\n" > README.md && git commit -qam "docs: main moved" -m "Closes #41"'
 }
+# Two conflicting commits on the PR branch: the first stop is the judgment one
+# the resolver is given, and continuing it stops again on the second. An epic
+# branch holds exactly one commit, so that shape is not the fixer's to resolve.
+seed_conflict_two_stops() {
+  seed_branch epic/42-add-widget main 'printf "export const items = [] // pr-guard\n" > frontend/src/index.ts && git commit -qam "feat: add guard" -m "Closes #42" && printf "# app\n\npr-notes\n" > README.md && git commit -qam "docs: add PR notes"'
+  seed_branch main main 'printf "export const items = [] // main-rename\n" > frontend/src/index.ts && printf "# app\n\nmain-notes\n" > README.md && git commit -qam "main: rename helper and note" -m "Closes #41"'
+}
 seed_mechanical_conflict() {
   seed_branch epic/42-add-widget main 'printf "export const items = []\nexport const fromPr = true\nexport const tail = true\n" > frontend/src/index.ts && git commit -qam "feat: add PR value" -m "Closes #42"'
   seed_branch main main 'printf "export const items = []\nexport const fromMain = true\nexport const tail = true\n" > frontend/src/index.ts && git commit -qam "main: add main value" -m "Closes #41"'
@@ -3705,8 +3712,10 @@ seed_conflict_three() {
 FIXBASE="$TMP/fixtures-fix"
 mkdir -p "$FIXBASE"
 fixture "$FIXBASE" fix-resolve '{"completed":true,"resolutions":[{"file":"frontend/src/index.ts","hunk":1,"mainIntent":"main renamed the helper","prIntent":"the PR added a guard","resolution":"Keeps the rename and the guard."}]}'
-# What the resolver does to the tree: settle the marked block, stage, continue.
-fixture_sh "$FIXBASE" fix-resolve 'printf "export const items = [] // main-rename pr-guard\n" > frontend/src/index.ts && git add frontend/src/index.ts && GIT_EDITOR=true git rebase --continue >/dev/null'
+# What the resolver does to the tree: settle the marked block and stop. Staging
+# and `rebase --continue` are the orchestrator's scripted steps, so a fixture
+# that does no Git work at all still has to reach a pushed, rebased branch.
+fixture_sh "$FIXBASE" fix-resolve 'printf "export const items = [] // main-rename pr-guard\n" > frontend/src/index.ts'
 accept_clear "$FIXBASE" fix-check 1
 run_fix() {
   GH_ISSUE_LABELS="${FIX_LABELS:-failed,needs-judgment},${FIX_ENGINE_LABELS-engine:claude}" \
@@ -3748,6 +3757,8 @@ assert_not_contains "and never rests for a human instead" "$RUN_OUT" 'readyToRev
 assert_contains "the resolver was handed the rung's classification" "$(cat "$STATE_DIR/fix-resolve.0.prompt")" 'needs judgment'
 assert_contains "the resolver may carry an intent outside a marker block" "$(cat "$STATE_DIR/fix-resolve.0.prompt")" "carries one side's intent to lines the other side moved"
 assert_contains "the resolver leaves deterministic checks to the pipeline" "$(cat "$STATE_DIR/fix-resolve.0.prompt")" "Do not run tests or post-edit verification commands"
+assert_contains "the resolver is told not to continue the rebase itself" "$(cat "$STATE_DIR/fix-resolve.0.prompt")" 'do not run `git rebase --continue`'
+assert_contains "the resolver is told the pipeline stages and continues" "$(cat "$STATE_DIR/fix-resolve.0.prompt")" "The pipeline stages exactly those files, continues the rebase once"
 assert_not_contains "the resolver is not assigned git diff verification" "$(cat "$STATE_DIR/fix-resolve.0.prompt")" "git diff --check"
 assert_contains "the skeptic is told to trace every out-of-block change" "$(cat "$STATE_DIR/fix-check.0.prompt")" 'trace every out-of-block change back to what one side'
 # Both sides' intent is captured before the call, so the resolver and the blind
@@ -3779,7 +3790,7 @@ assert_eq "the labels: ready-to-merge, ladder kept, needs-judgment cleared" "fix
 scenario 'fix-run: a scripted verification failure is repaired once and amended into the resolution'
 seed_conflict
 FIXVERIFYRETRY="$TMP/fixtures-fix-verify-retry"; cp -R "$FIXBASE" "$FIXVERIFYRETRY"
-fixture_sh "$FIXVERIFYRETRY" fix-resolve.0 'printf "export const items = [] // main-rename pr-guard verify-red\n" > frontend/src/index.ts; git add frontend/src/index.ts; GIT_EDITOR=true git rebase --continue >/dev/null'
+fixture_sh "$FIXVERIFYRETRY" fix-resolve.0 'printf "export const items = [] // main-rename pr-guard verify-red\n" > frontend/src/index.ts'
 fixture_sh "$FIXVERIFYRETRY" fix-resolve.1 'printf "export const items = [] // main-rename pr-guard verify-retry\n" > frontend/src/index.ts'
 run_fix "$FIXVERIFYRETRY" --issue 42
 assert_rc "the repaired verification retry ships" 0 "$RUN_RC"
@@ -3818,7 +3829,7 @@ seed_conflict_three
 PARTIALFIX="$TMP/fixtures-fix-partial"; cp -R "$FIXBASE" "$PARTIALFIX"; rm -f "$PARTIALFIX/fix-resolve.sh"
 accept_clear "$PARTIALFIX" fix-check 3
 fixture "$PARTIALFIX" fix-resolve '{"dispositions":[{"index":1,"action":"repaired","reason":"kept the main rename and the PR guard","mainIntent":"main renamed a","prIntent":"the PR guarded a","resolution":"Both intents survive in a."},{"index":2,"action":"repaired","reason":"kept the main rename and the PR guard","mainIntent":"main renamed b","prIntent":"the PR guarded b","resolution":"Both intents survive in b."},{"index":3,"action":"declined","reason":"the two sides require mutually exclusive c values"}],"summary":"Resolved a and b; retained the PR-side c text for human review."}'
-fixture_sh "$PARTIALFIX" fix-resolve 'printf "export const a = \"main-a pr-a\"\n" > frontend/src/a.ts; printf "export const b = \"main-b pr-b\"\n" > frontend/src/b.ts; printf "export const c = \"pr-c\"\n" > frontend/src/c.ts; git add frontend/src/a.ts frontend/src/b.ts frontend/src/c.ts; rebase_dir="$(git rev-parse --git-path rebase-merge)"; rebase_apply="$(git rev-parse --git-path rebase-apply)"; if [[ -d "$rebase_dir" || -d "$rebase_apply" ]]; then GIT_EDITOR=true git rebase --continue >/dev/null; fi'
+fixture_sh "$PARTIALFIX" fix-resolve 'printf "export const a = \"main-a pr-a\"\n" > frontend/src/a.ts; printf "export const b = \"main-b pr-b\"\n" > frontend/src/b.ts; printf "export const c = \"pr-c\"\n" > frontend/src/c.ts'
 BEFORE="$(origin_ref epic/42-add-widget)"
 BEFORE_MESSAGE="$(git -C "$ORIGIN" log -1 --format=%B epic/42-add-widget)"
 run_fix "$PARTIALFIX" --issue 42
@@ -3870,7 +3881,7 @@ scenario 'fix-run: a human-granted round receives only durable declined conflict
 seed_conflict_three
 GRANTBASE="$TMP/fixtures-fix-grant-base"; cp -R "$PARTIALFIX" "$GRANTBASE"
 fixture "$GRANTBASE" fix-resolve '{"dispositions":[{"index":1,"action":"repaired","reason":"kept both a intents","mainIntent":"main changed a","prIntent":"the PR changed a","resolution":"Both a intents survive."},{"index":2,"action":"declined","reason":"b still needs judgment"},{"index":3,"action":"declined","reason":"c still needs judgment"}],"summary":"Repaired a and retained b and c for review."}'
-fixture_sh "$GRANTBASE" fix-resolve 'printf "export const a = \"main-a pr-a\"\n" > frontend/src/a.ts; printf "export const b = \"pr-b\"\n" > frontend/src/b.ts; printf "export const c = \"pr-c\"\n" > frontend/src/c.ts; git add frontend/src/a.ts frontend/src/b.ts frontend/src/c.ts; GIT_EDITOR=true git rebase --continue >/dev/null'
+fixture_sh "$GRANTBASE" fix-resolve 'printf "export const a = \"main-a pr-a\"\n" > frontend/src/a.ts; printf "export const b = \"pr-b\"\n" > frontend/src/b.ts; printf "export const c = \"pr-c\"\n" > frontend/src/c.ts'
 run_fix "$GRANTBASE" --issue 42
 GRANTED_COMMENTS="$(gh_comments)"
 GRANTED_BEFORE="$(origin_ref epic/42-add-widget)"
@@ -4004,7 +4015,7 @@ scenario 'fix-run: an intent carried outside the marker block ships, and is reco
 seed_conflict_moved
 OUTSIDE="$TMP/fixtures-outside"; cp -R "$FIXBASE" "$OUTSIDE"
 fixture "$OUTSIDE" fix-resolve '{"completed":true,"resolutions":[{"file":"frontend/src/index.ts","hunk":1,"mainIntent":"main bounded the abort call","prIntent":"the PR moved the abort out of land() into postBlocker()","resolution":"Keeps the PR restructure and carries the bounded abort to where the call now lives.","outsideEdits":[{"where":"frontend/src/index.ts postBlocker()","intent":"the bounded abort main added, on the line the PR moved it to"}]}]}'
-fixture_sh "$OUTSIDE" fix-resolve 'printf "export const items = []\n\nexport function land() {\n  return finish()\n}\n\nexport const noop = () => {}\n\nexport const other = () => {}\n\nexport function postBlocker() {\n  return abort(bounded())\n}\n" > frontend/src/index.ts && git add frontend/src/index.ts && GIT_EDITOR=true git rebase --continue >/dev/null'
+fixture_sh "$OUTSIDE" fix-resolve 'printf "export const items = []\n\nexport function land() {\n  return finish()\n}\n\nexport const noop = () => {}\n\nexport const other = () => {}\n\nexport function postBlocker() {\n  return abort(bounded())\n}\n" > frontend/src/index.ts'
 run_fix "$OUTSIDE" --issue 42 --session myapp-epic-42
 assert_rc "exits 0" 0 "$RUN_RC"
 SHIPPED="$(git -C "$ORIGIN" show epic/42-add-widget:frontend/src/index.ts)"
@@ -4107,15 +4118,31 @@ assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
 assert_eq "a semantic human hold removes the fixer queue without a spent retry rung" "failed,fix-attempted," "$(gh_labels)"
 assert_eq "and runs no correction" "0 0" "$(calls correction) $(calls narrowconfirm)"
 
-scenario 'fix-run: a resolver that claims completion mid-rebase is caught'
+scenario 'fix-run: a resolver that claims completion but leaves the markers is caught'
 seed_conflict
 BEFORE="$(origin_ref epic/42-add-widget)"
 LIAR="$TMP/fixtures-liar"; cp -R "$FIXBASE" "$LIAR"; rm -f "$LIAR/fix-resolve.sh"
 run_fix "$LIAR" --issue 42
 assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
-assert_contains "the tree, not the claim, decides" "$RUN_OUT" 'the rebase is still in progress'
+assert_contains "the tree, not the claim, decides" "$RUN_OUT" 'conflict markers remain in the resolved tree'
 assert_eq "verify never ran" 0 "$(grep -c 'run verify' "$NPM_LOG")"
 assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+assert_eq "an unresolved stop is never staged or carried forward" "" "$(cd "$WT" && ls -d .git/rebase-merge .git/rebase-apply 2>/dev/null)"
+
+# The one shape a resolver could never settle for itself: the stop it was given
+# is not the whole rebase. The orchestrator continues the rebase, sees a second
+# stop, and blocks — a further stop is never a completed repair.
+scenario 'fix-run: a further rebase stop blocks instead of becoming a finished repair'
+seed_conflict_two_stops
+BEFORE="$(origin_ref epic/42-add-widget)"
+run_fix "$FIXBASE" --issue 42
+assert_rc "a second stop blocks" 3 "$RUN_RC"
+assert_contains "the scripted continuation names the further stop" "$RUN_OUT" 'continuing the rebase stopped again'
+assert_eq "no resolver is respawned at a stop it does not own" 1 "$(calls fix-resolve)"
+assert_eq "a further stop reaches neither verify nor the checker" "0 0" "$(grep -c '^run verify$' "$NPM_LOG" || true) $(calls fix-check)"
+assert_eq "a further stop pushes nothing" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+assert_not_contains "and never reaches the merge queue" "$(gh_labels)" "ready-to-merge"
+assert_eq "the blocked run leaves no rebase state behind" "" "$(cd "$WT" && ls -d .git/rebase-merge .git/rebase-apply 2>/dev/null)"
 
 scenario 'fix-run: an exhausted attempt ladder refuses without running'
 seed_conflict

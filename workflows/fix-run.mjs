@@ -7,8 +7,10 @@
 // has a model resolve the hunks left marked — stating what each side intended
 // and how both survive, editing outside a marker block only where that is what
 // carries a side's intent to lines the other side moved, escalating instead of
-// guessing — re-runs npm run verify, has a blind adversarial agent try to
-// refute the resolution, and force-pushes. A complete repair lands the issue
+// guessing, and editing nothing but that text — then checks the markers are
+// gone, stages exactly those files, continues the rebase itself and validates
+// the completed branch, re-runs npm run verify, has a blind adversarial agent
+// try to refute the resolution, and force-pushes. A complete repair lands the issue
 // ready-to-merge; a verified partial repair preserves the repaired hunks but
 // rests at ready-to-review with the fixer queue removed. Its authenticated,
 // head-bound record names only the declined hunks and their original diff3
@@ -59,7 +61,7 @@
 import { readFileSync } from 'node:fs'
 import { log } from './lib/runtime.mjs'
 import { HARNESS_DIR } from './lib/engine.mjs'
-import { sh, must, failureReason } from './lib/proc.mjs'
+import { sh, failureReason } from './lib/proc.mjs'
 import { authenticatedLogin, ensureLabels, editLabels, issueLabels, issueView, comment, openPrs, readBack, terminalTransition } from './lib/github.mjs'
 import { git, gitOut, captureDiff, changedFiles, discoverPackages, pkgList, ensureDeps, rebaseInProgress, pushRejected, intentToAdd } from './lib/repo.mjs'
 import { captureIssueRecord, captureIssueRecords, evidenceBlock, renderIssueRecords } from './lib/evidence.mjs'
@@ -152,9 +154,9 @@ ${prep.judgmentHunks.map((h, i) => `${i + 1}. ${h.file} hunk ${h.hunk} — ${h.r
 
 **Decline instead of guessing.** Treat each numbered judgment hunk independently. If you cannot honestly state both intents and show both surviving — the two sides genuinely contradict, or the evidence does not say what a side meant — leave that hunk as the exact PR-side text and mark its disposition declined with the reason. Continue repairing the other hunks. A partial result is held for a human; a silently dropped intent is not.
 
-Boundaries: the marker blocks are the target — that text is what you are here to rewrite. An edit OUTSIDE a marker block is allowed only in the files listed above, and only where it is what carries one side's intent to lines the other side moved or restructured: say main changed a call inside the block to use a bounded timeout while the PR moved that call outside the block, so keeping main's intent takes a one-line edit outside the markers. List every such edit in that hunk's resolution entry, under outsideEdits: where it is (file, and the symbol or line range) and which side's intent required it. Never revisit the mechanical resolutions; never touch a file that is not listed above; never commit anything new; never push. Where keeping both intents would take more than this, escalate instead of guessing.
+Boundaries: the marker blocks are the target — that text is what you are here to rewrite. An edit OUTSIDE a marker block is allowed only in the files listed above, and only where it is what carries one side's intent to lines the other side moved or restructured: say main changed a call inside the block to use a bounded timeout while the PR moved that call outside the block, so keeping main's intent takes a one-line edit outside the markers. List every such edit in that hunk's resolution entry, under outsideEdits: where it is (file, and the symbol or line range) and which side's intent required it. Never revisit the mechanical resolutions; never touch a file that is not listed above; never stage, commit or push anything. Where keeping both intents would take more than this, escalate instead of guessing.
 
-When every block has either been repaired or replaced with its exact PR-side text, \`git add\` exactly those files and run \`GIT_EDITOR=true git rebase --continue\` once. Do not run tests or post-edit verification commands. The pipeline checks diff validity, remaining markers, rebase state and branch shape before anything ships. If continuing the rebase reports another stop, mention that in the summary and do not claim a completed repair.
+Editing those blocks is your whole job. When every block has either been repaired or replaced with its exact PR-side text, stop and leave the files as they are — uncommitted, mid-rebase working-tree edits. Do not \`git add\`; do not run \`git rebase --continue\` or \`git rebase --abort\`. Do not run tests or post-edit verification commands. The pipeline stages exactly those files, continues the rebase once, and checks remaining markers, diff validity, rebase state and branch shape before anything ships; if the continuation stops again, that is the pipeline's call and never a completed repair.
 
 Return dispositions with exactly one entry for every numbered judgment hunk: index, action ("repaired" or "declined"), and a non-empty reason. A repaired entry also states mainIntent, prIntent, resolution (what the merged text does and how it keeps both), and outsideEdits when needed. A declined entry leaves the exact PR-side text and explains why both intents could not safely be combined. Also return a short summary. No missing, duplicate, or extra indexes.`,
 
@@ -299,7 +301,7 @@ const RESOLVE_SCHEMA = {
   type: 'object', additionalProperties: false,
   required: [],
   properties: {
-    completed: { type: 'boolean', description: 'true only when every marker block was resolved, the files staged, and rebase --continue finished with exactly one commit on top of origin/main' },
+    completed: { type: 'boolean', description: 'true only when every marker block was resolved in the working tree and left, unstaged and uncommitted, for the pipeline to stage and continue' },
     escalate: { type: 'string', description: 'set INSTEAD of completing when any hunk is a genuine contradiction or its intents cannot be established — which file/hunk and why both intents cannot both survive' },
     resolutions: {
       type: 'array',
@@ -698,8 +700,8 @@ async function prepare(ctx, { labels }) {
     markedFiles = (await gitOut(['diff', '--name-only', '--diff-filter=U'], 'git diff --diff-filter=U')).split('\n').filter(Boolean)
     if (!markedFiles.length) {
       // The conflict turned fully mechanical since the merge worker saw it (main moved).
-      must(await git(['rebase', '--continue'], { env: { ...process.env, GIT_EDITOR: 'true' } }), 'git rebase --continue')
-      if (await rebaseInProgress()) return { ...base, mergeBase, mainIssues, report, gitBlocked: 'more than one commit conflicted — an epic branch holds exactly one' }
+      const settled = await continueRebase()
+      if (settled) return { ...base, mergeBase, mainIssues, report, gitBlocked: settled }
     }
   }
 
@@ -750,19 +752,60 @@ function normalizedDispositions(result, hunks) {
   })
 }
 
-// What the resolver claims, checked against the tree: no rebase in progress, exactly one commit above
-// origin/main, no marker left in the files it owned. Returns the first problem, or null.
+// The diff3 markers git writes into a stopped rebase, as `git grep` reads them.
+const MARKER_PATTERN = '^(<<<<<<<|>>>>>>>|\\|{7})( |$)'
+
+// Continue a stopped rebase exactly once. A rebase still in progress afterwards
+// is never a finished repair, so the caller blocks on it rather than measuring
+// the branch — and the two ways that happens want different reasons: unmerged
+// paths mean git reached a further conflicting commit, a shape this fixer does
+// not own, while none mean the continuation itself refused (an empty commit, a
+// bad state) and git's own first line is the useful reason.
+// Returns the problem, or null.
+async function continueRebase() {
+  const cont = await git(['rebase', '--continue'], { env: { ...process.env, GIT_EDITOR: 'true' } })
+  if (!(await rebaseInProgress())) {
+    return cont.ok ? null : `git rebase --continue failed: ${failureReason(cont)}`
+  }
+  const unmerged = (await git(['diff', '--name-only', '--diff-filter=U'])).out
+  return unmerged
+    ? 'continuing the rebase stopped again on further conflicts — more than one commit conflicted, and an epic branch holds exactly one'
+    : `git rebase --continue left the rebase in progress: ${`${cont.err || ''}\n${cont.out || ''}`.split('\n').find(Boolean) || failureReason(cont)}`
+}
+
+// The scripted completion of the stop the resolver edited. The model owns the
+// marked text and nothing else: the orchestrator confirms no marker survived,
+// stages exactly the files the resolver was allowed to touch, refuses a stop
+// that still holds an unresolved path outside them, and continues the rebase
+// itself — so no claim of a finished repair can carry the branch forward.
+// A verification-driven retry and a human-granted continuation both amend a
+// rebase that already finished, which is why the in-progress check gates this.
+// Returns the first problem, or null.
+async function settleResolution(markedFiles) {
+  if (!(await rebaseInProgress())) return null
+  const markers = await git(['grep', '-n', '-E', MARKER_PATTERN, '--', ...markedFiles])
+  if (markers.ok) return `conflict markers remain in the resolved tree: ${markers.out.split('\n')[0]}`
+  const staged = await git(['add', '--', ...markedFiles])
+  if (!staged.ok) return `the resolved file(s) could not be staged: ${failureReason(staged)}`
+  const unmerged = (await gitOut(['diff', '--name-only', '--diff-filter=U'], 'git diff --diff-filter=U')).split('\n').filter(Boolean)
+  if (unmerged.length) return `the stop still holds unresolved path(s) the resolver was not given: ${unmerged.join(', ')}`
+  return continueRebase()
+}
+
+// The completed branch, checked against the tree after that continuation: no
+// rebase in progress, exactly one commit above origin/main, no marker left in
+// the files the resolver owned. Returns the first problem, or null.
 async function resolutionProblem(markedFiles) {
   if (await rebaseInProgress()) return 'the rebase is still in progress'
   const count = Number((await git(['rev-list', '--count', 'origin/main..HEAD'])).out)
   if (count !== 1) return `the rebased branch holds ${Number.isNaN(count) ? 'an unknown number of' : count} commit(s) above origin/main — an epic branch holds exactly one`
   const whitespace = await git(['diff', '--check', 'origin/main', '--', ...markedFiles])
   if (!whitespace.ok) return `the resolved tree fails git diff --check: ${whitespace.err || whitespace.out || `exit ${whitespace.code}`}`
-  // Read the working tree, not only HEAD: the first resolver normally commits
-  // through rebase --continue, while a verification-driven retry deliberately
-  // leaves its amendment uncommitted for the orchestrator to inspect and fold
-  // into that commit.
-  const markers = await git(['grep', '-n', '-E', '^(<<<<<<<|>>>>>>>|\\|{7})( |$)', '--', ...markedFiles])
+  // Read the working tree, not only HEAD: the scripted continuation commits the
+  // first resolution, while a verification-driven retry deliberately leaves its
+  // amendment uncommitted for the orchestrator to inspect and fold into that
+  // commit.
+  const markers = await git(['grep', '-n', '-E', MARKER_PATTERN, '--', ...markedFiles])
   if (markers.ok) return `conflict markers remain in the resolved tree: ${markers.out.split('\n')[0]}`
   return null
 }
@@ -1018,16 +1061,20 @@ await runFixerLifecycle({
     noResult: 'the resolver produced no result — the rebase is aborted for a clean retry.',
     normalize: (result, prep) => normalizedDispositions(result, prep.judgmentHunks),
     allDeclined: declined => `the resolver declined every judgment hunk: ${declined.map(d => `${d.file} hunk ${d.hunk}: ${d.reason}`).join('; ')}`,
+    // Marker check, staging and rebase continuation are the orchestrator's, and
+    // they run only after every hunk has a disposition and at least one repair:
+    // a round that declined everything leaves the stop for the abort in cleanup.
+    settle: (_ctx, prep) => settleResolution(prep.markedFiles),
     treeProblem: async (_ctx, prep) => {
       if (prep.partialRecord) return (await gitOut(['status', '--porcelain'], 'git status'))
         ? null
         : 'the resolver reported a repaired prior decline but changed no file'
       const problem = await resolutionProblem(prep.markedFiles)
-      return problem ? `the resolver reported completion but ${problem}.` : null
+      return problem ? `the settled resolution is not shippable: ${problem}.` : null
     },
     log: (_ctx, prep, _result, repaired, declined) => log(prep.partialRecord
       ? `Resolve: ${repaired.length} previously declined hunk(s) repaired, ${declined.length} still declined; working-tree delta ready for verification.`
-      : `Resolve: ${repaired.length} judgment hunk(s) repaired, ${declined.length} declined; rebase finished clean.`),
+      : `Resolve: ${repaired.length} judgment hunk(s) repaired, ${declined.length} declined; the pipeline staged the resolution and the rebase is finished.`),
   },
   verify: {
     packages: prep => prep.packages,

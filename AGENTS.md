@@ -137,8 +137,11 @@ than made launchable against a main without the code it describes.
   indexed-disposition gate, run state, quota/refund, blocker and human-hold
   paths, terminal budget, status and `RESULT`. The acceptance, correction and
   confirmation contract itself lives in `workflows/lib/repair-acceptance.mjs`,
-  shared with epic-run. The entry points remain explicit cause adapters: conflict owns
-  rebase/autoresolve and pre-push partial evidence, CI owns failing-check/log
+  shared with epic-run. The runner's optional `settle` hook is where an adapter
+  finishes the repository state its repair agent was left in. The entry points
+  remain explicit cause adapters: conflict owns rebase/autoresolve, the scripted
+  marker check, staging and rebase continuation that finish its stop, and
+  pre-push partial evidence, CI owns failing-check/log
   capture and local reproduction, and defect owns authenticated evidence,
   post-push head/evidence confirmation and landing-only recovery. Pushed
   partial state is monotonic in the runner and can never return through an
@@ -469,6 +472,11 @@ than made launchable against a main without the code it describes.
   required.
 - Mechanical conflict resolution stays containment-gated. If both sides' intent
   cannot be proven to survive, escalate instead of guessing.
+- The conflict fixer's resolver edits only the conflict text it was handed and
+  returns indexed repaired/declined dispositions. The marker check, staging,
+  rebase continuation and completed-branch validation are scripted, so a claim
+  of completion cannot advance the branch and a further rebase stop blocks
+  instead of becoming a success.
 - The conflict fixer never merges. A complete repair restores unattended
   eligibility at `ready-to-merge`; a verified partial repair preserves every
   repaired hunk but rests only at `ready-to-review`, with `needs-judgment`
