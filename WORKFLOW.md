@@ -155,7 +155,9 @@ epic/task entry points. **LLM calls:** none.
     the branch claim is secure.
 14. It makes `.epics/` worktree-locally ignored, writes the issue body to
     `.epics/<slug>/requirements.md`, and creates or resumes `epic.md` as the
-    phase log.
+    phase log. The orchestrator is that log's only writer for the whole run: no
+    step is asked to append to it, and every line comes from what a step
+    returned or from what the orchestrator itself did.
 15. It discovers the repo root and one-level child packages whose
     `package.json` declares `scripts.verify`.
 16. For each discovered package, it runs `npm ci` only when a lockfile exists
@@ -200,6 +202,10 @@ one logical call.
 6. A resumed code checkpoint first reuses `.epics/<slug>/architecture.json`.
    If that artifact is missing or invalid, a read-only architect reconstructs
    the plan from the finished implementation without changing it.
+   Both the reconstruction and a resumed partial continuation receive the
+   requirement and the orchestrator-captured diff of the existing work inline;
+   a capture that fails blocks rather than sending the architect to find it.
+   A fresh design receives the requirement inline and explores the codebase.
 7. The orchestrator validates the complete structure and non-empty verification
    evidence. Invalid architecture blocks before Code.
 8. Deterministic rendering writes `architecture.json` and `architecture.md`;
@@ -217,9 +223,11 @@ two logical calls, depending on resume state and verification mode.
 2. A fresh `test-first` plan begins with orchestrator-run `npm run verify` in
    every discovered package. A red baseline blocks; it cannot be mistaken for
    the requested regression.
-3. The RED `coder` process writes tests only, without executing them, and
-   identifies the exact intended failing test/assertion plus why it proves
-   missing required behavior.
+3. The RED `coder` process receives the requirement inline, writes tests only
+   without executing them, and identifies the exact intended failing
+   test/assertion, why it proves missing required behavior, and any surface it
+   deliberately left uncovered. The orchestrator records that uncovered list in
+   the phase log; the RED writer never writes to a run artifact itself.
 4. The orchestrator confirms the RED delta contains exactly the declared test
    files, then runs verify and accepts RED only when every failing package
    contains that exact assertion evidence. A green result, timeout, spawn
@@ -229,8 +237,11 @@ two logical calls, depending on resume state and verification mode.
 6. The GREEN `coder` process implements the architecture against the failing
    tests. In `direct` mode, one `coder` process instead implements the change
    and adds or updates useful tests in the same pass.
-7. The coder returns its edits without running tests, builds, linters, type
-   checks, or the project verification command, and may not commit or push.
+7. The coder receives the requirement inline and returns its edits without
+   running tests, builds, linters, type checks, or the project verification
+   command, and may not commit or push. Its scope decisions, plan adjustments
+   and unresolved questions come back in its returned status, which the
+   orchestrator writes into the phase log.
 8. The orchestrator alone runs `npm run verify` in every discovered package. The exit
    codes and bounded, terminal-formatting-free output are the authoritative
    evidence used in prompts, logs, and GitHub comments.
@@ -279,8 +290,11 @@ logical call, with one verification-driven retry available.
 
 1. Every review finding is immediately actionable; there is no separate model
    confirmation pass before repair.
-2. One fresh fixer receives the requirement, complete reviewed diff, source
-   tree, and numbered findings.
+2. One fresh fixer receives the pinned requirement and the same
+   orchestrator-captured diff the reviewer judged, inline, plus the source tree
+   and the numbered findings. It is never told to run a Git command for that
+   diff or to open the requirement file, so it and the final review that judges
+   it read the same bytes.
 3. For every index it must return exactly one disposition:
    - `fixed`: change the code and add meaningful regression coverage.
    - `disputed`: leave the code alone and cite concrete evidence that the
@@ -392,8 +406,11 @@ libraries for every mutation. **LLM calls:** one logical call.
      blocks with the resumable chain preserved.
    - A failed fetch or conflicting rebase falls back to the run's original
      base. The merge worker will rebase and re-check it later.
-3. It captures the final diff, the shippable-state snapshot, and opaque IDs for
-   every known structured blocker.
+3. It captures the final diff, the review ledger's final states, the
+   shippable-state snapshot, and opaque IDs for every known structured blocker.
+   Ship receives all of them inline and opens nothing under `.epics/`. Manual
+   `--slug` mode does the same for its summary, and appends the derived
+   changed-file list and the real verify evidence to `summary.md` itself.
 4. One read-only `shipper` process returns schema-checked delivery metadata:
    PR/commit title, source-issue delivery narrative, non-empty commit rationale,
    any project-defined legal marker, and the deferred-work ledger.
@@ -506,7 +523,12 @@ session name and durable engine pin. Each has a two-rung attempt ladder: first
 attempt, one retry, then human intervention. Their common sequence lives in
 [`workflows/lib/fixer-lifecycle.mjs`](workflows/lib/fixer-lifecycle.mjs):
 Prepare evidence, run one writable repair agent, run orchestrator verification,
-run one exhaustive acceptance check, then publish. If the first repair is red,
+run one exhaustive acceptance check, then publish. Prepare captures the whole
+brief before the first call — the issue bodies, the pinned diffs, both conflict
+sides and the commit subjects behind them, the failing jobs' logs — so the
+repair and the blind checker that judges it read the same bytes, and the audit
+comment's changed-file list is derived from the repair's own delta rather than
+copied from what the repair said it touched. If the first repair is red,
 the orchestrator gives one fresh repair process its bounded captured diagnostics
 and runs the full gate again before any acceptance check. This in-run diagnostic
 retry does not consume another durable attempt-ladder rung.
@@ -559,9 +581,13 @@ when both paths are needed.
    attempt rung.
 2. It fetches the branch, rebases onto captured current main, and runs
    `merge-autoresolve.sh --partial` to settle every mechanical hunk first.
-3. The repair agent receives only the remaining judgment hunks and must account
-   for each by either preserving both sides' intent or declining it without
-   guessing.
+3. The repair agent receives only the remaining judgment hunks, plus the
+   captured brief: both sides' diffs of exactly the marked files, the commit
+   subjects behind main's side, and the issue bodies stating what each side set
+   out to do (up to five of main's, since that list is parsed out of arbitrary
+   commit messages; the subjects always carry the rest). It must account for each hunk by either preserving both sides'
+   intent or declining it without guessing. The acceptance check and any scoped
+   correction receive that same captured brief.
 4. The orchestrator validates every indexed disposition, completed rebase
    shape, marker cleanup, and allowed edit boundary.
 5. It runs `npm run verify`; a red result and its captured diagnostics go back
@@ -589,8 +615,10 @@ when both paths are needed.
 1. It verifies routing, queue state, unique PR/head, and its independent CI
    attempt ladder.
 2. It reads the failing check names, captures bounded logs for up to three
-   failed jobs, installs dependencies, and runs local verify to establish
-   whether the failure reproduces.
+   failed jobs, captures the change under repair and the issue body it was built
+   against, installs dependencies, and runs local verify to establish whether
+   the failure reproduces. The fixer, the acceptance check and any correction
+   all receive that captured brief inline.
 3. The fixer accounts for every failed check as repaired or declined and may
    change only the smallest code necessary to fix the cause. It may not weaken
    a test, type, lint rule, assertion, or check.
@@ -628,7 +656,10 @@ manual launch stays available.
    it uses the envelope's pinned original requirement rather than mutable issue
    prose.
 3. The fixer may repair only the numbered, gate-confirmed defects and must
-   account for each as repaired or declined without reclassification.
+   account for each as repaired or declined without reclassification. Beside
+   the pinned requirement it receives the orchestrator-captured diff of the
+   reviewed change on the captured head, and so does the acceptance check; the
+   PR change is never a Git command either is told to run.
 4. The orchestrator validates exact coverage and runs `npm run verify`. A red
    result and its captured diagnostics go back to one fresh fixer before the
    full gate runs again; a second red blocks. It intent-adds new files only

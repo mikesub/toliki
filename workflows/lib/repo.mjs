@@ -219,6 +219,19 @@ export async function captureDiff(refs = [], { stat = false, paths = [] } = {}) 
   return result.ok ? result.out : null
 }
 
+// Which paths a change touched, derived here rather than reported by the step
+// that made it. A repair agent's own list of files is a claim like any other,
+// and the audit comment that names them is a durable record — so the record is
+// built from what git says the tree did, not from what the model said it did.
+// Same untrusted-configuration boundary as captureDiff. Returns null when the
+// capture failed, which callers report as unknown rather than as "no files".
+export async function changedFiles(refs = [], { paths = [] } = {}) {
+  const args = ['diff', '--no-ext-diff', '--no-textconv', '--name-only', ...refs]
+  if (paths.length) args.push('--', ...paths)
+  const result = await git(args)
+  return result.ok ? result.out.split('\n').map(line => line.trim()).filter(Boolean) : null
+}
+
 // A tree object for the whole worktree — tracked content whether staged or not,
 // plus untracked files — written through a THROWAWAY index so neither the run's
 // index nor a user's index is disturbed. It exists so a delta can be taken
@@ -278,7 +291,10 @@ export function readRequirements(dir) {
 }
 
 // epic.md is the run's own log; fresh on a new run, kept and appended to on a
-// resume so the phase log tells the whole story of the branch.
+// resume so the phase log tells the whole story of the branch. It is a factual
+// record of what the orchestrator did and what each step decided, so the
+// orchestrator writes every line of it: a run record maintained by the models
+// being recorded is a claim, and one of them forgetting to append is a hole.
 export function initEpicMd(dir, { title, slug, issue }) {
   mkdirSync(dir, { recursive: true })
   const file = path.join(dir, 'epic.md')
@@ -291,8 +307,10 @@ export function initEpicMd(dir, { title, slug, issue }) {
 }
 
 // Tolerant edits: the phase line and approach line are replaced where present,
-// the log line is appended. Agents also write notes here, which is why nothing
-// is ever rewritten wholesale.
+// the log line is appended. The orchestrator is the only writer — a model
+// returns its decisions and reasons in structured output and this file records
+// them — but nothing is ever rewritten wholesale, because a resumed run appends
+// to the log an earlier run left behind.
 export function updateEpicMd(dir, { phase, approach, log } = {}) {
   const file = path.join(dir, 'epic.md')
   let text = existsSync(file) ? readFileSync(file, 'utf8') : '# epic\n- phase:\n- approach:\n\n## Phase log\n'

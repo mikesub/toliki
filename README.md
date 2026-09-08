@@ -12,6 +12,13 @@ The pipeline is a plain Node script. It does everything deterministic itself —
 the claim, the labels, the commits, the push, the PR, `npm run verify` — and
 spawns a short-lived headless agent process, behind a small engine adapter,
 only where a judgment is needed. Claude Code and Codex are both supported.
+It also does the fetching and the bookkeeping around each of those calls: the
+issue bodies, the pinned diffs, both sides of a conflict, the failing jobs'
+logs and the review ledger are captured before the call and pasted into the
+prompt, and the changed-file lists, verification results and the run's phase log
+are written from what the script observed rather than from what a step said. A
+step is asked for a decision and its reasons; exploring the codebase stays open
+to it.
 
 ## The loop
 

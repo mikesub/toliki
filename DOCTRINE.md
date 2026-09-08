@@ -228,6 +228,21 @@ don't get re-litigated from memory.
   verify output; a failed command or timeout is not a regression test. Both
   coding paths must finish with verify green because the orchestrator ran it,
   not because a step said so.
+  The same split runs through the prompts, in both directions. Inputs: what a
+  step is KNOWN to need — the issue bodies, the pinned diffs, both sides of a
+  conflict and the commit subjects behind them, the CI job logs, the final
+  review ledger — is captured before the call and pasted in, never named as a
+  `git` or `gh` command for the step to run. A judging step has no shell to run
+  one with, evidence a step fetched for itself is evidence nothing proved it
+  received, and a builder and the blind checker that judges it have to read the
+  same bytes or the checker refutes a repair made against something else. What
+  stays open is EXPLORATION: writable steps read the tree and reviewers grep it.
+  Outputs: a step returns decisions and reasons, and the script writes the
+  records — the changed-file list is derived from the delta rather than copied
+  from the step's account of what it touched, and the run's phase log is written
+  from what each step returned rather than appended to by the steps it
+  describes. A factual record maintained by the models it records is a claim,
+  and one of them forgetting to write a line is a hole nothing can see.
 - **Work state is GitHub.** An issue body is the specification and its
   append-only comments are the human run record; lifecycle and engine-routing
   labels, `blocked_by` edges, claim refs, and technical PRs carry the remaining
