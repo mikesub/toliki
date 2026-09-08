@@ -575,14 +575,16 @@ manual launch stays available.
    gate, and the verify contract and narrow confirmation run again before any
    push.
 7. A surviving repair is amended and force-pushed with a lease. The script
-   confirms the PR advanced to that head over a bounded readback window and
-   immediately publishes a landing audit record.
+   immediately posts its audit comment, including a landing record for a
+   complete repair, then confirms the PR advanced to that head over a bounded
+   readback window. Publishing the record first preserves recovery evidence
+   even if head confirmation fails.
 8. A complete repair returns to `ready-to-merge`. A partial repair stays
    `ready-to-review`, removes the defect queue, and publishes fresh evidence on
    the amended head containing only declined defects.
-9. If a verified repair was pushed but landing confirmation failed, a trusted
-   audit record allows the next attempt to redo only the label landing; it does
-   not edit already-repaired defects a second time.
+9. If a verified complete repair was pushed but landing confirmation failed, a
+   trusted audit record allows the next attempt to redo only the label landing;
+   it does not edit already-repaired defects a second time.
 
 ## Shared failure behavior
 
