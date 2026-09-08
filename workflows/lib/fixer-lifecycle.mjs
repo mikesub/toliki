@@ -367,7 +367,7 @@ export async function runFixerLifecycle(spec) {
       spec.check.correction.prompt(ctx, prep, dispositions, {
         blockers: accepted.blockers, verdicts: accepted.verdicts, cumulative, verified,
       }),
-      spec.check.correction.agent)
+      { ...spec.check.correction.agent, retry: true })
     // The correction is a writable repair step: a death here is operational and
     // keeps the historical refund, ladder and blocker behavior.
     if (!raw) return stop(fail('check', spec.check.correction.noResult))
@@ -447,7 +447,15 @@ export async function runFixerLifecycle(spec) {
       }
       if (prep.refused) {
         log(`Prepare refused: ${prep.refused}`)
-        return { skipped: true, issue: ctx.issue, reason: prep.refused, refusalFinal: !!prep.refusalFinal, outcome: 'skipped' }
+        // A final refusal has already made and read back its terminal human
+        // transition. Classifying it as a generic skip would let a later
+        // exhausted-ladder probe overwrite the issue lifetime's real handoff.
+        // Ordinary closed/missing-queue refusals did no such work and remain
+        // skipped. An unverified final transition is conservatively blocked.
+        const outcome = prep.refusalFinal
+          ? (state.rest?.verified && state.rest.resting === 'ready-to-review' ? 'human-review' : 'human-blocked')
+          : 'skipped'
+        return { skipped: true, issue: ctx.issue, reason: prep.refused, refusalFinal: !!prep.refusalFinal, outcome }
       }
       state.attempt = prep.attempt
       state.prUrl = prep.prUrl || null

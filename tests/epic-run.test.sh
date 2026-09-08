@@ -2148,6 +2148,8 @@ fixture "$CORRECTED" ship '{"title":"Add widget","body":"CORRECTED_NARRATIVE_SEN
 run_pipeline "$EPIC_RUN" "$CORRECTED" --issue 42
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_eq "one correction and one narrow confirmation ran" "1 1" "$(calls correction) $(calls narrowconfirm)"
+assert_eq "the bounded correction is recorded as an in-run repair retry" "true" \
+  "$(usage_log | jq -r 'select(.type=="spawn" and .label=="correction") | .retry')"
 assert_contains "the confirmed correction reaches the merge queue" "$RUN_OUT" '"readyToMerge":true'
 assert_eq "the issue ends ready-to-merge with no repair queue" "ready-to-merge," "$(gh_labels)"
 assert_not_contains "no defect-fixer handoff is created" "$(gh_comments)" "🤖 defect-fix evidence"
@@ -3698,6 +3700,9 @@ BEFORE="$(origin_ref epic/42-add-widget)"
 FIX_LABELS="failed,needs-judgment,fix-attempted,fix-retried" run_fix "$FIXBASE" --issue 42
 assert_rc "exits 2 (skipped)" 2 "$RUN_RC"
 assert_contains "the refusal is final" "$RUN_OUT" '"refusalFinal":true'
+assert_contains "the exhausted conflict ladder remains a recorded human block" "$RUN_OUT" '"outcome":"human-blocked"'
+assert_eq "its lifecycle finish remains in the handoff denominator" "human-blocked true" \
+  "$(usage_log | jq -r 'select(.type=="run-finish") | "\(.outcome) \(.handoff)"')"
 assert_eq "no resolver was woken" 0 "$(calls fix-resolve)"
 assert_contains "the refusal was commented" "$(gh_comments)" "🤖 fix-conflict refused: attempt ladder exhausted"
 assert_contains "the issue is left failed" "$(gh_labels)" "failed,"
@@ -4109,6 +4114,9 @@ seed_ci_pr
 CI_LABELS="failed,needs-ci-fix,ci-attempted,ci-retried" run_ci "$CI_RUN" "$CIBASE" --issue 42
 assert_rc "exits 2 (skipped)" 2 "$RUN_RC"
 assert_contains "the refusal is final" "$RUN_OUT" '"refusalFinal":true'
+assert_contains "the exhausted CI ladder remains a recorded human block" "$RUN_OUT" '"outcome":"human-blocked"'
+assert_eq "its lifecycle finish remains in the handoff denominator" "human-blocked true" \
+  "$(usage_log | jq -r 'select(.type=="run-finish") | "\(.outcome) \(.handoff)"')"
 assert_eq "no fixer was woken" 0 "$(calls ci-fix)"
 assert_contains "the refusal was commented" "$(gh_comments)" "🤖 fix-ci refused: attempt ladder exhausted"
 
@@ -4867,6 +4875,9 @@ BEFORE="$(origin_ref epic/42-add-widget)"
 DEFECT_LABELS="ready-to-review,needs-defect-fix,defect-attempted,defect-retried" run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
 assert_rc "exits 2 (skipped/refused)" 2 "$RUN_RC"
 assert_contains "the reason names the exhausted ladder" "$RUN_OUT" "attempt ladder exhausted"
+assert_contains "the exhausted defect ladder remains a recorded review handoff" "$RUN_OUT" '"outcome":"human-review"'
+assert_eq "its lifecycle finish remains in the handoff denominator" "human-review true" \
+  "$(usage_log | jq -r 'select(.type=="run-finish") | "\(.outcome) \(.handoff)"')"
 assert_eq "no model ran" "0 0" "$(calls defect-fix) $(calls defect-check)"
 assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
 assert_eq "automation never resets the ladder or review state" "defect-attempted,defect-retried,needs-defect-fix,ready-to-review," "$(gh_labels)"
@@ -5154,6 +5165,8 @@ run_ci "$CI_RUN" "$CICORRECT" --issue 42
 assert_rc "a corrected CI repair lands" 0 "$RUN_RC"
 assert_contains "RESULT names every corrected blocker" "$RUN_OUT" '"correctedBlockers":["b1","b2"]'
 assert_eq "one repair, one acceptance, one correction, one confirmation" "1 1 1 1" "$(calls ci-fix) $(calls ci-check) $(calls ci-correction) $(calls ci-confirm)"
+assert_eq "the shared fixer records its correction as an in-run repair retry" "true" \
+  "$(usage_log | jq -r 'select(.type=="spawn" and .label=="ci-correction") | .retry')"
 assert_eq "the correction re-ran the full verify contract" 3 "$(grep -c '^run verify$' "$NPM_LOG")"
 assert_eq "the corrected branch is still one commit above main" 1 "$(origin_count epic/42-add-widget)"
 assert_contains "the correction's own new file is in the amended commit" "$(git -C "$ORIGIN" show epic/42-add-widget:frontend/src/types.ts)" "widgetType"

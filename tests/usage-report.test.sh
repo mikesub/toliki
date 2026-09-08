@@ -17,7 +17,7 @@ set -uo pipefail
 #   <repo>                          a group header line: the bare registry key
 #   #<issue> …                      one row per issue; its first line starts with #N
 #     …                             a continuation line with tokens and retries
-#   runs without repository/issue identity (never merged)
+#   runs without repository/issue identity (never joined to an issue lifetime)
 #                                   the trailing group, one row per runId
 #   all repositories: …             cross-repository totals
 #   human handoff: N of D conclusive lifetime(s) (P%)
@@ -177,6 +177,11 @@ assert_contains "the tuning view names its summed time model-active" "$REPORT_OU
 assert_contains "the average run reports model-active minutes" "$REPORT_OUT" 'model-active min'
 assert_contains "and says once what that time is not" "$REPORT_OUT" 'summed spawn duration, not wall-clock'
 assert_not_contains "lifecycle records never enter the per-step table" "$REPORT_OUT" 'undefined'
+LIFE_TOTALS="$(line_with 'all repositories:')"
+assert_contains "cross-repository totals include respawns" "$LIFE_TOTALS" 'respawns 1'
+assert_contains "cross-repository totals include in-run retries" "$LIFE_TOTALS" 'retries 2'
+assert_contains "cross-repository totals include relaunches" "$LIFE_TOTALS" 'relaunches 1'
+assert_contains "cross-repository totals include fixer ladder attempts" "$LIFE_TOTALS" 'fixer attempts 3'
 
 # ───────────────────────── repository identity ─────────────────────────
 section 'the same issue number in two repositories stays two lifetimes'
@@ -295,11 +300,39 @@ assert_contains "and it carries its result" "$ZERO_ROW" 'result skipped'
 KILLED_ROW="$(row 61)"
 assert_contains "a killed run leaves exactly one visible incomplete launch" "$KILLED_ROW" 'incomplete 1'
 assert_contains "whose result is not invented" "$KILLED_ROW" 'result incomplete'
+assert_contains "the cross-repository summary exposes partial retained history" "$REPORT_OUT" 'partial history 1 lifetime(s)'
+
+# Starts and finishes pair by runId, not by lifetime-wide counts. A finish-only
+# retained run must not cancel an unrelated invocation that never finished.
+PAIRS="$TMP/pairs.jsonl"
+run_start "$PAIRS" 2026-04-04T12:00:00.000Z pair-a epic-run claude 62 '"myapp"'
+run_finish "$PAIRS" 2026-04-04T12:10:00.000Z pair-b epic-run claude 62 '"myapp"' 300000 '"merge-queued"' false 0 null
+report "$PAIRS"
+PAIRS_ROW="$(row 62)"
+assert_contains "an unmatched start remains incomplete despite another finish" "$PAIRS_ROW" 'incomplete 1'
+assert_contains "the unmatched finish is disclosed as partial history too" "$PAIRS_ROW" 'finish-without-start 1'
+assert_contains "the row makes the retained-history gap explicit" "$PAIRS_ROW" 'partial history'
+
+# A syntactically valid but incomplete finish must not quietly contribute a
+# zero wall duration, and its redundant handoff flag must agree with the
+# normalized outcome. The outcome remains authoritative; the damage is named.
+DAMAGED_FINISH="$TMP/damaged-finish.jsonl"
+run_start "$DAMAGED_FINISH" 2026-04-04T13:00:00.000Z damaged-finish epic-run claude 63 '"myapp"'
+printf '{"type":"run-finish","ts":"2026-04-04T13:10:00.000Z","runId":"damaged-finish","script":"epic-run","engine":"claude","issue":63,"repo":"myapp","outcome":"human-review","handoff":false}\n' >> "$DAMAGED_FINISH"
+report "$DAMAGED_FINISH"
+DAMAGED_ROW="$(row 63)"
+assert_contains "a finish without wall duration is partial" "$DAMAGED_ROW" 'wall-missing 1'
+assert_contains "a contradictory handoff field is disclosed" "$DAMAGED_ROW" 'handoff-field-mismatch'
+assert_contains "the normalized outcome remains the handoff authority" "$DAMAGED_ROW" 'handoff yes'
 
 # ───────────────────────── legacy, unattributed and damaged records ─────────────────────────
 section 'legacy rows, missing identity, missing usage and a torn final line'
 MIXED="$TMP/mixed.jsonl"
 legacy_spawn "$MIXED" 2026-05-01T08:00:00.000Z legacy-r1 epic-run claude 7 architect:design 300000 0.25
+# Missing runIds carry no pairing evidence. Even identical-looking legacy rows
+# stay separate rather than being combined under one accidental `undefined` key.
+printf '{"ts":"2026-05-01T08:10:00.000Z","script":"epic-run","issue":10,"engine":"claude","step":"code","label":"code:green","attempt":1,"vendor":"claude","model":"opus","effort":"high","ok":true,"timedOut":false,"ms":1000,"tokens":%s,"costUsd":0.01,"costSource":"cli"}\n' "$TOKENS" >> "$MIXED"
+printf '{"ts":"2026-05-01T08:11:00.000Z","script":"epic-run","issue":10,"engine":"claude","step":"code","label":"code:green","attempt":1,"vendor":"claude","model":"opus","effort":"high","ok":true,"timedOut":false,"ms":1000,"tokens":%s,"costUsd":0.01,"costSource":"cli"}\n' "$TOKENS" >> "$MIXED"
 spawn        "$MIXED" 2026-05-01T08:30:00.000Z norepo-r2 epic-run claude 8 null code:green 1 false 300000 0.50 cli
 run_start    "$MIXED" 2026-05-01T08:40:00.000Z manual-r3 epic-run claude null '"myapp"'
 run_finish   "$MIXED" 2026-05-01T08:45:00.000Z manual-r3 epic-run claude null '"myapp"' 300000 '"manual"' false 0 null
@@ -318,8 +351,10 @@ assert_contains "spawns with no usage still count as spawns" "$MIXED_ROW" 'spawn
 assert_contains "an unpriced model is named as missing money, not as free" "$MIXED_ROW" '$0.00 (+$0.00 estimated, 1 unpriced)'
 assert_eq "a legacy row's issue number never joins a repository lifetime" "absent" "$(has_row 7 && echo present || echo absent)"
 assert_eq "nor does a typed run with no repository" "absent" "$(has_row 8 && echo present || echo absent)"
-assert_contains "unattributable runs get their own trailing group" "$REPORT_OUT" 'runs without repository/issue identity (never merged)'
+assert_contains "unattributable runs get their own trailing group" "$REPORT_OUT" 'runs without repository/issue identity (never joined to an issue lifetime)'
 assert_contains "the legacy run is listed by its runId" "$REPORT_OUT" 'legacy-r1'
+assert_eq "legacy rows without runIds are never coalesced accidentally" 2 \
+  "$(printf '%s\n' "$REPORT_OUT" | grep -c 'issue 10 · repo unknown')"
 assert_contains "so is the run with no repository" "$REPORT_OUT" 'norepo-r2'
 assert_contains "and the issueless manual run" "$REPORT_OUT" 'manual-r3'
 assert_contains "legacy history discloses exactly what it cannot say" "$REPORT_OUT" 'wall time, repository and result unknown'
@@ -327,6 +362,7 @@ assert_contains "an interior record that did not parse is reported, not hidden" 
 assert_contains "legacy tokens and dollars still reach the tuning view" "$REPORT_OUT" 'epic-run —'
 assert_contains "a spawn the CLI reported no usage for is disclosed" "$REPORT_OUT" 'spawns with no token usage reported (counted as 0)'
 assert_contains "and a model with no price row is named" "$REPORT_OUT" '1 spawn(s) on gpt-5.6-nopricerow have tokens but no price row'
+assert_contains "the lifetime summary exposes missing usage too" "$(line_with 'all repositories:')" 'missing usage 1 spawn(s)'
 
 # ───────────────────────── --since selects lifetimes, not records ─────────────────────────
 section '--since selects a lifetime by its latest activity, then totals all of it'
@@ -351,6 +387,16 @@ assert_contains "and its spawns" "$SINCE_ROW" 'spawns 2'
 assert_eq "a lifetime with no recent activity is not selected" "absent" "$(has_row 71 && echo present || echo absent)"
 assert_contains "the tuning view keeps filtering record by record" "$REPORT_OUT" 'fix-run — 1 run(s): claude 1'
 assert_not_contains "so the out-of-window epic spawn is not tuned on" "$REPORT_OUT" 'epic-run — '
+
+# The lifetime window is specifically based on lifecycle activity, not on the
+# timestamp of a spawn row. The per-step view still sees that recent spawn.
+LIFECYCLE_WINDOW="$TMP/lifecycle-window.jsonl"
+run_start "$LIFECYCLE_WINDOW" "$(old_ts)" lw1 epic-run claude 72 '"myapp"'
+spawn "$LIFECYCLE_WINDOW" "$(new_ts)" lw1 epic-run claude 72 '"myapp"' architect:design 1 false 300000 0.50 cli
+report "$LIFECYCLE_WINDOW" --since 7d
+assert_eq "recent spawn activity alone does not select an old issue lifetime" "absent" \
+  "$(has_row 72 && echo present || echo absent)"
+assert_contains "the same spawn remains in the record-filtered tuning view" "$REPORT_OUT" 'epic-run — 1 run(s): claude 1'
 
 # ───────────────────────── engine and script filters ─────────────────────────
 section '--engine and --script keep a lifetime by its latest completed run'
@@ -385,6 +431,11 @@ assert_contains "and says which file" "$REPORT_OUT" 'usage-report: cannot read'
 report "$TMP/empty.jsonl"
 assert_rc "an empty log is not an error" 0 "$REPORT_RC"
 assert_contains "it just says there is nothing" "$REPORT_OUT" 'no usage records in'
+NEWLINE_BAD="$TMP/newline-bad.jsonl"
+printf '{"type":"run-start"\n' > "$NEWLINE_BAD"
+report "$NEWLINE_BAD"
+assert_rc "a newline-terminated malformed final record is still reportable" 0 "$REPORT_RC"
+assert_contains "only an unterminated final fragment is silently ignored" "$REPORT_OUT" 'malformed records skipped: 1'
 
 # A populated log filtered down to nothing is still an answer. Printing nothing
 # at the end of `remote-control.sh usage 7` on a quiet week is indistinguishable

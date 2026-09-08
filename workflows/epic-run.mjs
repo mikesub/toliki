@@ -1688,7 +1688,7 @@ try {
       log(`Correction: ${batch.length} concrete blocker(s) from the final review — running one scoped correction (${batch.map(entry => entry.id).join(', ')}).`)
       const corrected = await agent(
         PROMPTS.correction(dir, pkgList(packages), requirement, batch, repairDelta || '(the repair delta could not be captured)', finalVerify?.detail || 'green'),
-        { label: 'correction', phase: 'Correction', step: 'fixes-after-review', schema: CORRECTION_SCHEMA })
+        { label: 'correction', phase: 'Correction', step: 'fixes-after-review', schema: CORRECTION_SCHEMA, retry: true })
       if (!corrected) {
         // The correction is a writable repair step: a death here is operational
         // — quota, an interrupted process, transport — and keeps the resumable

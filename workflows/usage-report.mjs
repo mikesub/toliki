@@ -84,10 +84,16 @@ for (let i = 0; i < lines.length; i++) {
   try {
     record = JSON.parse(lines[i])
   } catch {
-    if (i !== finalLine) malformed++
+    // Only an unterminated final fragment can be an append observed halfway
+    // through. A newline-terminated bad row is complete historical damage and
+    // must be disclosed even when it is the last non-empty line.
+    if (i !== finalLine || raw.endsWith('\n')) malformed++
     continue
   }
   if (!record || typeof record !== 'object' || Array.isArray(record)) { malformed++; continue }
+  // Internal provenance for records that do not carry a runId. Those rows
+  // cannot be paired safely, so their physical line is their unique report key.
+  record = { ...record, _line: i + 1 }
   if (record.type === undefined) spawns.push({ ...record, type: 'spawn', legacy: true })
   else if (record.type === 'spawn') spawns.push(record)
   else if (record.type === 'run-start') starts.push(record)
@@ -220,17 +226,20 @@ if (byScript.size) {
 // ───────────────────────── the issue-lifetime view ─────────────────────────
 // A lifetime is keyed by (repository, issue) and by nothing else. A record that
 // cannot state both — a legacy row, a hand-run with no --repo, a slug-mode run
-// with no issue — becomes its own row keyed by runId: coalescing those would
-// invent a shared history out of runs that merely look alike.
+// with no issue — becomes its own row keyed by runId. A row with no usable
+// runId is keyed by its source line instead: there is no evidence that two such
+// rows came from one invocation, so joining them would invent a history.
 const lifetimes = new Map()
 const orphans = new Map()
 for (const record of records) {
   const identified = !record.legacy && record.repo != null && record.issue != null
-  const key = identified ? `${record.repo} #${record.issue}` : `run ${record.runId}`
+  const hasRunId = ['string', 'number'].includes(typeof record.runId) && String(record.runId).length > 0
+  const orphanId = hasRunId ? String(record.runId) : `line ${record._line}`
+  const key = identified ? `${record.repo} #${record.issue}` : `run ${orphanId}`
   const into = identified ? lifetimes : orphans
   let entry = into.get(key)
   if (!entry) {
-    entry = { repo: identified ? record.repo : null, issue: identified ? record.issue : null, runId: record.runId, records: [] }
+    entry = { identified, repo: identified ? record.repo : null, issue: identified ? record.issue : null, runId: hasRunId ? record.runId : orphanId, records: [] }
     into.set(key, entry)
   }
   // An unattributed row still shows whatever identity it does have.
@@ -248,7 +257,32 @@ function summarize(entry) {
   const ownSpawns = own.filter(r => r.type === 'spawn')
   const times = own.map(at).filter(t => t !== null)
   const startTimes = ownStarts.map(at).filter(t => t !== null)
+  const lifecycleTimes = [...ownStarts, ...ownFinishes].map(at).filter(t => t !== null)
   const lastFinish = ownFinishes[ownFinishes.length - 1] || null
+  const runKey = record => {
+    const value = record?.runId
+    return ['string', 'number'].includes(typeof value) && String(value).length
+      ? `${typeof value}:${String(value)}`
+      : null
+  }
+  // Pair starts and finishes by runId, not by aggregate counts. A finish from
+  // retained run B cannot hide the fact that retained run A never finished.
+  const unmatchedFinishes = new Map()
+  for (const finish of ownFinishes) {
+    const key = runKey(finish)
+    if (key === null) continue
+    unmatchedFinishes.set(key, (unmatchedFinishes.get(key) || 0) + 1)
+  }
+  let incomplete = 0
+  for (const start of ownStarts) {
+    const key = runKey(start)
+    const available = key === null ? 0 : unmatchedFinishes.get(key) || 0
+    if (!available) incomplete++
+    else if (available === 1) unmatchedFinishes.delete(key)
+    else unmatchedFinishes.set(key, available - 1)
+  }
+  const missingStarts = [...unmatchedFinishes.values()].reduce((total, count) => total + count, 0) +
+    ownFinishes.filter(finish => runKey(finish) === null).length
 
   const s = {
     entry,
@@ -256,19 +290,28 @@ function summarize(entry) {
     legacyRows: own.filter(r => r.legacy).length,
     launches: ownStarts.length,
     byScript: new Map(),
-    first: startTimes.length ? Math.min(...startTimes) : (times.length ? Math.min(...times) : null),
-    latest: times.length ? Math.max(...times) : null,
+    // Never infer a missing first start from a spawn. For identified issue
+    // lifetimes, "latest" is likewise lifecycle activity only; --since is
+    // explicitly a lifecycle selector even though the tuning view still
+    // filters individual spawn rows.
+    first: startTimes.length ? Math.min(...startTimes) : null,
+    latest: entry.identified
+      ? (lifecycleTimes.length ? Math.max(...lifecycleTimes) : null)
+      : (times.length ? Math.max(...times) : null),
     lastFinish,
     wallMs: 0, spawns: ownSpawns.length, modelMs: 0,
     input: 0, cacheRead: 0, cacheCreate: 0, output: 0,
     billed: 0, estimated: 0, unpriced: 0, noUsage: 0,
     respawns: 0, retries: 0, relaunches: 0, fixerAttempts: 0,
-    incomplete: Math.max(0, ownStarts.length - ownFinishes.length),
+    incomplete,
+    missingStarts,
+    missingWall: ownFinishes.filter(r => !Number.isFinite(r.ms) || r.ms < 0).length,
     hasLifecycle: ownStarts.length > 0 || ownFinishes.length > 0,
   }
+  s.partialHistory = !!(s.incomplete || s.missingStarts || s.missingWall || (entry.identified && !s.hasLifecycle && ownSpawns.length))
   for (const r of ownStarts) s.byScript.set(r.script, (s.byScript.get(r.script) || 0) + 1)
   for (const r of ownFinishes) {
-    if (typeof r.ms === 'number') s.wallMs += r.ms
+    if (Number.isFinite(r.ms) && r.ms >= 0) s.wallMs += r.ms
     if (FIXER_SCRIPTS.includes(r.script) && typeof r.attempt === 'number' && r.attempt >= 1) s.fixerAttempts++
   }
   for (const r of ownSpawns) {
@@ -295,7 +338,16 @@ function summarize(entry) {
   s.result = lastFinish
     ? (Object.prototype.hasOwnProperty.call(OUTCOMES, lastFinish.outcome) ? lastFinish.outcome : 'unknown')
     : (s.hasLifecycle ? 'incomplete' : 'unknown')
+  // The normalized outcome is authoritative, but the finish row deliberately
+  // stores the derived flag too. Validate that redundancy so damaged telemetry
+  // is visible instead of silently presenting a contradictory handoff.
   s.handoff = !!OUTCOMES[s.result]?.handoff
+  s.handoffFieldIssue = lastFinish
+    ? (typeof lastFinish.handoff !== 'boolean'
+        ? 'missing'
+        : (lastFinish.handoff !== s.handoff ? 'mismatch' : null))
+    : null
+  if (s.handoffFieldIssue) s.partialHistory = true
   s.spanMs = (lastFinish && s.first !== null && at(lastFinish) !== null) ? at(lastFinish) - s.first : null
   return s
 }
@@ -349,7 +401,11 @@ for (const [repo, rows] of [...groups.entries()].sort((a, b) => String(a[0]).loc
     const counts = s.byScript.size ? ` (${scriptCounts(s)})` : ''
     console.log(`  #${s.issue}  launches ${s.launches}${counts} · first ${when(s.first)} · latest ${when(s.latest)}` +
       ` · wall ${duration(s.wallMs)} · span ${s.spanMs === null ? '-' : duration(s.spanMs)}` +
-      ` · result ${s.result} · handoff ${s.handoff ? 'yes' : 'no'}${s.incomplete ? ` · incomplete ${s.incomplete}` : ''}`)
+      ` · result ${s.result} · handoff ${s.handoff ? 'yes' : 'no'}` +
+      `${s.partialHistory ? ' · partial history' : ''}${s.incomplete ? ` · incomplete ${s.incomplete}` : ''}` +
+      `${s.missingStarts ? ` · finish-without-start ${s.missingStarts}` : ''}` +
+      `${s.missingWall ? ` · wall-missing ${s.missingWall}` : ''}` +
+      `${s.handoffFieldIssue ? ` · handoff-field-${s.handoffFieldIssue}` : ''}`)
     console.log(`        spawns ${s.spawns} · model-active ${duration(s.modelMs)} · ${tokensOf(s)} · ${costOf(s)}` +
       ` · respawns ${s.respawns} · retries ${s.retries} · relaunches ${s.relaunches} · fixer attempts ${s.fixerAttempts}` +
       (s.noUsage ? ` · partial: ${s.noUsage} spawn(s) reported no usage` : ''))
@@ -358,13 +414,13 @@ for (const [repo, rows] of [...groups.entries()].sort((a, b) => String(a[0]).loc
 }
 
 if (orphanRows.length) {
-  console.log('runs without repository/issue identity (never merged)')
+  console.log('runs without repository/issue identity (never joined to an issue lifetime)')
   for (const s of orphanRows.sort(byLatest)) {
     console.log(`  ${s.runId} · ${s.issue == null ? 'issue unknown' : `issue ${s.issue}`} · ${s.repo == null ? 'repo unknown' : `repo ${s.repo}`}` +
       ` · latest ${when(s.latest)} · wall ${s.hasLifecycle ? duration(s.wallMs) : 'unknown'}` +
       ` · spawns ${s.spawns} · model-active ${duration(s.modelMs)} · ${costOf(s)} · result ${s.result}`)
   }
-  console.log(`  ${orphanRows.length} run(s) above state no repository or issue and are listed one per runId, never joined to a lifetime.`)
+  console.log(`  ${orphanRows.length} run(s) above state no repository or issue and are listed one per runId, never joined to an issue lifetime.`)
   const legacyRuns = orphanRows.filter(s => s.legacyRows)
   if (legacyRuns.length) {
     const rows = legacyRuns.reduce((total, s) => total + s.legacyRows, 0)
@@ -379,7 +435,9 @@ if (lifetimeRows.length) {
   console.log(`all repositories: ${lifetimeRows.length} issue lifetime(s) · ${sum('launches')} launch(es)` +
     ` · wall ${duration(sum('wallMs'))} · spawns ${sum('spawns')} · model-active ${duration(sum('modelMs'))}` +
     ` · ${tokensOf({ input: sum('input'), cacheRead: sum('cacheRead'), cacheCreate: sum('cacheCreate'), output: sum('output') })}` +
-    ` · ${costOf({ billed: sum('billed'), estimated: sum('estimated'), unpriced: sum('unpriced') })}`)
+    ` · ${costOf({ billed: sum('billed'), estimated: sum('estimated'), unpriced: sum('unpriced') })}` +
+    ` · respawns ${sum('respawns')} · retries ${sum('retries')} · relaunches ${sum('relaunches')} · fixer attempts ${sum('fixerAttempts')}` +
+    ` · missing usage ${sum('noUsage')} spawn(s) · partial history ${lifetimeRows.filter(s => s.partialHistory).length} lifetime(s)`)
 
   // The rate answers one question — how often does automation end by handing an
   // issue to a person — so only lifetimes that answer it are in the denominator.
