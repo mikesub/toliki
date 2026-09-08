@@ -35,6 +35,9 @@ Two session kinds exist, and they must never be conflated:
   states its contract, its ordering choices and the incident behind them. The
   code and its comments are the operational manual; this file holds only what
   the code cannot show.
+- [docs/README.md](docs/README.md): the end-to-end workflow map. Every change
+  to workflow behavior must verify this document against the executable path
+  and update it in the same change when the description is no longer exact.
 - `etc/repos.conf.template` plus `etc/lib.sh`: the tracked configuration
   contract. `etc/repos.conf` is machine-local and gitignored; never commit it or
   overwrite the template with it.
@@ -510,9 +513,10 @@ than made launchable against a main without the code it describes.
    boundaries above.
 3. A behavior change gets a hermetic regression test. A new gate or refusal
    path gets both its pass and its stop scenario.
-4. When the contract or its rationale changes, update this file, DOCTRINE.md,
-   README, the template or the script header. Never leave an invariant only in
-   a commit message.
+4. For every workflow change, verify `docs/README.md` against the executable
+   path and update it when needed. When the contract or rationale changes,
+   update this file, DOCTRINE.md, the root README, the template or the script
+   header too. Never leave an invariant only in a commit message.
 5. Run every relevant suite; run all eleven before handing off a broad change.
 
 Trunk-based: when asked to commit or push, commit straight to `main` and push.
