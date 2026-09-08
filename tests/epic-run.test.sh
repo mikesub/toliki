@@ -1865,7 +1865,22 @@ assert_contains "the final review was handed the complete diff" "$FINALREVIEW_PR
 assert_contains "the complete diff includes the implementation" "$FINALREVIEW_PROMPT" 'frontend/src/widget.ts'
 assert_contains "the complete diff includes the regression test" "$FINALREVIEW_PROMPT" 'frontend/src/widget.test.ts'
 assert_not_contains "the final reviewer is not told to run Git" "$FINALREVIEW_PROMPT" 'git diff origin/main...HEAD'
-assert_contains "the assessor is directed to the pinned requirement" "$(cat "$STATE_DIR/triage.0.prompt")" "Read .epics/42-add-widget/requirements.md"
+TRIAGE_PROMPT_0="$(cat "$STATE_DIR/triage.0.prompt")"
+assert_contains "the assessor receives the pinned requirement inline" "$TRIAGE_PROMPT_0" "Build a widget."
+assert_contains "the assessor receives the orchestrator-captured change" "$TRIAGE_PROMPT_0" '<change-diff>'
+assert_contains "the captured change carries the implementation" "$TRIAGE_PROMPT_0" 'frontend/src/widget.ts'
+assert_not_contains "the assessor is not sent to fetch the requirement itself" "$TRIAGE_PROMPT_0" ".epics/42-add-widget/requirements.md"
+assert_not_contains "the assessor is not told to run Git" "$TRIAGE_PROMPT_0" 'git diff origin/main...HEAD'
+assert_not_contains "no step is asked to maintain the run record" "$TRIAGE_PROMPT_0" "epic.md's phase log"
+assert_contains "the coder gets the requirement instead of a file to open" "$(cat "$STATE_DIR/green.0.prompt")" "Build a widget."
+assert_not_contains "the coder is not sent to read requirements.md" "$(cat "$STATE_DIR/green.0.prompt")" "requirements.md"
+EPIC_MD="$(cat "$WT/.epics/42-add-widget/epic.md")"
+assert_contains "the orchestrator writes the coder's returned account into the phase log" "$EPIC_MD" "- code: frontend verified green"
+assert_contains "and the repair's returned account too" "$EPIC_MD" "- fixes-after-review: Fixed the null deref, verify green."
+SHIP_PROMPT_0="$(cat "$STATE_DIR/ship.0.prompt")"
+assert_contains "ship receives the final review ledger rather than a path to it" "$SHIP_PROMPT_0" '<review-ledger>'
+assert_contains "the supplied ledger carries the final states" "$SHIP_PROMPT_0" "Null deref on empty list"
+assert_not_contains "ship is not sent into the run's scratch directory" "$SHIP_PROMPT_0" "review.md"
 assert_contains "the final review receives the pinned requirement" "$FINALREVIEW_PROMPT" "Build a widget."
 assert_contains "the final review receives every original finding" "$FINALREVIEW_PROMPT" "Title: Null deref on empty list"
 assert_not_contains "but never the fixer's own explanation" "$FINALREVIEW_PROMPT" "Added the empty-list guard and regression coverage."
@@ -3728,6 +3743,20 @@ assert_contains "the resolver may carry an intent outside a marker block" "$(cat
 assert_contains "the resolver leaves deterministic checks to the pipeline" "$(cat "$STATE_DIR/fix-resolve.0.prompt")" "Do not run tests or post-edit verification commands"
 assert_not_contains "the resolver is not assigned git diff verification" "$(cat "$STATE_DIR/fix-resolve.0.prompt")" "git diff --check"
 assert_contains "the skeptic is told to trace every out-of-block change" "$(cat "$STATE_DIR/fix-check.0.prompt")" 'trace every out-of-block change back to what one side'
+# Both sides' intent is captured before the call, so the resolver and the blind
+# checker judge the same bytes instead of each running their own git and gh.
+FIX_RESOLVE_PROMPT="$(cat "$STATE_DIR/fix-resolve.0.prompt")"
+FIX_CHECK_PROMPT="$(cat "$STATE_DIR/fix-check.0.prompt")"
+assert_contains "the resolver receives the captured PR side" "$FIX_RESOLVE_PROMPT" '<pr-side-diff>'
+assert_contains "the captured PR side carries the PR's own text" "$FIX_RESOLVE_PROMPT" 'pr-guard'
+assert_contains "the resolver receives the captured main side" "$FIX_RESOLVE_PROMPT" '<main-side-diff>'
+assert_contains "the captured main side carries what landed" "$FIX_RESOLVE_PROMPT" 'main-rename'
+assert_contains "the resolver receives main's commit subjects" "$FIX_RESOLVE_PROMPT" 'main: rename helper'
+assert_contains "the resolver receives the captured issue body" "$FIX_RESOLVE_PROMPT" 'Build a widget.'
+assert_not_contains "the resolver is never told to fetch an issue itself" "$FIX_RESOLVE_PROMPT" 'gh issue view'
+assert_contains "the blind checker reads the same captured sides" "$FIX_CHECK_PROMPT" '<main-side-diff>'
+assert_not_contains "and is never told to gather its own evidence" "$FIX_CHECK_PROMPT" 'gh issue view'
+assert_contains "the audit record derives the changed files" "$(gh_comments)" "files changed: frontend/src/index.ts"
 assert_eq "the branch on origin was rewritten" "$(git -C "$WT" rev-parse HEAD)" "$(origin_ref epic/42-add-widget)"
 assert_not_contains "and is not what it was" "$(origin_ref epic/42-add-widget)" "$BEFORE"
 assert_eq "it is exactly one commit above the new main" 1 "$(origin_count epic/42-add-widget)"
@@ -4294,6 +4323,17 @@ assert_contains "the fixer is told which checks failed" "$FIXPROMPT" "Checks tha
 assert_contains "and gets the failing job log" "$FIXPROMPT" "expected createWidget to be exported"
 assert_contains "and is told the failure reproduces locally" "$FIXPROMPT" "RED locally on this exact tree"
 assert_contains "and is forbidden to weaken a test" "$FIXPROMPT" "Never weaken, skip, delete or loosen a test"
+# The change under repair and the requirement behind it are captured before the
+# call, so the fixer and its blind checker read the same bytes.
+assert_contains "the fixer receives the captured change under repair" "$FIXPROMPT" '<change-diff>'
+assert_contains "the captured change carries the PR's own code" "$FIXPROMPT" 'frontend/src/widget.test.ts'
+assert_contains "the fixer receives the captured requirement issue" "$FIXPROMPT" 'Build a widget.'
+assert_not_contains "the fixer is never told to fetch the issue itself" "$FIXPROMPT" 'gh issue view'
+assert_not_contains "nor to run git for the change under repair" "$FIXPROMPT" 'git diff origin/main...HEAD'
+CI_CHECK_PROMPT_0="$(cat "$STATE_DIR/ci-check.0.prompt")"
+assert_contains "the blind checker reads the same captured requirement" "$CI_CHECK_PROMPT_0" 'Build a widget.'
+assert_not_contains "and is never told to gather it itself" "$CI_CHECK_PROMPT_0" 'gh issue view'
+assert_contains "the audit names the orchestrator-derived file list" "$(gh_comments)" "Files: frontend/src/widget.ts"
 assert_eq "verify ran before and after the fix" 2 "$(grep -c '^run verify$' "$NPM_LOG")"
 
 scenario 'ci-run: malformed checker output cannot push or promote the repair'
@@ -4701,6 +4741,13 @@ assert_contains "the fixer is told to ignore non-defect deferrals" "$FIXPROMPT" 
 assert_contains "the fixer is forbidden to weaken tests" "$FIXPROMPT" "Never weaken"
 assert_contains "the skeptic sees the durable named defect" "$CHECKPROMPT" "Empty list still crashes"
 assert_contains "the skeptic is handed the captured delta rather than told to fetch it" "$CHECKPROMPT" "<repair-delta>"
+# The reviewed change under repair is captured beside the pinned envelope, so
+# neither the repair nor its checker is sent to run git for its own view of it.
+assert_contains "the fixer receives the captured PR change" "$FIXPROMPT" "<change-diff>"
+assert_contains "the captured PR change carries the reviewed code" "$FIXPROMPT" "items[0].name"
+assert_not_contains "and the fixer is not told to run git for it" "$FIXPROMPT" 'git diff origin/main...HEAD'
+assert_contains "the skeptic reads the same captured PR change" "$CHECKPROMPT" "<change-diff>"
+assert_contains "the audit names the orchestrator-derived file list" "$(gh_comments)" "Files: frontend/src/widget.ts"
 assert_not_contains "and is never asked to run git for its own evidence" "$CHECKPROMPT" "git diff $BEFORE"
 assert_not_contains "the skeptic is blind to the fixer's explanation" "$CHECKPROMPT" "PRIVATE_FIXER_EXPLANATION"
 assert_eq "verify runs once after the edit" 1 "$(grep -c '^run verify$' "$NPM_LOG")"

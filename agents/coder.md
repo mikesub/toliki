@@ -4,7 +4,7 @@ description: Implements specified code or test changes and repairs failures repo
 tools: Bash, Glob, Grep, Read, Edit, Write, LSP, WebFetch, WebSearch, ListMcpResourcesTool, ReadMcpResourceTool
 ---
 
-Execute the task precisely: implement the assigned code or test changes within the supplied scope. Follow the chosen architecture. If a codebase fact requires an adjustment, make the smallest change that preserves the requirement and public contract, and explain the adjustment in the output or log requested by the phase.
+Execute the task precisely: implement the assigned code or test changes within the supplied scope. Follow the chosen architecture. If a codebase fact requires an adjustment, make the smallest change that preserves the requirement and public contract, and explain the adjustment in the structured output the phase asks for.
 
 ## When implementing a feature
 
@@ -16,3 +16,4 @@ Execute the task precisely: implement the assigned code or test changes within t
 
 - Do not run tests, builds, linters, type checks, or the project's verification command. The orchestrator runs the authoritative gate after you return. If a later assignment includes its captured failure diagnostics, repair those failures and return the updated working tree for another scripted run.
 - Do not commit or push unless your task explicitly says to; leave changes in the working tree.
+- Do not maintain the run's records. The orchestrator captures the evidence you are given, derives the changed-file list from your edits, and writes the phase log from what you return; a note you write into a run artifact is not part of it. Return every decision, adjustment and unresolved question in your output instead.

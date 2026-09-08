@@ -74,7 +74,8 @@ in the same change.
   boundary, so architect, review, final-review and ship stay read-only under any
   vendor. Claude's reviewer and shipper charters withhold Bash, Edit and Write;
   Codex runs the same charters in its read-only sandbox. The orchestrator
-  supplies captured diff evidence and also proves the worktree, index, Git
+  supplies every step's captured evidence — diffs, issue bodies, conflict sides,
+  CI logs, the review ledger — and also proves the worktree, index, Git
   configuration, hooks and ancestry metadata unchanged around review, final
   review and ship. Nothing deterministic is a step: git, gh and npm work runs
   in the orchestrator. `task` maps both the task workflow's primary model
@@ -142,6 +143,15 @@ than made launchable against a main without the code it describes.
   post-push head/evidence confirmation and landing-only recovery. Pushed
   partial state is monotonic in the runner and can never return through an
   ordinary requeueing blocker. Gated by `tests/epic-run.test.sh`.
+- `workflows/lib/evidence.mjs` is where a prompt's known inputs are captured
+  before the call: the issue bodies behind a change or a conflict side, and the
+  one rendering every pipeline uses for a captured artifact. The pinned diffs,
+  commit subjects and CI logs are captured by each pipeline through
+  `lib/repo.mjs` and `lib/github.mjs` and rendered through the same block shape.
+  No prompt in any pipeline names a `git` or `gh` command for a step to run for
+  its own evidence. A diff that cannot be captured fails closed; an issue body
+  that cannot be read says so where the model reads it, exactly as an
+  unretrievable job log already does. Gated by `tests/epic-run.test.sh`.
 - `workflows/lib/engine.mjs` is the only file that knows how a vendor CLI is
   invoked. Its loader validates `etc/engines.json` before any phase touches
   GitHub. A Codex phase is ephemeral, sandboxed from the charter's tools, and
@@ -274,6 +284,18 @@ than made launchable against a main without the code it describes.
   the selected engine's `task` vendor. Candidates are never rerouted. Expired entries
   are pruned independently; malformed state or an unreadable engine vendor set
   fails closed.
+- A model step is asked for judgment, never for retrieval or bookkeeping.
+  Everything its brief is known to need — the issue bodies, the pinned diffs,
+  both conflict sides with the commit subjects behind them, the CI job logs, the
+  final review ledger — is captured before the call and supplied as bytes, so a
+  builder and the blind checker that later judges it read the SAME evidence and
+  a capture that failed is visible to the orchestrator instead of to nobody.
+  Source exploration stays open: writable steps read the tree and reviewers grep
+  it. In the other direction, changed-file lists and verification results are
+  derived in scripts and never copied from a step's account, and
+  `.epics/<slug>/epic.md` is written only by the orchestrator from what each
+  step returned — no prompt asks a model to maintain the run record. Gated by
+  `tests/epic-run.test.sh`.
 - Merge eligibility is computed from structured counts in `epic-run.mjs`.
   Never replace it with a model's sign-off.
 - The merge is pinned to the sha whose check gate was evaluated
