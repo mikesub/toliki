@@ -3,8 +3,9 @@
 # toliki
 
 A self-hosted coding-agent harness that turns GitHub issues into merged PRs unattended.
-A VPS runs detached pipelines in tmux; cron drains the issue queue, runs one
-autonomous "epic" per issue to an open green PR, and a serial merge worker
+A VPS runs detached pipelines in tmux; cron drains the issue queue, runs either
+a reviewed epic or an explicitly selected lightweight task to an open green PR,
+and a serial merge worker
 rebases, re-verifies and lands them. You write specs; the box does the rest.
 
 The pipeline is a plain Node script. It does everything deterministic itself —
@@ -16,15 +17,18 @@ only where a judgment is needed. Claude Code and Codex are both supported.
 
 1. **`/spec`** (interactive, the one human gate) — design a change,
    file it as one or more GitHub issues labeled `ready`, ordered by real
-   `blocked_by` dependencies.
+   `blocked_by` dependencies. A human may explicitly add `task` to clear,
+   low-risk work whose implementation approach is already settled.
 2. **`bin/dispatch.sh`** (cron, on the VPS) — walks each repo's `ready` queue
    and launches a tmux session per unblocked issue, up to the host's slot
    budget. Repair queues run first; ship-gate defect repair is walked only for
    repositories listed in the machine-local `DEFECT_FIX_REPOS` allowlist. A
    provider quota hold skips ordinary or dry-run candidates whose engine uses
    that vendor until its UTC reset time, while candidates on other vendors keep
-   launching; routing-only operations bypass the hold.
-3. **`workflows/epic-run.mjs`** (the session's pane) — claims the issue,
+   launching; routing-only operations bypass the hold. Plain `ready` selects
+   epic; `ready` plus the persistent, human-selected `task` label selects task.
+3. **The issue workflow** (the session's pane) — `workflows/epic-run.mjs`
+   claims an ordinary issue,
    makes a proportional architecture plan, then implements through either
    test-first red/green or a direct coding step. Both paths pass the project's
    verify gate run by the orchestrator. ONE broad reviewer runs, and it is the
@@ -53,7 +57,15 @@ only where a judgment is needed. Claude Code and Codex are both supported.
    held outcome instead: the resumable branch is preserved, the issue returns
    to its queue without spending a fixer attempt, and automatic dispatch waits
    only for the failed step's vendor hold. Ordinary transient 429s still retry
-   once.
+   once. For clear, low-risk work whose requirements and approach are already
+   settled, `workflows/task-run.mjs` instead starts exactly one writable tasker
+   process to implement and self-review. The same deterministic transport
+   claims and pins the issue, installs dependencies, runs the real verify gate,
+   rebases and re-verifies a moved clean base, creates the `Closes #N`
+   candidate, publishes its evidence and hands it to the merge worker. It
+   intentionally omits architecture, independent review and repair; malformed
+   output, a transient model failure or red verification blocks without a
+   model retry.
 4. **`bin/merge-worker.sh`** (cron) — one PR at a time per repo: rebase onto
    current main, give checks time to register, then wait for every published
    check on the rebased head and squash-merge. It explicitly supplies the full
@@ -163,7 +175,7 @@ same exact pin rather than falling back to a later host default, and missing,
 mismatched, or conflicting pins stop for an operator without being rewritten.
 Turning the box autonomous is a deliberate last step: install the cron file
 per the comment at the top of `etc/dispatch.cron`.
-`--engine` is optional on every manual `./remote-control.sh epic|fix|ci|defect`
+`--engine` is optional on every manual `./remote-control.sh epic|task|fix|ci|defect`
 launch. Given, it is persisted as the issue's durable `engine:<name>` label and
 verified before the run starts, so the choice survives resumes and fixer
 retries. Omitted, the host resolves it and writes nothing: the issue's own
@@ -176,9 +188,10 @@ launching.
 Defect repair is empty-by-default: add selected registered repo names to
 `DEFECT_FIX_REPOS=(...)` in the host's `etc/repos.conf`, or launch a marked
 issue explicitly with `./remote-control.sh defect N -r <repo>`.
-All explicit `remote-control.sh epic|fix|ci|defect` launches bypass an active
-provider hold as a deliberate operator override. A mixed engine waits if any
-vendor it uses is held; admission never reroutes an issue to a different engine.
+All explicit `remote-control.sh epic|task|fix|ci|defect` launches bypass an active
+provider hold as a deliberate operator override. An epic or fixer on a mixed
+engine waits if any vendor it uses is held; a task waits only on its configured
+`task` step vendor. Admission never reroutes an issue to a different engine.
 Adding `--over-capacity` to one of those four commands (and only those four)
 starts it even when the host is already at `MAX_PARALLEL_EPICS`; it counts as a
 slot once up, so automatic dispatch stays paused until usage drops back below
@@ -210,8 +223,11 @@ load the registration. Node and Codex must be installed for this registration st
   that were considered and rejected, with reasons.
 - **`bin/`, `etc/`** — the host-side scripts and config; each header states
   its contract and the incident behind it.
-- **`workflows/`** — the epic pipeline and three fixer entry points (`epic-run`,
-  `fix-run`, `ci-run`, and `defect-run`). The fixers share one fixed lifecycle
+- **`WORKFLOW.md`** — the executable path from queue selection through merge,
+  including the full epic, lightweight task and fixer call counts and gates.
+- **`workflows/`** — the epic and task pipelines plus three fixer entry points
+  (`epic-run`, `task-run`, `fix-run`, `ci-run`, and `defect-run`). The epic and
+  task paths share their safety-critical issue-delivery transport. The fixers share one fixed lifecycle
   runner for execution, verification/check gates, failure and final reporting,
   while each entry point keeps its cause-specific preparation, evidence,
   publication and recovery ordering. The surrounding runtime provides the

@@ -3,7 +3,7 @@
 // the log is (the host, via `./remote-control.sh usage`, or a laptop that ran
 // /epic), reads that one file and nothing else — no GitHub, no network.
 //
-// Usage: usage-report.mjs [--log <file>] [--since <N>d] [--engine <name>] [--script epic-run|fix-run|ci-run|defect-run]
+// Usage: usage-report.mjs [--log <file>] [--since <N>d] [--engine <name>] [--script epic-run|task-run|fix-run|ci-run|defect-run]
 //
 // 1. The per-step tuning view: which steps of an average run cost what, so
 //    etc/engines.json can be tuned from data. "tokens" is everything the model
@@ -35,7 +35,7 @@ import { readFileSync } from 'node:fs'
 import { OUTCOMES, USAGE_LOG } from './lib/usage.mjs'
 import { humanTimestamp } from './lib/time.mjs'
 
-const SCRIPTS = ['epic-run', 'fix-run', 'ci-run', 'defect-run']
+const SCRIPTS = ['epic-run', 'task-run', 'fix-run', 'ci-run', 'defect-run']
 const FIXER_SCRIPTS = ['fix-run', 'ci-run', 'defect-run']
 const USAGE = `Usage: usage-report.mjs [--log <file>] [--since <N>d] [--engine <name>] [--script ${SCRIPTS.join('|')}]`
 
@@ -334,7 +334,7 @@ function summarize(entry) {
     if (typeof r.attempt === 'number' && r.attempt > 1) s.respawns++
     else if (r.retry) s.retries++
   }
-  s.relaunches = Math.max(0, (s.byScript.get('epic-run') || 0) - 1)
+  s.relaunches = Math.max(0, (s.byScript.get('epic-run') || 0) + (s.byScript.get('task-run') || 0) - 1)
   s.result = lastFinish
     ? (Object.prototype.hasOwnProperty.call(OUTCOMES, lastFinish.outcome) ? lastFinish.outcome : 'unknown')
     : (s.hasLifecycle ? 'incomplete' : 'unknown')

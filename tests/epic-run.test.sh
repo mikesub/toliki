@@ -22,7 +22,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # mutable Git or GitHub fixture state. Set EPIC_TEST_GROUP to debug one shard;
 # set EPIC_TEST_JOBS=1 to retain the former serial execution shape.
 if [[ -z "${EPIC_TEST_GROUP:-}" ]]; then
-  EPIC_TEST_GROUPS=(contracts epic-a epic-b epic-c final-review read-only ship fix ci defect-a defect-b identity tail)
+  EPIC_TEST_GROUPS=(contracts task epic-a epic-b epic-c final-review read-only ship fix ci defect-a defect-b identity tail)
   EPIC_TEST_JOBS="${EPIC_TEST_JOBS:-4}"
   if [[ ! "$EPIC_TEST_JOBS" =~ ^[1-9][0-9]*$ ]]; then
     printf 'EPIC_TEST_JOBS must be a positive integer, got %s\n' "$EPIC_TEST_JOBS" >&2
@@ -90,11 +90,12 @@ if [[ -z "${EPIC_TEST_GROUP:-}" ]]; then
 fi
 
 case "$EPIC_TEST_GROUP" in
-  contracts|epic-a|epic-b|epic-c|final-review|read-only|ship|fix|ci|defect-a|defect-b|identity|tail) ;;
+  contracts|task|epic-a|epic-b|epic-c|final-review|read-only|ship|fix|ci|defect-a|defect-b|identity|tail) ;;
   *) printf 'unknown EPIC_TEST_GROUP: %s\n' "$EPIC_TEST_GROUP" >&2; exit 2 ;;
 esac
 
 EPIC_RUN="$ROOT/workflows/epic-run.mjs"
+TASK_RUN="$ROOT/workflows/task-run.mjs"
 FIX_RUN="$ROOT/workflows/fix-run.mjs"
 CI_RUN="$ROOT/workflows/ci-run.mjs"
 DEFECT_RUN="$ROOT/workflows/defect-run.mjs"
@@ -244,6 +245,7 @@ prompt="$(cat)"
 
 key=unknown
 case "${EPIC_STEP_LABEL:-}" in
+  task)                                        key=task ;;
   architect:design)                            key=design ;;
   architect:recover)                           key=recover ;;
   code:red|code:red:retry)                     key=red ;;
@@ -1671,6 +1673,121 @@ assert_eq "a previously rendered summary is reused verbatim without regenerating
 assert_eq "a follow-up URL outside the evidence PR repository is never linked" true "$(jq -r .invalidFollowUpRejected <<<"$EVIDENCE_CONTRACT")"
 assert_eq "an invalid PR URL is never placed in a Markdown destination" true "$(jq -r .invalidPrUrlRejected <<<"$EVIDENCE_CONTRACT")"
 assert_eq "escaping the summary does not alter the authoritative evidence envelope" true "$(jq -r .hostileEnvelopeRoundTripsExactly <<<"$EVIDENCE_CONTRACT")"
+
+fi
+
+# ───────────────────────── task-run ─────────────────────────
+if [[ "$EPIC_TEST_GROUP" == task ]]; then
+make_task_fixture() {
+  local dir="$1"
+  mkdir -p "$dir"
+  fixture "$dir" task '{"status":"completed","title":"Add lightweight widget","summary":"Implemented the smallest widget delivery.","commitBody":"Add the widget through the existing module boundary so callers share one path.","tests":"Added widget coverage.","selfReview":"Builder self-review traced callers and the full diff; no remaining defect found.","unresolved":[]}'
+  fixture_sh "$dir" task 'printf "export const createWidget = () => ({})\n" > frontend/src/widget.ts; printf "test(\"widget\", () => {})\n" > frontend/src/widget.test.ts'
+}
+
+scenario 'task-run: one tasker verifies, opens one clean PR, and queues merge'
+TASK_BASE="$TMP/fixtures-task"
+make_task_fixture "$TASK_BASE"
+GH_ISSUE_LABELS=ready,task run_pipeline "$TASK_RUN" "$TASK_BASE" --issue 42
+assert_rc "successful task exits 0" 0 "$RUN_RC"
+assert_contains "successful task claims the merge queue" "$RUN_OUT" '"readyToMerge":true'
+assert_eq "exactly one model process runs" 1 "$(calls task)"
+assert_eq "no epic model step runs" "0|0|0|0|0" "$(calls design)|$(calls direct)|$(calls review-general)|$(calls triage)|$(calls ship)"
+assert_eq "usage records exactly one successful spawn" 1 "$(usage_log | jq -r 'select(.type=="spawn") | .step' | grep -c '^task$' || true)"
+assert_contains "the task charter reaches the process" "$(cat "$RUN_LOG")" "single agent process"
+assert_contains "the task uses its own Claude model/effort row" "$(cat "$RUN_LOG")" "--model opus --effort high"
+assert_contains "one PR is opened" "$(gh_pr_created)" "--head epic/42-add-widget"
+assert_eq "task remains beside the landing state" "ready-to-merge,task," "$(gh_labels)"
+TASK_BRANCH="$(result_json | jq -r .branch)"
+TASK_COMMIT="$(git -C "$ORIGIN" log -1 --format='%s%n%b' "$TASK_BRANCH")"
+assert_contains "the candidate keeps its non-empty subject" "$TASK_COMMIT" "Add lightweight widget"
+assert_contains "the candidate keeps its rationale" "$TASK_COMMIT" "Add the widget through the existing module boundary"
+assert_contains "the candidate closes the source issue" "$TASK_COMMIT" "Closes #42"
+assert_contains "the issue record names the intentional review omission" "$(gh_comments)" "intentionally skipped architecture and independent semantic review"
+
+scenario 'task-run: the task engine row is independently configured for every named engine'
+assert_eq "Claude task routing is explicit" "claude/opus/high" "$(jq -r '.claude.task' "$ROOT/etc/engines.json")"
+assert_eq "Codex task routing is explicit" "codex/gpt-5.6-sol/high" "$(jq -r '.codex.task' "$ROOT/etc/engines.json")"
+assert_eq "mixed task routing follows its implementation provider" "claude/opus/high" "$(jq -r '.["codex+claude"].task' "$ROOT/etc/engines.json")"
+assert_not_contains "task does not inherit the code row" "$(jq -r '.codex.task' "$ROOT/etc/engines.json")" "xhigh"
+
+scenario 'task-run: malformed output blocks after one process with no PR'
+TASK_BAD="$TMP/fixtures-task-bad"
+make_task_fixture "$TASK_BAD"
+fixture "$TASK_BAD" task '{"status":"completed"}'
+GH_ISSUE_LABELS=ready,task run_pipeline "$TASK_RUN" "$TASK_BAD" --issue 42
+assert_rc "malformed task output blocks" 3 "$RUN_RC"
+assert_eq "off-schema output is never respawned" 1 "$(calls task)"
+assert_eq "malformed output opens no PR" "" "$(gh_pr_created)"
+assert_eq "the selector persists on the failed issue" "failed,task," "$(gh_labels)"
+assert_contains "the blocker names the one-process contract" "$RUN_OUT" "one-process contract forbids a respawn"
+
+scenario 'task-run: a transient process failure is not respawned'
+TASK_DEAD="$TMP/fixtures-task-dead"
+make_task_fixture "$TASK_DEAD"
+printf '1\n' > "$TASK_DEAD/task.0.rc"
+GH_ISSUE_LABELS=ready,task run_pipeline "$TASK_RUN" "$TASK_DEAD" --issue 42
+assert_rc "dead tasker blocks" 3 "$RUN_RC"
+assert_eq "transient failure still gets one process only" 1 "$(calls task)"
+assert_not_contains "no runtime respawn is announced" "$RUN_OUT" "respawning once"
+assert_eq "dead tasker opens no PR" "" "$(gh_pr_created)"
+
+scenario 'task-run: a timeout is not respawned'
+TASK_SLOW="$TMP/fixtures-task-slow"
+make_task_fixture "$TASK_SLOW"
+printf '3\n' > "$TASK_SLOW/task.0.sleep"
+EPIC_AGENT_TIMEOUT_MS=250 GH_ISSUE_LABELS=ready,task run_pipeline "$TASK_RUN" "$TASK_SLOW" --issue 42
+assert_rc "timed-out tasker blocks" 3 "$RUN_RC"
+assert_eq "timeout still gets one process only" 1 "$(calls task)"
+assert_contains "the task timeout remains visible" "$RUN_OUT" "timed out"
+assert_not_contains "timeout starts no respawn" "$RUN_OUT" "respawning once"
+assert_eq "timed-out tasker opens no PR" "" "$(gh_pr_created)"
+
+scenario 'task-run: red verification preserves the branch and opens no PR'
+TASK_RED="$TMP/fixtures-task-red"
+make_task_fixture "$TASK_RED"
+printf '1\n' > "$TASK_RED/verify.rc"
+GH_ISSUE_LABELS=ready,task run_pipeline "$TASK_RUN" "$TASK_RED" --issue 42
+assert_rc "red task verification blocks" 3 "$RUN_RC"
+assert_eq "red verification does not start another model" 1 "$(calls task)"
+assert_eq "red verification opens no PR" "" "$(gh_pr_created)"
+assert_eq "red verification rests failed with the selector" "failed,task," "$(gh_labels)"
+assert_contains "the blocked branch is preserved on origin" "$(git -C "$ORIGIN" show "epic/42-add-widget:frontend/src/widget.ts" 2>/dev/null)" "createWidget"
+
+scenario 'task-run: a moved clean base is reinstalled and reverified'
+TASK_MOVED="$TMP/fixtures-task-moved"
+make_task_fixture "$TASK_MOVED"
+fixture_sh "$TASK_MOVED" task "printf 'export const createWidget = () => ({})\\n' > frontend/src/widget.ts; $(land_on_main frontend/src/other.ts 'export const other = 1')"
+GH_ISSUE_LABELS=ready,task run_pipeline "$TASK_RUN" "$TASK_MOVED" --issue 42
+assert_rc "clean moved-base task exits 0" 0 "$RUN_RC"
+assert_eq "clean rebase runs verification before and after" 2 "$(grep -c '^run verify$' "$NPM_LOG" || true)"
+assert_contains "the queued candidate includes the newly landed base" "$(git -C "$ORIGIN" show "$(result_json | jq -r .branch):frontend/src/other.ts" 2>/dev/null)" "other = 1"
+
+scenario 'task-run: missing task selector is never claimed or modeled'
+run_pipeline "$TASK_RUN" "$TASK_BASE" --issue 42
+assert_rc "plain issue is skipped by task-run" 2 "$RUN_RC"
+assert_eq "selector refusal starts no process" 0 "$(calls task)"
+assert_eq "selector refusal opens no PR" "" "$(gh_pr_created)"
+assert_eq "selector refusal creates no claim" "" "$(origin_ref epic/42-add-widget)"
+
+scenario 'task-run: missing task engine rows fail before GitHub or model work'
+TASK_ENGINES_BAD="$TMP/engines-task-missing.json"
+jq 'del(.claude.task)' "$ROOT/etc/engines.json" > "$TASK_ENGINES_BAD"
+EPIC_ENGINES_FILE="$TASK_ENGINES_BAD" GH_ISSUE_LABELS=ready,task run_pipeline "$TASK_RUN" "$TASK_BASE" --issue 42
+assert_rc "missing task routing fails closed" 1 "$RUN_RC"
+assert_eq "invalid engine table touches no GitHub" "" "$(cat "$GH_LOG")"
+assert_eq "invalid engine table starts no process" 0 "$(calls task)"
+
+scenario 'task-run: provider quota restores ready while retaining task and route'
+TASK_QUOTA="$TMP/fixtures-task-quota"
+make_task_fixture "$TASK_QUOTA"
+fixture_error "$TASK_QUOTA" task '{"type":"result","subtype":"success","is_error":true,"terminal_reason":"api_error","api_error_status":429,"result":"You have hit your usage limit; resets 7:50pm (UTC)","duration_ms":386,"num_turns":1,"total_cost_usd":0,"usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
+GH_ISSUE_LABELS=ready,task run_pipeline "$TASK_RUN" "$TASK_QUOTA" --issue 42
+assert_rc "quota-held task exits 0" 0 "$RUN_RC"
+assert_eq "quota is never respawned" 1 "$(calls task)"
+assert_contains "quota result is explicit" "$RUN_OUT" '"outcome":"quota-held"'
+assert_eq "task selector and engine route survive the restored queue" "ready,task," "$(gh_labels)"
+assert_eq "engine pin survives quota" "engine:claude," "$(gh_engine_labels)"
 
 fi
 

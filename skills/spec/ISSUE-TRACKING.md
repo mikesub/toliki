@@ -14,8 +14,8 @@ refactor or an internal seam counts), but:
 - never a grab-bag of several unrelated changes.
 
 Test: *could one coherent squashed commit close it and still mean something on
-its own?* If not, split or merge. This is the unit `/epic` builds, so an issue
-that fails the test is an issue the pipeline cannot deliver.
+its own?* If not, split or merge. This is the unit the build queue delivers, so
+an issue that fails the test is an issue neither workflow can deliver.
 
 ## Ordering / gating: `blocked_by` dependencies
 
@@ -40,18 +40,26 @@ nobody is waiting for, and do not invent a label for it.
 Use **only** flat issues, `blocked_by` dependencies, `#N` cross-references.
 No custom fields, no status taxonomies.
 
-**Do not create labels by hand.** The label namespace belongs to the pipeline's
-lifecycle, defined in the shared harness's `workflows/epic-run.mjs` and
-`bin/merge-worker.sh`; no `area:*`, `type:*`, `track:*` or `priority:*`
-scheme. The one label you ever apply is **`ready`, after filing is complete**:
-it is the build queue. Create issues unqueued, finish every body and required
-dependency in the batch, and read them back from GitHub before applying `ready`
-to any of them. Dispatch may claim a `ready` issue immediately; it must never
-see missing dependencies or unresolved sibling placeholders. If a body or
-dependency write or readback fails, leave the batch unqueued and report the
-incomplete work. Once the whole batch is complete, apply `ready` in one bulk
-`gh issue edit` command per repository. Read back each issue's labels even if
-that command fails, and report any incomplete queueing.
+**Do not create labels by hand.** The label namespace belongs to the pipeline;
+no `area:*`, `type:*`, `track:*` or `priority:*` scheme. `/spec` may apply only
+**`ready`**, the build queue, and the persistent **`task`** workflow selector.
+Create issues unqueued, finish every body and required dependency in the batch,
+and read them back from GitHub before applying either label. Dispatch may claim
+a `ready` issue immediately; it must never see missing dependencies or
+unresolved sibling placeholders. If a body or dependency write or readback
+fails, leave the batch unqueued and report the incomplete work. Once the whole
+batch is complete, apply `ready` in one bulk `gh issue edit` command per
+repository, adding `task` only to the explicitly selected issue numbers. Read
+back each issue's labels even if an update fails, and report any incomplete
+queueing.
+
+`/spec` selects `task` only after an explicit human choice, for a clear,
+low-risk implementation whose requirements and approach are already settled.
+It must not infer the selector from issue size or let a model choose it. Keep
+the ordinary epic path for architecture, security, migrations, infrastructure,
+policy, broad refactors, or any work where independent review is material.
+Plain `ready` means epic; `ready` plus `task` means the deliberately cheaper
+single-agent workflow with verification but no independent model review.
 
 If a genuinely new need appears, **propose it to the human first** — don't
 improvise a convention.
@@ -86,6 +94,9 @@ gh api repos/:owner/:repo/issues/<number>/dependencies/blocked_by --jq '.[].numb
 # Only after the whole batch matches the intended bodies and dependencies:
 # Pass every issue number in this repository to one bulk label update.
 gh issue edit <number-1> <number-2> --add-label ready
+# For the human-selected lightweight subset only:
+gh label create task --color C5DEF5 --description "Human-selected lightweight single-agent task workflow"
+gh issue edit <task-number-1> <task-number-2> --add-label task
 # Read each issue back, even if the bulk update reported an error.
 gh issue view <number> --json labels --jq '.labels[].name'
 ```

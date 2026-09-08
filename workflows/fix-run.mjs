@@ -116,7 +116,7 @@ The machine classification of every hunk in this stop (mechanical ones already s
 ${prep.report}
 
 Evidence — read BOTH sides' intent before touching anything:
-- The PR side: \`git diff ${prep.mergeBase} ${prep.prHead} -- <the marked files>\` is what the epic changed there, and \`gh issue view ${issue} --json title,body\` is what it set out to do.
+- The PR side: \`git diff ${prep.mergeBase} ${prep.prHead} -- <the marked files>\` is what the ${prep.taskDelivery ? 'lightweight task workflow implemented and verified (intentionally without independent semantic review)' : 'epic workflow implemented, independently reviewed and verified'} there, and \`gh issue view ${issue} --json title,body\` is what it set out to do.
 - The main side: \`git diff ${prep.mergeBase} origin/main -- <the marked files>\` is what landed on main since the PR branched, \`git log ${prep.mergeBase}..origin/main --format='%h %s'\` names the commits, and ${prep.mainIssues.length ? `these are the issues they delivered — read each: ${prep.mainIssues.map(n => '#' + n).join(', ')} (\`gh issue view <n> --json title,body\`)` : 'their commit messages are the intent record (no Closes #N references found)'}.
 - Do NOT open anything under \`.epics/\` — leftovers there carry a previous run's framing and would anchor you; the diffs and issue bodies above are your whole evidence.
 
@@ -547,7 +547,7 @@ async function prepare(ctx, { labels }) {
     return { refused: 'could not record the attempt (label write failed)' }
   }
   const { attempt, rung: ladderLabel } = consumed
-  const base = { attempt, branch: pr.headRefName, prUrl: pr.url, prNumber: pr.number, prHead: pr.headRefOid, actor }
+  const base = { attempt, branch: pr.headRefName, prUrl: pr.url, prNumber: pr.number, prHead: pr.headRefOid, actor, taskDelivery: labels.includes('task') }
 
   // Git setup, in the session's own worktree. Scrub what a killed predecessor may have left first: a
   // relaunched fixer inherits the previous run's worktree, and a leftover mid-rebase state makes every
@@ -841,6 +841,7 @@ const buildComment = (prep, dispositions, verifyDetail, check, corrected) => {
   lines.push(declined.length ? '🤖 fix-conflict landed a partial judgment-conflict repair' : '🤖 fix-conflict resolved a judgment rebase conflict')
   lines.push(`- pr: ${prep.prUrl}`)
   lines.push(`- attempt: ${prep.attempt}`)
+  lines.push(`- source workflow: ${prep.taskDelivery ? 'lightweight task — implemented and verified, intentionally not independently reviewed' : 'epic — implemented, independently reviewed and verified'}`)
   lines.push('')
   if (prep.partialRecord) {
     lines.push('A human granted another bounded round on a previously pushed partial conflict repair. The authenticated head-bound record supplied only its remaining declined hunks; earlier repaired hunks were not reopened.')

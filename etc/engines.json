@@ -1,5 +1,6 @@
 {
   "claude": {
+    "task":               "claude/opus/high",
     "architect":          "claude/fable/xhigh",
     "code":               "claude/opus/high",
     "ship":               "claude/opus/high",
@@ -10,6 +11,7 @@
     "fix-ci":             "claude/opus/high"
   },
   "codex": {
+    "task":               "codex/gpt-5.6-sol/high",
     "architect":          "codex/gpt-5.6-sol/xhigh",
     "code":               "codex/gpt-5.6-sol/xhigh",
     "ship":               "codex/gpt-5.6-sol/xhigh",
@@ -20,6 +22,7 @@
     "fix-ci":             "codex/gpt-5.6-sol/xhigh"
   },
   "codex+claude": {
+    "task":               "claude/opus/high",
     "architect":          "claude/fable/xhigh",
     "code":               "claude/opus/xhigh",
     "ship":               "claude/opus/xhigh",

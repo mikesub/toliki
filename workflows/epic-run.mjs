@@ -92,10 +92,13 @@ import { initStatus, statusPhase, statusNote, statusFinish } from './lib/status.
 import { failureReason, must } from './lib/proc.mjs'
 import { validate } from './lib/schema.mjs'
 import {
-  ensureLabels, editLabels, issueLabels, issueView, openBlockers, comment, assignSelf,
-  openPrs, searchOpenPrs, prCreate, issueCreate, withBodyFile, hasDeferredRecord, issueId, addBlockedBy,
-  readBack, terminalBudget, terminalSpend, terminalTransition, verifyIssueEngine,
+  ensureLabels, editLabels, issueView, comment, issueCreate, hasDeferredRecord, issueId, addBlockedBy,
+  readBack, terminalBudget, terminalSpend,
 } from './lib/github.mjs'
+import {
+  ISSUE_LIFECYCLE, prepareIssueDelivery, renderIssuePrBody, createIssueCandidate, handoffIssue,
+  preserveIssueWork, holdIssueForQuota, restIssueFailed,
+} from './lib/issue-delivery.mjs'
 import { createBlockerIdentityRegistry } from './lib/blocker-identity.mjs'
 import {
   ACCEPTANCE_CONFIDENCE, CONFIRMATION_SCHEMA, CORRECTION_SCHEMA,
@@ -104,10 +107,9 @@ import {
 } from './lib/repair-acceptance.mjs'
 import {
   git, gitOut, captureDiff, discoverPackages, pkgList, ensureDeps, runVerify, ensureEpicsIgnored, checkpoint, intentToAdd,
-  pushRejected, rebaseInProgress, slugify, epicDir, writeRequirements, readRequirements, initEpicMd, updateEpicMd,
+  rebaseInProgress, epicDir, readRequirements, updateEpicMd,
   renderArchitecture, renderReview, worktreeTree,
 } from './lib/repo.mjs'
-import { recordQuotaHold } from './quota-hold.mjs'
 
 const USAGE = `Usage: epic-run.mjs (--issue <N> | --slug <slug>) [--session <name>] [--engine <name>] [--repo <key>]
 
@@ -604,14 +606,20 @@ onLog(statusNote)
 
 const issue = ARGS.issue
 let slug = ARGS.slug
+const spend = terminalSpend
+const deliveryMarker = candidate => `<!-- toliki-delivery-summary candidate:${candidate} -->`
+const matchingDeliverySummaries = (comments, candidate) => {
+  const marker = deliveryMarker(candidate)
+  return (Array.isArray(comments) ? comments : [])
+    .map(c => String(c?.body || ''))
+    .filter(body => body.startsWith('🤖 epic delivery summary\n') && body.split('\n').includes(marker))
+}
 const gitMode = issue != null
 
 // ───────────────────────── Transport ─────────────────────────
 // The deterministic half of the run. Every function here either returns a
 // structured outcome the pipeline branches on, or throws with a message that
 // names the command that failed — main()'s catch turns that into a blocker.
-
-const LIFECYCLE = ['in-progress', 'ready-to-merge', 'ready-to-review', 'failed', 'needs-defect-fix']
 
 // Claiming is what makes it safe to run epics in parallel. The label swap `ready` → `in-progress`
 // can't be the lock — it's a read-modify-write with a wide window — but creating a ref on origin is a
@@ -631,186 +639,19 @@ const LIFECYCLE = ['in-progress', 'ready-to-merge', 'ready-to-review', 'failed',
 // Layer 2 is not optional: a claim ref IS a branch on origin, so without it the loser lands in the
 // resume path and adopts its competitor's branch, never reaching 3 at all.
 async function prepare(issue) {
-  const notes = []
-  const view = await issueView(issue, 'number,title,body,state')
-  if (String(view.state || '').toUpperCase() === 'CLOSED') return { refused: `issue #${issue} is closed` }
-
-  // Building on an unlanded dependency is exactly what blocked_by exists to prevent — and a
-  // dependency check that could not be READ is never a green gate either, so an errored query
-  // skips the issue instead of building it as if unblocked. Skipped rather than blocked: nothing
-  // has been claimed or labelled yet, so the next tick simply re-reads it.
-  const deps = await openBlockers(issue)
-  if (deps.error) return { refused: `the blocked_by dependency check could not be read (${deps.error}) — refusing to build as if unblocked` }
-  if (deps.blockers.length) return { refused: `blocked by open issue(s) ${deps.blockers.map(n => `#${n}`).join(', ')}` }
-
-  // Same rule for the base: every branch below is cut from origin/main and the claim is a push to
-  // origin, so a failed fetch means building against a base this run could not confirm and then
-  // claiming over a link that just failed.
-  const fetched = await git(['fetch', 'origin'])
-  if (!fetched.ok) return { refused: `git fetch origin failed (${failureReason(fetched)}) — refusing to build against an unconfirmed base` }
-  // Captured BEFORE any branch switch: the deps check compares this worktree's original checkout
-  // against the new base.
-  const base = await gitOut(['rev-parse', 'HEAD'], 'git rev-parse HEAD')
-
-  // An open PR already delivering this issue — by branch name, and (for legacy title-derived branch
-  // names) by the Closes line in its body.
-  const prefix = `epic/${issue}-`
-  const delivering = (await openPrs('number,headRefName')).find(p => String(p.headRefName || '').startsWith(prefix))
-  if (delivering) return { alreadyExists: true, note: `an open PR already delivers this issue (PR #${delivering.number})` }
-  const legacy = await searchOpenPrs(`Closes #${issue} in:body`)
-  if (legacy.length) return { alreadyExists: true, note: `an open PR already delivers this issue (PR #${legacy[0].number})` }
-
-  // A leftover branch (an interrupted or blocked prior run) is RESUMED, never started over.
-  const local = (await gitOut(['branch', '--list', `${prefix}*`, '--format=%(refname:short)'], 'git branch --list'))
-    .split('\n').map(s => s.trim()).filter(Boolean)
-  const remote = (await gitOut(['ls-remote', '--heads', 'origin', `${prefix}*`], 'git ls-remote'))
-    .split('\n').map(l => l.trim().split(/\s+/)[1]).filter(Boolean).map(r => r.replace(/^refs\/heads\//, ''))
-  let branch = local[0] || remote[0] || null
-  let resumed = false
-  let codeDone = false
-  let partialWork = false
-  if (branch) {
-    slug = branch.slice('epic/'.length)
-    let sw
-    if (local.includes(branch)) {
-      sw = await git(['switch', branch])
-    } else {
-      // Only on origin: a leftover, or another run's live claim? A branch whose every commit above
-      // origin/main is a claim commit holds no work — its owner is building this issue right now.
-      await gitOut(['fetch', 'origin', branch], `git fetch origin ${branch}`)
-      const subjects = (await gitOut(['log', '--format=%s', 'origin/main..FETCH_HEAD'], 'git log')).split('\n').filter(Boolean)
-      if (subjects.length && subjects.every(s => s.startsWith(`chore(epic ${issue}): claim`))) return { refused: 'claimed by another run' }
-      sw = await git(['switch', '-c', branch, '--track', `origin/${branch}`])
-    }
-    if (!sw.ok) {
-      if (/already (checked out|used by worktree)/i.test(`${sw.err}\n${sw.out}`)) {
-        return { refused: `${branch} is checked out in another worktree — a run may be live there` }
-      }
-      must(sw, `git switch ${branch}`)
-    }
-    // A relaunch reuses the worktree, so a killed run's uncommitted work may still be sitting here.
-    // Checkpoint it: nothing is lost, and the rebase below refuses a dirty tree.
-    if (await gitOut(['status', '--porcelain'], 'git status')) {
-      await gitOut(['add', '-A'], 'git add -A')
-      if ((await git(['diff', '--cached', '--quiet'])).code !== 0) await gitOut(['commit', '-q', '-m', `wip(epic ${slug}): resume checkpoint`], 'git commit (resume checkpoint)')
-    }
-    const rb = await git(['rebase', 'origin/main'])
-    if (!rb.ok) {
-      await git(['rebase', '--abort'])
-      return { refused: `resume rebase onto origin/main conflicted — resolve manually on ${branch} or delete it for a fresh build` }
-    }
-    resumed = true
-    // A code checkpoint means an earlier run finished implementation. Do not repeat it: recover the
-    // architecture plan if needed, re-prove the tree through verify, then review.
-    const subjects = (await gitOut(['log', '--format=%s', 'origin/main..HEAD'], 'git log')).split('\n')
-    codeDone = subjects.some(s => new RegExp(`^wip\\(epic ${slug.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\): (code|triage) checkpoint$`).test(s.trim()))
-    partialWork = !codeDone && subjects.some(s => s.trim() && !s.startsWith(`chore(epic ${issue}): claim`))
-  } else {
-    slug = slugify(issue, view.title)
-    branch = `epic/${slug}`
-    // ALWAYS from origin/main, never the local checkout (it can be stale).
-    await gitOut(['switch', '-c', branch, 'origin/main'], `git switch -c ${branch} origin/main`)
-    // CLAIM, right now — before requirements.md, before npm ci, before anything else expensive.
-    await gitOut(['commit', '--allow-empty', '-q', '-m', `chore(epic ${issue}): claim ${Math.floor(Date.now() / 1000)}-${process.pid}`], 'git commit (claim)')
-    const push = await git(['push', 'origin', `HEAD:refs/heads/${branch}`])
-    if (!push.ok) {
-      // Losing this race is the mechanism working: never retry, force, or pick another slug.
-      if (pushRejected(push)) return { refused: 'claimed by another run' }
-      must(push, 'git push (claim)')
-    }
-  }
-
-  // The claim makes this engine selection durable. Only a newly won claim may
-  // fill an absent route; a resumed branch must already have the exact pin its
-  // launcher selected. This hard gate precedes lifecycle signalling, installs,
-  // and every model spawn, and never overwrites an explicit/conflicting route.
-  await verifyIssueEngine(issue, ARGS.engine, { allowCreate: !resumed })
-
-  // Signal on GitHub that autonomous work has started — now, before the slow deps step. Best-effort:
-  // a failure is noted in the phase log (so it surfaces in the PR body) and never aborts the run.
-  await ensureLabels(LIFECYCLE)
-  const swap = await editLabels(issue, { add: ['in-progress'], remove: ['ready', 'ready-to-merge', 'ready-to-review', 'failed', 'needs-defect-fix'] })
-  if (!swap.ok) notes.push(`prepare: label swap failed: ${failureReason(swap)}`)
-  const assigned = await assignSelf(issue)
-  if (!assigned.ok) notes.push(`prepare: self-assign failed: ${failureReason(assigned)}`)
-
-  const dir = epicDir(slug)
-  await ensureEpicsIgnored()
-  writeRequirements(dir, issue, view.body)
-  initEpicMd(dir, { title: view.title, slug, issue })
-  for (const n of notes) updateEpicMd(dir, { log: n })
-
-  const packages = discoverPackages('.')
-  const depLines = packages.length ? await ensureDeps(packages, { pairs: [[base, 'HEAD']] }) : []
-  return {
-    slug, branch, resumed, codeDone, partialWork, requirement: readRequirements(dir),
-    requirementTitle: String(view.title || ''), requirementBody: String(view.body || ''),
-    packages, depLines,
-  }
+  return prepareIssueDelivery({ issue, engine: ARGS.engine, lifecycle: ISSUE_LIFECYCLE })
 }
 
-// One budget for everything from the run's first terminal label to its last GitHub call. That label is
-// whichever terminal write comes first: ship's `ready-to-review`, or a pre-ship blocker's `failed`.
-// Everything after it — the evidence comment and its readback, the queue label edit, the promotion to
-// `ready-to-merge`, a post-ship blocker report — runs while bin/reap.sh has already started the settle
-// clock at that label. On the default gh timeout any one of those calls is longer than the shortest
-// window reap will honour, so the sweep can kill a live session between the label and the record of
-// what the gate decided. terminalBudget() opens the window at the first such write and hands the same
-// one back to every caller after it; before the write there is no clock running, so `spend()` is empty
-// and the default timeout stands. The same window is why no model step may run after that first write:
-// runtime's agent() refuses a spawn once it is open, since a ninety-minute ceiling is the one thing this
-// budget cannot cap.
-const spend = terminalSpend
-
-const deliveryMarker = candidate => `<!-- toliki-delivery-summary candidate:${candidate} -->`
-
-const matchingDeliverySummaries = (comments, candidate) => {
-  const marker = deliveryMarker(candidate)
-  return (Array.isArray(comments) ? comments : [])
-    .map(c => String(c?.body || ''))
-    .filter(body => body.startsWith('🤖 epic delivery summary\n') && body.split('\n').includes(marker))
-}
-
-const renderPrBody = ({ issue, decision }) => {
-  const deferred = Array.isArray(decision.deferred) ? decision.deferred : []
-  const pointer = deferred.length
-    ? `Specification and run record: #${issue}. Deferred items recorded on #${issue}.`
-    : `Specification and run record: #${issue}.`
-  return [pointer, decision.legalMarker, `Closes #${issue}`].filter(Boolean).join('\n\n') + '\n'
-}
-
-// Build and push the checked candidate, then open its technical PR. Nothing
-// append-only is written to the issue here: the caller records this returned
-// identity immediately, so every later reporting failure can name the real PR,
-// branch and candidate rather than offering a retry prepare will skip.
+// Candidate formation and GitHub handoff share their safety-critical transport
+// with task-run; this wrapper supplies the epic's deferral and legal metadata.
 async function createCandidate({ issue, slug, decision }) {
-  const branch = `epic/${slug}`
-  const title = String(decision.title || '').trim().split('\n')[0]
-  if (!title) throw new Error('ship returned no PR title')
-  const body = renderPrBody({ issue, decision })
-
-  // Squash to ONE clean commit: fold leftovers into the checkpoint chain, soft-reset to the merge
-  // base (NOT origin/main, which may have advanced during the run), commit once.
-  await gitOut(['add', '-A'], 'git add -A')
-  if ((await git(['diff', '--cached', '--quiet'])).code !== 0) await gitOut(['commit', '-q', '-m', `wip(epic ${slug}): pre-ship`], 'git commit (pre-ship)')
-  const mergeBase = await gitOut(['merge-base', 'HEAD', 'origin/main'], 'git merge-base')
-  await gitOut(['reset', '--soft', mergeBase], 'git reset --soft')
-  if ((await git(['diff', '--cached', '--quiet'])).code === 0) throw new Error('nothing to ship — the branch holds no change against origin/main')
-  const commitBody = String(decision.commitBody || '').trim()
-  const message = [title, '', commitBody, decision.legalMarker ? `\n${decision.legalMarker}` : '', '', `Closes #${issue}`]
-    .join('\n').replace(/\n{3,}/g, '\n\n')
-  await withBodyFile(message, (file) => gitOut(['commit', '-q', '-F', file], 'git commit (squash)'))
-
-  // The branch has been on origin since prepare claimed it, and the squash rewrote every commit above
-  // the merge base; the lease overwrites only the ref THIS run has held since the claim and fails if
-  // anything else moved it.
-  const push = await git(['push', '--force-with-lease', '-u', 'origin', branch])
-  if (!push.ok) throw new Error(pushRejected(push) ? `the force-with-lease push was rejected — ${branch} moved on origin under this run` : `git push failed (${failureReason(push)})`)
-
-  const prHead = await gitOut(['rev-parse', 'HEAD'], 'git rev-parse HEAD')
-  const prUrl = await withBodyFile(body, file => prCreate({ head: branch, title, bodyFile: file }))
-  const prNumber = Number(String(prUrl).trim().split('/').pop())
-  return { prUrl, prNumber, prHead, branch, title, body }
+  const deferred = Array.isArray(decision.deferred) ? decision.deferred : []
+  const body = renderIssuePrBody({
+    issue,
+    detail: deferred.length ? `Deferred items recorded on #${issue}.` : '',
+    legalMarker: decision.legalMarker,
+  })
+  return createIssueCandidate({ issue, slug, decision, body })
 }
 
 const deliverySummary = ({ candidate, decision, verify, reviewTally, deferred, mergeBlockers, blockerIdentity }) => {
@@ -994,73 +835,14 @@ async function recordCandidateDeferrals({ issue, slug, dir, decision, blockerIde
 //     after it — not the one before — is what lets the PR be reported as held. `unresolved` is the state
 //     that is neither, and the caller blocks on it rather than resting on a label it cannot account for.
 async function handoff(issue, dir) {
-  const readLabels = async () => {
-    try {
-      return await issueLabels(issue, spend())
-    } catch (e) {
-      log(`handoff: the issue's labels could not be read back (${e && e.message || e})`)
-      return null
-    }
-  }
-  const observedIn = (labels) => labels ? `observed labels: ${labels.join(', ') || 'none'}` : 'the labels could not be read back'
-  await ensureLabels(['ready-to-merge'], spend())
-  const r = await editLabels(issue, { add: ['ready-to-merge'], remove: ['ready-to-review'] }, spend())
-  const labels = await readLabels()
-  const why = r.ok ? observedIn(labels) : `${failureReason(r)}; ${observedIn(labels)}`
-  if (labels && labels.includes('ready-to-merge') && !labels.includes('ready-to-review')) {
-    // Local bookkeeping, and it cannot unseat an observed verdict: .epics/ dies with the worktree,
-    // while the label is already on the issue and RESULT has to say so.
-    try { updateEpicMd(dir, { log: 'handoff: queued for merge-worker' }) } catch { /* the pane log is the record */ }
-    return { labelled: true, summary: r.ok ? 'ready-to-merge observed' : `the write itself was not confirmed (${failureReason(r)}) but ready-to-merge is observed on the issue` }
-  }
-  const rest = terminalTransition({ rest: 'ready-to-review' })
-  await ensureLabels(rest.add, spend())
-  const undo = await editLabels(issue, rest, spend())
-  // The demotion's readback IS the verdict that lets the PR be reported as held, so it is bounded
-  // rather than single-shot: GitHub can take seconds to show a strip it has already applied, and one
-  // immediate read would report a proved demotion as unresolved and block a complete PR. The read
-  // BEFORE the compensating transition is deliberately left single-shot — there a non-match is not a
-  // verdict but the decision to compensate, and a promotion that lands after the read has to be taken
-  // back off rather than waited for.
-  const after = (await readBack(readLabels,
-    ls => ls === null || (ls.includes('ready-to-review') && !ls.includes('ready-to-merge')), spend())).observed
-  if (after && after.includes('ready-to-review') && !after.includes('ready-to-merge')) {
-    return { labelled: false, summary: `${why} — the promotion was taken back off and ready-to-review confirmed` }
-  }
-  const undoneWhy = undo.ok ? observedIn(after) : `${failureReason(undo)}; ${observedIn(after)}`
-  return { labelled: false, summary: why, unresolved: `${why} — and the demotion back to ready-to-review could not be verified (${undoneWhy})` }
+  return handoffIssue({ issue, dir, log })
 }
 
 // Preserve unfinished work for either terminal path. A quota hold needs this
 // operation to succeed before it can advertise a resumable ready issue; the
 // ordinary blocker keeps its historical best-effort behavior around it.
 async function preserveWork({ slug, phase }) {
-  if (!slug) return
-  const branch = `epic/${slug}`
-  if (await gitOut(['status', '--porcelain'], 'git status')) {
-    await gitOut(['add', '-A'], 'git add -A')
-    if ((await git(['diff', '--cached', '--quiet'])).code !== 0) await gitOut(['commit', '-q', '-m', `wip: epic blocked at ${phase}`], 'git commit (wip)')
-  }
-  // "Ahead of the claimed ref" is the wrong question once ship can rebase: a rebase rewrites every
-  // commit above the base, so a chain that is genuinely unpushed can still count zero commits the
-  // remote lacks (a rebase that dropped work main already carried). What has to be pushed is a tip
-  // that DIFFERS from the ref this run claimed — unless the remote is strictly ahead of it, which is
-  // someone else's push and never something to overwrite. With no claimed ref yet, ahead of
-  // origin/main is still the only sensible test.
-  const claimed = `refs/remotes/origin/${branch}`
-  const hasClaim = (await git(['rev-parse', '--verify', '-q', claimed])).ok
-  let push
-  if (hasClaim) {
-    const head = (await git(['rev-parse', 'HEAD'])).out
-    const remote = (await git(['rev-parse', claimed])).out
-    push = !!head && !!remote && head !== remote && (await git(['merge-base', '--is-ancestor', 'HEAD', claimed])).code !== 0
-  } else {
-    push = (Number((await git(['rev-list', '--count', 'origin/main..HEAD'])).out) || 0) > 0
-  }
-  if (push) {
-    const pushed = await git(['push', '--force-with-lease', '-u', 'origin', branch])
-    if (!pushed.ok) throw new Error(`git push failed (${failureReason(pushed)})`)
-  }
+  return preserveIssueWork({ slug, phase })
 }
 
 // The blocker report: preserve the work, say where it is, flip the label to failed.
@@ -1098,10 +880,7 @@ async function postBlocker({ issue, slug, phase, reason, prUrl, candidate }) {
   // The assignee stays. `failed` is a terminal write like ship's, so a run blocked before ship opens
   // the window here: the clock starts as GitHub applies it either way. A run blocked AFTER ship keeps
   // the window ship opened; terminalBudget() never hands out a second one.
-  terminalBudget()
-  const rest = terminalTransition({ rest: 'failed', drop: ['ready', 'needs-defect-fix'] })
-  await ensureLabels(rest.add, spend())
-  const flip = await editLabels(issue, rest, spend())
+  const { flipped: flip } = await restIssueFailed({ issue })
   if (!flip.ok) log(`blocked: label flip to failed failed (${failureReason(flip)})`)
 }
 
@@ -1115,23 +894,7 @@ let openPr = null
 let openCandidate = null
 async function holdForQuota(phase, failure) {
   if (!gitMode) return { error: 'quota holds require issue mode' }
-  try {
-    await preserveWork({ slug, phase })
-    const { hostHold, trigger } = await recordQuotaHold({ vendor: failure.vendor, reason: failure.reason })
-    terminalBudget()
-    await ensureLabels(['ready'], spend())
-    const remove = ['in-progress', 'failed', 'ready-to-merge', 'ready-to-review', 'needs-defect-fix']
-    const flip = await editLabels(issue, { add: ['ready'], remove }, spend())
-    const labels = await issueLabels(issue, spend())
-    if (!flip.ok || !labels.includes('ready') || remove.some(label => labels.includes(label))) {
-      throw new Error(flip.ok ? `observed labels: ${labels.join(', ') || 'none'}` : failureReason(flip))
-    }
-    // The hold transition was read back above, so the issue really is waiting
-    // on the provider: automatic waiting, never a human handoff.
-    return { held: true, issue, slug, phase, ...hostHold, ...trigger, outcome: 'quota-held' }
-  } catch (error) {
-    return { error: error?.message || String(error) }
-  }
+  return holdIssueForQuota({ issue, slug, phase, failure })
 }
 
 async function fail(phase, reason, suppliedFailure = undefined) {

@@ -362,9 +362,21 @@ printf '%s\n' '{"codex":{"holdUntil":"2099-01-01T00:00:00.000Z","reason":"limit 
 run_dispatch --dry-run
 assert_rc "selective dry-run exits cleanly" 0 "$RUN_RC"
 assert_eq "dry-run logs the held Codex candidate once" 1 "$(printf '%s\n' "$RUN_OUT" | grep -c '#4: held (codex quota until 2099-01-01 01:00:00 CET)' || true)"
-assert_contains "dry-run still reports an unheld Claude launch" "$RUN_OUT" "#5 (testrepo): would launch 'testrepo-epic-5' with claude"
-assert_not_contains "dry-run does not report the held candidate as launchable" "$RUN_OUT" "would launch 'testrepo-epic-4'"
+assert_contains "dry-run still reports an unheld Claude epic" "$RUN_OUT" "#5 (testrepo): would launch --epic 'testrepo-epic-5' with claude"
+assert_not_contains "dry-run does not report the held candidate as launchable" "$RUN_OUT" "would launch --epic 'testrepo-epic-4'"
 assert_eq "dry-run calls no launch command" "" "$(cat "$TMP/launch.log")"
+
+printf '\ndispatch hold: task admission uses only the task step vendor\n'
+reset_state
+READY_QUEUE='9\n10'
+printf 'ready,task,engine:codex+claude' > "$TMP/labels/9"
+printf 'ready,engine:codex+claude' > "$TMP/labels/10"
+printf '%s\n' '{"codex":{"holdUntil":"2099-01-01T00:00:00.000Z","reason":"usage limit","fallback":false}}' > "$TMP/provider-hold.json"
+run_dispatch --dry-run
+assert_rc "workflow-specific admission exits cleanly" 0 "$RUN_RC"
+assert_contains "the Claude task step remains launchable through a Codex hold" "$RUN_OUT" "#9 (testrepo): would launch --task 'testrepo-epic-9' with codex+claude"
+assert_eq "the same engine's full epic vendor set is held" 1 "$(printf '%s\n' "$RUN_OUT" | grep -c '#10: held (codex quota until 2099-01-01 01:00:00 CET)' || true)"
+assert_not_contains "the held epic is not launchable" "$RUN_OUT" "would launch --epic 'testrepo-epic-10'"
 
 printf '\ndispatch hold: every matching vendor is named and both vendors stop all candidates\n'
 reset_state
@@ -501,6 +513,25 @@ TOLIKI_TEST_REAL_QUOTA_STATUS=1 run_dispatch
 assert_rc "tick exits 0" 0 "$RUN_RC"
 assert_contains "Claude is passed to launch" "$(cat "$TMP/launch.log")" '--epic 1 --repo testrepo --engine claude'
 assert_matches "human dispatch logs use the configured zone" "$RUN_OUT" '[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} (CET|CEST) \[dispatch\]'
+
+printf '\ndispatch: the strong-read task selector chooses the workflow\n'
+reset_state
+READY_QUEUE='70\n71'
+printf 'ready,task,engine:codex' > "$TMP/labels/70"
+printf 'ready,engine:codex' > "$TMP/labels/71"
+run_dispatch
+assert_rc "task/plain routing exits 0" 0 "$RUN_RC"
+assert_contains "ready plus task launches the task workflow" "$(cat "$TMP/launch.log")" '--task 70 --repo testrepo --engine codex'
+assert_contains "plain ready still launches the epic workflow" "$(cat "$TMP/launch.log")" '--epic 71 --repo testrepo --engine codex'
+assert_not_contains "task never uses a parallel session namespace" "$(cat "$TMP/launch.log")" 'task-70'
+
+reset_state
+READY_QUEUE='72\n73'
+printf 'ready,task,engine:codex' > "$TMP/labels/72"
+printf 'ready,engine:codex' > "$TMP/labels/73"
+run_dispatch --dry-run
+assert_contains "dry-run names the task launch selected by the strong read" "$RUN_OUT" "would launch --task 'testrepo-epic-72' with codex"
+assert_contains "dry-run names the ordinary epic separately" "$RUN_OUT" "would launch --epic 'testrepo-epic-73' with codex"
 
 printf '\ndispatch: with no installed cron file both paths take the built-in claude\n'
 # The tick's own EPIC_ENGINE must not select anything. A queue tick inherits it
@@ -1007,7 +1038,7 @@ assert_eq "the issue's labels are unchanged" "ready,engine:codex" "$(cat "$TMP/l
 assert_contains "the operator is told which label chose the engine" "$CONTROL_OUT" "engine codex selected by the issue's engine:codex label"
 assert_contains "and that nothing was persisted" "$CONTROL_OUT" "no label written"
 
-for kind in fix ci defect; do
+for kind in task fix ci defect; do
   reset_state
   printf 'ready,engine:codex' > "$TMP/labels/11"
   run_control "$kind" 11 -r testrepo
@@ -1043,13 +1074,17 @@ assert_eq "a refused inherit writes no label" "" "$(grep 'issue edit' "$TMP/gh.l
 reset_state
 run_control start --engine codex -r testrepo
 assert_rc "--engine is still refused for interactive sessions" 1 "$CONTROL_RC"
-assert_contains "and says it is pipeline-only" "$CONTROL_OUT" "only applies to manual epic/fix/ci/defect launches"
+assert_contains "and says it is pipeline-only" "$CONTROL_OUT" "only applies to manual epic/task/fix/ci/defect launches"
 assert_eq "a refused interactive --engine launches nothing" "" "$(cat "$TMP/launch.log")"
 
 reset_state
 SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/remote-control.sh" epic 10 --engine codex
 assert_contains "manual epic forwards its explicit engine" "$(cat "$TMP/ssh.log")" "--engine 'codex'"
 assert_contains "manual epic persists the engine first" "$(cat "$TMP/ssh.log")" "--route-issue '10' 'codex'"
+: > "$TMP/ssh.log"
+SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/remote-control.sh" task 10 --engine codex -r testrepo >/dev/null 2>&1
+assert_contains "manual task persists the engine before launching" "$(cat "$TMP/ssh.log")" "--route-issue '10' 'codex'"
+assert_contains "manual task uses the dedicated launch mode" "$(cat "$TMP/ssh.log")" "--task '10' --engine 'codex'"
 : > "$TMP/ssh.log"
 set +e
 SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/remote-control.sh" defect 10 --engine codex -r testrepo >/dev/null 2>&1

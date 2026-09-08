@@ -241,11 +241,12 @@ const charterCache = new Map()
 // Which tool boundary each pipeline step runs under. Fixed by the pipeline,
 // never by etc/engines.json: the file picks a vendor, model and effort per
 // step, not whether the step may write files. architect, review, final-review
-// and ship are read-only under both vendors; the rest carry the coder
-// charter and may edit the worktree. Every step here is a judgment call; the
+// and ship are read-only under both vendors; task carries the tasker charter,
+// and the remaining writable steps carry coder. Every step here is a judgment call; the
 // run's git, gh and npm work is done by the orchestrator (lib/github.mjs,
 // lib/repo.mjs), never by a model.
 export const STEPS = {
+  task: 'tasker',
   architect: 'architect',
   code: 'coder',
   review: 'reviewer',

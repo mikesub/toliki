@@ -463,7 +463,7 @@ assert_eq "and that instant reads back as its epoch" "1777626600" "$(iso_epoch 2
 assert_eq "no fixture depends on GNU date alone" "" \
   "$(grep -n 'date -u -d' "${BASH_SOURCE[0]}" | grep -v '|| date -u -d' || true)"
 HELP="$(HOST_TIMEZONE=UTC TZ=UTC node "$ROOT/workflows/usage-report.mjs" --help 2>&1)"
-assert_contains "the help names every pipeline the log now holds" "$HELP" '--script epic-run|fix-run|ci-run|defect-run'
+assert_contains "the help names every pipeline the log now holds" "$HELP" '--script epic-run|task-run|fix-run|ci-run|defect-run'
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

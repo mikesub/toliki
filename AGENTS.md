@@ -7,15 +7,16 @@ relative markdown links, never `@file` includes.
 ## What this is
 
 Toliki is a self-hosted coding-agent harness. A VPS turns `ready` GitHub issues
-into reviewed, verified pull requests using cron, tmux, git worktrees, plain
-Node orchestrators and short-lived headless agent processes. There is no
+into verified pull requests using cron, tmux, git worktrees, plain Node
+orchestrators and short-lived headless agent processes. Epic deliveries are
+independently reviewed; explicitly selected lightweight tasks are not. There is no
 daemon, database, web UI or npm dependency tree. GitHub holds durable state;
 tmux holds live processes; git worktrees isolate runs.
 
 Two session kinds exist, and they must never be conflated:
 
 - **Pipeline sessions** (`<repo>-epic-<N>`), launched by dispatch. The pane runs
-  one of `workflows/{epic,fix,ci,defect}-run.mjs`, which spawns one headless
+  one of `workflows/{epic,task,fix,ci,defect}-run.mjs`, which spawns one headless
   agent process per step through the engine adapter. No interactive agent wraps
   it and there is no steering channel; the only intervention is kill. Read one
   with `tmux attach` or `capture-pane`: the pane holds the whole phase log and a
@@ -35,7 +36,7 @@ Two session kinds exist, and they must never be conflated:
   states its contract, its ordering choices and the incident behind them. The
   code and its comments are the operational manual; this file holds only what
   the code cannot show.
-- [docs/README.md](docs/README.md): the end-to-end workflow map. Every change
+- [WORKFLOW.md](WORKFLOW.md): the end-to-end workflow map. Every change
   to workflow behavior must verify this document against the executable path
   and update it in the same change when the description is no longer exact.
 - `etc/repos.conf.template` plus `etc/lib.sh`: the tracked configuration
@@ -51,6 +52,9 @@ in the same change.
 
 - **Epic**: one autonomous run of `epic-run.mjs` on one issue, ending at an open
   PR or a blocker comment.
+- **Task**: one explicitly selected run of `task-run.mjs` on a `task`-labeled
+  issue. One writable tasker implements and self-reviews; the orchestrator
+  verifies and delivers without an independent model review.
 - **Fixer**: a run of `fix-run.mjs` on a `needs-judgment` issue,
   `ci-run.mjs` on a `needs-ci-fix` issue, or `defect-run.mjs` on a
   `needs-defect-fix` issue. All reuse the epic's session name on purpose so
@@ -64,7 +68,7 @@ in the same change.
   fixers require the exact persisted singleton; the label survives fixer
   retries. A manual launch may omit `--engine`, and then inherits — issue label,
   else host default, else claude — without writing any label.
-- **Step**: one of the eight pipeline steps in `STEPS` in
+- **Step**: one of the nine pipeline steps in `STEPS` in
   `workflows/lib/engine.mjs`, each a judgment call. Pipelines name steps; the
   engine file says who runs them; `STEPS` fixes each step's charter and tool
   boundary, so architect, review, final-review and ship stay read-only under any
@@ -73,7 +77,8 @@ in the same change.
   supplies captured diff evidence and also proves the worktree, index, Git
   configuration, hooks and ancestry metadata unchanged around review, final
   review and ship. Nothing deterministic is a step: git, gh and npm work runs
-  in the orchestrator.
+  in the orchestrator. `task` maps to the writable `tasker` charter and is the
+  task workflow's only model process.
 - **Charter**: an `agents/*.md` file, read on every phase. Missing or malformed
   refuses the run.
 - **Package**: a directory whose `package.json` declares `scripts.verify`. The
@@ -83,7 +88,7 @@ in the same change.
   the lock; labels are reporting.
 - **Slot**: one running tmux session, whoever started it. `MAX_PARALLEL_EPICS`
   in `etc/repos.conf` is the budget, enforced only in `bin/launch.sh`. Its one
-  bypass is `--over-capacity` on a manual epic/fix/ci/defect launch; the
+  bypass is `--over-capacity` on a manual epic/task/fix/ci/defect launch; the
   session it admits still counts as a slot afterwards.
 
 Lifecycle labels are owned by automation. Do not add or repurpose one.
@@ -103,6 +108,10 @@ Lifecycle labels are owned by automation. Do not add or repurpose one.
 | `defect-attempted` / `defect-retried` | the defect fixer's own ladder, same shape — one PR can need all three repairs |
 | issue closed | merged |
 
+`task` is a persistent human-selected workflow selector, not a lifecycle
+label. Plain `ready` dispatches epic; `ready` plus `task` dispatches task. Every
+lifecycle transition and provider-quota requeue retains the selector.
+
 `engine:<name>` is the separate routing namespace and is never cleared by a
 lifecycle change. A claimed branch with no exact matching engine pin is blocked
 rather than inferred from the current host default; a mismatched or conflicting
@@ -114,9 +123,12 @@ than made launchable against a main without the code it describes.
 
 ## Architecture boundaries
 
-- `workflows/epic-run.mjs`, `workflows/fix-run.mjs`, `workflows/ci-run.mjs`
-  and `workflows/defect-run.mjs`
+- `workflows/epic-run.mjs`, `workflows/task-run.mjs`, `workflows/fix-run.mjs`,
+  `workflows/ci-run.mjs` and `workflows/defect-run.mjs`
   are plain Node orchestrators. They must not name a vendor.
+- `workflows/lib/issue-delivery.mjs` owns the epic and task workflows' shared
+  claim, engine-pin, candidate, preservation, quota and terminal handoff
+  mechanics. Task-run adds no alternate transport path around those gates.
 - `workflows/lib/fixer-lifecycle.mjs` owns the three fixers' shared argv/runtime
   setup, repair → verify → one diagnostics-driven repair retry when red → accept
   → correct → confirm → publish sequencing, the
@@ -137,7 +149,8 @@ than made launchable against a main without the code it describes.
   `tests/engine-codex.test.sh`.
 - `workflows/lib/runtime.mjs` owns phase execution, the concurrency gate,
   timeouts and signal forwarding. Deterministic control flow lives here or in
-  scripts, never inside model judgment.
+  scripts, never inside model judgment. Task-run disables both transient and
+  schema respawns so its one invocation is exactly one model process.
 - `etc/lib.sh` validates and exports the host-wide `HOST_TIMEZONE`, and
   `workflows/lib/time.mjs` is the matching Node formatter. Human-facing pane,
   status, script-log and resource-report timestamps use that zone; parsed usage,
@@ -155,7 +168,7 @@ than made launchable against a main without the code it describes.
   `type:"spawn"` per agent spawn (step, vendor, model, effort, tokens, seconds,
   cost, `retry`, and the failure kind/reason when a spawn fails) plus
   `type:"run-start"` and `type:"run-finish"` bracketing every invocation of all
-  four pipelines, including one that spawned nothing. A start carries the run's
+  five pipelines, including one that spawned nothing. A start carries the run's
   identity — `runId`, script, engine, session, issue and the registered
   repository key `--repo` supplies (null when absent, never split out of the
   session name); its finish adds wall-clock `ms` and the pipeline's own
@@ -176,8 +189,9 @@ than made launchable against a main without the code it describes.
   writes under dispatch's lock, independent expiry, and the read-only operator
   peek. A hard quota is recorded before a run restores its queue labels;
   ordinary dispatch snapshots the map before capacity or GitHub and skips each
-  candidate whose engine uses a held vendor. Routing-only and explicit manual
-  launches bypass it.
+  candidate whose selected workflow steps use a held vendor. A task candidate
+  checks only its `task` step's vendor; an epic or fixer checks its full engine
+  vendor set. Routing-only and explicit manual launches bypass it.
 - `workflows/lib/prices.mjs` holds the published per-model prices for vendors
   whose CLI reports no cost. Claude bills itself and is not in the table; a
   Codex spawn is priced from it and stamped `costSource:"table"`, so a computed
@@ -225,14 +239,24 @@ than made launchable against a main without the code it describes.
   CI conclusion, ref listing, routing label or conflict classification is never
   a green gate. Gated by `tests/dispatch-engine.test.sh` and
   `tests/epic-run.test.sh`.
+- The `task` workflow is a human opt-in economy with exactly one writable
+  tasker process. The orchestrator still owns the shared claim and engine pin,
+  dependency install, project verify, clean moved-base rebase plus re-verify,
+  candidate commit containing `Closes #N`, push, PR, delivery-summary readback
+  and handoff. Invalid output, provider transients and red verification never
+  respawn it; they preserve the branch and rest at `failed`. A hard quota is
+  the exception: it records the task vendor's hold and restores `ready` without
+  removing `task` or the engine pin. Its PR and later fixer prompts state that
+  the original delivery was intentionally not independently reviewed.
 - A provider `quota-exhausted` result is never transient-respawned. The run
   preserves its resumable state, records only the failed step's vendor hold,
   refunds a fixer's current attempt rung, and only then restores the appropriate
   queue labels; failure to persist the hold or verify those labels uses the
   ordinary blocker path. Dispatch validates one snapshot under its tick lock
   before capacity or any GitHub access, then checks each resolved engine before
-  any candidate label write and continues past held candidates. Mixed engines
-  wait on the union of their vendors and are never rerouted. Expired entries
+  any candidate label write and continues past held candidates. Epic and fixer
+  candidates wait on the union of their vendors; task candidates check only
+  the selected engine's `task` vendor. Candidates are never rerouted. Expired entries
   are pruned independently; malformed state or an unreadable engine vendor set
   fails closed.
 - Merge eligibility is computed from structured counts in `epic-run.mjs`.
@@ -566,8 +590,8 @@ than made launchable against a main without the code it describes.
 2. Make the smallest coherent change that respects the doctrine and the
    boundaries above.
 3. A behavior change gets a hermetic regression test. A new gate or refusal
-   path gets both its pass and its stop scenario.
-4. For every workflow change, verify `docs/README.md` against the executable
+  path gets both its pass and its stop scenario.
+4. For every workflow change, verify `WORKFLOW.md` against the executable
    path and update it when needed. When the contract or rationale changes,
    update this file, DOCTRINE.md, the root README, the template or the script
    header too. Never leave an invariant only in a commit message.

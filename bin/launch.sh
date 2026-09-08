@@ -10,9 +10,9 @@ set -euo pipefail
 # than trusting the ssh caller or a long-lived tmux server's cached environment.
 #
 # Two kinds of session, and they run different things:
-#   --epic N / --fix N / --ci N / --defect N
+#   --epic N / --task N / --fix N / --ci N / --defect N
 #                        a pipeline run: this script creates the git worktree
-#                        and the pane runs workflows/{epic,fix,ci,defect}-run.mjs, which
+#                        and the pane runs workflows/{epic,task,fix,ci,defect}-run.mjs, which
 #                        spawns one headless agent process per phase. No
 #                        interactive session wraps it, so there is no
 #                        --remote-control channel to attach to — watch it with
@@ -25,7 +25,7 @@ set -euo pipefail
 # because dispatch.sh reads it as "stop this tick" rather than as a failure.
 #
 # --over-capacity is the one deliberate bypass of that refusal, and it is
-# narrow on purpose: only a named --epic/--fix/--ci/--defect launch may carry
+# narrow on purpose: only a named --epic/--task/--fix/--ci/--defect launch may carry
 # it (a probe, an interactive session or a bare name exits 1), no environment
 # variable grants it, and dispatch.sh never passes it — so queue-driven work
 # stays bounded no matter how often an operator overrides by hand.
@@ -37,13 +37,14 @@ usage() {
   cat <<EOF
 Usage: $0 [session-name] [-m <message>] [-r <repo>] [--check-capacity|--check-idle]
        $0 --epic <N> [-r <repo>] [--engine <engine>] [--over-capacity]
+       $0 --task <N> [-r <repo>] [--engine <engine>] [--over-capacity]
        $0 --fix <N>  [-r <repo>] [--engine <engine>] [--over-capacity]
        $0 --ci <N>   [-r <repo>] [--engine <engine>] [--over-capacity]
        $0 --defect <N> [-r <repo>] [--engine <engine>] [--over-capacity]
 
 Creates a detached tmux session in the named repo (default: $DEFAULT_REPO).
 
---epic/--fix/--ci/--defect run the autonomous pipeline: the session is named <repo>-epic-<N>,
+--epic/--task/--fix/--ci/--defect run the autonomous pipeline: the session is named <repo>-epic-<N>,
 this script creates its git worktree under \${EPIC_WORKTREE_ROOT:-\$HOME/.epic-worktrees},
 and the pane runs the corresponding workflows/*-run.mjs there. They take no
 session name and no -m — both are derived from the issue number.
@@ -68,7 +69,7 @@ otherwise) — bin/update-claude.sh asks it before moving the claude binary.
 bypasses nothing else: the count still runs under the launch lock, the session
 counts like any other afterwards (so dispatch stays paused until usage drops
 below $MAX_PARALLEL_EPICS), and it is refused with exit 1 on the probes above
-and on anything that isn't --epic/--fix/--ci/--defect.
+and on anything that isn't --epic/--task/--fix/--ci/--defect.
 EOF
 }
 
@@ -143,16 +144,17 @@ while [[ $# -gt 0 ]]; do
       ENGINE="${1#*=}"
       shift
       ;;
-    --epic|--fix|--ci|--defect|--epic=*|--fix=*|--ci=*|--defect=*)
+    --epic|--task|--fix|--ci|--defect|--epic=*|--task=*|--fix=*|--ci=*|--defect=*)
       # One leading '#' is stripped so `--epic #42` and `--epic 42` agree.
       case "$1" in
         --epic*) want="epic" ;;
+        --task*) want="task" ;;
         --ci*)   want="ci" ;;
         --fix*)  want="fix" ;;
         *)       want="defect" ;;
       esac
       if [[ -n "$MODE" ]]; then
-        echo "[launch] --epic, --fix, --ci and --defect are mutually exclusive" >&2
+        echo "[launch] --epic, --task, --fix, --ci and --defect are mutually exclusive" >&2
         exit 1
       fi
       MODE="$want"
@@ -197,7 +199,7 @@ if [[ $HAVE_ENGINE -eq 1 ]]; then
     exit 1
   fi
   if [[ -z "$MODE" ]]; then
-    echo "[launch] --engine only applies to --epic/--fix/--ci/--defect pipeline runs" >&2
+    echo "[launch] --engine only applies to --epic/--task/--fix/--ci/--defect pipeline runs" >&2
     exit 1
   fi
 fi
@@ -211,7 +213,7 @@ if [[ $OVER_CAPACITY -eq 1 && ( $CHECK_CAPACITY -eq 1 || $CHECK_IDLE -eq 1 ) ]];
   exit 1
 fi
 if [[ $OVER_CAPACITY -eq 1 && -z "$MODE" ]]; then
-  echo "[launch] --over-capacity only applies to --epic/--fix/--ci/--defect pipeline runs" >&2
+  echo "[launch] --over-capacity only applies to --epic/--task/--fix/--ci/--defect pipeline runs" >&2
   exit 1
 fi
 
@@ -462,6 +464,7 @@ if [[ -n "$MODE" ]]; then
   # that out of — the same number in two repos is two different issues.
   case "$MODE" in
     epic) SCRIPT="$HERE/../workflows/epic-run.mjs" ;;
+    task) SCRIPT="$HERE/../workflows/task-run.mjs" ;;
     fix)  SCRIPT="$HERE/../workflows/fix-run.mjs" ;;
     ci)   SCRIPT="$HERE/../workflows/ci-run.mjs" ;;
     defect) SCRIPT="$HERE/../workflows/defect-run.mjs" ;;

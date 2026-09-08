@@ -87,6 +87,21 @@ engine_vendors() { # engine name; one unique vendor per line
     end
   ' "$ENGINES_FILE" 2>/dev/null
 }
+engine_step_vendor() { # engine name, step; exactly one vendor
+  jq -er --arg e "$1" --arg step "$2" '
+    def vendor:
+      if type != "string" then error("engine step is not a string") else . end
+      | split("/") as $parts
+      | if ($parts | length) == 3 and all($parts[]; length > 0)
+        then $parts[0]
+        else error("engine step is not vendor/model/effort")
+        end;
+    if has($e) and (.[$e] | type) == "object" and (.[$e] | has($step))
+      then .[$e][$step] | vendor
+      else error("unknown engine or step")
+    end
+  ' "$ENGINES_FILE" 2>/dev/null
+}
 
 # The engine a run gets when nothing names one: no engine:* label on the issue,
 # no --engine on launch.sh. EPIC_ENGINE is still the one knob (the Node side

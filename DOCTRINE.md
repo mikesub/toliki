@@ -15,7 +15,8 @@ don't get re-litigated from memory.
   a split into multiple issues. A single clear issue is filed immediately;
   the skill writes the bodies without requiring a prose review. The whole
   batch's bodies and dependencies are completed and read back before any
-  issue enters the build queue.
+  issue enters the build queue. A human may explicitly mark a clear, low-risk,
+  already-settled issue `task`; the skill never infers that choice from size.
 - **Build** — cron dispatches one detached run per unblocked `ready` issue: a
   plain Node orchestrator that walks architecture → implementation → blind
   review → fixes after review → an open, green PR, spawning one short-lived
@@ -35,6 +36,19 @@ don't get re-litigated from memory.
   gate state. The PR description stays a deterministic pointer to the issue.
   Later fixer audits and status remain separate comments instead of rewriting
   the immutable candidate snapshot.
+- **Task is a deliberate economy, not a smaller epic.** `ready` plus the
+  persistent `task` selector runs one writable tasker process that implements
+  and self-reviews the settled issue. Deterministic code still owns the claim,
+  engine pin, dependency install, full project verification, moved-base
+  rebase and re-verification, candidate commit, push, PR, durable summary and
+  handoff. It omits architecture, RED/GREEN orchestration, independent review,
+  repair, correction and ship prose. The accepted trade-off is explicit: the
+  candidate is verified but intentionally not independently model-reviewed,
+  so this path is only for work where a human has judged that review cost
+  disproportionate. One task invocation means one model process — malformed
+  output, a transient provider error or red verification blocks instead of
+  quietly turning the cheap path into a retry loop. Plain `ready` remains the
+  full epic workflow.
 - **The pipeline outlives its engine.** Every phase is a process behind one
   adapter, so which vendor's CLI runs an epic is a routing value, not an
   architecture. That is worth the orchestration we now own outright (a

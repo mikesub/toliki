@@ -54,7 +54,7 @@ NAME_MAX_LEN=40
 # pipeline bug.
 #
 # An operator can exceed it for one run at a time with
-# `./remote-control.sh epic|fix|ci|defect N [--engine <e>] --over-capacity`.
+# `./remote-control.sh epic|task|fix|ci|defect N [--engine <e>] --over-capacity`.
 # Nothing else can: dispatch never passes the flag, and no environment variable
 # grants it. From the laptop, `./config.sh --max <count>` updates
 # this installed value with validation and readback; `./config.sh` reports it

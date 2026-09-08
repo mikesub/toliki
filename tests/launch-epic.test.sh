@@ -159,6 +159,15 @@ assert_contains "the pane gets the registry zone despite hostile caller values" 
 assert_not_contains "no interactive claude is launched" "$(tmux_log)" "--remote-control"
 assert_file "the worktree exists" "$WT_ROOT/testrepo/testrepo-epic-63/frontend/package.json"
 
+printf '\nlaunch --task: same session/worktree shape, one-agent task script\n'
+run_launch --task '#73' --repo testrepo --engine codex
+assert_rc "task exits 0 (and strips the leading #)" 0 "$RUN_RC"
+assert_contains "task session is still <repo>-epic-<N>" "$(tmux_log)" "new-session -d -s testrepo-epic-73"
+assert_contains "the pane runs the task orchestrator" "$(tmux_log)" "workflows/task-run.mjs' --issue 73"
+assert_contains "the task uses the ordinary pipeline worktree" "$(tmux_log)" "-c $WT_ROOT/testrepo/testrepo-epic-73"
+assert_contains "the task engine reaches the orchestrator" "$(tmux_log)" "--engine 'codex'"
+assert_contains "the task carries repository telemetry identity" "$(tmux_log)" "--repo 'testrepo'"
+
 printf '\nlaunch --fix: same session shape, fixer script\n'
 run_launch --fix '#63' --repo testrepo
 assert_rc "exits 0 (and strips the leading #)" 0 "$RUN_RC"
@@ -321,7 +330,7 @@ assert_not_contains "validation happens before any session is created" "$(tmux_l
 
 run_launch --engine codex --repo testrepo
 assert_rc "--engine is refused for interactive sessions" 1 "$RUN_RC"
-assert_contains "and says it is pipeline-only" "$RUN_OUT" "only applies to --epic/--fix/--ci/--defect"
+assert_contains "and says it is pipeline-only" "$RUN_OUT" "only applies to --epic/--task/--fix/--ci/--defect"
 
 printf '\nlaunch --check-idle: the cap'"'"'s own count, against zero\n'
 run_launch --check-idle
@@ -425,12 +434,12 @@ assert_contains "and reports the count" "$RUN_OUT" "at capacity (2/2 running)"
 
 run_launch --repo testrepo -m "hello" --over-capacity
 assert_rc "an interactive session cannot carry the override" 1 "$RUN_RC"
-assert_contains "and it says where the flag applies" "$RUN_OUT" "only applies to --epic/--fix/--ci/--defect"
+assert_contains "and it says where the flag applies" "$RUN_OUT" "only applies to --epic/--task/--fix/--ci/--defect"
 assert_not_contains "no session is created" "$(tmux_log)" "new-session"
 
 run_launch --repo testrepo --over-capacity
 assert_rc "nor a bare pool-name launch" 1 "$RUN_RC"
-assert_contains "and it says where the flag applies" "$RUN_OUT" "only applies to --epic/--fix/--ci/--defect"
+assert_contains "and it says where the flag applies" "$RUN_OUT" "only applies to --epic/--task/--fix/--ci/--defect"
 assert_not_contains "no session is created" "$(tmux_log)" "new-session"
 unset STUB_SESSIONS STUB_PANE_CMD
 

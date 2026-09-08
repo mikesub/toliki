@@ -229,8 +229,10 @@ function release() {
 //   retry      true when the call site is a bounded in-run retry of a step that
 //              already ran — recorded so the report can tell that apart from a
 //              transient respawn inside this call
+//   respawn    false makes this call a strict one-process contract: transient
+//              failures and invalid structured output return null immediately
 export async function agent(prompt, opts = {}) {
-  const { label = 'agent', step, schema, timeoutMs = DEFAULT_TIMEOUT_MS, retry = false } = opts
+  const { label = 'agent', step, schema, timeoutMs = DEFAULT_TIMEOUT_MS, retry = false, respawn = true } = opts
   lastAgentFailure = null
   const agentType = STEPS[step]
   if (!ENGINE || !agentType) {
@@ -315,7 +317,7 @@ export async function agent(prompt, opts = {}) {
   }
 
   let r = await attempt()
-  if (!r.ok && retryable(r)) {
+  if (respawn && !r.ok && retryable(r)) {
     log(`${label}: ${r.reason} — respawning once (transient)`)
     r = await attempt('transient retry')
   }
@@ -332,7 +334,7 @@ export async function agent(prompt, opts = {}) {
   // vocabulary the engine does not enforce or a payload that got past it. One
   // fresh respawn, then null: retrying twice would just spend a second failure.
   let errors = validateOrEmpty(schema, r.output)
-  if (errors.length) {
+  if (respawn && errors.length) {
     log(`${label}: structured output did not match the schema (${errors.slice(0, 3).join('; ')}) — respawning once`)
     r = await attempt('schema retry')
     if (!r.ok) {
@@ -347,6 +349,12 @@ export async function agent(prompt, opts = {}) {
       log(`${label}: FAILED — ${reason}`)
       return null
     }
+  }
+  if (errors.length) {
+    const reason = `structured output did not match the schema (${errors.slice(0, 3).join('; ')})`
+    rememberFailure(r, reason, 'invalid-output')
+    log(`${label}: FAILED — ${reason}; respawn disabled for this call`)
+    return null
   }
   return r.output
 }

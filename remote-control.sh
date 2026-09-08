@@ -47,6 +47,10 @@ Commands:
                            Run the epic pipeline on an issue, as session
                            <repo>-epic-<ref>. The manual override for dispatch's
                            ready queue. A ref starting with # isn't doubled.
+  task <ref> [--engine <e>]
+                           Run the lightweight single-agent task workflow on an
+                           issue carrying the persistent task selector label.
+                           Uses the same <repo>-epic-<ref> session/worktree.
   fix <ref> [--engine <e>] Run the conflict fixer on a needs-judgment issue —
                            the manual override for dispatch's fixer walk. Same
                            session name as dispatch would use, which is what
@@ -62,7 +66,7 @@ Commands:
                            otherwise uses dispatch's host-wide interleaving.
   <name> [-m msg]          Shorthand for: start <name> [-m msg]
 
-  Note: epic/fix/ci/defect sessions run the pipeline directly (a node orchestrator that
+  Note: epic/task/fix/ci/defect sessions run the pipeline directly (a node orchestrator that
   spawns one headless agent per phase), so they have no Remote Control channel
   to attach to. Watch one with: ssh <host> 'tmux attach -t <name>' — or read it
   after the fact with 'tmux capture-pane -p -t <name> -S -200'.
@@ -72,11 +76,11 @@ Commands:
                            is non-interactive and would exit immediately). Also
                            names the session when no explicit name is given.
   -r, --repo <name>        Repo to run in: $(repo_names | tr '\n' ' ')(default: $DEFAULT_REPO).
-                           Applies to start/restart/stop/epic/fix/ci/defect/next; ls and stop-all
+                           Applies to start/restart/stop/epic/task/fix/ci/defect/next; ls and stop-all
                            are host-wide. Every session is named <repo>-<name>, so
                            "epic 63 -r otherapp" -> otherapp-epic-63. Names are given
                            short (epic-63) or full (otherapp-epic-63) interchangeably.
-  --engine <engine>        Optional for manual epic/fix/ci/defect launches; a name from
+  --engine <engine>        Optional for manual epic/task/fix/ci/defect launches; a name from
                            etc/engines.json ($(engine_names | tr '\n' ' ')). Given, it is
                            persisted as the issue's durable engine:<name> label before
                            the launch. Omitted, the engine is resolved on the host —
@@ -84,7 +88,7 @@ Commands:
                            EPIC_ENGINE default, else claude — and nothing is written:
                            an inherited default stays a default. Queue-driven launches
                            get the engine from the issue label the same way.
-  --over-capacity          Manual epic/fix/ci/defect only: start the run even
+  --over-capacity          Manual epic/task/fix/ci/defect only: start the run even
                            though the host is already at MAX_PARALLEL_EPICS.
                            Refused on anything else, and never forwarded by
                            dispatch — the queue stays bounded, and the session
@@ -96,7 +100,7 @@ EOF
 # The cap's one bypass has to stay attached to a deliberate, named pipeline
 # launch, so every path that is not one refuses it here rather than on the host.
 refuse_over_capacity() {
-  echo "[control] --over-capacity only applies to manual epic/fix/ci/defect launches" >&2
+  echo "[control] --over-capacity only applies to manual epic/task/fix/ci/defect launches" >&2
   exit 1
 }
 
@@ -206,7 +210,7 @@ else
       ACTION="stop"                        # `rm` is an alias for stop
       SESSIONS=("${POSITIONAL[@]:1}")       # stop takes one or more session names
       ;;
-    epic|fix|ci|defect)
+    epic|task|fix|ci|defect)
       # `epic <ref>` == `start --epic <ref>`, and likewise for each fixer.
       # All produce exactly the session dispatch would have: launch.sh derives
       # the <repo>-epic-<N> name itself, which is what makes a manual launch
@@ -256,7 +260,7 @@ if [[ $HAVE_ENGINE -eq 1 ]] && ! engine_known "$ENGINE"; then
   exit 1
 fi
 if [[ -z "$PIPELINE" && $HAVE_ENGINE -eq 1 ]]; then
-  echo "[control] --engine only applies to manual epic/fix/ci/defect launches" >&2
+  echo "[control] --engine only applies to manual epic/task/fix/ci/defect launches" >&2
   exit 1
 fi
 # Refused here rather than on the host, so start/restart/stop/ls/stop-all/usage/
@@ -273,7 +277,7 @@ fi
 
 # ls and stop-all are host-wide, so a repo would be meaningless there.
 if [[ $HAVE_REPO -eq 1 && "$ACTION" != "start" && "$ACTION" != "restart" && "$ACTION" != "stop" && "$ACTION" != "next" ]]; then
-  echo "[control] --repo only applies to start/restart/stop/epic/fix/ci/defect/next" >&2
+  echo "[control] --repo only applies to start/restart/stop/epic/task/fix/ci/defect/next" >&2
   exit 1
 fi
 

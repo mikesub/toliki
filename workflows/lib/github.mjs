@@ -128,7 +128,8 @@ export async function ghJson(args, what, opts) {
 // first epic files one may never have been touched by /spec, so the label has
 // to be creatable from this side as well.
 export const LABELS = {
-  ready:             { color: '1D76DB', description: 'Spec complete; queued for the epic-run pipeline' },
+  ready:             { color: '1D76DB', description: 'Spec complete; queued for the selected build workflow' },
+  task:              { color: 'C5DEF5', description: 'Human-selected lightweight single-agent task workflow' },
   'in-progress':     { color: 'FBCA04', description: 'Actively being worked by epic-run' },
   'ready-to-merge':  { color: '0E8A16', description: 'epic-run finished; PR open and gates cleared — queued for bin/merge-worker.sh' },
   'ready-to-review': { color: '0E8A16', description: 'epic-run finished; PR is open and awaiting review' },

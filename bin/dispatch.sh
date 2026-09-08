@@ -3,9 +3,10 @@ set -euo pipefail
 
 # Runs ON the host, once per cron tick (etc/dispatch.cron). This is the primary
 # launch path: it walks each repo's `ready` issue queue oldest-first and starts
-# an epic session per unblocked issue until the host is at capacity, then exits.
-# `./remote-control.sh epic N` (laptop-side) remains the manual override for
-# jumping the queue.
+# a task run when the persistent `task` selector is present, otherwise an epic,
+# until the host is at capacity, then exits.
+# `./remote-control.sh epic N` or `task N` (laptop-side) remains the manual
+# override for jumping the queue.
 #
 # It walks three repair queues first: two filled by the merge worker and one
 # filled by epic-run's deterministic ship gate:
@@ -63,10 +64,11 @@ One dispatch tick. First walks the repair queues — \`needs-judgment\`
 rebased head), both applied by the merge worker, then \`needs-defect-fix\`
 for repos in DEFECT_FIX_REPOS — and launches at most one
 fixer session per repo (\`launch.sh --fix N\`, \`--ci N\`, or \`--defect N\`, session
-\`<repo>-epic-<N>\`). Then walks
-the \`ready\` queue of every registered repo ($(repo_names | tr '\n' ' '))
-oldest-first, skipping issues that have open blocked_by dependencies or
-already have a session, and launches each remaining one as \`<repo>-epic-<N>\`
+\`<repo>-epic-<N>\`). Then walks the \`ready\` queue of every registered repo
+($(repo_names | tr '\n' ' ')) oldest-first, skipping issues that have open
+blocked_by dependencies or already have a session. \`ready\` + \`task\`
+launches \`--task\`; plain \`ready\` launches \`--epic\`. Both use
+\`<repo>-epic-<N>\`
 until the host hits MAX_PARALLEL_EPICS ($MAX_PARALLEL_EPICS).
 
   -r, --repo <name>   Only dispatch for this repo.
@@ -77,7 +79,7 @@ until the host hits MAX_PARALLEL_EPICS ($MAX_PARALLEL_EPICS).
                       engine. Uses the same lock, queue order, and strong reads
                       as dispatch, but does not probe capacity or launch work.
   --route-issue <N> <name>
-                      Persist an explicit manual epic/fix engine choice on one
+                      Persist an explicit manual pipeline engine choice on one
                       issue. Requires -r; labels only and launches nothing.
   --resolve-issue <N> Report which engine one issue would run on, and what
                       chose it, as a single line "<engine> <source>" on stdout
@@ -399,10 +401,12 @@ if (( ! HAVE_ROUTE_NEXT )); then
 fi
 
 HELD_DETAILS=""
-candidate_is_held() { # resolved engine; 0 held, 1 clear, 2 invalid engine rows
-  local engine="$1" vendors vendor hold_until
+candidate_is_held() { # resolved engine, optional single step; 0 held, 1 clear, 2 invalid rows
+  local engine="$1" step="${2:-}" vendors vendor hold_until
   HELD_DETAILS=""
-  if ! vendors="$(engine_vendors "$engine")"; then
+  if [[ "$step" == "task" ]]; then
+    vendors="$(engine_step_vendor "$engine" "$step")" || return 2
+  elif ! vendors="$(engine_vendors "$engine")"; then
     return 2
   fi
   while IFS= read -r vendor; do
@@ -782,6 +786,17 @@ for entry in "${ORDER[@]}"; do
     continue
   fi
 
+  # The direct strong read above, not the lagging queue search, selects the
+  # workflow. `task` is a persistent selector and remains on the issue through
+  # every lifecycle transition; without it this is the ordinary epic path.
+  if has_issue_label task; then
+    WORKFLOW_FLAG="--task"
+    WORKFLOW_KIND="task"
+  else
+    WORKFLOW_FLAG="--epic"
+    WORKFLOW_KIND="epic"
+  fi
+
   if (( HAVE_ROUTE_NEXT )); then
     if (( ISSUE_ENGINE_EXPLICIT )); then
       say "  #$num ($repo): already routed to $ISSUE_ENGINE, skipping"
@@ -795,11 +810,11 @@ for entry in "${ORDER[@]}"; do
       warn "  #$num ($repo): routing write could not be verified or issue changed — refusing success"
       exit 1
     fi
-    say "  #$num ($repo): routed next epic to $ROUTE_NEXT"
+    say "  #$num ($repo): routed next $WORKFLOW_KIND to $ROUTE_NEXT"
     exit 0
   fi
 
-  if candidate_is_held "$ISSUE_ENGINE"; then
+  if candidate_is_held "$ISSUE_ENGINE" "$WORKFLOW_KIND"; then
     say "  #$num: held ($HELD_DETAILS)"
     continue
   else
@@ -828,16 +843,16 @@ for entry in "${ORDER[@]}"; do
   fi
 
   if (( DRY_RUN )); then
-    say "  #$num ($repo): would launch '$session' with $ISSUE_ENGINE"
+    say "  #$num ($repo): would launch $WORKFLOW_FLAG '$session' with $ISSUE_ENGINE"
     LAUNCHED=$((LAUNCHED + 1))
     continue
   fi
 
-  say "  #$num ($repo): launching '$session' with $ISSUE_ENGINE"
+  say "  #$num ($repo): launching $WORKFLOW_FLAG '$session' with $ISSUE_ENGINE"
   set +e
   # 9>&- so the tmux server this may start cannot inherit the tick lock; see
   # the flock comment above for what that costs when it leaks.
-  "$LAUNCH" --epic "$num" --repo "$repo" --engine "$ISSUE_ENGINE" 9>&-
+  "$LAUNCH" "$WORKFLOW_FLAG" "$num" --repo "$repo" --engine "$ISSUE_ENGINE" 9>&-
   rc=$?
   set -e
   case "$rc" in

@@ -70,7 +70,7 @@ const PROMPTS = {
   // what their logs said, whether the failure reproduces locally, and the
   // change under repair.
   fix: (issue, prep) =>
-`Fix the failing checks on a finished PR. The change on branch ${prep.branch} (issue #${issue}) was built, reviewed and verified, then the merge worker rebased it onto current origin/main and re-ran its checks — and they came back RED. HEAD is that rebased commit. Your job is exactly the failure below: make those checks pass without changing what the PR set out to do.
+`Fix the failing checks on a finished PR. The change on branch ${prep.branch} (issue #${issue}) ${prep.taskDelivery ? 'was implemented and verified by the lightweight task workflow, intentionally without independent semantic review' : 'was built, independently reviewed and verified by the epic workflow'}, then the merge worker rebased it onto current origin/main and re-ran its checks — and they came back RED. HEAD is that rebased commit. Your job is exactly the failure below: make those checks pass without changing what the PR set out to do.
 
 Checks that failed: ${prep.failedChecks.join(', ')}.
 Numbered for the disposition record:
@@ -112,7 +112,7 @@ ${dispositions.map(d => `${d.index}. ${d.name}: ${d.action} — ${d.reason}`).jo
 
 Uphold a numbered claim only when the code establishes it: a repaired check's cause is demonstrably gone, or a declined check is genuinely outside what a code change here can fix AND the delta changed nothing attributed to it. Two things refute a repair however green it makes the run:
 - it hides the cause instead of fixing it — a test weakened, skipped, deleted or its assertion loosened; an expectation rewritten to match wrong behavior; a type widened or an error swallowed; a lint rule disabled or a suppression added; a check excluded from a config;
-- it changes something else — this PR was reviewed and verified before the edit, so anything beyond the failure is unreviewed: behavior changed outside the failing path, a dropped side effect, a broken neighbour, scope creep dressed as a fix.
+- it changes something else — this PR was verified before the edit${prep.taskDelivery ? ' but intentionally did not receive independent semantic review' : ' and independently reviewed'}, so anything beyond the failure is outside this repair: behavior changed outside the failing path, a dropped side effect, a broken neighbour, scope creep dressed as a fix.
 
 The requirement the PR was built against is issue #${issue} (\`gh issue view ${issue} --json title,body\`). Do NOT open anything under \`.epics/\` — it carries a builder's framing and would anchor you.
 
@@ -289,7 +289,7 @@ async function prepare(ctx, { labels }) {
     return { refused: 'could not record the attempt (label write failed)' }
   }
   const { attempt } = consumed
-  const base = { attempt, branch: pr.headRefName, prUrl: pr.url, prNumber: pr.number, prHead: pr.headRefOid }
+  const base = { attempt, branch: pr.headRefName, prUrl: pr.url, prNumber: pr.number, prHead: pr.headRefOid, taskDelivery: labels.includes('task') }
 
   // The checks have to be red RIGHT NOW, not when the merge worker looked: a
   // re-run may have gone green since, and there is nothing to fix then.
@@ -433,6 +433,7 @@ const buildComment = (prep, fix, dispositions, verifyDetail, check, corrected) =
   `- pr: ${prep.prUrl}`,
   `- attempt: ${prep.attempt}`,
   `- checks that were red: ${prep.failedChecks.join(', ')}`,
+  `- source workflow: ${prep.taskDelivery ? 'lightweight task — implemented and verified, intentionally not independently reviewed' : 'epic — implemented, independently reviewed and verified'}`,
   '',
   'Check dispositions:',
   ...dispositions.map(d => `- ${d.name}: ${d.action} — ${d.reason}`),

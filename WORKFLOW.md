@@ -7,7 +7,7 @@ and its comments remain authoritative when the two disagree.
 ## At a glance
 
 ```text
-ready issue
+plain ready issue
   -> Prepare
   -> Architect
   -> Code + verify
@@ -17,6 +17,15 @@ ready issue
   -> Correction + verify + narrow confirmation, when every blocker is concrete
   -> Ship PR
   -> Merge gate
+  -> Merge worker
+  -> main
+
+ready + task issue
+  -> Shared Prepare
+  -> One tasker (implement + self-review)
+  -> Verify
+  -> Rebase + re-verify when main moved cleanly
+  -> Shared candidate + handoff
   -> Merge worker
   -> main
 ```
@@ -37,14 +46,16 @@ failure behavior.
 | 8. Ship | `shipper` charter plus orchestrator | One prose/metadata call |
 | 9. Merge gate | Node orchestrator | None |
 | 10. Merge worker | Shell scripts | None |
+| Task path | `tasker` charter plus orchestrator | Exactly one; no model or schema respawn |
 
 Every LLM call is a new, short-lived process. The selected `engine:<name>` maps
-each step to a vendor, model, and effort in [`etc/engines.json`](../etc/engines.json).
-The eight engine step keys and their charters are fixed in
-[`workflows/lib/engine.mjs`](../workflows/lib/engine.mjs):
+each step to a vendor, model, and effort in [`etc/engines.json`](etc/engines.json).
+The nine engine step keys and their charters are fixed in
+[`workflows/lib/engine.mjs`](workflows/lib/engine.mjs):
 
 | Engine step | Charter | May edit the worktree? |
 | --- | --- | --- |
+| `task` | `tasker` | Yes |
 | `architect` | `architect` | No |
 | `code` | `coder` | Yes |
 | `review` | `reviewer` | No |
@@ -58,11 +69,36 @@ Git, GitHub, labels, dependency installation, verification, checkpointing,
 pushes, PR creation, and merging are always performed by deterministic code.
 An agent's report that one of those operations succeeded is never the gate.
 
+## Lightweight task path
+
+The persistent `task` label is an explicit human workflow choice, not a
+lifecycle state or a model classification. Dispatch sends plain `ready` to
+`epic-run.mjs` and `ready` plus `task` to `task-run.mjs`; both reuse the same
+`<repo>-epic-<N>` session, `epic/<N>-*` branch namespace and safety-critical
+claim, engine-pin, candidate, quota and handoff implementation.
+
+Task-run starts exactly one writable `tasker` process. It receives the settled
+issue and must implement it, add meaningful coverage and return structured
+title, summary, commit rationale, test, self-review and unresolved-work fields.
+The orchestrator then runs every discovered package's `npm run verify`. A
+clean moved base is rebased and verified again before the candidate is formed;
+a conflicting base is left to the merge worker and its conflict fixer. The
+squashed candidate commit includes `Closes #N`, and its issue summary records
+that the delivery was verified but intentionally not independently reviewed.
+
+There is no architect, RED/GREEN split, reviewer, repair, correction or
+shipper. There is also no transient or invalid-schema model respawn: malformed
+output, a provider transient, a red verify or transport failure preserves the
+branch and rests the issue at `failed`. A hard quota records only the task
+step's vendor hold and restores `ready` while retaining `task` and the engine
+pin. Later conflict or CI fixer prompts carry the intentional review omission.
+
 ## 1. Prepare
 
-**Owner:** [`bin/dispatch.sh`](../bin/dispatch.sh),
-[`bin/launch.sh`](../bin/launch.sh), and the `prepare()` phase in
-[`workflows/epic-run.mjs`](../workflows/epic-run.mjs). **LLM calls:** none.
+**Owner:** [`bin/dispatch.sh`](bin/dispatch.sh),
+[`bin/launch.sh`](bin/launch.sh), shared
+[`workflows/lib/issue-delivery.mjs`](workflows/lib/issue-delivery.mjs), and the
+epic/task entry points. **LLM calls:** none.
 
 1. Cron runs `dispatch.sh`, which checks repair queues first and then walks
    each repo's `ready` issues oldest-first.
@@ -72,14 +108,15 @@ An agent's report that one of those operations succeeded is never the gate.
 3. `launch.sh` enforces the host-wide slot cap inside the session-creation lock,
    updates the registered clone, creates or reuses the issue worktree, and
    starts `<repo>-epic-<N>` in tmux.
-4. The pane runs `node workflows/epic-run.mjs --issue <N> --session <name>
+4. The pane runs `node workflows/epic-run.mjs` or `node workflows/task-run.mjs`
+   according to the strong-read labels, with `--issue <N> --session <name>
    --engine <name> --repo <registered-key>`; its scrollback becomes the complete
    phase log. The explicit repository key also keeps host telemetry for equal
    issue numbers in different repositories separate.
 5. The orchestrator starts one best-effort live status comment on the issue.
    Phase changes edit that comment in place; reporting failure never decides a
    pipeline gate.
-6. `epic-run.mjs` reads the issue number, title, body, and state. A closed issue
+6. The selected run reads the issue number, title, body, and state. A closed issue
    is refused.
 7. It reads `blocked_by` again. An open dependency or an unreadable dependency
    query is refused before the issue is claimed.
@@ -96,9 +133,11 @@ An agent's report that one of those operations succeeded is never the gate.
      claim-only branch owned by another run, checkpoint any dirty work,
      and rebase the saved branch onto `origin/main`. A conflicting resume is
      left for manual resolution.
-11. On a resumed branch, it inspects checkpoint subjects to distinguish a
+11. On a resumed epic branch, it inspects checkpoint subjects to distinguish a
     completed code phase from preserved partial work. Completed code is not
-    rebuilt later; partial work receives a direct continuation plan.
+    rebuilt later; partial work receives a direct continuation plan. A task
+    resume keeps the preserved tree but spends its new invocation on one fresh
+    tasker process.
 12. It verifies the exact durable `engine:<name>` label. Only a newly won claim
     may create a missing route; a resume requires the existing singleton and
     never rewrites a conflicting route.
@@ -114,22 +153,22 @@ An agent's report that one of those operations succeeded is never the gate.
     and `node_modules` is missing or that lockfile changed across the base
     transition.
 17. Prepare returns the requirement, branch, package list, dependency evidence,
-    and resume state to Architect. Finding no verifiable package blocks before
-    any model runs.
+    and resume state to Architect or Task. Finding no verifiable package blocks
+    before any model runs.
 
 Manual `--slug` mode does not run Prepare. It uses the current working tree and
 requires an existing `.epics/<slug>/requirements.md`.
 
-An operator may launch issue mode through `remote-control.sh epic <N>` instead
-of waiting for dispatch. It still goes through `launch.sh` and the same
-`epic-run.mjs` Prepare phase. An omitted engine is resolved read-only from the
-issue pin or host default; an explicitly selected engine is persisted before
+An operator may launch issue mode through `remote-control.sh epic <N>` or
+`remote-control.sh task <N>` instead of waiting for dispatch. It still goes
+through `launch.sh` and the same shared Prepare transport. An omitted engine is
+resolved read-only from the issue pin or host default; an explicitly selected engine is persisted before
 launch. Only this manual pipeline path can request `--over-capacity`.
 
 ## 2. Architect
 
 **Owner:** `architect` charter, invoked by
-[`workflows/epic-run.mjs`](../workflows/epic-run.mjs). **LLM calls:** zero or
+[`workflows/epic-run.mjs`](workflows/epic-run.mjs). **LLM calls:** zero or
 one logical call.
 
 1. The orchestrator loads the prepared requirement and discovered package
@@ -160,8 +199,8 @@ one logical call.
 ## 3. Code
 
 **Owner:** `coder` charter plus the verification/checkpoint code in
-[`workflows/epic-run.mjs`](../workflows/epic-run.mjs) and
-[`workflows/lib/repo.mjs`](../workflows/lib/repo.mjs). **LLM calls:** zero to
+[`workflows/epic-run.mjs`](workflows/epic-run.mjs) and
+[`workflows/lib/repo.mjs`](workflows/lib/repo.mjs). **LLM calls:** zero to
 two logical calls, depending on resume state and verification mode.
 
 1. A resumed code checkpoint skips the coding agent and immediately re-runs
@@ -195,7 +234,7 @@ two logical calls, depending on resume state and verification mode.
 ## 4. Review
 
 **Owner:** `reviewer` charter plus the review coordinator in
-[`workflows/epic-run.mjs`](../workflows/epic-run.mjs). **LLM calls:** exactly
+[`workflows/epic-run.mjs`](workflows/epic-run.mjs). **LLM calls:** exactly
 one.
 
 1. One broad `review:general` process runs, and it is the only broad review of
@@ -378,7 +417,7 @@ GitHub labels.
 ## 9. Merge gate
 
 **Owner:** structured calculations and GitHub transport in
-[`workflows/epic-run.mjs`](../workflows/epic-run.mjs). **LLM calls:** none.
+[`workflows/epic-run.mjs`](workflows/epic-run.mjs). **LLM calls:** none.
 
 1. The gate reads only structured review outcomes produced before Ship:
    unresolved original findings, repair regressions, unmet requirements,
@@ -407,9 +446,9 @@ remaining GitHub calls. No new model may start after that window opens.
 
 ## 10. Merge worker
 
-**Owner:** [`bin/merge-tick.sh`](../bin/merge-tick.sh),
-[`bin/merge-worker.sh`](../bin/merge-worker.sh), and
-[`bin/merge-autoresolve.sh`](../bin/merge-autoresolve.sh). **LLM calls:** none.
+**Owner:** [`bin/merge-tick.sh`](bin/merge-tick.sh),
+[`bin/merge-worker.sh`](bin/merge-worker.sh), and
+[`bin/merge-autoresolve.sh`](bin/merge-autoresolve.sh). **LLM calls:** none.
 
 1. Cron runs `merge-tick.sh`, which starts one worker per registered repo in
    parallel.
@@ -456,7 +495,7 @@ remaining GitHub calls. No new model may start after that window opens.
 Repair queues are processed before new `ready` work. They reuse the same issue
 session name and durable engine pin. Each has a two-rung attempt ladder: first
 attempt, one retry, then human intervention. Their common sequence lives in
-[`workflows/lib/fixer-lifecycle.mjs`](../workflows/lib/fixer-lifecycle.mjs):
+[`workflows/lib/fixer-lifecycle.mjs`](workflows/lib/fixer-lifecycle.mjs):
 Prepare evidence, run one writable repair agent, run orchestrator verification,
 run one exhaustive acceptance check, then publish. If the first repair is red,
 the orchestrator gives one fresh repair process its bounded captured diagnostics
@@ -464,7 +503,7 @@ and runs the full gate again before any acceptance check. This in-run diagnostic
 retry does not consume another durable attempt-ladder rung.
 
 All three share the **bounded repair contract** in
-[`workflows/lib/repair-acceptance.mjs`](../workflows/lib/repair-acceptance.mjs),
+[`workflows/lib/repair-acceptance.mjs`](workflows/lib/repair-acceptance.mjs),
 the same contract epic-run's Final review and Correction use:
 
 - The acceptance check replaces a global `survives` boolean and a free-form
@@ -501,7 +540,7 @@ the same contract epic-run's Final review and Correction use:
 ### Judgment-conflict fixer
 
 **Entry:** `failed` + `needs-judgment`. **Script:**
-[`workflows/fix-run.mjs`](../workflows/fix-run.mjs). **LLM calls:** normally two
+[`workflows/fix-run.mjs`](workflows/fix-run.mjs). **LLM calls:** normally two
 (`fix-conflicts`, then `final-review` as the acceptance check), up to three when
 verification needs a repair retry, up to four when a correction runs, and five
 when both paths are needed.
@@ -533,7 +572,7 @@ when both paths are needed.
 ### CI fixer
 
 **Entry:** `failed` + `needs-ci-fix`. **Script:**
-[`workflows/ci-run.mjs`](../workflows/ci-run.mjs). **LLM calls:** normally two
+[`workflows/ci-run.mjs`](workflows/ci-run.mjs). **LLM calls:** normally two
 (`fix-ci`, then `final-review` as the acceptance check), up to three when
 verification needs a repair retry, up to four when a correction runs, and five
 when both paths are needed.
@@ -564,7 +603,7 @@ when both paths are needed.
 
 **Entry:** `ready-to-review` + `needs-defect-fix`, and only in repos opted into
 automatic defect repair. Manual launch remains possible. **Script:**
-[`workflows/defect-run.mjs`](../workflows/defect-run.mjs). **LLM calls:** normally
+[`workflows/defect-run.mjs`](workflows/defect-run.mjs). **LLM calls:** normally
 two (`fixes-after-review`, then `final-review` as the acceptance check), up to
 three when verification needs a repair retry, up to four when a correction
 runs, and five when both paths are needed.
@@ -609,7 +648,7 @@ manual launch stays available.
 `workflows/lib/usage.mjs` appends best-effort host telemetry to
 `EPIC_USAGE_LOG` (normally `~/epic-usage.jsonl`). A failed append never changes
 a pipeline result or exit code. Every model process writes a typed `spawn`
-record. Every epic, conflict-fixer, CI-fixer, and defect-fixer invocation also
+record. Every epic, task, conflict-fixer, CI-fixer, and defect-fixer invocation also
 writes a `run-start` after engine validation and before Prepare, then a
 `run-finish` after final status reporting and its `RESULT` line. A killed or
 crashed process can therefore remain as a visible start with no finish. All
@@ -649,11 +688,13 @@ line is ignored as a possible concurrent append.
 
 1. Every structured model call is schema checked. Runtime may respawn once for
    a transient process failure and once for an off-schema result; timeouts and
-   hard provider-quota failures are not transiently retried.
-2. On a hard provider quota failure, an epic checkpoints and pushes resumable
-   work before restoring `ready`. A fixer cleans unpushed edits and refunds its
-   current rung. Both record a vendor-specific host hold and accept the hold
-   only after the required label state is verified.
+   hard provider-quota failures are not transiently retried. Task-run disables
+   both respawns to preserve its exact one-process contract.
+2. On a hard provider quota failure, an epic or task checkpoints and pushes
+   resumable work before restoring `ready`; task retains its selector. A fixer
+   cleans unpushed edits and refunds its current rung. All record a
+   vendor-specific host hold and accept it only after the required label state
+   is verified.
 3. Queries fail closed: an unreadable dependency, route, PR head, review result,
    CI conclusion, or write readback is never interpreted as success.
 4. A model phase that judges a change is read-only. The orchestrator hashes the
