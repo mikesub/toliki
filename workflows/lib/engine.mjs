@@ -333,22 +333,91 @@ function loadCharter(agentType) {
   return charter
 }
 
-// A target project's instructions live in its AGENTS.md (CLAUDE.md is a
-// pointer to it) plus any .claude/rules it still keeps. Claude Code loads both
-// itself; Codex's own AGENTS.md discovery is a CLI setting rather than a
-// guarantee and never covers .claude/rules, so read both explicitly for Codex
-// so a Codex phase gets what a Claude phase gets. Missing or unreadable
-// instructions fail closed.
-function loadProjectInstructions(cwd) {
+// Project instructions: Codex discovers the target project's AGENTS.md itself,
+// so the adapter no longer reads that file into the prompt. Measured on
+// codex-cli 0.152.1 against THESE launch flags (exec --ephemeral
+// --ignore-user-config --sandbox <mode> -c developer_instructions=… -C <cwd>),
+// with the request body captured off a local stand-in provider: the file
+// arrives ahead of the task as `# AGENTS.md instructions for <cwd>`, in
+// addition to — never instead of — the charter in developer_instructions.
+// Injecting a second copy only spent context on the same bytes and would drift
+// from whatever the CLI actually read.
+//
+// Two things native discovery does NOT do, which is why this is not simply a
+// deletion:
+//
+//   * project_doc_max_bytes caps the discovered documents and truncates past
+//     it SILENTLY — no event, no warning, the tail is just gone. Its default is
+//     32 KiB and this harness's own AGENTS.md is already past that, so the cap
+//     is set explicitly on the command line (--ignore-user-config means the
+//     host's config.toml can neither raise nor zero it) and the preflight below
+//     refuses a project file bigger than it. A phase never runs on half its
+//     instructions, and never silently.
+//   * .claude/rules has no Codex equivalent — see loadCompatRules.
+const PROJECT_DOC_MAX_BYTES = 256 * 1024
+
+// The one fail-closed check kept from the old injection path: a project with no
+// readable AGENTS.md, or one Codex would truncate, refuses the phase before the
+// CLI is spawned. It reads the file to measure it and passes none of it on.
+// The cap is Codex's budget for every document it discovers (a $CODEX_HOME
+// AGENTS.md and any directory doc above cwd count against the same total), so
+// the bound here is deliberately far above any real project file.
+function preflightProjectInstructions(cwd) {
   const instructions = path.join(cwd, 'AGENTS.md')
-  let body
+  let raw
   try {
-    body = readFileSync(instructions, 'utf8').trim()
+    raw = readFileSync(instructions, 'utf8')
   } catch (e) {
     throw new Error(`Codex project instructions could not be read at ${instructions}: ${e.message}`)
   }
-  if (!body) throw new Error(`Codex project instructions are empty at ${instructions}`)
+  if (!raw.trim()) throw new Error(`Codex project instructions are empty at ${instructions}`)
+  const bytes = Buffer.byteLength(raw)
+  if (bytes > PROJECT_DOC_MAX_BYTES) {
+    throw new Error(`Codex project instructions at ${instructions} are ${bytes} bytes, past the ${PROJECT_DOC_MAX_BYTES}-byte project_doc_max_bytes this adapter sets — Codex would load a silently truncated copy. Split the file or raise PROJECT_DOC_MAX_BYTES in workflows/lib/engine.mjs.`)
+  }
+}
 
+// One .claude/rules file, read the way Claude Code reads it: its body without
+// the frontmatter, or null when the rule is path-scoped rather than always on.
+// Claude loads .claude/rules/**/*.md alongside CLAUDE.md, but a file whose
+// frontmatter carries `paths:` is CONDITIONAL — it enters context only once
+// Claude touches a file those patterns match. A missing key, an empty list, or
+// patterns that all reduce to `**` mean the rule is unconditional, and so does
+// a file with no frontmatter at all. Matching that split is what keeps this a
+// compatibility layer rather than a second, larger rule loader.
+function unconditionalRuleBody(raw) {
+  const m = raw.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n([\s\S]*))?$/)
+  if (!m) return raw.trim()
+  const [, front, rest = ''] = m
+  const lines = front.split(/\r?\n/)
+  const at = lines.findIndex(l => /^paths\s*:/.test(l))
+  if (at === -1) return rest.trim()
+  const patterns = []
+  const push = (value) => {
+    for (const part of value.replace(/^\s*\[|\]\s*$/g, '').split(',')) {
+      const pattern = part.trim().replace(/^['"]|['"]$/g, '').replace(/\/\*\*$/, '')
+      if (pattern) patterns.push(pattern)
+    }
+  }
+  push(lines[at].replace(/^paths\s*:/, ''))
+  // A block list: `paths:` alone on its line, then `- pattern` items under it.
+  for (let i = at + 1; i < lines.length && /^\s*-\s/.test(lines[i]); i++) {
+    push(lines[i].replace(/^\s*-\s*/, ''))
+  }
+  const scoped = patterns.length > 0 && !patterns.every(pattern => pattern === '**')
+  return scoped ? null : rest.trim()
+}
+
+// .claude/rules compatibility, and only that. Codex has no rules directory of
+// its own, so a project that keeps required guidance there would lose it under
+// a Codex engine. What the old code did instead — flatten every Markdown file
+// under .claude/rules into every phase — imported rules Claude Code itself
+// would not have loaded: a rule scoped with `paths:` to a corner of the repo
+// reached an architect that never opens that corner, on every phase, priced per
+// token. Only the unconditional rules are carried, so a Codex phase starts with
+// what a Claude phase starts with, no more. Unreadable rules fail closed: a
+// present-but-unreadable rule directory is a broken checkout, not an empty one.
+function loadCompatRules(cwd) {
   const ruleRoot = path.join(cwd, '.claude', 'rules')
   const rules = []
   const visit = (dir) => {
@@ -363,16 +432,13 @@ function loadProjectInstructions(cwd) {
       const file = path.join(dir, entry.name)
       if (entry.isDirectory()) visit(file)
       else if (entry.isFile() && entry.name.endsWith('.md')) {
-        rules.push({ file: path.relative(cwd, file), body: readFileSync(file, 'utf8').trim() })
+        const body = unconditionalRuleBody(readFileSync(file, 'utf8'))
+        if (body) rules.push({ file: path.relative(cwd, file), body })
       }
     }
   }
   visit(ruleRoot)
-
-  return [
-    `<project-instructions source="AGENTS.md">\n${body}\n</project-instructions>`,
-    ...rules.map(rule => `<project-rule source="${rule.file}">\n${rule.body}\n</project-rule>`),
-  ].join('\n\n')
+  return rules.map(rule => `<project-rule source="${rule.file}">\n${rule.body}\n</project-rule>`).join('\n\n')
 }
 
 const claudeVendor = {
@@ -478,6 +544,10 @@ const claudeVendor = {
 // therefore injected as developer instructions, and the tool boundary is
 // enforced by the Codex sandbox: charters without Edit/Write are read-only;
 // mutating phases retain the existing autonomous pipeline's full authority.
+// Only the charter and the .claude/rules compatibility block travel that way:
+// the project's AGENTS.md is the CLI's own discovery (see
+// preflightProjectInstructions), so nothing here re-sends it.
+//
 // --json makes stdout the event stream, which a long phase runs into megabytes.
 // Only its tail is ever read — turn.completed and the error events come last —
 // and the payload comes from --output-last-message, so a bounded tail is whole.
@@ -500,12 +570,20 @@ const codexVendor = {
       '--disable', 'multi_agent', '--disable', 'enable_fanout',
       '--sandbox', sandbox,
       '-c', 'approval_policy="never"',
-      '-c', `developer_instructions=${JSON.stringify(developerInstructions)}`,
+      // The project's own AGENTS.md is discovered by the CLI, not injected
+      // here; this raises its silent 32 KiB truncation point to the bound
+      // preflightProjectInstructions enforces.
+      '-c', `project_doc_max_bytes=${PROJECT_DOC_MAX_BYTES}`,
       '-C', cwd,
       '--model', model,
       '-c', `model_reasoning_effort="${effort}"`,
       '--output-last-message', outputFile,
     ]
+    // Empty only for a phase with no charter and a project with no always-on
+    // rules; an empty developer message is worth nothing and is left out.
+    if (developerInstructions) {
+      args.push('-c', `developer_instructions=${JSON.stringify(developerInstructions)}`)
+    }
     if (schemaFile) args.push('--output-schema', schemaFile)
     args.push('-')
     return args
@@ -518,8 +596,8 @@ const codexVendor = {
     try {
       if (schemaFile) writeFileSync(schemaFile, JSON.stringify(codexOutputSchema(schema)))
       const charter = agentType ? loadCharter(agentType) : null
-      const projectInstructions = loadProjectInstructions(cwd)
-      const developerInstructions = [charter?.body, projectInstructions].filter(Boolean).join('\n\n')
+      preflightProjectInstructions(cwd)
+      const developerInstructions = [charter?.body, loadCompatRules(cwd)].filter(Boolean).join('\n\n')
       const args = this.buildArgs({ charter, developerInstructions, model, effort, schemaFile, outputFile, cwd })
       const r = await execute({ bin: this.bin, args, prompt, cwd, timeoutMs, onStart, label, step, stdoutCap: CODEX_STDOUT_CAP })
       const events = codexEvents(r.stdout)

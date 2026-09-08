@@ -17,9 +17,16 @@ assert_not_contains() { if [[ "$2" != *"$3"* ]]; then ok "$1"; else nok "$1 (une
 assert_rc() { if [[ "$2" == "$3" ]]; then ok "$1"; else nok "$1 (want rc $2, got $3)"; fi; }
 
 mkdir -p "$TMP/bin"
-mkdir -p "$TMP/.claude/rules"
+mkdir -p "$TMP/.claude/rules/nested"
 printf 'PROJECT_INSTRUCTIONS_MARKER\n' > "$TMP/AGENTS.md"
+# .claude/rules fixtures, mirroring how Claude Code loads them: a bare rule and
+# one whose frontmatter names no paths are always in context; one scoped with
+# `paths:` loads only when Claude touches a matching file, and a `paths: "**"`
+# that matches everything is scoped to nothing, so it is always on again.
 printf 'PROJECT_RULE_MARKER\n' > "$TMP/.claude/rules/safety.md"
+printf -- '---\ndescription: RULE_FRONTMATTER_MARKER\n---\nDESCRIBED_RULE_MARKER\n' > "$TMP/.claude/rules/described.md"
+printf -- '---\npaths:\n  - src/**\n---\nSCOPED_RULE_MARKER\n' > "$TMP/.claude/rules/nested/scoped.md"
+printf -- '---\npaths: "**"\n---\nWILDCARD_RULE_MARKER\n' > "$TMP/.claude/rules/nested/wildcard.md"
 cat > "$TMP/bin/codex" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -128,8 +135,21 @@ assert_contains "the working root is explicit" "$ARGS" "ARG:$PHYSICAL_TMP"
 assert_contains "hidden multi-agent fan-out is disabled" "$ARGS" 'ARG:multi_agent'
 assert_contains "the secondary fan-out flag is disabled" "$ARGS" 'ARG:enable_fanout'
 assert_contains "the coder charter has developer-role delivery" "$ARGS" 'ARG:developer_instructions='
-assert_contains "the target AGENTS.md reaches developer instructions" "$ARGS" 'PROJECT_INSTRUCTIONS_MARKER'
-assert_contains "the target .claude/rules reach developer instructions" "$ARGS" 'PROJECT_RULE_MARKER'
+# The CLI discovers the project's AGENTS.md itself (measured on codex-cli
+# 0.152.1 under exactly these flags), so a second copy in argv would only be
+# context spent twice on the same bytes.
+assert_not_contains "the target AGENTS.md is left to native discovery" "$ARGS" 'PROJECT_INSTRUCTIONS_MARKER'
+# Native discovery truncates past project_doc_max_bytes without saying so, and
+# its 32 KiB default is smaller than real project instructions.
+assert_contains "the project-doc cap is raised explicitly" "$ARGS" 'ARG:project_doc_max_bytes=262144'
+assert_contains "an always-on .claude/rule reaches developer instructions" "$ARGS" 'PROJECT_RULE_MARKER'
+assert_contains "so does one whose frontmatter names no paths" "$ARGS" 'DESCRIBED_RULE_MARKER'
+assert_not_contains "its frontmatter is not carried with it" "$ARGS" 'RULE_FRONTMATTER_MARKER'
+assert_contains "a nested rule scoped to everything is still always on" "$ARGS" 'WILDCARD_RULE_MARKER'
+# Claude Code would not have this one in context either: it enters only when a
+# matching file is touched, so shipping it on every phase imports a rule the
+# phase has no use for.
+assert_not_contains "a path-scoped rule is not imported" "$ARGS" 'SCOPED_RULE_MARKER'
 assert_contains "the task itself stays on stdin" "$(cat "$TMP/prompt")" 'adapter probe'
 SCHEMA="$(cat "$TMP/schema")"
 assert_contains "Codex schema requires every property" "$SCHEMA" '"required":["name","note","maybe"]'
@@ -208,6 +228,26 @@ run_adapter coder gpt-5.6-sol xhigh 1 structured
 assert_rc "adapter returns a failure record" 0 "$RUN_RC"
 assert_contains "the phase is refused" "$RUN_OUT" 'Codex project instructions could not be read'
 assert_not_contains "the CLI was never spawned" "$(cat "$TMP/args")" 'CALL'
+mv "$TMP/AGENTS.saved" "$TMP/AGENTS.md"
+
+printf '\nCodex adapter: instructions Codex would truncate fail closed\n'
+# The preflight only measures the file; the CLI is what loads it. Instructions
+# past the cap would arrive cut off mid-sentence with nothing reporting it.
+mv "$TMP/AGENTS.md" "$TMP/AGENTS.saved"
+head -c 262145 /dev/zero | tr '\0' 'x' > "$TMP/AGENTS.md"
+run_adapter coder gpt-5.6-sol xhigh 1 structured
+assert_rc "adapter returns a failure record" 0 "$RUN_RC"
+assert_contains "the oversized file is named with its size" "$RUN_OUT" 'are 262145 bytes'
+assert_contains "and the reason is the silent truncation" "$RUN_OUT" 'silently truncated copy'
+assert_not_contains "the CLI was never spawned" "$(cat "$TMP/args")" 'CALL'
+mv "$TMP/AGENTS.saved" "$TMP/AGENTS.md"
+
+printf '\nCodex adapter: instructions at the cap still run\n'
+mv "$TMP/AGENTS.md" "$TMP/AGENTS.saved"
+head -c 262144 /dev/zero | tr '\0' 'x' > "$TMP/AGENTS.md"
+run_adapter coder gpt-5.6-sol xhigh 1 structured
+assert_contains "the phase runs" "$RUN_OUT" '"ok":true'
+assert_contains "the CLI was spawned" "$(cat "$TMP/args")" 'CALL'
 mv "$TMP/AGENTS.saved" "$TMP/AGENTS.md"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
