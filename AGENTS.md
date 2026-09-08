@@ -144,8 +144,15 @@ than made launchable against a main without the code it describes.
 - `workflows/lib/engine.mjs` is the only file that knows how a vendor CLI is
   invoked. Its loader validates `etc/engines.json` before any phase touches
   GitHub. A Codex phase is ephemeral, sandboxed from the charter's tools, and
-  receives the target project's `AGENTS.md` and `.claude/rules` as developer
-  instructions; a missing `AGENTS.md` refuses the phase. Gated by
+  reads the target project's `AGENTS.md` through the CLI's own discovery rather
+  than a copy the adapter pastes in. Developer instructions carry the charter
+  and one compatibility block: the `.claude/rules` files Claude Code always has
+  in context, which Codex has no equivalent for. A rule scoped by `paths:`
+  frontmatter is left out, exactly as Claude Code leaves it out until a matching
+  file is touched. Native discovery truncates past `project_doc_max_bytes`
+  silently and defaults to 32 KiB — smaller than this repo's own `AGENTS.md` —
+  so the adapter raises that cap explicitly and refuses the phase when
+  `AGENTS.md` is missing, empty or larger than the raised cap. Gated by
   `tests/engine-codex.test.sh`.
 - `workflows/lib/runtime.mjs` owns phase execution, the concurrency gate,
   timeouts and signal forwarding. Deterministic control flow lives here or in
