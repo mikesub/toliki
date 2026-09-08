@@ -8,7 +8,7 @@ import { correctionContract, renderBlockerBatch } from '../../lib/repair-accepta
 import { NO_SELF_VERIFY } from './shared.mjs'
 
 export const correctionPrompt = (requirement, batch, repairDelta, verifyDetail) =>
-`Correct the blockers an independent final review found in a repair you did not write. The repaired change is already checkpointed and the project's verify gate was GREEN on it (${verifyDetail}); you are amending that work in place, never redoing it and never revisiting anything no blocker names.
+`Correct the blockers an independent final review found in the repair already on this branch. The repaired change is already checkpointed and the project's verify gate was GREEN on it (${verifyDetail}); you are amending that work in place, never redoing it and never revisiting anything no blocker names.
 
 The original requirement — the only spec context you get:
 """

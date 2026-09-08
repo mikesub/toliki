@@ -241,6 +241,24 @@ set -euo pipefail
 # break every assertion that greps this log.
 printf '%s\n' "$*" | tr '\n' ' ' | tr -s ' ' >> "$STUB_LOG"
 printf '\n' >> "$STUB_LOG"
+# The conversation the adapter asked for. --resume <id> continues one and keeps
+# its id; its absence opens a new one, numbered per run so a scenario can name
+# the exact session a later phase must continue. STUB_NO_SESSION_ID is the CLI
+# that reports none, which the orchestrator must treat as unresumable context.
+# Only when called with argv: the codex stub reuses this router for the payload
+# alone and passes none.
+sid=""
+if (( $# > 0 )); then
+  while (( $# > 0 )); do
+    case "$1" in --resume) sid="$2"; shift 2 ;; *) shift ;; esac
+  done
+  if [[ -z "$sid" ]]; then
+    sn="$(cat "$STUB_STATE/claude-sessions" 2>/dev/null || echo 0)"; sn=$((sn + 1))
+    printf '%s' "$sn" > "$STUB_STATE/claude-sessions"
+    sid="session-$sn"
+  fi
+  [[ "${STUB_NO_SESSION_ID:-}" != "1" ]] || sid=""
+fi
 prompt="$(cat)"
 
 key=unknown
@@ -279,7 +297,10 @@ for f in "$STUB_FIXTURES/$key.$n.sh" "$STUB_FIXTURES/$key.sh"; do
   if [[ -f "$f" ]]; then bash "$f"; break; fi
 done
 for f in "$STUB_FIXTURES/$key.$n.json" "$STUB_FIXTURES/$key.json"; do
-  if [[ -f "$f" ]]; then cat "$f"; exit 0; fi
+  if [[ -f "$f" ]]; then
+    if [[ -n "$sid" ]] && jq -c --arg sid "$sid" '. + {session_id:$sid}' "$f" 2>/dev/null; then exit 0; fi
+    cat "$f"; exit 0
+  fi
 done
 printf 'stub: no fixture for key %s (call %s)\n' "$key" "$n" >&2
 exit 9
@@ -298,13 +319,23 @@ set -euo pipefail
 printf '%s\n' "$(printf '%s' "$*" | tr '\n' ' ' | tr -s ' ')" >> "$STUB_CODEX_LOG"
 out=""
 schema=""
+sid=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -o|--output-last-message) out="$2"; shift 2 ;;
     --output-schema) schema="$2"; shift 2 ;;
+    # `exec resume` takes the conversation id positionally; a new session gets
+    # one from the CLI, which is why only Codex's id can be echoed back rather
+    # than chosen. thread-<n> is numbered per run, like the Claude stub's.
+    thread-*) sid="$1"; shift ;;
     *) shift ;;
   esac
 done
+if [[ -z "$sid" ]]; then
+  sn="$(cat "$STUB_STATE/codex-threads" 2>/dev/null || echo 0)"; sn=$((sn + 1))
+  printf '%s' "$sn" > "$STUB_STATE/codex-threads"
+  sid="thread-$sn"
+fi
 prompt="$(cat)"
 if [[ "${CODEX_QUOTA_STDERR_ONLY:-}" == "1" ]]; then
   printf '%s\n' 'You have hit your usage limit; resets 7:50pm (UTC)' >&2
@@ -316,6 +347,7 @@ payload="$(printf '%s' "$prompt" | STUB_LOG=/dev/null "$STUB_CLAUDE")"
 rc=$?
 set -e
 (( rc == 0 )) || exit "$rc"
+[[ "${STUB_NO_SESSION_ID:-}" == "1" ]] || printf '{"type":"thread.started","thread_id":"%s"}\n' "$sid"
 printf '{"type":"turn.completed","usage":{"input_tokens":1000,"cached_input_tokens":300,"cache_write_input_tokens":0,"output_tokens":234,"reasoning_output_tokens":100}}\n'
 if [[ -n "$schema" ]]; then
   printf '%s' "$payload" | jq -c '.structured_output' > "$out"
@@ -1162,6 +1194,7 @@ run_pipeline() { # script fixtures-dir args...   (scenario knobs via GH_* env)
     GIT_SLOW_AFTER_LANDING="${GIT_SLOW_AFTER_LANDING:-}" \
     EXPECT_HOLD_BEFORE_LABEL="${EXPECT_HOLD_BEFORE_LABEL:-}" \
     CODEX_QUOTA_STDERR_ONLY="${CODEX_QUOTA_STDERR_ONLY:-}" \
+    STUB_NO_SESSION_ID="${STUB_NO_SESSION_ID:-}" \
     TMPDIR="$state/tmp" \
     EPIC_PROVIDER_HOLD_FILE="$state/provider-hold.json" \
     HOST_TIMEZONE="${HOST_TIMEZONE:-}" \
@@ -1722,12 +1755,20 @@ assert_contains "the task timeout remains visible" "$RUN_OUT" "timed out"
 assert_not_contains "timeout starts no respawn" "$RUN_OUT" "respawning once"
 assert_eq "timed-out tasker opens no PR" "" "$(gh_pr_created)"
 
+# A first verify that is genuinely red, and a repair that clears it. Built from
+# scratch per scenario rather than copied: the repair's own side effect deletes
+# the failing-verify marker, so a reused directory would be green again.
+make_task_repair_fixture() {
+  local dir="$1"
+  make_task_fixture "$dir"
+  printf '1\n' > "$dir/verify.rc"
+  fixture "$dir" task.1 '{"status":"completed","title":"Repair lightweight widget","summary":"Repaired the verification failure in the existing widget delivery.","commitBody":"Keep the widget implementation aligned with the project verification contract.","tests":"Kept and repaired the widget coverage without weakening it.","selfReview":"Builder self-review inspected the existing changes and corrected the reported defect.","unresolved":[]}'
+  fixture_sh "$dir" task.1 'rm "$STUB_FIXTURES/verify.rc"; printf "export const createWidget = () => ({ repaired: true })\n" > frontend/src/widget.ts'
+}
+
 scenario 'task-run: red verification gets one diagnostics-driven repair and then delivers'
 TASK_REPAIRED="$TMP/fixtures-task-repaired"
-make_task_fixture "$TASK_REPAIRED"
-printf '1\n' > "$TASK_REPAIRED/verify.rc"
-fixture "$TASK_REPAIRED" task.1 '{"status":"completed","title":"Repair lightweight widget","summary":"Repaired the verification failure in the existing widget delivery.","commitBody":"Keep the widget implementation aligned with the project verification contract.","tests":"Kept and repaired the widget coverage without weakening it.","selfReview":"Builder self-review inspected the existing changes and corrected the reported defect.","unresolved":[]}'
-fixture_sh "$TASK_REPAIRED" task.1 'rm "$STUB_FIXTURES/verify.rc"; printf "export const createWidget = () => ({ repaired: true })\n" > frontend/src/widget.ts'
+make_task_repair_fixture "$TASK_REPAIRED"
 GH_ISSUE_LABELS=ready,task run_pipeline "$TASK_RUN" "$TASK_REPAIRED" --issue 42
 assert_rc "repaired task verification exits 0" 0 "$RUN_RC"
 assert_eq "initial red gets exactly one fresh task process" 2 "$(calls task)"
@@ -1742,6 +1783,45 @@ assert_contains "the repair prompt points at the existing worktree" "$(cat "$STA
 assert_not_contains "the orchestrator does not inject a generated full diff" "$(cat "$STATE_DIR/task.1.prompt")" "diff --git"
 assert_eq "usage distinguishes the repair while routing both through task" "task false|task:verify-repair true" \
   "$(usage_log | jq -r 'select(.type=="spawn") | "\(.label) \(.retry)"' | paste -sd '|' -)"
+# The repair is the same conversation, not a stranger re-reading minutes-old
+# work: the initial process opens the tasker conversation and the repair
+# continues that exact id.
+assert_not_contains "the initial tasker opens rather than resumes" "$(sed -n 1p "$RUN_LOG")" "--resume"
+assert_contains "the repair continues the initial tasker's own conversation" "$(sed -n 2p "$RUN_LOG")" "--resume session-1"
+assert_contains "the pane records the continuation" "$RUN_OUT" "continuing the tasker conversation"
+assert_eq "telemetry separates the opened conversation from the continued one" "false|true" \
+  "$(usage_log | jq -r 'select(.type=="spawn") | .resumed' | paste -sd '|' -)"
+assert_eq "both processes stay on the one task engine row" 2 "$(grep -c -- '--model opus --effort high' "$RUN_LOG" || true)"
+assert_contains "the repair still carries its complete standalone brief" "$(cat "$STATE_DIR/task.1.prompt")" "Original requirement"
+
+# Reuse is context, never correctness: a CLI that records no session leaves the
+# repair exactly the fresh, fully briefed process it used to be.
+scenario 'task-run: a CLI that reports no session repairs on a fresh briefed process'
+TASK_NOSESSION="$TMP/fixtures-task-nosession"
+make_task_repair_fixture "$TASK_NOSESSION"
+STUB_NO_SESSION_ID=1 GH_ISSUE_LABELS=ready,task run_pipeline "$TASK_RUN" "$TASK_NOSESSION" --issue 42
+assert_rc "the repaired task still exits 0" 0 "$RUN_RC"
+assert_contains "the repaired task still delivers" "$RUN_OUT" '"readyToMerge":true'
+assert_eq "still exactly two processes" 2 "$(calls task)"
+assert_eq "nothing resumes a session that was never recorded" 0 "$(grep -c -- '--resume' "$RUN_LOG" || true)"
+assert_contains "the run says the context was unusable" "$RUN_OUT" "the CLI reported no resumable session id"
+assert_contains "the repair still receives the captured diagnostics" "$(cat "$STATE_DIR/task.1.prompt")" "verify: widget.test.ts expected 2 got 1"
+
+# The ceiling is the ceiling: an unresumable conversation is reported, never
+# paid for with a third process.
+scenario 'task-run: an unresumable conversation blocks inside the two-process ceiling'
+TASK_LOSTSESSION="$TMP/fixtures-task-lost-session"
+make_task_repair_fixture "$TASK_LOSTSESSION"
+fixture_error "$TASK_LOSTSESSION" task.1 '{"type":"result","subtype":"error_during_execution","is_error":true,"result":"No conversation found with session ID: session-1","duration_ms":120,"num_turns":0,"total_cost_usd":0,"usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
+GH_ISSUE_LABELS=ready,task run_pipeline "$TASK_RUN" "$TASK_LOSTSESSION" --issue 42
+assert_rc "the lost conversation blocks" 3 "$RUN_RC"
+assert_eq "no third process is bought to recover it" 2 "$(calls task)"
+assert_eq "the second verify is never reached" 1 "$(grep -c '^run verify$' "$NPM_LOG" || true)"
+assert_eq "no PR is opened" "" "$(gh_pr_created)"
+assert_contains "the run names the dropped conversation" "$RUN_OUT" "dropping the tasker conversation"
+assert_not_contains "and buys no fresh replacement process" "$RUN_OUT" "respawning once"
+assert_contains "the blocker keeps the hard process bound" "$RUN_OUT" "no third task process is permitted"
+assert_eq "the selector persists on the failed issue" "failed,task," "$(gh_labels)"
 
 scenario 'task-run: a second red verification preserves the branch and opens no PR'
 TASK_RED="$TMP/fixtures-task-red"
@@ -2158,6 +2238,15 @@ assert_eq "the reviewer and the final review ran on Codex" "$(( 1 + $(calls fina
 assert_contains "coding stayed on Claude" "$(cat "$RUN_LOG")" "--model opus"
 assert_contains "the architect stayed on Claude" "$(cat "$RUN_LOG")" "--model fable"
 assert_contains "the pane names the vendor and model per step" "$RUN_OUT" "[codex gpt-5.6-sol/xhigh]"
+# This engine routes code and fixes-after-review to the same vendor and model at
+# DIFFERENT efforts, which is exactly where reuse must stop: the repair opens its
+# own conversation instead of being quietly retiered into the coder's.
+assert_contains "a differently routed repair opens its own conversation" "$RUN_OUT" "does not match the builder conversation on claude/opus/xhigh"
+assert_eq "the repair keeps the row etc/engines.json gave it" 1 \
+  "$(grep 'Execute the task precisely' "$RUN_LOG" | grep -c -- '--model opus --effort high' || true)"
+assert_eq "only the implementation's own continuation resumes" 1 "$(grep -c -- '--resume' "$RUN_LOG" || true)"
+assert_eq "and it stays on the row that conversation was opened under" 1 \
+  "$(grep -- '--resume' "$RUN_LOG" | grep -c -- '--effort xhigh' || true)"
 # A mixed run's dollars come from two places: Claude bills itself, Codex is
 # priced from lib/prices.mjs. The report has to say which is which, or a
 # computed floor reads as an invoice.
@@ -2530,6 +2619,16 @@ assert_eq "telemetry separates the four steps of the repair path" "correction,fi
 assert_eq "the correction runs on the writable step and the confirmation on the read-only one" "fixes-after-review|final-review" \
   "$(usage_log | jq -r 'select(.label=="correction") | .step')|$(usage_log | jq -r 'select(.label=="narrow-confirm") | .step')"
 assert_eq "and a correction is one spawn, never a counted pipeline relaunch" "1" "$(usage_log | jq -r 'select(.label=="correction") | .attempt')"
+# The authorized correction is the builder answering for its own repair, so it
+# continues that conversation — while the confirmation that judges it does not.
+assert_eq "the scoped correction continues the builder conversation" 1 \
+  "$(printf '%s\n' "$RUN_OUT" | grep -c 'correction:.*continuing the builder conversation' || true)"
+assert_eq "telemetry records the correction as a continuation" "true" \
+  "$(usage_log | jq -r 'select(.label=="correction") | .resumed')"
+assert_eq "the narrow confirmation inherits nothing" "false|null" \
+  "$(usage_log | jq -r 'select(.label=="narrow-confirm") | "\(.resumed)|\(.conversation)"')"
+assert_not_contains "the correction is no longer told a stranger wrote the repair" "$(cat "$STATE_DIR/correction.0.prompt")" "a repair you did not write"
+assert_contains "it is still pointed at the exact repair on the branch" "$(cat "$STATE_DIR/correction.0.prompt")" "the repair already on this branch"
 
 scenario 'epic-run: a correction that changes no file is held, never retried'
 NODIFFCORRECT="$TMP/fixtures-correction-nodiff"; cp -R "$CORRECTED" "$NODIFFCORRECT"; rm -f "$NODIFFCORRECT/correction.sh"
@@ -3429,18 +3528,58 @@ assert_rc "an ancestry metadata mutation blocks" 3 "$RUN_RC"
 assert_contains "the refusal names hooks or ancestry metadata" "$RUN_OUT" 'changed hooks or ancestry metadata'
 assert_eq "no PR is opened" "" "$(gh_pr_created)"
 
-# Every phase is its own process that dies when it returns: the fixer and the
-# final reviewer reconstruct context from the requirement, the findings and the
-# diffs rather than inheriting a session. The Codex adapter is where that is
-# visible in argv, so the whole run is replayed there and every line checked.
-scenario 'ephemeral: every model phase is a fresh, non-resumable process'
+# The run keeps ONE builder conversation and every judging phase stays a fresh,
+# non-resumable process. Both halves are argv facts, invisible in production
+# until they bill or until a reviewer quietly inherits the builder's own story,
+# so the whole run is replayed on each vendor and every line is checked.
+# Writable spawns here: RED opens the conversation, GREEN continues it, and the
+# fixer that answers the review's findings continues it too.
+scenario 'session reuse: one builder conversation, and every judging phase fresh'
 run_pipeline "$EPIC_RUN" "$BASE" --issue 42 --engine codex
 assert_rc "exits 0" 0 "$RUN_RC"
-assert_eq "every Codex spawn is ephemeral" 0 "$(grep -cv -- 'exec --ephemeral' "$CODEX_LOG" || true)"
 assert_eq "and there were spawns to check" 6 "$(wc -l < "$CODEX_LOG" | tr -d ' ')"
-assert_eq "no spawn resumes or continues an earlier session" 0 "$(grep -c -E 'resume|--continue|--session-id' "$CODEX_LOG" "$RUN_LOG" | awk -F: '{sum += $2} END {print sum + 0}')"
-assert_eq "the fresh fixer still ran exactly once" 1 "$(calls triage)"
-assert_eq "and the fresh final review once" 1 "$(calls finalreview)"
+CODEX_JUDGING="$(grep -E 'Review code against project guidelines|Design a decisive, build-ready approach' "$CODEX_LOG" || true)"
+CODEX_WRITABLE="$(grep 'Execute the task precisely' "$CODEX_LOG" || true)"
+assert_eq "the three judging phases stay ephemeral" 3 "$(printf '%s\n' "$CODEX_JUDGING" | grep -c -- 'exec --ephemeral' || true)"
+assert_eq "and none of them resumes or continues anything" 0 "$(printf '%s\n' "$CODEX_JUDGING" | grep -c -E 'resume|--continue' || true)"
+assert_eq "the three writable phases are one opened conversation and two continuations" "1 2" \
+  "$(printf '%s\n' "$CODEX_WRITABLE" | grep -c -E '^exec --ignore-user-config' || true) $(printf '%s\n' "$CODEX_WRITABLE" | grep -c '^exec resume ' || true)"
+assert_eq "every continuation names the one conversation the builder opened" 1 \
+  "$(grep -o 'thread-[0-9]*' "$CODEX_LOG" | sort -u | wc -l | tr -d ' ')"
+assert_eq "no writable spawn is ephemeral, or its session could not be continued" 0 "$(printf '%s\n' "$CODEX_WRITABLE" | grep -c -- '--ephemeral' || true)"
+# `exec resume` takes neither --sandbox nor -C, so the sandbox the charter earned
+# has to survive as a config override or a writable phase would silently resume
+# read-only.
+assert_eq "a continued writable phase keeps its full sandbox" 2 "$(grep -c 'sandbox_mode="danger-full-access"' "$CODEX_LOG" || true)"
+assert_eq "and never passes exec-only flags to the resume subcommand" 0 "$(grep '^exec resume ' "$CODEX_LOG" | grep -c -E -- '--sandbox|-C ' || true)"
+assert_eq "the fixer still ran exactly once" 1 "$(calls triage)"
+assert_eq "and the independent final review once" 1 "$(calls finalreview)"
+
+scenario 'session reuse: the Claude adapter continues one conversation by id'
+run_pipeline "$EPIC_RUN" "$BASE" --issue 42
+assert_rc "exits 0" 0 "$RUN_RC"
+assert_eq "exactly the two writable continuations resume" 2 "$(grep -c -- '--resume' "$RUN_LOG" || true)"
+assert_eq "and they name one single conversation" 1 "$(grep -o -- '--resume [a-z0-9-]*' "$RUN_LOG" | sort -u | wc -l | tr -d ' ')"
+assert_eq "no judging phase resumes anything" 0 \
+  "$(grep -E 'Review code against project guidelines|Design a decisive, build-ready approach' "$RUN_LOG" | grep -c -- '--resume' || true)"
+assert_contains "the pane says which spawn opened the builder conversation" "$RUN_OUT" "opening the builder conversation"
+assert_contains "and which continued it" "$RUN_OUT" "continuing the builder conversation"
+assert_eq "telemetry separates rediscovery from continuation" "3 2" \
+  "$(usage_log | jq -r 'select(.type=="spawn" and .conversation=="builder") | .resumed' | wc -l | tr -d ' ') $(usage_log | jq -r 'select(.type=="spawn" and .resumed==true) | .label' | wc -l | tr -d ' ')"
+assert_eq "no judging spawn is recorded against a conversation" "0" \
+  "$(usage_log | jq -r 'select(.type=="spawn" and (.step=="review" or .step=="final-review" or .step=="architect") and .conversation!=null) | .label' | wc -l | tr -d ' ')"
+
+# A CLI that reports no session id is a run without reusable context, not a run
+# that guesses at one: it is dropped once, said out loud, and every later phase
+# pays its own rediscovery on the complete brief the prompt still carries.
+scenario 'session reuse: a CLI that reports no session id degrades to fresh processes'
+STUB_NO_SESSION_ID=1 run_pipeline "$EPIC_RUN" "$BASE" --issue 42
+assert_rc "the run still ships" 0 "$RUN_RC"
+assert_contains "RESULT still queues the merge" "$RUN_OUT" '"readyToMerge":true'
+assert_eq "nothing resumes a session that was never recorded" 0 "$(grep -c -- '--resume' "$RUN_LOG" || true)"
+assert_contains "the pane names the unusable context once" "$RUN_OUT" "the CLI reported no resumable session id"
+assert_contains "and later writable phases say they run fresh" "$RUN_OUT" "runs fresh on its own brief"
+assert_eq "the same six phases still ran" 6 "$(wc -l < "$RUN_LOG" | tr -d ' ')"
 
 fi
 

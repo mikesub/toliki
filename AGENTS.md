@@ -79,7 +79,10 @@ in the same change.
   CI logs, the review ledger — and also proves the worktree, index, Git
   configuration, hooks and ancestry metadata unchanged around review, the final
   review and the narrow confirmation. There is no delivery-prose step: the
-  coding phase returns the record its change is published from. Nothing
+  coding phase returns the record its change is published from. In epic-run and
+  task-run the WRITABLE steps of one invocation share one builder conversation
+  per engine row (see `lib/runtime.mjs`); the judging steps stay ephemeral, so
+  no reviewer inherits the builder's account of its own work. Nothing
   deterministic is a step: git, gh and npm work runs in the orchestrator.
   `task` maps both the task workflow's primary model process and its optional
   one-time verification-diagnostics repair to the writable `tasker` charter.
@@ -175,11 +178,16 @@ than made launchable against a main without the code it describes.
   prompt that describes it. Gated by `tests/workflow-prompts.test.sh`.
 - `workflows/lib/engine.mjs` is the only file that knows how a vendor CLI is
   invoked. Its loader validates `etc/engines.json` before any phase touches
-  GitHub. A Codex phase is ephemeral, sandboxed from the charter's tools, and
-  reads the target project's `AGENTS.md` through the CLI's own discovery rather
-  than a copy the adapter pastes in. Developer instructions carry the charter
-  and one compatibility block: the `.claude/rules` files Claude Code always has
-  in context, which Codex has no equivalent for. A rule scoped by `paths:`
+  GitHub. A Codex phase is sandboxed from the charter's tools and reads the
+  target project's `AGENTS.md` through the CLI's own discovery rather than a
+  copy the adapter pastes in. It is ephemeral unless the caller hands it a
+  conversation: the optional `conversation` argument is the whole session
+  surface — absent means "persist nothing", `{ id: null }` opens a session and
+  returns the id it ran under, an id resumes exactly that one. No adapter ever
+  asks a CLI for its most recent session, and `exec resume` carries its sandbox,
+  model and effort explicitly because that subcommand takes fewer flags than
+  `exec`. Developer instructions carry the charter and one compatibility block:
+  the `.claude/rules` files Claude Code always has in context, which Codex has no equivalent for. A rule scoped by `paths:`
   frontmatter is left out, exactly as Claude Code leaves it out until a matching
   file is touched. Native discovery truncates past `project_doc_max_bytes`
   silently and defaults to 32 KiB — smaller than this repo's own `AGENTS.md` —
@@ -187,10 +195,16 @@ than made launchable against a main without the code it describes.
   `AGENTS.md` is missing, empty or larger than the raised cap. Gated by
   `tests/engine-codex.test.sh`.
 - `workflows/lib/runtime.mjs` owns phase execution, the concurrency gate,
-  timeouts and signal forwarding. Deterministic control flow lives here or in
-  scripts, never inside model judgment. Task-run disables both transient and
-  schema respawns on every invocation; only a normal red first project verify
-  may cause one explicitly labelled fresh tasker invocation.
+  timeouts, signal forwarding and the run's builder conversation.
+  Deterministic control flow lives here or in scripts, never inside model
+  judgment. Task-run disables both transient and schema respawns on every
+  invocation; only a normal red first project verify may cause one explicitly
+  labelled second tasker invocation, which continues the first one's
+  conversation. `conversation()` returns a handle a pipeline passes to its
+  writable calls only. It holds one session per engine row, is keyed to the run
+  id and worktree it was created in, and is dropped with a logged reason when a
+  CLI reports no session or can no longer find one — every prompt stays a
+  complete brief, so lost context costs re-exploration, never correctness.
 - `etc/lib.sh` validates and exports the host-wide `HOST_TIMEZONE`, and
   `workflows/lib/time.mjs` is the matching Node formatter. Human-facing pane,
   status, script-log and resource-report timestamps use that zone; parsed usage,
@@ -206,7 +220,8 @@ than made launchable against a main without the code it describes.
 - `workflows/lib/usage.mjs` appends typed JSON lines to `EPIC_USAGE_LOG`,
   default `~/epic-usage.jsonl` on whichever machine ran the pipeline:
   `type:"spawn"` per agent spawn (step, vendor, model, effort, tokens, seconds,
-  cost, `retry`, and the failure kind/reason when a spawn fails) plus
+  cost, `retry`, the `conversation` it belonged to and whether it `resumed` one,
+  and the failure kind/reason when a spawn fails) plus
   `type:"run-start"` and `type:"run-finish"` bracketing every invocation of all
   five pipelines, including one that spawned nothing. A start carries the run's
   identity — `runId`, script, engine, session, issue and the registered
@@ -294,8 +309,9 @@ than made launchable against a main without the code it describes.
   candidate commit containing `Closes #N`, push, PR, delivery-summary readback
   and handoff. Invalid output, a tasker blocker, provider/process failure or
   timeout never respawns it; they preserve the branch and rest at `failed`. A
-  normal nonzero first project verify is the sole bounded exception: one fresh
-  tasker receives the original requirement plus sanitized bounded diagnostics,
+  normal nonzero first project verify is the sole bounded exception: a second
+  process continues the tasker's conversation with the original requirement
+  plus sanitized bounded diagnostics,
   inspects the existing worktree without an injected full diff, and repairs
   without weakening tests or expanding scope. Its runtime and schema respawns
   remain disabled, the full verify runs once more, and no third tasker or
@@ -402,7 +418,8 @@ than made launchable against a main without the code it describes.
   for concrete material work with a standalone definition of done; the cap is
   a ceiling, not a target, and filing never clears the current PR's blockers.
 - The initial review's findings are actionable as they stand: there is no
-  confirmation pass before repair. Findings spawn ONE fresh fixer, which must
+  confirmation pass before repair. Findings go to ONE fixer in the run's
+  builder conversation, which must
   account for every finding with an indexed disposition — fixed, disputed with
   concrete code evidence, or deferred as unsafe to repair. Missing, duplicate,
   extra or ambiguous coverage blocks the run at `triage`. Titles are not
@@ -442,14 +459,16 @@ than made launchable against a main without the code it describes.
   `correction-required` (every blocker is a concrete implementation defect) or
   `human`. Malformed, incomplete, duplicate, extra, unknown, ambiguous or
   low-confidence evidence authorizes nothing. On `correction-required` the
-  unpushed repair is preserved exactly as it is and ONE fresh writable
-  correction runs in the same invocation over the whole batch — no cleanup, no
-  restored queue, no consumed retry rung, no second whole fixer — then the full
-  verify contract again and ONE narrow read-only confirmation that receives the
-  complete cumulative delta and the exact correction delta but never the
-  correction's narrative. A missing or declined blocker disposition, no relevant
-  change, a red second verify, or a refused, dead or malformed confirmation ends
-  human-held; there is no second correction batch. Distinct usage labels record
+  unpushed repair is preserved exactly as it is and ONE writable correction
+  runs in the same invocation over the whole batch — epic-run continues its
+  builder conversation; the standalone fixers start a fresh process. There is
+  no cleanup, restored queue, consumed retry rung or second whole fixer; then
+  the full verify contract runs again and ONE narrow read-only confirmation
+  receives the complete cumulative delta and the exact correction delta but
+  never the correction's narrative. A missing or declined blocker disposition,
+  no relevant change, a red second verify, or a refused, dead or malformed
+  confirmation ends human-held; there is no second correction batch. Distinct
+  usage labels record
   the initial repair, the acceptance check, the correction and the confirmation,
   so a correction is never counted as a pipeline relaunch. Gated by
   `tests/epic-run.test.sh`.
@@ -473,10 +492,10 @@ than made launchable against a main without the code it describes.
   ship without another gate (an empty review, a cleared final review) are
   exactly where nothing else would catch it. Gated by `tests/epic-run.test.sh`.
 - Deferrals never gate the merge: `kind` only ranks which items earn a
-  follow-up issue and what the deferred record says. Every model process in the
-  run — architect, code, review, fixer, final review, correction — is a
-  short-lived process that ends when it returns; nothing resumes or continues an
-  earlier one. Gated by `tests/epic-run.test.sh`.
+  follow-up issue and what the deferred record says. Every model call runs in a
+  short-lived process that ends when it returns; epic-run's writable calls
+  continue the run's compatible builder conversation, while its judging calls
+  remain fresh. Gated by `tests/epic-run.test.sh`.
 - There is no dedicated delivery-prose call. The coding phase returns the run's
   delivery record beside its own account — title, durable commit rationale, the
   project's own legal marker, and what it deliberately left undone — a deferred

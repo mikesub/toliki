@@ -52,25 +52,27 @@
 // architect-selected focused reviewer is gone, because a second pre-repair
 // opinion bought less than one exhaustive acceptance check after the repair.
 // Its findings are actionable as they stand — there is no pre-repair
-// confirmation pass. Findings spawn ONE fresh fixer, which accounts for every
-// finding as fixed, disputed with code evidence, or deferred as unsafe to
-// repair. The orchestrator then runs verify (one retry, exactly as after code)
-// and, when the fixer changed code or disputed/deferred anything, spawns ONE
-// fresh read-only final review over the original requirement, every original
-// finding, the complete diff and the exact repair delta — never the fixer's
-// explanation, so it judges the code rather than agreeing with the story. That
-// final review IS this repair's exhaustive acceptance check: it decides every
-// finding, names everything the repair broke and everything the requirement
-// still lacks, in one answer rather than one sufficient refutation.
+// confirmation pass. Findings go to ONE fixer, which continues the run's
+// builder conversation and accounts for every finding as fixed, disputed with
+// code evidence, or deferred as unsafe to repair. The orchestrator then runs
+// verify (one retry, exactly as after code) and, when the fixer changed code or
+// disputed/deferred anything, spawns ONE fresh read-only final review over the
+// original requirement, every original finding, the complete diff and the exact
+// repair delta — never the fixer's explanation, so it judges the code rather
+// than agreeing with the story. That final review IS this repair's exhaustive
+// acceptance check: it decides every finding, names everything the repair broke
+// and everything the requirement still lacks, in one answer rather than one
+// sufficient refutation.
 //
 // When the batch it leaves is made ENTIRELY of concrete defects it positively
-// showed, one scoped correction runs right here — in this process, on this
-// worktree, before the PR exists — over exactly those blockers, followed by the
-// full verify contract again and ONE narrow read-only confirmation that proves
-// the batch cleared and nothing else broke. That is why nothing here queues
-// needs-defect-fix any more: the concrete-only hold is the case the correction
-// takes, and a mixed or uncertain hold never earned an automated repair. There
-// is no second correction batch; every other way this can end holds the PR at
+// showed, one scoped correction runs right here — in this run's builder
+// conversation, on this worktree, before the PR exists — over exactly those
+// blockers, followed by the full verify contract again and ONE narrow read-only
+// confirmation, itself a fresh process, that proves the batch cleared and
+// nothing else broke. That is why nothing here queues needs-defect-fix any
+// more: the concrete-only hold is the case the correction takes, and a mixed or
+// uncertain hold never earned an automated repair. There is no second
+// correction batch; every other way this can end holds the PR at
 // ready-to-review for a human. defect-run remains, for durable evidence older
 // runs already published.
 //
@@ -79,10 +81,25 @@
 // repair regression, no unmet requirement.
 //
 // Every model process here is short-lived: each agent() call is a new process
-// that ends when it returns, and nothing resumes or continues an earlier one.
-// The fresh fixer and the fresh final reviewer rebuild their context from the
-// requirement, the findings and the diffs, which costs some re-exploration and
-// buys an adjudication that owes the previous process nothing.
+// that ends when it returns. What can outlive one is the run's BUILDER
+// CONVERSATION — a session lib/runtime.mjs opens on the first writable call and
+// continues on the writable ones after it: the RED and implementation retries,
+// the fixer that answers the review's findings, its own verify retry, and the
+// one scoped correction. A repair used to be a stranger to work that was
+// minutes old, re-reading the tree to rediscover an implementation this run had
+// just written; now the process that wrote it is the one that answers for it.
+// The prompts below did not shrink for that: each still carries the complete
+// captured brief, so a conversation that could not be continued costs context
+// and never correctness.
+//
+// The judging steps are deliberately NOT in it. The architect, the broad
+// reviewer, the final review and the narrow confirmation each start a fresh
+// ephemeral process that owes the builder nothing and never sees its account of
+// what it did — that independence is the whole value of the adjudication, and
+// it is why reuse stops exactly at the writable steps. Ship starts no model.
+// Routing is never bent to keep a conversation either: a phase whose
+// etc/engines.json row differs from the one the conversation was opened on
+// starts its own rather than being retiered into it.
 //
 // Deferrals are a record, not a gate: what the coding phase and the fixer class
 // as deferred work becomes follow-up prose and at most three follow-up issues,
@@ -102,7 +119,7 @@
 import { existsSync, lstatSync, readFileSync, readdirSync, readlinkSync, writeFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import path from 'node:path'
-import { agent, phase, log, initRuntime, onPhase, onLog, takeAgentFailure, withAgentFailure } from './lib/runtime.mjs'
+import { agent, phase, log, initRuntime, onPhase, onLog, takeAgentFailure, withAgentFailure, conversation } from './lib/runtime.mjs'
 import { parseArgs, finish, UsageError, EXIT } from './lib/cli.mjs'
 import { initStatus, statusPhase, statusNote, statusFinish } from './lib/status.mjs'
 import { failureReason, must } from './lib/proc.mjs'
@@ -945,6 +962,11 @@ const applyDiscovery = (pkgs) => {
 
 async function main() {
   const blockerIdentity = createBlockerIdentityRegistry()
+  // The run's one writable conversation. Every writable call below passes it;
+  // no judging call does. It holds one session per engine row, so a mixed
+  // engine whose code and repair rows differ keeps two compatible builders
+  // rather than moving either phase off the model it was routed to.
+  const builder = conversation('builder')
 try {
   // ───────────────────────── Phase 0: Prepare (issue mode only) ─────────────────────────
   if (gitMode) {
@@ -1096,7 +1118,7 @@ try {
       const redBaseline = await redTreePaths()
 
       red = await agent(codeRedPrompt(dir, requirement),
-        { label: 'code:red', phase: 'Code', step: 'code', schema: RED_SCHEMA },
+        { label: 'code:red', phase: 'Code', step: 'code', schema: RED_SCHEMA, conversation: builder },
       )
       if (!validRed(red)) return await fail('code', 'Red step returned no meaningful test files, assertion excerpt, or reason — aborting before implementation.')
       let redProblem = await redTreeProblem(red, redBaseline)
@@ -1107,7 +1129,7 @@ try {
           : `verify failed, but not with the reported assertion excerpt or a runnable test failure (${gate.detail})`)
         log(`Code: RED was not established — respawning the red step once (${rejection}).`)
         red = await agent(codeRedPrompt(dir, requirement) + redRetryPrompt(rejection),
-          { label: 'code:red:retry', phase: 'Code', step: 'code', schema: RED_SCHEMA, retry: true },
+          { label: 'code:red:retry', phase: 'Code', step: 'code', schema: RED_SCHEMA, retry: true, conversation: builder },
         )
         if (!validRed(red)) return await fail('code', 'Red step returned no meaningful evidence on its retry — aborting before implementation.')
         redProblem = await redTreeProblem(red, redBaseline)
@@ -1124,11 +1146,11 @@ try {
       }
 
       green = await agent(codeGreenPrompt(dir, requirement, red),
-        { label: 'code:green', phase: 'Code', step: 'code', schema: CODE_SCHEMA },
+        { label: 'code:green', phase: 'Code', step: 'code', schema: CODE_SCHEMA, conversation: builder },
       )
     } else {
       green = await agent(codeDirectPrompt(dir, requirement),
-        { label: 'code:direct', phase: 'Code', step: 'code', schema: CODE_SCHEMA },
+        { label: 'code:direct', phase: 'Code', step: 'code', schema: CODE_SCHEMA, conversation: builder },
       )
     }
     if (!validCodeResult(green)) return await fail('code', 'Implementation step failed or returned no usable delivery record — aborting before review, because nothing later in this run writes the title, commit rationale or deferred-work ledger it owes.')
@@ -1140,7 +1162,7 @@ try {
       : codeGreenPrompt(dir, requirement, red)
     log('Code: verify is red after implementation — respawning implementation once with the failure.')
     green = await agent(implementationPrompt + verifyRetryPrompt(gate),
-      { label: design.verification.mode === 'direct' ? 'code:direct:retry' : 'code:green:retry', phase: 'Code', step: 'code', schema: CODE_SCHEMA, retry: true },
+      { label: design.verification.mode === 'direct' ? 'code:direct:retry' : 'code:green:retry', phase: 'Code', step: 'code', schema: CODE_SCHEMA, retry: true, conversation: builder },
     )
     if (!validCodeResult(green)) return await fail('code', 'Implementation step failed or returned no usable delivery record on its retry — aborting before review.')
     gate = await verifyGate('Code: verify gate (retry)')
@@ -1226,8 +1248,11 @@ try {
   // ───────────────────────── Phase 4: One repair, then one independent final review ─────────────────────────
   // A straight line, never a loop: the fixer accounts for every finding, the
   // orchestrator proves the tree with verify, and one fresh read-only review
-  // decides what actually holds. Both processes are spawned here and end when
-  // they return; neither resumes the implementation agent's session.
+  // decides what actually holds. The fixer continues the run's builder
+  // conversation — the findings reach the process that wrote the code, still
+  // with the whole captured brief in its prompt — while the final review is a
+  // fresh process that inherits nothing from it, which is what makes its
+  // verdict independent rather than agreement.
   currentPhase = 'triage'
   phase('Fixes after review')
 
@@ -1246,7 +1271,7 @@ try {
     // would dispute findings against evidence nothing else in the run saw.
     const repairPrompt = fixPrompt(items, requirement, reviewDiff)
     let assessed = await agent(repairPrompt,
-      { label: 'fixes-after-review', phase: 'Fixes after review', step: 'fixes-after-review', schema: TRIAGE_SCHEMA })
+      { label: 'fixes-after-review', phase: 'Fixes after review', step: 'fixes-after-review', schema: TRIAGE_SCHEMA, conversation: builder })
     if (!validAssessments(assessed, items.length)) {
       return await fail('triage', `fixes-after-review produced no complete assessment with unique indices and evidence for ${items.length} finding(s) — refusing to drop an unassessed finding.`)
     }
@@ -1254,7 +1279,7 @@ try {
     if (!fixGate.green) {
       log('Fixes after review: verify is red — respawning once with the failure.')
       assessed = await agent(repairPrompt + verifyRetryPrompt(fixGate),
-        { label: 'fixes-after-review:retry', phase: 'Fixes after review', step: 'fixes-after-review', schema: TRIAGE_SCHEMA, retry: true })
+        { label: 'fixes-after-review:retry', phase: 'Fixes after review', step: 'fixes-after-review', schema: TRIAGE_SCHEMA, retry: true, conversation: builder })
       if (!validAssessments(assessed, items.length)) {
         return await fail('triage', 'fixes-after-review produced no complete assessment on its verify retry — refusing to drop an unassessed finding.')
       }
@@ -1437,7 +1462,7 @@ try {
       log(`Correction: ${batch.length} concrete blocker(s) from the final review — running one scoped correction (${batch.map(entry => entry.id).join(', ')}).`)
       const corrected = await agent(
         correctionPrompt(requirement, batch, repairDelta || '(the repair delta could not be captured)', finalVerify?.detail || 'green'),
-        { label: 'correction', phase: 'Correction', step: 'fixes-after-review', schema: CORRECTION_SCHEMA, retry: true })
+        { label: 'correction', phase: 'Correction', step: 'fixes-after-review', schema: CORRECTION_SCHEMA, retry: true, conversation: builder })
       if (!corrected) {
         // The correction is a writable repair step: a death here is operational
         // — quota, an interrupted process, transport — and keeps the resumable

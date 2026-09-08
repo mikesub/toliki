@@ -38,6 +38,33 @@
 // session reaped mid-sentence.
 // Pane narration uses the configured host-zone human clock; usage records keep
 // the separate UTC ISO timestamp another script parses.
+//
+// ONE BUILDER CONVERSATION PER RUN. A writable step's later retries and repairs
+// used to be strangers to the work they were repairing: each spawn re-read the
+// tree to rediscover an implementation the previous process had just written.
+// conversation() opens a handle a pipeline passes to its writable calls, and
+// agent() resumes it (see lib/engine.mjs), so a verify failure, a review
+// finding or a bounded correction reaches the builder that already holds the
+// implementation. Four properties hold it in place, and each has a test:
+//
+//   * Judgment stays fresh. A handle is only ever passed by a pipeline to its
+//     writable steps; review, final review, confirmation, architect and ship
+//     get none, so an independent process never inherits the builder's own
+//     account of what it did.
+//   * Routing is never bent to reuse context. A handle keeps one session PER
+//     engine row (vendor/model/effort). A phase whose row differs opens its own
+//     conversation and says so; nothing is silently retiered to keep talking.
+//   * Identity is scoped to this run and this worktree. Ids live in memory,
+//     keyed by the run id and cwd the handle was created under, so nothing
+//     crosses issues, worktrees or invocations, and no CLI is ever asked for
+//     "the most recent session". An interrupted run therefore takes its
+//     conversation with it: the relaunch that resumes the branch opens a new
+//     builder rather than reaching into a dead run's session.
+//   * Unavailable context is explicit, never silent. A session the CLI did not
+//     report, or one it can no longer find, is dropped with a logged reason and
+//     the run continues on the fresh, fully briefed prompt every phase still
+//     carries — one extra process only where the caller's own contract already
+//     allows a respawn.
 
 import os from 'node:os'
 import { resolveEngine, resolveVendor, STEPS, terminateAll, isTransient } from './engine.mjs'
@@ -218,6 +245,54 @@ function release() {
   else inFlight--
 }
 
+// ───────────────────────── conversations ─────────────────────────
+// A handle a pipeline hands to its writable steps. It carries no session of its
+// own: it holds one entry per engine row it has been used on, so a run whose
+// code and repair rows differ keeps two compatible conversations rather than
+// one retiered conversation. Created by the pipeline, never module state — two
+// handles in one process (there are none today) would simply be two builders.
+export function conversation(name = 'builder') {
+  return { name, runId: RUN_ID, cwd: process.cwd(), routes: new Map() }
+}
+
+// The entry this call may use, or null when it must run fresh. Every refusal
+// says why on the pane: a conversation nobody can see the boundaries of is
+// worse than none.
+function conversationEntry(convo, route, label) {
+  if (!convo) return null
+  // Belt for the identity rule: a handle only ever belongs to the run and the
+  // worktree it was created in. Neither can change inside one process today,
+  // which is exactly why an unnoticed change later must not silently reuse.
+  if (convo.runId !== RUN_ID || convo.cwd !== process.cwd()) {
+    log(`${label}: not reusing the ${convo.name} conversation — it was opened by another run or worktree; this phase runs fresh`)
+    return null
+  }
+  const existing = convo.routes.get(route)
+  if (existing?.unusable) {
+    log(`${label}: the ${convo.name} conversation for ${route} is unusable (${existing.unusable}) — this phase runs fresh on its own brief`)
+    return null
+  }
+  if (existing) return existing
+  const others = [...convo.routes.keys()]
+  if (others.length) {
+    log(`${label}: ${route} does not match the ${convo.name} conversation on ${others.join(', ')} — opening its own rather than switching vendor, model or effort to reuse context`)
+  }
+  const entry = { route, id: null, spawns: 0, unusable: null }
+  convo.routes.set(route, entry)
+  return entry
+}
+
+// A conversation that cannot be continued is dropped here, once, with the
+// reason it is dropped. That route then stays fresh for the rest of the run
+// rather than reopening: a CLI that just lost or never recorded a session has
+// said what it can do, and one clear line beats a drop notice per phase.
+function dropConversation(convo, entry, label, why) {
+  if (!entry || entry.unusable) return
+  entry.unusable = why
+  entry.id = null
+  log(`${label}: dropping the ${convo.name} conversation for ${entry.route} — ${why}`)
+}
+
 // ───────────────────────── agent ─────────────────────────
 // One pipeline step = one vendor process. opts:
 //   label      short name for the log line (e.g. 'review:2')
@@ -231,8 +306,13 @@ function release() {
 //              transient respawn inside this call
 //   respawn    false makes this call a strict one-process contract: transient
 //              failures and invalid structured output return null immediately
+//   conversation  a handle from conversation(): this call continues that
+//              builder's own session when the run already opened one on this
+//              step's engine row, and opens it when it did not. Judgment steps
+//              pass none and stay ephemeral. Every prompt remains a complete
+//              brief, so a dropped conversation costs context, never correctness
 export async function agent(prompt, opts = {}) {
-  const { label = 'agent', step, schema, timeoutMs = DEFAULT_TIMEOUT_MS, retry = false, respawn = true } = opts
+  const { label = 'agent', step, schema, timeoutMs = DEFAULT_TIMEOUT_MS, retry = false, respawn = true, conversation: convo = null } = opts
   lastAgentFailure = null
   const agentType = STEPS[step]
   if (!ENGINE || !agentType) {
@@ -262,6 +342,13 @@ export async function agent(prompt, opts = {}) {
     return null
   }
 
+  // One session per engine row, so continuing a conversation can never move a
+  // phase off the vendor, model or effort etc/engines.json gave it. Resolved
+  // after the ordering gate: a refused spawn must not narrate a conversation it
+  // was never going to open.
+  const route = `${vendorName}/${model}/${effort}`
+  const entry = conversationEntry(convo, route, label)
+
   let attempts = 0
   const rememberFailure = (r, reason = r?.reason, kind = failureKind({ ...r, reason })) => {
     const failure = {
@@ -272,13 +359,20 @@ export async function agent(prompt, opts = {}) {
     // quota, a later ordinary failure must not hide the admission signal.
     if (lastAgentFailure?.kind !== 'quota-exhausted' || kind === 'quota-exhausted') lastAgentFailure = failure
   }
-  const attempt = async (why) => {
+  const attempt = async (why, { fresh = false } = {}) => {
     await acquire()
     const started = Date.now()
     attempts++
+    // Read per attempt, never captured once: a fallback attempt after a dropped
+    // session must go out as a genuinely fresh process.
+    const useEntry = fresh ? null : entry
+    const resumed = !!useEntry?.id
     let r
     try {
-      r = await vendor.run({ prompt, agentType, model, effort, schema, cwd: process.cwd(), timeoutMs, label, step })
+      r = await vendor.run({
+        prompt, agentType, model, effort, schema, cwd: process.cwd(), timeoutMs, label, step,
+        conversation: useEntry ? { id: useEntry.id } : null,
+      })
       r = { ...r, elapsedMs: Date.now() - started }
     } catch (e) {
       // An adapter is contracted not to throw; if one ever does, it must still
@@ -288,17 +382,27 @@ export async function agent(prompt, opts = {}) {
       release()
       const secs = Math.round((Date.now() - started) / 1000)
       // Name what ran it: engines can mix vendors per step, so the pane is the
-      // record of which model produced which artifact.
-      log(`${label}${why ? ` (${why})` : ''}: ${secs}s [${vendorName} ${model}/${effort}]`)
+      // record of which model produced which artifact — and whether it carried
+      // the run's builder context or started cold.
+      const context = useEntry ? ` ${resumed ? 'continuing' : 'opening'} the ${convo.name} conversation` : ''
+      log(`${label}${why ? ` (${why})` : ''}: ${secs}s [${vendorName} ${model}/${effort}]${context}`)
+    }
+    if (useEntry) {
+      useEntry.spawns++
+      if (r.sessionId) useEntry.id = r.sessionId
+      else if (r.ok) dropConversation(convo, useEntry, label, 'the CLI reported no resumable session id')
     }
     // One line in the usage log per spawn, failed ones included: they cost
     // tokens too, and a retry that always costs a second spawn should show.
+    // `resumed` separates a spawn that carried the builder's context from one
+    // that paid to rediscover it.
     recordUsage({
       type: 'spawn', ts: new Date(started).toISOString(), ...runIdentity(),
       step, label, attempt: attempts, retry: !!retry, vendor: vendorName, model, effort,
       ok: !!r.ok, timedOut: !!r.timedOut, ms: r.elapsedMs,
       tokens: r.usage?.tokens || { input: null, output: null, cacheRead: null, cacheCreate: null, total: null },
       costUsd: r.usage?.costUsd ?? null, costSource: r.usage?.costSource ?? null, turns: r.usage?.turns ?? null,
+      conversation: convo ? convo.name : null, resumed,
       failureKind: r.ok ? null : failureKind(r), failureReason: r.ok ? null : r.reason || null,
     })
     return r
@@ -317,7 +421,19 @@ export async function agent(prompt, opts = {}) {
   }
 
   let r = await attempt()
-  if (respawn && !r.ok && retryable(r)) {
+  // A resume that failed because the session is gone is not a verdict on the
+  // work and not a transient error: the context is simply unavailable. Drop it
+  // so no later phase resumes a corpse, then start fresh where this call's own
+  // contract allows a second process at all — task-run's does not, and its
+  // two-invocation ceiling is preserved by the same `respawn: false` that
+  // already governs every other second spawn.
+  if (!r.ok && r.sessionMissing) {
+    dropConversation(convo, entry, label, `the recorded session could not be resumed (${r.reason})`)
+    if (respawn) {
+      log(`${label}: ${r.reason} — respawning once on a fresh process with the same complete brief`)
+      r = await attempt('fresh process after an unresumable session', { fresh: true })
+    }
+  } else if (respawn && !r.ok && retryable(r)) {
     log(`${label}: ${r.reason} — respawning once (transient)`)
     r = await attempt('transient retry')
   }

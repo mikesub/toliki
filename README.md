@@ -40,9 +40,13 @@ to it.
    test-first red/green or a direct coding step. Both paths pass the project's
    verify gate run by the orchestrator. ONE broad reviewer runs, and it is the
    only broad review of the change.
-   Findings go to one fresh fixer, which repairs, disputes or defers each one;
-   the orchestrator then re-runs the verify gate. One fresh read-only final
-   review decides every finding against the final tree, the complete diff and
+   Findings go to one fixer, which repairs, disputes or defers each one; it
+   continues the run's own builder conversation rather than rediscovering an
+   implementation this run wrote minutes earlier, and its prompt still carries
+   the complete captured brief.
+   The orchestrator then re-runs the verify gate. One fresh read-only final
+   review — a process that inherits nothing from the builder — decides every
+   finding against the final tree, the complete diff and
    the exact repair delta, and names any repair regression or unmet
    requirement — one exhaustive answer, not the first refutation it finds.
    There is no second repair round. When everything it leaves open is a
@@ -76,10 +80,10 @@ to it.
    candidate, publishes its evidence and hands it to the merge worker. It
    intentionally omits architecture and independent review. Malformed output,
    a tasker blocker or a non-quota provider/process failure blocks without a
-   respawn. A normal red first verification gets one fresh tasker with the
-   captured diagnostics and one final full verify; no third tasker or
-   rebase-time repair is allowed. A hard quota preserves the work and restores
-   `ready` with `task` and its route intact.
+   respawn. A normal red first verification continues the same tasker
+   conversation with the captured diagnostics and runs one final full verify;
+   no third tasker or rebase-time repair is allowed. A hard quota preserves the
+   work and restores `ready` with `task` and its route intact.
 4. **`bin/merge-worker.sh`** (cron) — one PR at a time per repo: rebase onto
    current main, give checks time to register, then wait for every published
    check on the rebased head and squash-merge. It explicitly supplies the full
