@@ -169,19 +169,21 @@ two logical calls, depending on resume state and verification mode.
 2. A fresh `test-first` plan begins with orchestrator-run `npm run verify` in
    every discovered package. A red baseline blocks; it cannot be mistaken for
    the requested regression.
-3. The RED `coder` process writes tests only and reports the exact expected
-   assertion excerpt and why it proves missing required behavior.
-4. The orchestrator runs verify and accepts RED only when a runnable test
-   failure contains that exact assertion evidence. A green result, timeout,
-   spawn error, unrelated failure, or different assertion is rejected.
+3. The RED `coder` process writes tests only, without executing them, and
+   identifies the exact intended failing test/assertion plus why it proves
+   missing required behavior.
+4. The orchestrator confirms the RED delta contains exactly the declared test
+   files, then runs verify and accepts RED only when every failing package
+   contains that exact assertion evidence. A green result, timeout, spawn
+   error, undeclared-file failure, or different assertion is rejected.
 5. One explicit RED retry is allowed. A second failure to establish meaningful
    RED blocks before implementation.
 6. The GREEN `coder` process implements the architecture against the failing
    tests. In `direct` mode, one `coder` process instead implements the change
    and adds or updates useful tests in the same pass.
-7. The coder may use `npm run verify` as its feedback loop, but it does not own
-   the verdict and may not commit or push.
-8. The orchestrator runs `npm run verify` in every discovered package. The exit
+7. The coder returns its edits without running tests, builds, linters, type
+   checks, or the project verification command, and may not commit or push.
+8. The orchestrator alone runs `npm run verify` in every discovered package. The exit
    codes and bounded, terminal-formatting-free output are the authoritative
    evidence used in prompts, logs, and GitHub comments.
 9. If verification is red, the implementation process is respawned once with
@@ -456,7 +458,10 @@ session name and durable engine pin. Each has a two-rung attempt ladder: first
 attempt, one retry, then human intervention. Their common sequence lives in
 [`workflows/lib/fixer-lifecycle.mjs`](../workflows/lib/fixer-lifecycle.mjs):
 Prepare evidence, run one writable repair agent, run orchestrator verification,
-run one exhaustive acceptance check, then publish.
+run one exhaustive acceptance check, then publish. If the first repair is red,
+the orchestrator gives one fresh repair process its bounded captured diagnostics
+and runs the full gate again before any acceptance check. This in-run diagnostic
+retry does not consume another durable attempt-ladder rung.
 
 All three share the **bounded repair contract** in
 [`workflows/lib/repair-acceptance.mjs`](../workflows/lib/repair-acceptance.mjs),
@@ -497,8 +502,9 @@ the same contract epic-run's Final review and Correction use:
 
 **Entry:** `failed` + `needs-judgment`. **Script:**
 [`workflows/fix-run.mjs`](../workflows/fix-run.mjs). **LLM calls:** normally two
-(`fix-conflicts`, then `final-review` as the acceptance check), and up to four
-when a correction runs.
+(`fix-conflicts`, then `final-review` as the acceptance check), up to three when
+verification needs a repair retry, up to four when a correction runs, and five
+when both paths are needed.
 
 1. Dispatch moves the resting issue to `in-progress` before launching and the
    fixer verifies the exact engine pin, queue evidence, unique PR, and available
@@ -510,9 +516,11 @@ when a correction runs.
    guessing.
 4. The orchestrator validates every indexed disposition, completed rebase
    shape, marker cleanup, and allowed edit boundary.
-5. It runs `npm run verify`, then the acceptance check tries to refute every
-   repaired hunk and prove every declined hunk retained the exact PR-side text,
-   returning the complete blocker batch rather than the first refutation.
+5. It runs `npm run verify`; a red result and its captured diagnostics go back
+   to one fresh resolver before the full gate runs again. Only a green tree
+   reaches the acceptance check, which tries to refute every repaired hunk and
+   prove every declined hunk retained the exact PR-side text, returning the
+   complete blocker batch rather than the first refutation.
 6. A `correction-required` batch gets one scoped correction that must keep both
    sides' authenticated intent; its edits go into the same amended commit, and
    the verify contract and narrow confirmation run again before any push.
@@ -526,8 +534,9 @@ when a correction runs.
 
 **Entry:** `failed` + `needs-ci-fix`. **Script:**
 [`workflows/ci-run.mjs`](../workflows/ci-run.mjs). **LLM calls:** normally two
-(`fix-ci`, then `final-review` as the acceptance check), and up to four when a
-correction runs.
+(`fix-ci`, then `final-review` as the acceptance check), up to three when
+verification needs a repair retry, up to four when a correction runs, and five
+when both paths are needed.
 
 1. It verifies routing, queue state, unique PR/head, and its independent CI
    attempt ladder.
@@ -538,7 +547,8 @@ correction runs.
    change only the smallest code necessary to fix the cause. It may not weaken
    a test, type, lint rule, assertion, or check.
 4. The orchestrator validates the indexed dispositions and runs the full
-   `npm run verify` contract.
+   `npm run verify` contract. A red result and its captured diagnostics go back
+   to one fresh fixer before the full gate runs again; a second red blocks.
 5. The acceptance check inspects the orchestrator-captured repair delta and
    refutes by default if a cause remains, a gate was weakened, a decline
    changed, or unrelated behavior moved.
@@ -555,8 +565,9 @@ correction runs.
 **Entry:** `ready-to-review` + `needs-defect-fix`, and only in repos opted into
 automatic defect repair. Manual launch remains possible. **Script:**
 [`workflows/defect-run.mjs`](../workflows/defect-run.mjs). **LLM calls:** normally
-two (`fixes-after-review`, then `final-review` as the acceptance check), and up
-to four when a correction runs.
+two (`fixes-after-review`, then `final-review` as the acceptance check), up to
+three when verification needs a repair retry, up to four when a correction
+runs, and five when both paths are needed.
 
 Epic-run no longer publishes new defect evidence or writes `needs-defect-fix`:
 that hold now gets its one scoped correction inside the epic. This fixer remains
@@ -570,8 +581,10 @@ manual launch stays available.
    prose.
 3. The fixer may repair only the numbered, gate-confirmed defects and must
    account for each as repaired or declined without reclassification.
-4. The orchestrator validates exact coverage, runs `npm run verify`, and
-   intent-adds new files so the complete delta reaches the checker.
+4. The orchestrator validates exact coverage and runs `npm run verify`. A red
+   result and its captured diagnostics go back to one fresh fixer before the
+   full gate runs again; a second red blocks. It intent-adds new files only
+   after verification is green so the complete delta reaches the checker.
 5. The acceptance check tries to refute each repair, prove declines were
    untouched, detect weakened gates, and reject unrelated behavior, returning
    the complete blocker batch rather than the first refutation.

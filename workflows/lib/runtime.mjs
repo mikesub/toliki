@@ -58,9 +58,9 @@ let ENGINE = null
 const MAX_PARALLEL_AGENTS = Number(process.env.EPIC_MAX_PARALLEL_AGENTS) ||
   Math.min(16, Math.max(1, os.cpus().length - 2))
 
-// Generous by design: code:green runs the project's whole verify gate, which
-// can legitimately boot a database tier. A step this long is pathological,
-// not slow.
+// Generous by design: writable model steps can still perform substantial code
+// exploration and edits. Deterministic project verification has its own timeout
+// in repo.mjs and is never run inside one of these model processes.
 const DEFAULT_TIMEOUT_MS = Number(process.env.EPIC_AGENT_TIMEOUT_MS) || 90 * 60 * 1000
 
 // A step that died this quickly with no payload never got to work: an auth or

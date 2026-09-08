@@ -150,20 +150,20 @@ Read ${dir}/requirements.md and inspect the existing implementation with \`${dif
 
   codeRed: (dir) =>
 `Code phase, RED step. Write tests ONLY (no implementation). Read ${dir}/requirements.md and ${dir}/architecture.md, and derive tests from the requirements + the public contract/API surface. Cover what is genuinely testable in this stack (units, pure logic, backend handlers, frontend component behavior); for hard-to-test surfaces (canvas/visual, external I/O), SKIP and note in ${dir}/epic.md what is uncovered and why — do not fake a test.
-Return structured testFiles, the exact distinctive assertion-failure excerpt you observed as expectedFailure, and why that failure demonstrates the missing required behavior. A typo, missing import, infrastructure error, timeout, or unrelated failure is not valid RED. The pipeline then runs \`npm run verify\` itself and requires that excerpt in its own failure output.`,
+Do not run tests or any verification command. Return structured testFiles, the exact distinctive assertion-failure excerpt the intended assertion should produce as expectedFailure, and why that assertion demonstrates the missing required behavior. A typo, missing import, infrastructure error, timeout, or unrelated failure is not valid RED. The pipeline runs \`npm run verify\` itself and requires that excerpt in its own failure output.`,
 
-  codeGreen: (dir, red, pkgs) =>
+  codeGreen: (dir, red) =>
 `Code phase, GREEN step. Read ${dir}/architecture.md and ${dir}/requirements.md and the existing failing tests:
 ${JSON.stringify(red, null, 2)}
 
-Implement the feature to make those tests pass, following architecture.md's build steps. Note any scope decision or wrong-test fix in ${dir}/epic.md's phase log. Run \`npm run verify\` in EACH touched package (this repo's packages: ${pkgs}) until green — that script is the project's whole gate, so whatever it runs (including any real-database tier it triggers for itself) has to be green, not just the unit tests.
-Leave everything in the working tree: do NOT commit or push; the pipeline checkpoints your work itself, and re-runs \`npm run verify\` after you return — a red run comes back to you once, then blocks the run. Return a short status: packages verified green, and any in-flight decisions or remaining failures you could not resolve.`,
+Implement the feature to make those tests pass, following architecture.md's build steps. Note any scope decision or wrong-test fix in ${dir}/epic.md's phase log.
+Do not run tests or any verification command. Leave everything in the working tree: do NOT commit or push. The pipeline checkpoints your work and runs the full project gate itself after you return; if it is red, its captured diagnostics come back to one fresh repair attempt. Return a short status covering the edits, in-flight decisions, and anything you could not resolve.`,
 
-  codeDirect: (dir, pkgs) =>
+  codeDirect: (dir) =>
 `Code phase, direct implementation. Read ${dir}/requirements.md and ${dir}/architecture.md, then implement the feature in one coherent pass. Add or update tests where they meaningfully prove the architecture's verification evidence; do not manufacture a test for an untestable surface.
 
-Follow the architecture while preserving its requirement and public contract. If a codebase fact makes a planned detail wrong or impractical, make the smallest justified adjustment and record it in ${dir}/epic.md's phase log. Run \`npm run verify\` in EACH touched package (this repo's packages: ${pkgs}) until green.
-Leave everything in the working tree: do NOT commit or push; the pipeline checkpoints your work itself and re-runs verify after you return. Return a short status including evidence produced, tests added or updated, justified plan adjustments, and remaining failures.`,
+Follow the architecture while preserving its requirement and public contract. If a codebase fact makes a planned detail wrong or impractical, make the smallest justified adjustment and record it in ${dir}/epic.md's phase log.
+Do not run tests or any verification command. Leave everything in the working tree: do NOT commit or push. The pipeline checkpoints your work and runs the full project gate itself after you return; if it is red, its captured diagnostics come back to one fresh repair attempt. Return a short status including evidence produced, tests added or updated, justified plan adjustments, and unresolved implementation questions.`,
 
   review: (requirement, changeDiff) =>
 `Independently review this change for requirements coverage, meaningful defects or regressions, and whether the verification adequately proves the changed behavior. Prioritize concrete consequences over stylistic preferences. This is the ONE broad review of this change: nothing else looks at it this widely, so cover the whole diff rather than a slice of it.
@@ -181,7 +181,7 @@ ${changeDiff}
 Use the read-only source-tree tools for surrounding context. Do NOT open ANY file under \`.epics/\` — architecture.md, epic.md, review.md and summary.md all encode the builder's intended behavior and would anchor you; you have the requirement above and do not need that directory.
 If nothing meets your confidence bar, return an empty findings array.`,
 
-  fix: (dir, pkgs, items, diffCmd) =>
+  fix: (dir, items, diffCmd) =>
 `Assess and repair review findings, autonomous (NO user sign-off). The findings below are claims to investigate, not established defects; there is no separate confirmation pass, and this is the only repair round.
 Read ${dir}/requirements.md, the source tree and \`${diffCmd}\` for the change under review. For each numbered finding, either fix the actual defect, dispute a false positive with concrete code evidence, or defer it with the reason it cannot safely be repaired. Never repair code merely to satisfy a mistaken review.
 
@@ -195,7 +195,7 @@ Regression evidence: ${item.finding.gate}`).join('\n\n')}
 
 Apply the smallest correct repair, highest severity first. Add or update meaningful regression evidence, following the project's explicit verification rules. For a repair whose correctness a reader cannot establish from the diff alone, provide a regression test that fails without the fix and passes with it, or a code change that removes the exact ambiguity the finding named. Multiple findings may describe one fault: one repair may satisfy them, but return a separate assessment for EVERY finding. Do not add unrelated refactors, abstractions, hardening rules or speculative follow-ups. Update existing documentation when a necessary repair changes its contract. Shared harness skills, agents and pipeline files outside this project remain out of scope.
 Never weaken, skip or delete a test, assertion, type or lint rule to make a check pass. If an item cannot safely be decided, defer it instead of guessing.
-Record material decisions and remaining work in ${dir}/epic.md's phase log. Run \`npm run verify\` in each touched package (${pkgs}) until green. Leave edits in the working tree: do NOT commit or push. The orchestrator checkpoints and runs verify itself.
+Record material decisions and remaining work in ${dir}/epic.md's phase log. Do not run tests or any verification command. Leave edits in the working tree: do NOT commit or push. The orchestrator checkpoints the repair and runs the full project gate; if it is red, its captured diagnostics come back to one fresh repair attempt.
 
 Return status (short summary, use "Finding 3", never a bare #number) and assessments: exactly ${items.length} entries, each with index (the 1-based finding number above), action ("fixed", "disputed", or "deferred"), and reason (concrete evidence for the repair, concrete code evidence disputing the claim, or why it cannot be repaired safely). No missing, duplicate or extra indices.
 Account for every finding: a disputed or deferred one stays open until an independent final review decides it against the code, and that review never sees this explanation. Your account of a repair clears nothing by itself.`,
@@ -205,7 +205,7 @@ Account for every finding: a disputed or deferred one stays open until an indepe
   // preserved exactly as it is, the correction may address only the numbered
   // blockers, and anything it leaves undone goes to a human rather than to
   // another attempt.
-  correction: (dir, pkgs, requirement, batch, repairDelta, verifyDetail) =>
+  correction: (dir, requirement, batch, repairDelta, verifyDetail) =>
 `Correct the blockers an independent final review found in a repair you did not write. The repaired change is already checkpointed and the project's verify gate was GREEN on it (${verifyDetail}); you are amending that work in place, never redoing it and never revisiting anything no blocker names.
 
 The original requirement — the only spec context you get:
@@ -222,7 +222,7 @@ The final review's blockers, each with the observable outcome that clears it:
 ${renderBlockerBatch(batch)}
 
 ${correctionContract({ blockerCount: batch.length })}
-Add or update meaningful regression evidence where a reader could not otherwise establish the correction from the diff alone. Do not add unrelated refactors, abstractions or hardening rules. Run \`npm run verify\` in each touched package (${pkgs}) until green; the orchestrator runs it again itself and a red tree blocks the run. Record material decisions in ${dir}/epic.md's phase log.`,
+Add or update meaningful regression evidence where a reader could not otherwise establish the correction from the diff alone. Do not add unrelated refactors, abstractions or hardening rules. Do not run tests or any verification command; the orchestrator runs the full project gate after you return, and a red tree blocks the run. Record material decisions in ${dir}/epic.md's phase log.`,
 
   // The narrow confirmation: read-only, blind to the correction's own account,
   // and explicitly NOT a second broad review. It proves the batch cleared and
@@ -259,14 +259,14 @@ ${confirmationContract({ blockerCount: batch.length })}`,
   redRetry: (gate) =>
 `
 
-The pipeline rejected your previous RED step: ${gate}. This is your one retry. Rewrite the tests so the project's verify command fails on a distinctive unmet assertion against the public contract in architecture.md, then return that exact observed assertion excerpt. Do not use an import error, timeout, infrastructure failure, or unrelated failure.`,
+The pipeline rejected your previous RED step: ${gate}. This is your one retry. Rewrite the tests so the project's verify command should fail on a distinctive unmet assertion against the public contract in architecture.md, then identify that exact expected assertion excerpt. Do not run the tests yourself, and do not use an import error, timeout, infrastructure failure, or unrelated failure.`,
 
   verifyRetry: (gate) =>
 `
 
 The pipeline ran \`npm run verify\` after your previous attempt and it is RED. This is your one retry; a second red blocks the run for a human.
 ${gate.tail}
-Fix the cause — never by weakening, skipping or deleting a test — and leave every package's verify green.`,
+Repair the reported cause — never by weakening, skipping or deleting a test. Do not run tests or verification yourself; leave the updated working tree for the pipeline's final scripted retry.`,
 
   // The single adjudication point after repair: one fresh, read-only process
   // decides every original finding against the FINAL tree, plus what the repair
@@ -402,7 +402,7 @@ const RED_SCHEMA = {
   type: 'object', additionalProperties: false, required: ['testFiles', 'expectedFailure', 'reason'],
   properties: {
     testFiles: { type: 'array', items: { type: 'string' } },
-    expectedFailure: { type: 'string', description: 'exact distinctive assertion-failure excerpt observed by the agent' },
+    expectedFailure: { type: 'string', description: 'exact distinctive failure excerpt the intended assertion should produce before implementation' },
     reason: { type: 'string', description: 'why the assertion demonstrates missing required behavior' },
   },
 }
@@ -420,9 +420,37 @@ const validDesign = d => matchesSchema(DESIGN_SCHEMA, d) &&
 const validRed = red => !!red && Array.isArray(red.testFiles) && red.testFiles.length > 0 &&
   red.testFiles.every(nonblank) && nonblank(red.expectedFailure) && red.expectedFailure.trim().length >= 8 && nonblank(red.reason)
 
-const provesExpectedRed = (gate, red) => !gate.green && gate.failures?.length > 0 &&
+const normalizeRepoPath = value => String(value || '').replace(/^\.\//u, '').replaceAll('\\', '/')
+
+async function redTreePaths() {
+  // Compare with HEAD so staged and unstaged tracked changes are both visible;
+  // a writable agent may use git add even though it may never commit.
+  const tracked = await git(['diff', '--name-only', '-z', 'HEAD'])
+  const untracked = await git(['ls-files', '--others', '--exclude-standard', '-z'])
+  if (!tracked.ok || !untracked.ok) return null
+  return [...new Set(`${tracked.out}\0${untracked.out}`.split('\0').map(normalizeRepoPath).filter(Boolean))]
+}
+
+async function redTreeProblem(red, before) {
+  const after = await redTreePaths()
+  if (!before || !after) return 'the orchestrator could not inspect the RED-only worktree delta'
+  const changed = after.filter(file => !before.includes(file))
+  const declared = [...new Set(red.testFiles.map(normalizeRepoPath))]
+  const extra = changed.filter(file => !declared.includes(file))
+  const missing = declared.filter(file => !changed.includes(file))
+  if (extra.length) return `the RED step changed undeclared file(s): ${extra.join(', ')}`
+  if (missing.length) return `the RED step reported unchanged test file(s): ${missing.join(', ')}`
+  return changed.length ? null : 'the RED step changed no declared test file'
+}
+
+const provesExpectedRed = (gate, red, treeProblem = null) => !treeProblem && !gate.green && gate.failures?.length > 0 &&
   gate.failures.every(f => !f.timedOut && !f.spawnError && Number.isInteger(f.code) && f.code !== 0) &&
-  gate.failures.some(f => f.output.includes(red.expectedFailure.trim()))
+  // Every changed path must also be one the RED writer declared above. That
+  // keeps an unrelated failure in another file from hiding beside the named
+  // assertion, even when both files belong to one package. Arbitrary project
+  // test output has no universal parser, so package output supplies the other
+  // half of attribution: every failed package must contain the excerpt.
+  gate.failures.every(f => f.output.includes(red.expectedFailure.trim()))
 const FINDINGS_SCHEMA = {
   type: 'object', additionalProperties: false, required: ['findings'],
   properties: {
@@ -1341,7 +1369,8 @@ try {
   currentPhase = 'code'
   phase('Code')
 
-  // The verify gate, run here. A step's own verify run is its feedback loop; this one is the verdict.
+  // The verify gate, run only here. Writable agents edit; this scripted result
+  // is both the verdict and, on the bounded retry path, their failure brief.
   // Keep the latest complete result as well: the issue's candidate record uses
   // the orchestrator's actual final output rather than model-written claims.
   let finalVerify = null
@@ -1370,31 +1399,34 @@ try {
     if (design.verification.mode === 'test-first') {
       const baseline = await verifyGate('Code: test-first baseline')
       if (!baseline.green) return await fail('code', `npm run verify was not green before RED (${baseline.detail}) — refusing to mistake an existing failure for a regression.`)
+      const redBaseline = await redTreePaths()
 
       red = await agent(PROMPTS.codeRed(dir),
         { label: 'code:red', phase: 'Code', step: 'code', schema: RED_SCHEMA },
       )
       if (!validRed(red)) return await fail('code', 'Red step returned no meaningful test files, assertion excerpt, or reason — aborting before implementation.')
+      let redProblem = await redTreeProblem(red, redBaseline)
       gate = await verifyGate('Code: red gate')
-      if (!provesExpectedRed(gate, red)) {
-        const rejection = gate.green
+      if (!provesExpectedRed(gate, red, redProblem)) {
+        const rejection = redProblem || (gate.green
           ? `verify stayed green (${gate.detail})`
-          : `verify failed, but not with the reported assertion excerpt or a runnable test failure (${gate.detail})`
+          : `verify failed, but not with the reported assertion excerpt or a runnable test failure (${gate.detail})`)
         log(`Code: RED was not established — respawning the red step once (${rejection}).`)
         red = await agent(PROMPTS.codeRed(dir) + PROMPTS.redRetry(rejection),
           { label: 'code:red:retry', phase: 'Code', step: 'code', schema: RED_SCHEMA, retry: true },
         )
         if (!validRed(red)) return await fail('code', 'Red step returned no meaningful evidence on its retry — aborting before implementation.')
+        redProblem = await redTreeProblem(red, redBaseline)
         gate = await verifyGate('Code: red gate (retry)')
-        if (!provesExpectedRed(gate, red)) return await fail('code', `RED could not be established twice (${gate.detail}) — refusing to implement against an unproven regression.`)
+        if (!provesExpectedRed(gate, red, redProblem)) return await fail('code', `RED could not be established twice (${redProblem || gate.detail}) — refusing to implement against an unproven regression.`)
       }
       log('Code: the expected RED assertion failure was observed by the orchestrator; semantic relevance remains for blind review to judge.')
 
-      green = await agent(PROMPTS.codeGreen(dir, red, pkgList(packages)),
+      green = await agent(PROMPTS.codeGreen(dir, red),
         { label: 'code:green', phase: 'Code', step: 'code' },
       )
     } else {
-      green = await agent(PROMPTS.codeDirect(dir, pkgList(packages)),
+      green = await agent(PROMPTS.codeDirect(dir),
         { label: 'code:direct', phase: 'Code', step: 'code' },
       )
     }
@@ -1403,8 +1435,8 @@ try {
   }
   if (!gate.green) {
     const implementationPrompt = design.verification.mode === 'direct'
-      ? PROMPTS.codeDirect(dir, pkgList(packages))
-      : PROMPTS.codeGreen(dir, red, pkgList(packages))
+      ? PROMPTS.codeDirect(dir)
+      : PROMPTS.codeGreen(dir, red)
     log('Code: verify is red after implementation — respawning implementation once with the failure.')
     green = await agent(implementationPrompt + PROMPTS.verifyRetry(gate),
       { label: design.verification.mode === 'direct' ? 'code:direct:retry' : 'code:green:retry', phase: 'Code', step: 'code', retry: true },
@@ -1494,7 +1526,7 @@ try {
   const reviewBlockers = []
   if (items.length) {
     const beforeSha = gitMode ? await gitOut(['rev-parse', 'HEAD'], 'git rev-parse HEAD') : null
-    const fixPrompt = PROMPTS.fix(dir, pkgList(packages), items, DIFF)
+    const fixPrompt = PROMPTS.fix(dir, items, DIFF)
     let assessed = await agent(fixPrompt,
       { label: 'fixes-after-review', phase: 'Fixes after review', step: 'fixes-after-review', schema: TRIAGE_SCHEMA })
     if (!validAssessments(assessed, items.length)) {
@@ -1687,7 +1719,7 @@ try {
 
       log(`Correction: ${batch.length} concrete blocker(s) from the final review — running one scoped correction (${batch.map(entry => entry.id).join(', ')}).`)
       const corrected = await agent(
-        PROMPTS.correction(dir, pkgList(packages), requirement, batch, repairDelta || '(the repair delta could not be captured)', finalVerify?.detail || 'green'),
+        PROMPTS.correction(dir, requirement, batch, repairDelta || '(the repair delta could not be captured)', finalVerify?.detail || 'green'),
         { label: 'correction', phase: 'Correction', step: 'fixes-after-review', schema: CORRECTION_SCHEMA, retry: true })
       if (!corrected) {
         // The correction is a writable repair step: a death here is operational

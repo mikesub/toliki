@@ -169,13 +169,13 @@ case "${EPIC_STEP_LABEL:-}" in
   fixes-after-review|fixes-after-review:retry) key=triage ;;
   ship:pr)                                     key=ship ;;
   summary:write)                               key=summary ;;
-  resolve)                                     key=fix-resolve ;;
+  resolve|resolve:retry)                       key=fix-resolve ;;
   acceptance)                                  key=fix-check ;;
-  fix-ci)                                      key=ci-fix ;;
+  fix-ci|fix-ci:retry)                         key=ci-fix ;;
   ci-acceptance)                               key=ci-check ;;
   ci-correction)                               key=ci-correction ;;
   ci-confirm)                                  key=ci-confirm ;;
-  fix-defect)                                  key=defect-fix ;;
+  fix-defect|fix-defect:retry)                 key=defect-fix ;;
   defect-acceptance)                           key=defect-check ;;
   defect-correction)                           key=defect-correction ;;
   defect-confirm)                              key=defect-confirm ;;
@@ -554,6 +554,19 @@ case "$*" in
     if [[ -f "${STUB_FIXTURES:-/nonexistent}/verify.rc" ]]; then
       printf 'verify: widget.test.ts expected 2 got 1\n' >&2
       exit "$(cat "$STUB_FIXTURES/verify.rc")"
+    fi
+    if [[ -f src/unrelated-red.test.ts && -f src/widget.test.ts && ! -f src/widget.ts ]]; then
+      printf 'FAIL src/widget.test.ts: missing export createWidget\n' >&2
+      printf 'FAIL src/unrelated-red.test.ts: unrelated assertion expected true got false\n' >&2
+      exit 1
+    fi
+    if [[ -f src/unrelated-red.test.ts ]]; then
+      printf 'FAIL src/unrelated-red.test.ts: unrelated assertion expected true got false\n' >&2
+      exit 1
+    fi
+    if [[ -f src/index.ts ]] && grep -q 'verify-red' src/index.ts; then
+      printf 'FAIL src/index.test.ts: resolution assertion expected both intents got stale value\n' >&2
+      exit 1
     fi
     # Like a real test run against the stub project: red exactly while a test
     # exists without its implementation (red wrote widget.test.ts, green has
@@ -1599,6 +1612,10 @@ assert_eq "deps were installed once for the discovered package" 1 "$(grep -c '^c
 assert_eq "the orchestrator ran baseline, red, green and post-fix verify" 4 "$(grep -c '^run verify$' "$NPM_LOG")"
 assert_contains "the red gate saw red" "$RUN_OUT" "Code: red gate: verify RED"
 assert_contains "the green gate saw green" "$RUN_OUT" "Code: verify gate: verify green"
+assert_not_contains "the coder charter never assigns project verification" "$(cat "$ROOT/agents/coder.md")" 'run `npm run verify`'
+assert_contains "the RED writer is told to leave execution to the orchestrator" "$(cat "$STATE_DIR/red.0.prompt")" "Do not run tests or any verification command"
+assert_contains "the GREEN writer is told to leave execution to the orchestrator" "$(cat "$STATE_DIR/green.0.prompt")" "Do not run tests or any verification command"
+assert_contains "the review repair is told to leave execution to the orchestrator" "$(cat "$STATE_DIR/triage.0.prompt")" "Do not run tests or any verification command"
 # The fixer delta is captured by the orchestrator from two real snapshots and
 # handed over as inert evidence. The reviewer never needs shell access.
 assert_contains "the final review was handed the exact fixer delta" "$FINALREVIEW_PROMPT" '<repair-delta>'
@@ -2133,6 +2150,7 @@ assert_contains "the correction is given the required observable outcome" "$CORR
 assert_contains "the correction is given the successful verification evidence" "$CORRECTION_PROMPT" "verify gate was GREEN"
 assert_contains "the correction is given the exact repair delta" "$CORRECTION_PROMPT" "<repair-delta>"
 assert_contains "the correction is told there is no second round" "$CORRECTION_PROMPT" "there is no second correction round"
+assert_contains "the correction leaves verification to the orchestrator" "$CORRECTION_PROMPT" "Do not run tests or any verification command"
 HELD_SUMMARY="$(gh_delivery_summary)"
 HELD_SHA="$(origin_ref epic/42-add-widget)"
 assert_eq "the held candidate gets exactly one delivery summary" 1 "$(delivery_summary_count)"
@@ -2517,7 +2535,7 @@ run_pipeline "$EPIC_RUN" "$VACUOUS" --issue 42
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_eq "red was spawned twice" 2 "$(calls red)"
 assert_contains "the retry was announced" "$RUN_OUT" "respawning the red step once"
-assert_contains "the retry prompt says why" "$(cat "$STATE_DIR/red.1.prompt")" "verify stayed green"
+assert_contains "the retry prompt says why" "$(cat "$STATE_DIR/red.1.prompt")" "reported unchanged test file(s): frontend/src/widget.test.ts"
 assert_contains "the run still ships" "$RUN_OUT" '"readyToMerge":true'
 
 scenario 'verify gate: a red test-first baseline blocks before writing tests'
@@ -2537,6 +2555,27 @@ assert_rc "mismatched RED evidence blocks" 3 "$RUN_RC"
 assert_eq "the RED author gets one retry" 2 "$(calls red)"
 assert_contains "the mismatch is explicit" "$RUN_OUT" "not with the reported assertion excerpt"
 assert_eq "implementation never runs on unproven RED" 0 "$(calls green)"
+
+scenario 'verify gate: an unrelated package failure cannot count as RED'
+UNRELATED="$TMP/fixtures-red-unrelated"; cp -R "$BASE" "$UNRELATED"
+mkdir -p "$UNRELATED/worktree/backend/src"
+printf '{"name":"backend","scripts":{"verify":"true"}}\n' > "$UNRELATED/worktree/backend/package.json"
+fixture_sh "$UNRELATED" red 'printf "test(\"widget\", () => {})\n" > frontend/src/widget.test.ts; printf "unrelated\n" > backend/src/unrelated-red.test.ts'
+run_pipeline "$EPIC_RUN" "$UNRELATED" --issue 42
+assert_rc "an unrelated package failure blocks RED" 3 "$RUN_RC"
+assert_eq "the RED writer gets its one bounded retry" 2 "$(calls red)"
+assert_contains "the rejection names the undeclared unrelated file" "$RUN_OUT" "changed undeclared file(s): backend/src/unrelated-red.test.ts"
+assert_eq "implementation never runs on mixed RED evidence" 0 "$(calls green)"
+
+scenario 'verify gate: a staged unrelated file in the same package cannot hide beside expected RED'
+SAMEPKG="$TMP/fixtures-red-same-package"; cp -R "$BASE" "$SAMEPKG"
+fixture_sh "$SAMEPKG" red 'printf "test(\"widget\", () => {})\n" > frontend/src/widget.test.ts; printf "unrelated\n" > frontend/src/unrelated-red.test.ts; git add frontend/src/unrelated-red.test.ts'
+run_pipeline "$EPIC_RUN" "$SAMEPKG" --issue 42
+assert_rc "a staged same-package mixed failure blocks RED" 3 "$RUN_RC"
+assert_eq "the staged same-package RED writer gets one bounded retry" 2 "$(calls red)"
+assert_contains "the staged undeclared same-package file is named" "$RUN_OUT" "changed undeclared file(s): frontend/src/unrelated-red.test.ts"
+assert_contains "the scripted gate observed the intended assertion too" "$RUN_OUT" "missing export createWidget"
+assert_eq "implementation never runs on same-package mixed RED" 0 "$(calls green)"
 
 scenario 'architect gate: an empty verification strategy is refused'
 EMPTYPLAN="$TMP/fixtures-empty-plan"; cp -R "$BASE" "$EMPTYPLAN"
@@ -3371,6 +3410,8 @@ assert_contains "it records one judgment hunk" "$RUN_OUT" '"resolvedHunks":1'
 assert_not_contains "and never rests for a human instead" "$RUN_OUT" 'readyToReview'
 assert_contains "the resolver was handed the rung's classification" "$(cat "$STATE_DIR/fix-resolve.0.prompt")" 'needs judgment'
 assert_contains "the resolver may carry an intent outside a marker block" "$(cat "$STATE_DIR/fix-resolve.0.prompt")" "carries one side's intent to lines the other side moved"
+assert_contains "the resolver leaves deterministic checks to the pipeline" "$(cat "$STATE_DIR/fix-resolve.0.prompt")" "Do not run tests or post-edit verification commands"
+assert_not_contains "the resolver is not assigned git diff verification" "$(cat "$STATE_DIR/fix-resolve.0.prompt")" "git diff --check"
 assert_contains "the skeptic is told to trace every out-of-block change" "$(cat "$STATE_DIR/fix-check.0.prompt")" 'trace every out-of-block change back to what one side'
 assert_eq "the branch on origin was rewritten" "$(git -C "$WT" rev-parse HEAD)" "$(origin_ref epic/42-add-widget)"
 assert_not_contains "and is not what it was" "$(origin_ref epic/42-add-widget)" "$BEFORE"
@@ -3383,6 +3424,22 @@ assert_contains "the audit comment states the PR's intent" "$(gh_comments)" "the
 assert_contains "the audit comment records the exhaustive acceptance check" "$(gh_comments)" "returned 0 blocker(s) (confidence floor 90/100)"
 assert_contains "and says the merge worker re-runs the checks before anything lands" "$(gh_comments)" "re-runs the real checks before anything lands"
 assert_eq "the labels: ready-to-merge, ladder kept, needs-judgment cleared" "fix-attempted,ready-to-merge," "$(gh_labels)"
+
+scenario 'fix-run: a scripted verification failure is repaired once and amended into the resolution'
+seed_conflict
+FIXVERIFYRETRY="$TMP/fixtures-fix-verify-retry"; cp -R "$FIXBASE" "$FIXVERIFYRETRY"
+fixture_sh "$FIXVERIFYRETRY" fix-resolve.0 'printf "export const items = [] // main-rename pr-guard verify-red\n" > frontend/src/index.ts; git add frontend/src/index.ts; GIT_EDITOR=true git rebase --continue >/dev/null'
+fixture_sh "$FIXVERIFYRETRY" fix-resolve.1 'printf "export const items = [] // main-rename pr-guard verify-retry\n" > frontend/src/index.ts'
+run_fix "$FIXVERIFYRETRY" --issue 42
+assert_rc "the repaired verification retry ships" 0 "$RUN_RC"
+assert_eq "the resolver gets exactly one verification-driven retry" 2 "$(calls fix-resolve)"
+assert_eq "the orchestrator verifies both repair attempts" 2 "$(grep -c '^run verify$' "$NPM_LOG")"
+assert_contains "the retry receives the scripted failure" "$(cat "$STATE_DIR/fix-resolve.1.prompt")" "resolution assertion expected both intents got stale value"
+assert_contains "the retry is told not to execute verification" "$(cat "$STATE_DIR/fix-resolve.1.prompt")" "Do not run tests or verification yourself"
+assert_contains "the retry is told the rebase already finished" "$(cat "$STATE_DIR/fix-resolve.1.prompt")" "there is no rebase in progress"
+assert_not_contains "the retry never receives the stale mid-rebase brief" "$(cat "$STATE_DIR/fix-resolve.1.prompt")" "You are mid-rebase"
+assert_contains "the retry's verified edit is amended into the pushed commit" "$(git -C "$ORIGIN" show epic/42-add-widget:frontend/src/index.ts)" "verify-retry"
+assert_eq "the acceptance check runs only after the repaired gate is green" 1 "$(calls fix-check)"
 
 scenario 'fix-run: a missing checker result cannot push or promote the resolution'
 seed_conflict
@@ -3671,14 +3728,18 @@ assert_contains "RESULT classifies the spent ladder as a human handoff" "$RUN_OU
 assert_eq "the lifecycle records the handoff on the second attempt" "human-blocked true 2" \
   "$(usage_log | jq -r 'select(.type=="run-finish") | "\(.outcome) \(.handoff) \(.attempt)"')"
 
-scenario 'fix-run: a red verify blocks — the fixer never fixes code'
+scenario 'fix-run: a red verify is returned once, then blocks before checking'
 seed_conflict
 BEFORE="$(origin_ref epic/42-add-widget)"
 REDVERIFY="$TMP/fixtures-redverify"; cp -R "$FIXBASE" "$REDVERIFY"
+fixture_sh "$REDVERIFY" fix-resolve.1 'true'
 printf '1' > "$REDVERIFY/verify.rc"
 run_fix "$REDVERIFY" --issue 42
 assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
 assert_contains "the failing detail reaches the blocker" "$RUN_OUT" 'widget.test.ts expected 2 got 1'
+assert_eq "the conflict repair gets one diagnostic retry" 2 "$(calls fix-resolve)"
+assert_eq "both conflict repair attempts are verified" 2 "$(grep -c '^run verify$' "$NPM_LOG")"
+assert_contains "the conflict retry receives the failure tail" "$(cat "$STATE_DIR/fix-resolve.1.prompt")" 'widget.test.ts expected 2 got 1'
 assert_eq "the adversarial check never ran" 0 "$(calls fix-check)"
 assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
 
@@ -4092,6 +4153,9 @@ BEFORE="$(origin_ref epic/42-add-widget)"
 run_ci "$CI_RUN" "$REDV" --issue 42
 assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
 assert_contains "the failing detail reaches the blocker" "$RUN_OUT" 'npm run verify is red after the fix'
+assert_eq "the CI repair gets one diagnostic retry" 2 "$(calls ci-fix)"
+assert_eq "prepare plus both CI repair attempts run verification" 3 "$(grep -c '^run verify$' "$NPM_LOG")"
+assert_contains "the CI retry receives the failure tail" "$(cat "$STATE_DIR/ci-fix.1.prompt")" 'missing export createWidget'
 assert_eq "no adversarial check ran" 0 "$(calls ci-check)"
 assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
 
@@ -4421,7 +4485,7 @@ REDPARTIALDEFECT="$TMP/fixtures-defect-partial-red"; cp -R "$PARTIALDEFECT" "$RE
 BEFORE="$(origin_ref epic/42-add-widget)"
 DEFECT_COMMENTS="$(make_three_defect_evidence "$BEFORE")" run_defect "$DEFECT_RUN" "$REDPARTIALDEFECT" --issue 42
 assert_rc "a red partial defect repair follows the refusal path" 3 "$RUN_RC"
-assert_eq "a red partial defect repair verifies once and never reaches its skeptic" "1 0" "$(grep -c '^run verify$' "$NPM_LOG" || true) $(calls defect-check)"
+assert_eq "a red partial defect repair retries and never reaches its skeptic" "2 2 0" "$(grep -c '^run verify$' "$NPM_LOG" || true) $(calls defect-fix) $(calls defect-check)"
 assert_contains "the partial verification failure reaches the refusal" "$RUN_OUT$(gh_comments)" "npm run verify is red"
 assert_eq "a red partial defect repair does not push" "$BEFORE" "$(origin_ref epic/42-add-widget)"
 
@@ -4561,6 +4625,9 @@ BEFORE="$(origin_ref epic/42-add-widget)"
 run_defect "$DEFECT_RUN" "$REDDEFECT" --issue 42
 assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
 assert_contains "the failure names npm run verify" "$RUN_OUT" "npm run verify is red"
+assert_eq "the defect repair gets one diagnostic retry" 2 "$(calls defect-fix)"
+assert_eq "both defect repair attempts are verified" 2 "$(grep -c '^run verify$' "$NPM_LOG")"
+assert_contains "the defect retry receives the failure tail" "$(cat "$STATE_DIR/defect-fix.1.prompt")" 'widget.test.ts expected 2 got 1'
 assert_eq "the skeptic never sees a red tree" 0 "$(calls defect-check)"
 assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
 assert_eq "it rests at ready-to-review, never failed" "defect-attempted,needs-defect-fix,ready-to-review," "$(gh_labels)"

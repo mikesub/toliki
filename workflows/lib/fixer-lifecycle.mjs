@@ -1,7 +1,8 @@
 // The conflict, CI and defect fixers have different admission evidence and
 // publication ordering, but the run around that cause-specific work is one
 // lifecycle. This fixed-purpose runner owns that lifecycle: argv/runtime/status
-// setup, prepare -> repair -> verify -> check -> publish sequencing, shared
+// setup, prepare -> repair -> verify (with one diagnostic repair retry) ->
+// check -> publish sequencing, shared
 // gates, quota/refund handling, blocker fallback, final status, RESULT and exit
 // selection. Entry points supply only the cause adapter described below; this
 // is deliberately not a configurable workflow framework.
@@ -52,6 +53,20 @@ import {
 import { recordQuotaHold } from '../quota-hold.mjs'
 
 const message = error => error?.message || String(error)
+
+// Writable agents do not execute project gates. When their first repair leaves
+// the tree red, the orchestrator gives one fresh process its own bounded,
+// sanitized output and then runs the complete gate once more. This is separate
+// from a provider/process respawn inside agent() and from the fixer's durable
+// two-rung attempt ladder.
+const verificationRetryPrompt = verified => `
+
+The orchestrator ran the project's full verification command after your repair and it is RED. This is the one verification-driven repair retry in this run; a second red result blocks before the acceptance check.
+
+Captured failure diagnostics:
+${verified.tail || verified.detail}
+
+Repair the reported cause without weakening, skipping, deleting or loosening a test, assertion, type, lint rule, check, or security guard. Do not run tests or verification yourself. Leave the updated working tree for the orchestrator to verify, and return the complete structured result requested above again.`
 
 // Exact indexed coverage is the common contract between every repair agent and
 // its blind checker. `legacy` preserves the entry point's existing safe
@@ -466,25 +481,53 @@ export async function runFixerLifecycle(spec) {
 
       let repairResult = null
       let dispositions = []
-      if (spec.repair.needed(prep)) {
+      let repairRetried = false
+      const repairNeeded = spec.repair.needed(prep)
+      const runRepair = async (failedVerify = null) => {
         ctx.enter(spec.repair.key, spec.repair.phase)
-        repairResult = await agent(spec.repair.prompt(ctx, prep), spec.repair.agent)
-        if (!repairResult) return fail(spec.repair.key, spec.repair.noResult)
+        const retry = failedVerify !== null
+        if (retry) repairRetried = true
+        const options = retry
+          ? { ...spec.repair.agent, label: `${spec.repair.agent.label}:retry`, retry: true }
+          : spec.repair.agent
+        repairResult = await agent(
+          spec.repair.prompt(ctx, prep, { retry, failedVerify }) + (retry ? verificationRetryPrompt(failedVerify) : ''),
+          options)
+        if (!repairResult) return { stopped: true, result: await fail(spec.repair.key, spec.repair.noResult) }
         const normalized = spec.repair.normalize(repairResult, prep)
-        if (normalized.problem) return fail(spec.repair.key, normalized.problem)
+        if (normalized.problem) return { stopped: true, result: await fail(spec.repair.key, normalized.problem) }
         dispositions = normalized.dispositions
         const repaired = dispositions.filter(item => item.action === 'repaired')
         const declined = dispositions.filter(item => item.action === 'declined')
-        if (!repaired.length) return fail(spec.repair.key, spec.repair.allDeclined(declined))
+        if (!repaired.length) return { stopped: true, result: await fail(spec.repair.key, spec.repair.allDeclined(declined)) }
         const treeProblem = await spec.repair.treeProblem?.(ctx, prep, repairResult, dispositions)
-        if (treeProblem) return fail(spec.repair.key, treeProblem)
+        if (treeProblem) return { stopped: true, result: await fail(spec.repair.key, treeProblem) }
         spec.repair.log(ctx, prep, repairResult, repaired, declined)
+        return { stopped: false }
+      }
+
+      if (repairNeeded) {
+        const repaired = await runRepair()
+        if (repaired.stopped) return repaired.result
       }
 
       ctx.enter('verify', 'Verify')
-      const verified = await runVerify(spec.verify.packages(prep))
+      let verified = await runVerify(spec.verify.packages(prep))
       spec.verify.log(ctx, prep, verified)
-      if (!verified.green) return fail('verify', spec.verify.failure(prep, verified))
+      if (!verified.green && repairNeeded) {
+        log('Verify: RED — respawning the repair once with the scripted failure diagnostics.')
+        const repaired = await runRepair(verified)
+        if (repaired.stopped) return repaired.result
+        ctx.enter('verify', 'Verify')
+        verified = await runVerify(spec.verify.packages(prep))
+        spec.verify.log(ctx, prep, verified)
+      }
+      if (!verified.green) {
+        const reason = spec.verify.failure(prep, verified)
+        return fail('verify', repairNeeded
+          ? `${reason} The gate remained red after its one diagnostic repair retry.`
+          : reason)
+      }
 
       let check = null
       let corrected = null
@@ -528,7 +571,7 @@ export async function runFixerLifecycle(spec) {
       const declined = dispositions.filter(item => item.action === 'declined')
       const partial = declined.length > 0
       const shipped = await spec.ship(ctx, {
-        prep, repairResult, dispositions, declined, verified: finalVerified, check, corrected, partial,
+        prep, repairResult, dispositions, declined, verified: finalVerified, check, corrected, partial, repairRetried,
       })
       if (!shipped.pushed) return fail('ship', spec.shipFailure(shipped))
       if (partial) state.partialPushed = true
@@ -541,7 +584,7 @@ export async function runFixerLifecycle(spec) {
       // reported readbacks were both required above, so the issue is resting in
       // front of a person rather than in any queue.
       return {
-        ...spec.result(ctx, { prep, repairResult, dispositions, declined, verified: finalVerified, check, corrected, partial, shipped }),
+        ...spec.result(ctx, { prep, repairResult, dispositions, declined, verified: finalVerified, check, corrected, partial, repairRetried, shipped }),
         outcome: partial ? 'human-review' : 'merge-queued',
       }
     } catch (error) {

@@ -118,7 +118,8 @@ than made launchable against a main without the code it describes.
   and `workflows/defect-run.mjs`
   are plain Node orchestrators. They must not name a vendor.
 - `workflows/lib/fixer-lifecycle.mjs` owns the three fixers' shared argv/runtime
-  setup, repair → verify → accept → correct → confirm → publish sequencing, the
+  setup, repair → verify → one diagnostics-driven repair retry when red → accept
+  → correct → confirm → publish sequencing, the
   indexed-disposition gate, run state, quota/refund, blocker and human-hold
   paths, terminal budget, status and `RESULT`. The acceptance, correction and
   confirmation contract itself lives in `workflows/lib/repair-acceptance.mjs`,

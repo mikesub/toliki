@@ -36,8 +36,9 @@
 // needs-judgment and rests with a human without spending a ladder rung; only
 // operational failures relaunch a fixer.
 //
-// Up to four model steps: the resolver, its acceptance check, one scoped
-// correction and its narrow confirmation. The shared fixed-purpose fixer
+// Up to five model steps: the resolver, one diagnostics-driven resolver retry,
+// its acceptance check, one scoped correction and its narrow confirmation. The
+// shared fixed-purpose fixer
 // lifecycle owns their sequencing, common gates, failure/refund handling and
 // final RESULT. This adapter retains rebase/autoresolve, conflict evidence,
 // continuation and publication ordering.
@@ -131,9 +132,30 @@ ${prep.judgmentHunks.map((h, i) => `${i + 1}. ${h.file} hunk ${h.hunk} — ${h.r
 
 Boundaries: the marker blocks are the target — that text is what you are here to rewrite. An edit OUTSIDE a marker block is allowed only in the files listed above, and only where it is what carries one side's intent to lines the other side moved or restructured: say main changed a call inside the block to use a bounded timeout while the PR moved that call outside the block, so keeping main's intent takes a one-line edit outside the markers. List every such edit in that hunk's resolution entry, under outsideEdits: where it is (file, and the symbol or line range) and which side's intent required it. Never revisit the mechanical resolutions; never touch a file that is not listed above; never commit anything new; never push. Where keeping both intents would take more than this, escalate instead of guessing.
 
-When every block has either been repaired or replaced with its exact PR-side text: confirm no markers remain (\`git diff --check\` and \`grep -n '^<<<<<<<\\|^>>>>>>>' <files>\` must be clean), \`git add\` exactly those files, \`GIT_EDITOR=true git rebase --continue\`. Then confirm the rebase fully finished (\`git status\` shows no rebase in progress; \`git rev-list --count origin/main..HEAD\` is exactly 1). A second stop is not a disposition item; report it in summary and do not claim any completed repair. The pipeline checks all of that again before anything ships.
+When every block has either been repaired or replaced with its exact PR-side text, \`git add\` exactly those files and run \`GIT_EDITOR=true git rebase --continue\` once. Do not run tests or post-edit verification commands. The pipeline checks diff validity, remaining markers, rebase state and branch shape before anything ships. If continuing the rebase reports another stop, mention that in the summary and do not claim a completed repair.
 
 Return dispositions with exactly one entry for every numbered judgment hunk: index, action ("repaired" or "declined"), and a non-empty reason. A repaired entry also states mainIntent, prIntent, resolution (what the merged text does and how it keeps both), and outsideEdits when needed. A declined entry leaves the exact PR-side text and explains why both intents could not safely be combined. Also return a short summary. No missing, duplicate, or extra indexes.`,
+
+  // A verification retry starts after the first resolver already completed the
+  // rebase. Replaying the mid-rebase prompt would ask a fresh process to finish
+  // a stop that no longer exists, so reconstruct the same intent boundary over
+  // the completed, still-unpushed resolution instead.
+  resolveRetry: (issue, prep) =>
+`Repair a scripted verification failure in the completed judgment-conflict resolution on branch ${prep.branch} (issue #${issue}). The first resolver already finished the rebase: there is no rebase in progress and HEAD is exactly one still-unpushed commit above origin/main. Amend only the working tree; do not restart or continue a rebase.
+
+The original machine classification and numbered judgment worklist remain the boundary:
+${prep.report}
+
+${prep.judgmentHunks.map((h, i) => `${i + 1}. ${h.file} hunk ${h.hunk} — ${h.report}`).join('\n')}
+
+Reconstruct both sides' intent from the same durable evidence:
+- PR: \`git diff ${prep.mergeBase} ${prep.prHead} -- <the marked files>\` and issue #${issue}.
+- main: \`git diff ${prep.mergeBase} origin/main -- <the marked files>\`, its commits, and ${prep.mainIssues.length ? `issues ${prep.mainIssues.map(n => '#' + n).join(', ')}` : 'their commit messages'}.
+- completed resolution: current HEAD plus the working tree.
+
+Repair only a failure caused by how those numbered hunks were resolved. Touch only ${prep.markedFiles.join(', ')}; an edit elsewhere in one of those files is allowed solely where it carries one side's intent to code the other side moved, and must be listed under outsideEdits. Never touch another file, create a file, revisit a mechanical resolution, commit, amend, push, label, or comment. If the reported failure cannot be repaired inside that evidence and boundary, decline the affected item rather than guessing.
+
+Return dispositions with exactly one entry for every numbered judgment hunk: index, action ("repaired" or "declined"), and a non-empty reason. A repaired entry also states mainIntent, prIntent, resolution, and outsideEdits when needed. Also return a short summary. No missing, duplicate, or extra indexes.`,
 
   // The exhaustive acceptance check. Blind on purpose: the resolver's stated
   // intents are deliberately NOT in this prompt, so agreement can only come
@@ -648,8 +670,14 @@ async function resolutionProblem(markedFiles) {
   if (await rebaseInProgress()) return 'the rebase is still in progress'
   const count = Number((await git(['rev-list', '--count', 'origin/main..HEAD'])).out)
   if (count !== 1) return `the rebased branch holds ${Number.isNaN(count) ? 'an unknown number of' : count} commit(s) above origin/main — an epic branch holds exactly one`
-  const markers = await git(['grep', '-n', '-E', '^(<<<<<<<|>>>>>>>|\\|{7})( |$)', 'HEAD', '--', ...markedFiles])
-  if (markers.ok) return `conflict markers remain at HEAD: ${markers.out.split('\n')[0]}`
+  const whitespace = await git(['diff', '--check', 'origin/main', '--', ...markedFiles])
+  if (!whitespace.ok) return `the resolved tree fails git diff --check: ${whitespace.err || whitespace.out || `exit ${whitespace.code}`}`
+  // Read the working tree, not only HEAD: the first resolver normally commits
+  // through rebase --continue, while a verification-driven retry deliberately
+  // leaves its amendment uncommitted for the orchestrator to inspect and fold
+  // into that commit.
+  const markers = await git(['grep', '-n', '-E', '^(<<<<<<<|>>>>>>>|\\|{7})( |$)', '--', ...markedFiles])
+  if (markers.ok) return `conflict markers remain in the resolved tree: ${markers.out.split('\n')[0]}`
   return null
 }
 
@@ -678,14 +706,14 @@ function partialConflictRecord(issue, prep, dispositions, head, verifyDetail, ch
 // branch the push is rejected and nothing further happens. A human-granted
 // continuation starts from an already committed partial head, so its checked
 // working-tree delta is amended before the push just as CI/defect repairs are.
-async function ship(ctx, prep, body, { partial = false, dispositions = [], verifyDetail, check, corrected = null } = {}) {
+async function ship(ctx, prep, body, { partial = false, dispositions = [], verifyDetail, check, corrected = null, repairRetried = false } = {}) {
   const { issue } = ctx
   // A human-granted continuation starts from an already committed partial head,
-  // and a scoped correction leaves working-tree edits on top of a resolution the
-  // rebase already committed. Both are amended into the branch's single commit
-  // before the push: a correction that stayed in the working tree would be
-  // verified, confirmed and then silently dropped by the push.
-  if (prep.partialRecord || corrected) {
+  // and either a scoped correction or a verification-driven repair retry leaves
+  // working-tree edits on top of a resolution the rebase already committed.
+  // All are amended into the branch's single commit before the push: verified
+  // edits left in the working tree would otherwise be silently dropped.
+  if (prep.partialRecord || corrected || repairRetried) {
     await gitOut(['add', '-A'], 'git add -A')
     if ((await git(['diff', '--cached', '--quiet'])).code === 0) {
       if (prep.partialRecord) return { pushed: false, labelled: false, note: 'nothing staged to amend' }
@@ -891,7 +919,9 @@ await runFixerLifecycle({
   repair: {
     needed: prep => Array.isArray(prep.markedFiles) && prep.markedFiles.length > 0,
     key: 'resolve', phase: 'Resolve',
-    prompt: (ctx, prep) => PROMPTS.resolve(ctx.issue, prep),
+    prompt: (ctx, prep, { retry } = {}) => retry && !prep.partialRecord
+      ? PROMPTS.resolveRetry(ctx.issue, prep)
+      : PROMPTS.resolve(ctx.issue, prep),
     agent: { label: 'resolve', phase: 'Resolve', step: 'fix-conflicts', schema: RESOLVE_SCHEMA },
     noResult: 'the resolver produced no result — the rebase is aborted for a clean retry.',
     normalize: (result, prep) => normalizedDispositions(result, prep.judgmentHunks),
@@ -910,7 +940,7 @@ await runFixerLifecycle({
   verify: {
     packages: prep => prep.packages,
     log: (_ctx, _prep, verified) => { if (verified.green) log(`Verify: green — ${verified.detail}`) },
-    failure: (_prep, verified) => `npm run verify is red after the resolution (${verified.detail}) — the fixer never fixes code, so nothing was pushed and the PR branch is untouched.`,
+    failure: (_prep, verified) => `npm run verify is red after the resolution (${verified.detail}) — nothing was pushed and the PR branch is untouched.`,
   },
   check: {
     needed: prep => Array.isArray(prep.markedFiles) && prep.markedFiles.length > 0,
@@ -939,9 +969,9 @@ await runFixerLifecycle({
       noResult: 'the narrow confirmation produced no result — an unconfirmed correction must not ship.',
     },
   },
-  ship: (ctx, { prep, dispositions, verified, check, corrected, partial }) => ship(
+  ship: (ctx, { prep, dispositions, verified, check, corrected, partial, repairRetried }) => ship(
     ctx, prep, () => buildComment(prep, dispositions, verified.detail, check, corrected),
-    { partial, dispositions, verifyDetail: verified.detail, check, corrected }),
+    { partial, dispositions, verifyDetail: verified.detail, check, corrected, repairRetried }),
   shipFailure: shipped => `the force-with-lease push did not land${shipped.note ? ` (${shipped.note})` : ''} — the branch on origin is untouched.`,
   partialShipFailure: shipped => `the partial repair was pushed, but its human-held landing could not be fully verified${shipped.note ? ` (${shipped.note})` : ''}`,
   landingFailure: shipped => `pushed, but the ready-to-merge label swap could not be verified${shipped.note ? ` (${shipped.note})` : ''} — a human finishes the labels; the PR itself is fixed and rebased.`,

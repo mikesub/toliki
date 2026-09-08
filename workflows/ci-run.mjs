@@ -27,8 +27,9 @@
 // blocker. A semantic dead end removes needs-ci-fix and rests with a human
 // without spending a ladder rung; only operational failures relaunch a fixer.
 //
-// Up to four model steps: the fixer, its acceptance check, one scoped
-// correction and its narrow confirmation. The shared fixed-purpose fixer
+// Up to five model steps: the fixer, one diagnostics-driven fixer retry, its
+// acceptance check, one scoped correction and its narrow confirmation. The
+// shared fixed-purpose fixer
 // lifecycle owns their sequencing, common gates, failure/refund handling and
 // final RESULT; this adapter owns red-check capture, prompts and publication.
 // A hard provider-quota death cleans the unpushed edit and records the
@@ -77,7 +78,7 @@ ${prep.failedChecks.map((name, index) => `${index + 1}. ${name}`).join('\n')}.
 
 ${prep.localVerify.green
   ? `\`npm run verify\` is GREEN locally on this exact tree (${prep.localVerify.detail}). The failure is therefore something the local gate does not run — a job configured only in CI, a platform or version difference, a missing fixture, a check against the merged result — so read the logs below rather than expecting to reproduce it, and be explicit in your summary about why it fails there and not here.`
-  : `\`npm run verify\` is RED locally on this exact tree too (${prep.localVerify.detail}), so the failure reproduces here and you can iterate against it.`}
+  : `\`npm run verify\` is RED locally on this exact tree too (${prep.localVerify.detail}), so the failure reproduces here; use that scripted result and the logs below as evidence.`}
 
 ${prep.logs || 'No job logs could be retrieved; the check names above and the local verify result are your whole evidence.'}
 
