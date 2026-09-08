@@ -68,19 +68,20 @@ in the same change.
   fixers require the exact persisted singleton; the label survives fixer
   retries. A manual launch may omit `--engine`, and then inherits — issue label,
   else host default, else claude — without writing any label.
-- **Step**: one of the nine pipeline steps in `STEPS` in
+- **Step**: one of the eight pipeline steps in `STEPS` in
   `workflows/lib/engine.mjs`, each a judgment call. Pipelines name steps; the
   engine file says who runs them; `STEPS` fixes each step's charter and tool
-  boundary, so architect, review, final-review and ship stay read-only under any
-  vendor. Claude's reviewer and shipper charters withhold Bash, Edit and Write;
+  boundary, so architect, review and final-review stay read-only under any
+  vendor. Claude's reviewer charter withholds Bash, Edit and Write;
   Codex runs the same charters in its read-only sandbox. The orchestrator
   supplies every step's captured evidence — diffs, issue bodies, conflict sides,
   CI logs, the review ledger — and also proves the worktree, index, Git
-  configuration, hooks and ancestry metadata unchanged around review, final
-  review and ship. Nothing deterministic is a step: git, gh and npm work runs
-  in the orchestrator. `task` maps both the task workflow's primary model
-  process and its optional one-time verification-diagnostics repair to the
-  writable `tasker` charter.
+  configuration, hooks and ancestry metadata unchanged around review, the final
+  review and the narrow confirmation. There is no delivery-prose step: the
+  coding phase returns the record its change is published from. Nothing
+  deterministic is a step: git, gh and npm work runs in the orchestrator.
+  `task` maps both the task workflow's primary model process and its optional
+  one-time verification-diagnostics repair to the writable `tasker` charter.
 - **Charter**: an `agents/*.md` file, read on every phase. Missing or malformed
   refuses the run.
 - **Package**: a directory whose `package.json` declares `scripts.verify`. The
@@ -117,9 +118,10 @@ lifecycle transition and provider-quota requeue retains the selector.
 `engine:<name>` is the separate routing namespace and is never cleared by a
 lifecycle change. A claimed branch with no exact matching engine pin is blocked
 rather than inferred from the current host default; a mismatched or conflicting
-pin is never rewritten by a run. A follow-up issue ship files is queued as it is filed —
-`ready`, and `blocked_by` the issue it came out of, so it cannot run until that
-one closes — and links back with a `Follow-up to #N` line in the body. Ordering
+pin is never rewritten by a run. A follow-up issue the run files is queued as
+it is filed — `ready`, and `blocked_by` the issue it came out of, so it cannot
+run until that one closes — and links back with a `Follow-up to #N` line in the
+body. Ordering
 is written before the label: an unordered follow-up is left unqueued rather
 than made launchable against a main without the code it describes.
 
@@ -323,11 +325,10 @@ than made launchable against a main without the code it describes.
   rerun skips an open PR. A matching existing record and an existing deferred
   record are each left alone. Everything before the PR is idempotent under a
   re-run.
-- Follow-up URLs in defect evidence are correlated by opaque, run-local blocker
-  IDs assigned before ship, never by title, reason or occurrence. Ship copies
-  every known ID into any non-empty deferred ledger; unknown, repeated or
-  missing known IDs refuse before the PR is created. The IDs stay internal and
-  never enter the versioned defect-evidence envelope.
+- Follow-up URLs and deferral records are correlated by opaque, run-local
+  blocker IDs assigned to the exact structured item, never by title, reason or
+  occurrence: two findings with identical display text keep their own follow-up.
+  The IDs stay internal and never enter the versioned defect-evidence envelope.
 - Epic-run adds `needs-defect-fix` only after it posts and reads back a
   structured repair envelope authored by the authenticated automation identity
   and bound to the issue, same-repository PR and captured head. Defect-run pins
@@ -434,29 +435,45 @@ than made launchable against a main without the code it describes.
   spent retry label to get there. Provider quota, process interruption,
   transport failure and landing-only recovery keep their existing refund, retry
   and durable-recovery behavior.
-- A phase that judges a change may not alter it. Reviewer and shipper charters
-  have no shell or write tools; the orchestrator supplies their diff evidence
+- A phase that judges a change may not alter it. The reviewer charter
+  has no shell or write tools; the orchestrator supplies its diff evidence
   and hashes the shippable worktree (all tracked content, including tracked
   paths an ignore rule also
   matches, plus untracked files, `.epics/` excluded) and HEAD around review,
-  final review and ship, including the real index, Git configuration, hooks,
+  the final review and the narrow confirmation, including the real index, Git
+  configuration, hooks,
   replacement refs and grafts, and blocks the run when any moved. Orchestrator
   Git calls neutralize repository hooks while preserving caller configuration —
   an edit those phases make is neither reviewed nor verified, and the paths that
   ship without another gate (an empty review, a cleared final review) are
   exactly where nothing else would catch it. Gated by `tests/epic-run.test.sh`.
-- Ship's deferrals never gate the merge: `kind` only ranks which items earn a
+- Deferrals never gate the merge: `kind` only ranks which items earn a
   follow-up issue and what the deferred record says. Every model process in the
-  run — architect, code, review, fixer, final review, ship — is a short-lived
-  process that ends when it returns; nothing resumes or continues an earlier
-  one. Gated by `tests/epic-run.test.sh`.
-- Ship rebases the run's checkpoint chain onto current origin/main before the
-  squash, because a run takes an hour and its PR is often held for hours more,
-  so the base has usually moved. A clean rebase re-runs the verify gate against
-  what landed; a red one blocks with the chain intact, so a re-run resumes from
-  its checkpoint. A failed fetch or a conflicted rebase ships on the run's own
-  base instead — the merge worker rebases and re-checks before anything lands,
-  and its fixers own that conflict. Gated by `tests/epic-run.test.sh`.
+  run — architect, code, review, fixer, final review, correction — is a
+  short-lived process that ends when it returns; nothing resumes or continues an
+  earlier one. Gated by `tests/epic-run.test.sh`.
+- There is no dedicated delivery-prose call. The coding phase returns the run's
+  delivery record beside its own account — title, durable commit rationale, the
+  project's own legal marker, and what it deliberately left undone — a deferred
+  finding's follow-up issue comes from the fixer that deferred it, and both are
+  persisted (`.epics/<slug>/delivery.json`) so a resumed checkpoint publishes
+  without a model re-deriving judgment about a change it did not make; a
+  checkpoint whose artifact did not survive recovers it read-only, and a record
+  that is missing or blank blocks in the coding phase. Everything else about the
+  publication — the PR title and body, the squashed commit, the candidate
+  delivery summary, the review and verification facts, the changed-file list,
+  the remaining-work list, the deferred record and the follow-up filing — is
+  rendered in `epic-run.mjs`. A script renders a judgment and never invents one:
+  nothing files a follow-up issue no model wrote. Gated by
+  `tests/epic-run.test.sh`.
+- The ship phase rebases the run's checkpoint chain onto current origin/main
+  before the squash, because a run takes an hour and its PR is often held for
+  hours more, so the base has usually moved. A clean rebase re-runs the verify
+  gate against what landed; a red one blocks with the chain intact, so a re-run
+  resumes from its checkpoint. A failed fetch or a conflicted rebase ships on
+  the run's own base instead — the merge worker rebases and re-checks before
+  anything lands, and its fixers own that conflict. Gated by
+  `tests/epic-run.test.sh`.
 - GitHub is the durable work state store: issues, labels, `blocked_by`, claim
   refs, PRs. The provider hold is the narrow host-fact exception, alongside
   locks and usage telemetry: it expires, orders no work, and is never a second
@@ -565,7 +582,7 @@ than made launchable against a main without the code it describes.
   (`TERMINAL_REPORT_BUDGET_MS`, a share per call capped by what is left of the
   window): a fixer's swap, the readback its guidance is composed from and the
   refusal comment; a fixer's landing swap (`ready-to-review` / `ready-to-merge`)
-  and its readback; epic-run's merge gate, which runs after ship's
+  and its readback; epic-run's merge gate, which runs after the ship phase's
   `ready-to-review`, and its blocker write to `failed`; the status comment's
   final edit. One window per run, not per caller: `terminalBudget()` opens it at
   whichever terminal write comes first and hands the same one back afterwards,
@@ -576,8 +593,8 @@ than made launchable against a main without the code it describes.
   re-reading a label until it settles can never push the report past it. Never
   add a GitHub call — or a local git cleanup, which has a timeout of its own —
   on the default timeout from a terminal label write onward. No model step runs
-  inside that window: `agent()` refuses a spawn once it is open, so ship's
-  PR-description step runs before the `ready-to-review` write.
+  inside that window: `agent()` refuses a spawn once it is open, and the ship
+  phase spawns nothing at all, so every model step is already behind it.
 - A dead pipeline pane whose issue rests at `ready` is a completed quota hold,
   so reap applies the normal settle window and removes its session. A live
   `ready` pane is still working and a dead `in-progress` pane remains a crash

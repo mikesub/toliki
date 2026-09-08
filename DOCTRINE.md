@@ -31,18 +31,26 @@ don't get re-litigated from memory.
   the only requirement the run is judged against; nobody answers follow-up
   questions at 3 a.m., so a spec that needs clarification is a spec that fails.
   Once a technical PR exists, the run appends a candidate-bound delivery
-  summary to that same issue: implementation/design narrative, actual verify
+  summary to that same issue: implementation/design rationale, actual verify
   evidence, independent review outcome, remaining work, and the pre-handoff
-  gate state. The PR description stays a deterministic pointer to the issue.
-  Later fixer audits and status remain separate comments instead of rewriting
-  the immutable candidate snapshot.
+  gate state. That record is rendered by the script, not written by a model —
+  the judgment inside it was collected where it was made, the coding phase
+  returning the title, commit rationale, legal marker and deferred work beside
+  its own account, and the fixer deciding the follow-up for a finding it
+  defers. Paying a separate model call to restate decisions the run already
+  had, from a diff it would have to re-read, bought prose rather than judgment;
+  what a script must never do is supply the half a model left out, so a missing
+  delivery record blocks and an unwritten follow-up is simply not filed. The PR
+  description stays a deterministic pointer to the issue. Later fixer audits
+  and status remain separate comments instead of rewriting the immutable
+  candidate snapshot.
 - **Task is a deliberate economy, not a smaller epic.** `ready` plus the
   persistent `task` selector runs one writable tasker process that implements
   and self-reviews the settled issue. Deterministic code still owns the claim,
   engine pin, dependency install, full project verification, moved-base
   rebase and re-verification, candidate commit, push, PR, durable summary and
   handoff. It omits architecture, RED/GREEN orchestration, independent review,
-  repair, correction and ship prose. The accepted trade-off is explicit: the
+  repair and correction. The accepted trade-off is explicit: the
   candidate is verified but intentionally not independently model-reviewed,
   so this path is only for work where a human has judged that review cost
   disproportionate. Malformed output, a tasker blocker, non-quota
@@ -73,12 +81,12 @@ don't get re-litigated from memory.
   run beside it and was removed: a second pre-repair opinion bought less than
   one exhaustive acceptance check after the repair, and two broad passes over
   one diff mostly re-litigated each other. Judging is read-only, and that is enforced
-  rather than trusted: Claude's reviewer and shipper charters withhold shell and
-  write tools, Codex runs them in a read-only sandbox, and the orchestrator
+  rather than trusted: Claude's reviewer charter withholds shell and
+  write tools, Codex runs it in a read-only sandbox, and the orchestrator
   supplies inert diff evidence. It also snapshots the shippable worktree, index,
   Git configuration, hooks and ancestry metadata around review, final review
-  and ship, blocking when a phase changed what it was judging. Orchestrator Git
-  calls neutralize repository hooks. Their
+  and the narrow confirmation, blocking when a phase changed what it was
+  judging. Orchestrator Git calls neutralize repository hooks. Their
   findings are actionable as they stand: one fresh fixer either repairs each
   one, disputes it with code evidence, or defers it as unsafe to repair.
   Assessment and repair share that one pass rather than confirming every

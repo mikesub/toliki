@@ -49,14 +49,18 @@ to it.
    concrete defect it positively showed, the run takes ONE scoped correction
    over that whole batch, re-runs verify, and has a narrow read-only
    confirmation prove it; anything else, and any correction that does not
-   confirm, holds the PR for a human. Ship then
+   confirm, holds the PR for a human. The scripted ship phase then
    rebases the run's checkpoint chain onto current `main` and re-runs verify
    before squashing, so a base that moved during the run is met here rather
    than by the merge worker; a conflict or a failed fetch ships on the run's
-   own base and leaves it to the worker. After the PR exists, ship appends one
-   candidate-bound delivery summary to the source issue with its narrative,
-   actual verification, review/repair tally, remaining work, and pre-handoff
-   gate state. The issue body remains the specification; the PR description is
+   own base and leaves it to the worker. No model runs there: the coding phase
+   already returned the title, the durable commit rationale, the project's own
+   legal marker and what it left undone, and the fixer already decided the
+   follow-up for anything it deferred. After the PR exists, the run appends one
+   candidate-bound delivery summary to the source issue with that rationale,
+   the actual verification, the review/repair tally and each finding's verdict,
+   the derived changed-file list, remaining work, and the pre-handoff gate
+   state. The issue body remains the specification; the PR description is
    only deterministic linkage back to that issue plus required project markers
    and the closing relationship. The run ends at an open PR with
    `ready-to-merge` (gates cleared, lands unattended)
