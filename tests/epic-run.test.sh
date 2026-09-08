@@ -4997,7 +4997,12 @@ assert_not_contains "invalid evidence is removed from autonomous dispatch" "$(gh
 scenario 'defect-run: a completed status without the deferred record also refuses'
 seed_defect_pr
 BEFORE="$(origin_ref epic/42-add-widget)"
-DEFECT_COMMENTS='🤖 **epic-run** · `myapp-epic-42` · phase: **finished**
+DEFECT_COMMENTS='🤖 **epic-run** · `myapp-epic-42`
+Phase: finished
+Started: 2026-09-08 23:14:39 CEST
+Updated: 2026-09-08 23:14:41 CEST
+
+_Live status, edited in place_
 
 **done, held for review** — https://github.com/o/r/pull/7 (1 deferred defect(s) that still exist on main after this merge)' \
   run_defect "$DEFECT_RUN" "$DEFECTBASE" --issue 42
@@ -5744,10 +5749,10 @@ if [[ "$EDITS" -ge 1 ]]; then ok "later updates edit that comment ($EDITS)"; els
 assert_contains "it names the phase and the session" "$GH" "epic-run"
 assert_contains "and the session name" "$GH" "myapp-epic-42"
 assert_matches "pane log prefixes use the configured human zone" "$RUN_OUT" '[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} (CET|CEST) \[epic-run myapp-epic-42\]'
-assert_matches "status started/updated fields use the configured human zone" "$GH" 'started [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} (CET|CEST) · updated [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} (CET|CEST)'
+assert_matches "status started field uses the configured human zone" "$GH" 'Started: [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} (CET|CEST)'
+assert_matches "status updated field uses the configured human zone" "$GH" 'Updated: [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} (CET|CEST)'
 assert_contains "the last write reports the outcome" "$GH" "queued for the merge worker"
-assert_contains "live status points readers to the issue run record" "$(printf '%s' "$GH" | tr '[:upper:]' '[:lower:]')" "issue carries the specification and run record"
-assert_contains "live status describes the PR as the technical artifact" "$(printf '%s' "$GH" | tr '[:upper:]' '[:lower:]')" "pr is the technical artifact"
+assert_contains "live status retains its concise edit-in-place footer" "$GH" "_Live status, edited in place_"
 assert_not_contains "live status no longer sends the narrative to the PR" "$GH" "The PR carries what was built and the review outcome"
 
 # GitHub renders every bare #N as that issue/PR's TITLE, so numbering findings

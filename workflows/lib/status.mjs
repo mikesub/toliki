@@ -67,11 +67,13 @@ function body() {
   const i = phases.indexOf(currentPhase)
   const step = i >= 0 && phases.length ? ` (${i + 1}/${phases.length})` : ''
   const lines = [
-    `🤖 **${script}**${session ? ` · \`${session}\`` : ''} · phase: **${currentPhase || 'starting'}**${step}`,
-    `started ${startedAt} · updated ${humanTimestamp()}`,
+    `🤖 **${script}**${session ? ` · \`${session}\`` : ''}`,
+    `Phase: ${currentPhase || 'starting'}${step}`,
+    `Started: ${startedAt}`,
+    `Updated: ${humanTimestamp()}`,
   ]
   if (lastNote) lines.push('', humanizeTimestamps(lastNote))
-  lines.push('', '_Live status, edited in place. The issue carries the specification and run record; the PR is the technical artifact._')
+  lines.push('', '_Live status, edited in place_')
   return lines.join('\n')
 }
 
