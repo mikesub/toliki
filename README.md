@@ -58,14 +58,17 @@ only where a judgment is needed. Claude Code and Codex are both supported.
    to its queue without spending a fixer attempt, and automatic dispatch waits
    only for the failed step's vendor hold. Ordinary transient 429s still retry
    once. For clear, low-risk work whose requirements and approach are already
-   settled, `workflows/task-run.mjs` instead starts exactly one writable tasker
-   process to implement and self-review. The same deterministic transport
+   settled, `workflows/task-run.mjs` instead starts one writable tasker process
+   to implement and self-review. The same deterministic transport
    claims and pins the issue, installs dependencies, runs the real verify gate,
    rebases and re-verifies a moved clean base, creates the `Closes #N`
    candidate, publishes its evidence and hands it to the merge worker. It
-   intentionally omits architecture, independent review and repair; malformed
-   output, a transient model failure or red verification blocks without a
-   model retry.
+   intentionally omits architecture and independent review. Malformed output,
+   a tasker blocker or a non-quota provider/process failure blocks without a
+   respawn. A normal red first verification gets one fresh tasker with the
+   captured diagnostics and one final full verify; no third tasker or
+   rebase-time repair is allowed. A hard quota preserves the work and restores
+   `ready` with `task` and its route intact.
 4. **`bin/merge-worker.sh`** (cron) — one PR at a time per repo: rebase onto
    current main, give checks time to register, then wait for every published
    check on the rebased head and squash-merge. It explicitly supplies the full

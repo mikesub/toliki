@@ -15,6 +15,11 @@ the changed contract would otherwise leave it inaccurate. Never weaken, skip,
 or delete a test, assertion, type, lint rule, or safety check merely to make
 the change pass.
 
+When the prompt identifies this process as the one verification-driven repair,
+treat the existing implementation as the starting point. Diagnose the captured
+orchestrator output against the real worktree and make the smallest correction
+that satisfies the original requirement; do not redo or broaden unrelated work.
+
 Before returning, inspect the complete diff, including new files, against every
 requirement. Trace affected callers and failure paths, and correct any concrete
 defects you find. This is builder self-review.

@@ -3,9 +3,10 @@
 // tasker process implements and self-reviews the settled requirement; the
 // orchestrator alone claims, verifies, rebases, commits, pushes, opens the PR,
 // publishes evidence and hands the candidate to the ordinary merge worker.
-// There is no architect, RED step, implementation retry, independent review,
-// repair, correction or shipper. Runtime respawns are disabled for the one
-// call, making one invocation an enforceable one-process contract.
+// There is no architect, RED step, independent review, correction or shipper.
+// Runtime respawns are disabled for every call. The one bounded exception is
+// a fresh tasker given captured diagnostics after the first project verify is
+// genuinely red; its full second verify is final and can never spawn a third.
 
 import path from 'node:path'
 import { existsSync, readFileSync } from 'node:fs'
@@ -80,7 +81,25 @@ Requirement:
 ${prep.requirementBody}
 """
 
-This invocation has exactly one writable model process. Follow the tasker charter: inspect the real codebase, implement the complete settled requirement, add meaningful tests and documentation, and perform builder self-review. Do not run verification or perform Git/GitHub transport. Return the required structured task result.`
+This is the initial writable task process. Follow the tasker charter: inspect the real codebase, implement the complete settled requirement, add meaningful tests and documentation, and perform builder self-review. Do not run verification or perform Git/GitHub transport. Return the required structured task result.`
+
+const verifyRepairPrompt = (prep, verified) => `Repair issue #${issue} in the existing lightweight-task worktree after the orchestrator's project verification failed.
+
+Title: ${prep.requirementTitle}
+
+Original requirement:
+"""
+${prep.requirementBody}
+"""
+
+The initial tasker's implementation and every current worktree change are already available to inspect in place. Diagnose them from the real codebase; no generated diff is injected into this prompt.
+
+Captured failure diagnostics from the exact orchestrator-run verification command:
+"""
+${verified.tail || verified.detail}
+"""
+
+This is the one verification-driven repair process. Inspect the existing changes and fix the reported verification failure without weakening, skipping, deleting or loosening a test, assertion, type, lint rule, check or safety guard, and without expanding beyond the original requirement. Inspect for directly related concrete defects and perform builder self-review. Do not run tests or verification yourself, and do not perform Git/GitHub transport. Leave the updated working tree for one final orchestrator verification and return the normal structured task result.`
 
 const nonblank = value => typeof value === 'string' && value.trim().length > 0
 
@@ -97,6 +116,12 @@ function resultProblem(result) {
   if (!Array.isArray(result.unresolved) || result.unresolved.length) return 'the tasker reported completed with unresolved work'
   return null
 }
+
+const repairableVerifyFailure = verified => !verified.green &&
+  Array.isArray(verified.failures) && verified.failures.length > 0 &&
+  verified.failures.every(failure => !failure.timedOut && !failure.spawnError)
+
+const verifyDiagnostic = verified => verified.tail || verified.detail || 'no verification diagnostics captured'
 
 const deliveryMarker = candidate => `<!-- toliki-task-delivery candidate:${candidate.prHead} -->`
 
@@ -194,10 +219,10 @@ async function main() {
 
     currentPhase = 'task'
     phase('Task')
-    const implemented = await agent(prompt(prep), {
+    let implemented = await agent(prompt(prep), {
       label: 'task', phase: 'Task', step: 'task', schema: TASK_SCHEMA, respawn: false,
     })
-    if (!implemented) return fail('task', 'the single tasker process failed or returned malformed output; the one-process contract forbids a respawn.')
+    if (!implemented) return fail('task', 'the initial tasker process failed or returned malformed output; the one-process contract forbids a respawn for runtime or schema failure.')
     const problem = resultProblem(implemented)
     if (problem) return fail('task', problem)
     if (implemented.status === 'blocked') {
@@ -209,7 +234,38 @@ async function main() {
     phase('Verify')
     finalVerify = await runVerify(prep.packages)
     log(`Verify: ${finalVerify.green ? 'green' : 'RED'} — ${finalVerify.detail}`)
-    if (!finalVerify.green) return fail('verify', `npm run verify is red after the single implementation process (${finalVerify.detail}) — no implementation retry is permitted.`)
+    if (!finalVerify.green && repairableVerifyFailure(finalVerify)) {
+      const firstVerify = finalVerify
+      log('Verify: RED — starting the one fresh task repair process with captured diagnostics.')
+      currentPhase = 'task'
+      phase('Task')
+      const repaired = await agent(verifyRepairPrompt(prep, firstVerify), {
+        label: 'task:verify-repair', phase: 'Task', step: 'task', schema: TASK_SCHEMA,
+        retry: true, respawn: false,
+      })
+      if (!repaired) {
+        return fail('task', `the verification repair tasker failed or returned malformed output; no third task process is permitted. Initial verification diagnostics:\n${verifyDiagnostic(firstVerify)}`)
+      }
+      const repairProblem = resultProblem(repaired)
+      if (repairProblem) {
+        return fail('task', `${repairProblem} during the verification repair; no third task process is permitted. Initial verification diagnostics:\n${verifyDiagnostic(firstVerify)}`)
+      }
+      if (repaired.status === 'blocked') {
+        return fail('task', `the verification repair tasker could not complete safely: ${repaired.unresolved.map(String).join('; ')}. No third task process is permitted. Initial verification diagnostics:\n${verifyDiagnostic(firstVerify)}`)
+      }
+      implemented = repaired
+      updateEpicMd(epicDir(slug), { phase: 'task → verify repair', log: `task verify repair: ${repaired.summary}` })
+
+      currentPhase = 'verify'
+      phase('Verify')
+      finalVerify = await runVerify(prep.packages)
+      log(`Verify retry: ${finalVerify.green ? 'green' : 'RED'} — ${finalVerify.detail}`)
+      if (!finalVerify.green) {
+        return fail('verify', `npm run verify remained red after the one diagnostics-driven task repair; no third task process is permitted.\n\nInitial verification diagnostics:\n${verifyDiagnostic(firstVerify)}\n\nFinal verification diagnostics:\n${verifyDiagnostic(finalVerify)}`)
+      }
+    } else if (!finalVerify.green) {
+      return fail('verify', `npm run verify did not produce a repairable test/check failure (${finalVerify.detail}); timeout or process-launch failures never start another task process.`)
+    }
     await checkpoint(slug, 'task')
 
     currentPhase = 'rebase'

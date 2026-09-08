@@ -245,7 +245,7 @@ prompt="$(cat)"
 
 key=unknown
 case "${EPIC_STEP_LABEL:-}" in
-  task)                                        key=task ;;
+  task|task:verify-repair)                     key=task ;;
   architect:design)                            key=design ;;
   architect:recover)                           key=recover ;;
   code:red|code:red:retry)                     key=red ;;
@@ -1743,16 +1743,66 @@ assert_contains "the task timeout remains visible" "$RUN_OUT" "timed out"
 assert_not_contains "timeout starts no respawn" "$RUN_OUT" "respawning once"
 assert_eq "timed-out tasker opens no PR" "" "$(gh_pr_created)"
 
-scenario 'task-run: red verification preserves the branch and opens no PR'
+scenario 'task-run: red verification gets one diagnostics-driven repair and then delivers'
+TASK_REPAIRED="$TMP/fixtures-task-repaired"
+make_task_fixture "$TASK_REPAIRED"
+printf '1\n' > "$TASK_REPAIRED/verify.rc"
+fixture "$TASK_REPAIRED" task.1 '{"status":"completed","title":"Repair lightweight widget","summary":"Repaired the verification failure in the existing widget delivery.","commitBody":"Keep the widget implementation aligned with the project verification contract.","tests":"Kept and repaired the widget coverage without weakening it.","selfReview":"Builder self-review inspected the existing changes and corrected the reported defect.","unresolved":[]}'
+fixture_sh "$TASK_REPAIRED" task.1 'rm "$STUB_FIXTURES/verify.rc"; printf "export const createWidget = () => ({ repaired: true })\n" > frontend/src/widget.ts'
+GH_ISSUE_LABELS=ready,task run_pipeline "$TASK_RUN" "$TASK_REPAIRED" --issue 42
+assert_rc "repaired task verification exits 0" 0 "$RUN_RC"
+assert_eq "initial red gets exactly one fresh task process" 2 "$(calls task)"
+assert_eq "the orchestrator runs the full verify gate twice" 2 "$(grep -c '^run verify$' "$NPM_LOG" || true)"
+assert_contains "the repaired task reaches delivery" "$RUN_OUT" '"readyToMerge":true'
+assert_contains "the repair prompt repeats the original title" "$(cat "$STATE_DIR/task.1.prompt")" "Add widget"
+assert_contains "the repair prompt repeats the original requirement" "$(cat "$STATE_DIR/task.1.prompt")" "Build a widget."
+assert_contains "the repair prompt carries exact captured diagnostics" "$(cat "$STATE_DIR/task.1.prompt")" "verify: widget.test.ts expected 2 got 1"
+assert_contains "the repair prompt forbids weakening tests" "$(cat "$STATE_DIR/task.1.prompt")" "without weakening, skipping, deleting or loosening"
+assert_contains "the repair prompt forbids scope expansion" "$(cat "$STATE_DIR/task.1.prompt")" "without expanding beyond the original requirement"
+assert_contains "the repair prompt points at the existing worktree" "$(cat "$STATE_DIR/task.1.prompt")" "already available to inspect in place"
+assert_not_contains "the orchestrator does not inject a generated full diff" "$(cat "$STATE_DIR/task.1.prompt")" "diff --git"
+assert_eq "usage distinguishes the repair while routing both through task" "task false|task:verify-repair true" \
+  "$(usage_log | jq -r 'select(.type=="spawn") | "\(.label) \(.retry)"' | paste -sd '|' -)"
+
+scenario 'task-run: a second red verification preserves the branch and opens no PR'
 TASK_RED="$TMP/fixtures-task-red"
 make_task_fixture "$TASK_RED"
 printf '1\n' > "$TASK_RED/verify.rc"
 GH_ISSUE_LABELS=ready,task run_pipeline "$TASK_RUN" "$TASK_RED" --issue 42
 assert_rc "red task verification blocks" 3 "$RUN_RC"
-assert_eq "red verification does not start another model" 1 "$(calls task)"
+assert_eq "red verification starts only one bounded repair" 2 "$(calls task)"
+assert_eq "both verification attempts run" 2 "$(grep -c '^run verify$' "$NPM_LOG" || true)"
 assert_eq "red verification opens no PR" "" "$(gh_pr_created)"
 assert_eq "red verification rests failed with the selector" "failed,task," "$(gh_labels)"
 assert_contains "the blocked branch is preserved on origin" "$(git -C "$ORIGIN" show "epic/42-add-widget:frontend/src/widget.ts" 2>/dev/null)" "createWidget"
+assert_contains "the blocker preserves the initial diagnostics" "$(gh_comments)" "Initial verification diagnostics"
+assert_contains "the blocker preserves the final diagnostics" "$(gh_comments)" "Final verification diagnostics"
+assert_contains "the blocker makes the bound explicit" "$RUN_OUT" "no third task process is permitted"
+
+scenario 'task-run: malformed verification repair blocks without a third process'
+TASK_BAD_REPAIR="$TMP/fixtures-task-bad-repair"
+make_task_fixture "$TASK_BAD_REPAIR"
+printf '1\n' > "$TASK_BAD_REPAIR/verify.rc"
+fixture "$TASK_BAD_REPAIR" task.1 '{"status":"completed"}'
+GH_ISSUE_LABELS=ready,task run_pipeline "$TASK_RUN" "$TASK_BAD_REPAIR" --issue 42
+assert_rc "malformed verification repair blocks" 3 "$RUN_RC"
+assert_eq "malformed repair gets no schema or third-process respawn" 2 "$(calls task)"
+assert_eq "malformed repair never reaches a second verify" 1 "$(grep -c '^run verify$' "$NPM_LOG" || true)"
+assert_eq "malformed repair opens no PR" "" "$(gh_pr_created)"
+assert_contains "malformed repair reports the hard process bound" "$RUN_OUT" "no third task process is permitted"
+
+scenario 'task-run: failed verification repair blocks without a third process'
+TASK_DEAD_REPAIR="$TMP/fixtures-task-dead-repair"
+make_task_fixture "$TASK_DEAD_REPAIR"
+printf '1\n' > "$TASK_DEAD_REPAIR/verify.rc"
+printf '1\n' > "$TASK_DEAD_REPAIR/task.1.rc"
+GH_ISSUE_LABELS=ready,task run_pipeline "$TASK_RUN" "$TASK_DEAD_REPAIR" --issue 42
+assert_rc "failed verification repair blocks" 3 "$RUN_RC"
+assert_eq "failed repair gets no runtime or third-process respawn" 2 "$(calls task)"
+assert_eq "failed repair never reaches a second verify" 1 "$(grep -c '^run verify$' "$NPM_LOG" || true)"
+assert_eq "failed repair opens no PR" "" "$(gh_pr_created)"
+assert_not_contains "failed repair does not invoke runtime respawn" "$RUN_OUT" "respawning once"
+assert_contains "failed repair reports the hard process bound" "$RUN_OUT" "no third task process is permitted"
 
 scenario 'task-run: a moved clean base is reinstalled and reverified'
 TASK_MOVED="$TMP/fixtures-task-moved"

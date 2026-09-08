@@ -77,8 +77,9 @@ in the same change.
   supplies captured diff evidence and also proves the worktree, index, Git
   configuration, hooks and ancestry metadata unchanged around review, final
   review and ship. Nothing deterministic is a step: git, gh and npm work runs
-  in the orchestrator. `task` maps to the writable `tasker` charter and is the
-  task workflow's only model process.
+  in the orchestrator. `task` maps both the task workflow's primary model
+  process and its optional one-time verification-diagnostics repair to the
+  writable `tasker` charter.
 - **Charter**: an `agents/*.md` file, read on every phase. Missing or malformed
   refuses the run.
 - **Package**: a directory whose `package.json` declares `scripts.verify`. The
@@ -157,7 +158,8 @@ than made launchable against a main without the code it describes.
 - `workflows/lib/runtime.mjs` owns phase execution, the concurrency gate,
   timeouts and signal forwarding. Deterministic control flow lives here or in
   scripts, never inside model judgment. Task-run disables both transient and
-  schema respawns so its one invocation is exactly one model process.
+  schema respawns on every invocation; only a normal red first project verify
+  may cause one explicitly labelled fresh tasker invocation.
 - `etc/lib.sh` validates and exports the host-wide `HOST_TIMEZONE`, and
   `workflows/lib/time.mjs` is the matching Node formatter. Human-facing pane,
   status, script-log and resource-report timestamps use that zone; parsed usage,
@@ -246,15 +248,21 @@ than made launchable against a main without the code it describes.
   CI conclusion, ref listing, routing label or conflict classification is never
   a green gate. Gated by `tests/dispatch-engine.test.sh` and
   `tests/epic-run.test.sh`.
-- The `task` workflow is a human opt-in economy with exactly one writable
+- The `task` workflow is a human opt-in economy with one primary writable
   tasker process. The orchestrator still owns the shared claim and engine pin,
   dependency install, project verify, clean moved-base rebase plus re-verify,
   candidate commit containing `Closes #N`, push, PR, delivery-summary readback
-  and handoff. Invalid output, provider transients and red verification never
-  respawn it; they preserve the branch and rest at `failed`. A hard quota is
-  the exception: it records the task vendor's hold and restores `ready` without
-  removing `task` or the engine pin. Its PR and later fixer prompts state that
-  the original delivery was intentionally not independently reviewed.
+  and handoff. Invalid output, a tasker blocker, provider/process failure or
+  timeout never respawns it; they preserve the branch and rest at `failed`. A
+  normal nonzero first project verify is the sole bounded exception: one fresh
+  tasker receives the original requirement plus sanitized bounded diagnostics,
+  inspects the existing worktree without an injected full diff, and repairs
+  without weakening tests or expanding scope. Its runtime and schema respawns
+  remain disabled, the full verify runs once more, and no third tasker or
+  rebase-time repair is allowed. A hard quota from either tasker records the
+  task vendor's hold and restores `ready` without removing `task` or the engine
+  pin. Its PR and later fixer prompts state that the original delivery was
+  intentionally not independently reviewed.
 - A provider `quota-exhausted` result is never transient-respawned. The run
   preserves its resumable state, records only the failed step's vendor hold,
   refunds a fixer's current attempt rung, and only then restores the appropriate

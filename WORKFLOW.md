@@ -46,7 +46,7 @@ failure behavior.
 | 8. Ship | `shipper` charter plus orchestrator | One prose/metadata call |
 | 9. Merge gate | Node orchestrator | None |
 | 10. Merge worker | Shell scripts | None |
-| Task path | `tasker` charter plus orchestrator | Exactly one; no model or schema respawn |
+| Task path | `tasker` charter plus orchestrator | One; at most one fresh diagnostics-driven repair after a genuinely red first verify |
 
 Every LLM call is a new, short-lived process. The selected `engine:<name>` maps
 each step to a vendor, model, and effort in [`etc/engines.json`](etc/engines.json).
@@ -77,21 +77,30 @@ lifecycle state or a model classification. Dispatch sends plain `ready` to
 `<repo>-epic-<N>` session, `epic/<N>-*` branch namespace and safety-critical
 claim, engine-pin, candidate, quota and handoff implementation.
 
-Task-run starts exactly one writable `tasker` process. It receives the settled
-issue and must implement it, add meaningful coverage and return structured
-title, summary, commit rationale, test, self-review and unresolved-work fields.
-The orchestrator then runs every discovered package's `npm run verify`. A
+Task-run starts one writable `tasker` process. It receives the settled issue
+and must implement it, add meaningful coverage and return structured title,
+summary, commit rationale, test, self-review and unresolved-work fields. The
+orchestrator then runs every discovered package's `npm run verify`. If that
+first gate is genuinely red, one fresh tasker receives the original requirement
+and the bounded, sanitized failure diagnostics, inspects the existing worktree,
+and repairs it in place; the worktree diff is not duplicated into its prompt.
+The orchestrator runs the complete gate once more and that verdict is final. A
 clean moved base is rebased and verified again before the candidate is formed;
 a conflicting base is left to the merge worker and its conflict fixer. The
 squashed candidate commit includes `Closes #N`, and its issue summary records
 that the delivery was verified but intentionally not independently reviewed.
 
-There is no architect, RED/GREEN split, reviewer, repair, correction or
+There is no architect, RED/GREEN split, reviewer, review repair, correction or
 shipper. There is also no transient or invalid-schema model respawn: malformed
-output, a provider transient, a red verify or transport failure preserves the
-branch and rests the issue at `failed`. A hard quota records only the task
-step's vendor hold and restores `ready` while retaining `task` and the engine
-pin. Later conflict or CI fixer prompts carry the intentional review omission.
+output, a tasker-declared blocker, a provider/process failure or timeout
+preserves the branch and rests the issue at `failed`. The verification repair
+is started only for a normal nonzero project-gate result, runs with both
+respawns disabled, may not weaken tests or expand scope, and can never spawn a
+third tasker. A second red gate blocks with both attempts' diagnostics; a
+rebase-time red gate never retries. A hard quota in either tasker records only
+the task step's vendor hold and restores `ready` while retaining `task` and the
+engine pin. Later conflict or CI fixer prompts carry the intentional review
+omission.
 
 ## 1. Prepare
 
@@ -689,7 +698,8 @@ line is ignored as a possible concurrent append.
 1. Every structured model call is schema checked. Runtime may respawn once for
    a transient process failure and once for an off-schema result; timeouts and
    hard provider-quota failures are not transiently retried. Task-run disables
-   both respawns to preserve its exact one-process contract.
+   both respawns for each call; its only second call is the explicit bounded
+   repair after a normal red first project verify.
 2. On a hard provider quota failure, an epic or task checkpoints and pushes
    resumable work before restoring `ready`; task retains its selector. A fixer
    cleans unpushed edits and refunds its current rung. All record a

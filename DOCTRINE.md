@@ -45,10 +45,15 @@ don't get re-litigated from memory.
   repair, correction and ship prose. The accepted trade-off is explicit: the
   candidate is verified but intentionally not independently model-reviewed,
   so this path is only for work where a human has judged that review cost
-  disproportionate. One task invocation means one model process — malformed
-  output, a transient provider error or red verification blocks instead of
-  quietly turning the cheap path into a retry loop. Plain `ready` remains the
-  full epic workflow.
+  disproportionate. Malformed output, a tasker blocker, non-quota
+  provider/process failure or timeout still blocks after that one process. A
+  genuine red first verification is the bounded exception: its sanitized
+  failure diagnostics go to one fresh tasker in the same worktree, followed by
+  one final full verify.
+  This spends at most two model processes, never applies to rebase-time verify,
+  and never becomes a retry loop. A hard quota from either tasker preserves the
+  work and restores `ready` with the selector and route intact. Plain `ready`
+  remains the full epic workflow.
 - **The pipeline outlives its engine.** Every phase is a process behind one
   adapter, so which vendor's CLI runs an epic is a routing value, not an
   architecture. That is worth the orchestration we now own outright (a
