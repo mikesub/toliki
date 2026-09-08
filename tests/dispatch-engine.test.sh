@@ -962,15 +962,17 @@ assert_not_contains "host-wide next does not default to the first repo" "$(cat "
 SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/remote-control.sh" next claude -r testrepo
 assert_contains "an explicit repo is forwarded" "$(cat "$TMP/ssh.log")" "--repo 'testrepo'"
 
-# The laptop hands the report only what an operator asked for, and the host's
-# own zone: usage-report.mjs renders lifetime timestamps for a human, so a
-# forwarded command with no zone would date the host's runs in UTC.
-printf '\nremote control: usage forwards the report filters and the host zone\n'
+# The laptop hands the report only what an operator asked for. The zone the
+# lifetime view renders in is the HOST's, resolved on the host by sourcing its
+# own etc/lib.sh — which clears any inherited HOST_TIMEZONE first, so no laptop
+# value can ride along. tests/timezone.test.sh gates that with two registries.
+printf '\nremote control: usage forwards the report filters and loads the host registry\n'
 SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/remote-control.sh" usage 7 codex
 USAGE_CMD="$(cat "$TMP/ssh.log")"
 assert_contains "the window and engine reach the report" "$USAGE_CMD" "usage-report.mjs --since '7d' --engine 'codex'"
-assert_contains "the forwarded usage report renders timestamps in the host's zone" "$USAGE_CMD" "HOST_TIMEZONE='Europe/Amsterdam'"
-assert_matches "the report's clock comes from the registry, not the laptop" "$USAGE_CMD" "(^| )TZ='Europe/Amsterdam'"
+assert_contains "the host's own registry is loaded before the report" "$USAGE_CMD" "source '$HARNESS/etc/lib.sh' && node"
+assert_not_contains "the laptop never ships a zone for the host to use" "$USAGE_CMD" "HOST_TIMEZONE="
+assert_not_contains "nor a TZ" "$USAGE_CMD" "TZ="
 SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/remote-control.sh" usage
 BARE_USAGE="$(cat "$TMP/ssh.log")"
 assert_contains "a bare usage still runs the report" "$BARE_USAGE" "workflows/usage-report.mjs"

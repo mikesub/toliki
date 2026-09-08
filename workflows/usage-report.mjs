@@ -95,11 +95,16 @@ for (let i = 0; i < lines.length; i++) {
   else malformed++
 }
 const records = [...spawns, ...starts, ...finishes]
-if (!records.length) {
-  console.log(`no usage records in ${file}${since ? ` since ${since}` : ''}${engineFilter ? ` for engine ${engineFilter}` : ''}`)
+// Said for an empty log and again once the filters have run: a window, engine
+// or script that selects nothing prints no tuning table, no lifetime header and
+// no totals, and silence at the end of an ssh reads as a broken connection
+// rather than as a quiet week.
+const nothingSelected = () => {
+  console.log(`no usage records in ${file}${since ? ` since ${since}` : ''}${engineFilter ? ` for engine ${engineFilter}` : ''}${scriptFilter ? ` for script ${scriptFilter}` : ''}`)
   if (malformed) console.log(`malformed records skipped: ${malformed}`)
   process.exit(0)
 }
+if (!records.length) nothingSelected()
 
 // ───────────────────────── formatting ─────────────────────────
 const fmt = (n, d = 0) => (n === null || n === undefined || Number.isNaN(n)) ? '-' : Number(n).toLocaleString('en-US', { maximumFractionDigits: d, minimumFractionDigits: d })
@@ -315,6 +320,7 @@ const orphanRows = [...orphans.values()].map(summarize).filter(s => {
   if (scriptFilter && !s.entry.records.some(r => r.script === scriptFilter)) return false
   return true
 })
+if (!tuned.length && !lifetimeRows.length && !orphanRows.length) nothingSelected()
 
 const byLatest = (a, b) => (b.latest ?? 0) - (a.latest ?? 0)
 const scriptCounts = s => [...s.byScript.entries()]

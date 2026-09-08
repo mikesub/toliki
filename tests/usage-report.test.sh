@@ -56,6 +56,13 @@ assert_not_contains() { if [[ "$2" != *"$3"* ]]; then ok "$1"; else nok "$1 (une
 section() { printf '\n%s\n' "$1"; }
 
 # ───────────────────────── fixture writers ─────────────────────────
+# The laptop these suites also run on is macOS, whose date has no GNU -d: every
+# conversion below tries the BSD form first and falls back to GNU, the way
+# tests/reap-worktree.test.sh and bin/reap.sh do. `date -u +%s` is the one
+# relative form both implementations share, so offsets are taken in seconds.
+iso_epoch() { date -u -j -f '%Y-%m-%dT%H:%M:%S' "${1%.*}" +%s 2>/dev/null || date -u -d "$1" +%s; }
+epoch_iso() { date -u -r "$1" +%Y-%m-%dT%H:%M:%S.000Z 2>/dev/null || date -u -d "@$1" +%Y-%m-%dT%H:%M:%S.000Z; }
+
 # issue, repo and session are written as JSON literals ("myapp" or null), so a
 # fixture can state the absence of an identity as precisely as its presence.
 TOKENS='{"input":1000,"output":200,"cacheRead":500,"cacheCreate":100,"total":1800}'
@@ -68,7 +75,7 @@ run_start() { # file ts runId script engine issue repo [session]
 
 run_finish() { # file ts runId script engine issue repo ms outcome handoff exit attempt
   local file="$1" ts="$2" ms="$8" started
-  started="$(date -u -d "@$(( $(date -u -d "$ts" +%s) - ms / 1000 ))" +%Y-%m-%dT%H:%M:%S.000Z)"
+  started="$(epoch_iso $(( $(iso_epoch "$ts") - ms / 1000 )))"
   printf '{"type":"run-finish","ts":"%s","runId":"%s","script":"%s","engine":"%s","session":null,"issue":%s,"repo":%s,"startedAt":"%s","ms":%s,"outcome":%s,"handoff":%s,"exit":%s,"attempt":%s}\n' \
     "$ts" "$3" "$4" "$5" "$6" "$7" "$started" "$ms" "$9" "${10}" "${11}" "${12}" >> "$file"
 }
@@ -324,16 +331,17 @@ assert_contains "and a model with no price row is named" "$REPORT_OUT" '1 spawn(
 # ───────────────────────── --since selects lifetimes, not records ─────────────────────────
 section '--since selects a lifetime by its latest activity, then totals all of it'
 SINCE="$TMP/since.jsonl"
-old_ts() { date -u -d "40 days ago ${1:-}" +%Y-%m-%dT%H:%M:%S.000Z; }
-new_ts() { date -u -d "1 hour ago ${1:-}" +%Y-%m-%dT%H:%M:%S.000Z; }
+NOW="$(date -u +%s)"
+old_ts() { epoch_iso $(( NOW - 40 * 86400 + ${1:-0} )); }   # 40 days ago, plus N seconds
+new_ts() { epoch_iso $(( NOW - 3600 + ${1:-0} )); }         # 1 hour ago, plus N seconds
 run_start  "$SINCE" "$(old_ts)"             s1 epic-run claude 70 '"myapp"'
-spawn      "$SINCE" "$(old_ts '+1 minute')" s1 epic-run claude 70 '"myapp"' architect:design 1 false 300000 0.50 cli
-run_finish "$SINCE" "$(old_ts '+30 minutes')" s1 epic-run claude 70 '"myapp"' 1800000 '"human-review"' true 0 null
+spawn      "$SINCE" "$(old_ts 60)"           s1 epic-run claude 70 '"myapp"' architect:design 1 false 300000 0.50 cli
+run_finish "$SINCE" "$(old_ts 1800)"         s1 epic-run claude 70 '"myapp"' 1800000 '"human-review"' true 0 null
 run_start  "$SINCE" "$(new_ts)"             s2 fix-run claude 70 '"myapp"'
-spawn      "$SINCE" "$(new_ts '+1 minute')" s2 fix-run claude 70 '"myapp"' fix:resolve 1 false 300000 0.50 cli
-run_finish "$SINCE" "$(new_ts '+10 minutes')" s2 fix-run claude 70 '"myapp"' 600000 '"merge-queued"' false 0 1
-run_start  "$SINCE" "$(old_ts '+2 hours')"  s3 epic-run claude 71 '"myapp"'
-run_finish "$SINCE" "$(old_ts '+3 hours')"  s3 epic-run claude 71 '"myapp"' 1800000 '"merge-queued"' false 0 null
+spawn      "$SINCE" "$(new_ts 60)"           s2 fix-run claude 70 '"myapp"' fix:resolve 1 false 300000 0.50 cli
+run_finish "$SINCE" "$(new_ts 600)"          s2 fix-run claude 70 '"myapp"' 600000 '"merge-queued"' false 0 1
+run_start  "$SINCE" "$(old_ts 7200)"         s3 epic-run claude 71 '"myapp"'
+run_finish "$SINCE" "$(old_ts 10800)"        s3 epic-run claude 71 '"myapp"' 1800000 '"merge-queued"' false 0 null
 report "$SINCE" --since 7d
 assert_rc "a windowed report succeeds" 0 "$REPORT_RC"
 SINCE_ROW="$(row 70)"
@@ -377,6 +385,32 @@ assert_contains "and says which file" "$REPORT_OUT" 'usage-report: cannot read'
 report "$TMP/empty.jsonl"
 assert_rc "an empty log is not an error" 0 "$REPORT_RC"
 assert_contains "it just says there is nothing" "$REPORT_OUT" 'no usage records in'
+
+# A populated log filtered down to nothing is still an answer. Printing nothing
+# at the end of `remote-control.sh usage 7` on a quiet week is indistinguishable
+# from a broken ssh or a crashed node, so every filter that selects nothing says
+# so and names itself.
+QUIET="$TMP/quiet.jsonl"
+run_start  "$QUIET" "$(old_ts)"          q1 epic-run claude 90 '"myapp"'
+spawn      "$QUIET" "$(old_ts 60)"       q1 epic-run claude 90 '"myapp"' architect:design 1 false 300000 0.50 cli
+run_finish "$QUIET" "$(old_ts 1800)"     q1 epic-run claude 90 '"myapp"' 1800000 '"merge-queued"' false 0 null
+report "$QUIET" --since 1d
+assert_rc "a window that selects nothing is not an error" 0 "$REPORT_RC"
+assert_contains "a quiet week says so rather than printing nothing" "$REPORT_OUT" 'no usage records in'
+assert_contains "and names the window it was given" "$REPORT_OUT" 'since 1d'
+report "$LIFE" --engine no-such-engine
+assert_rc "an engine matching nothing is not an error" 0 "$REPORT_RC"
+assert_contains "an engine that never ran is named, not left blank" "$REPORT_OUT" 'for engine no-such-engine'
+report "$LIFE" --script no-such-script
+assert_rc "a script matching nothing is not an error" 0 "$REPORT_RC"
+assert_contains "so is a script that never ran" "$REPORT_OUT" 'for script no-such-script'
+
+# The fixture clock is the suite's own dependency: it must hold on the laptop's
+# BSD date as well as the host's GNU one.
+assert_eq "an epoch renders as a canonical UTC instant" "2026-05-01T09:10:00.000Z" "$(epoch_iso 1777626600)"
+assert_eq "and that instant reads back as its epoch" "1777626600" "$(iso_epoch 2026-05-01T09:10:00.000Z)"
+assert_eq "no fixture depends on GNU date alone" "" \
+  "$(grep -n 'date -u -d' "${BASH_SOURCE[0]}" | grep -v '|| date -u -d' || true)"
 HELP="$(HOST_TIMEZONE=UTC TZ=UTC node "$ROOT/workflows/usage-report.mjs" --help 2>&1)"
 assert_contains "the help names every pipeline the log now holds" "$HELP" '--script epic-run|fix-run|ci-run|defect-run'
 

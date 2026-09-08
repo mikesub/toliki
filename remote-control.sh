@@ -320,11 +320,12 @@ esac
 
 case "$ACTION" in
   usage)
-    # Read-only: the report script only reads the usage log. The host's zone
-    # rides along the way bin/launch.sh writes it into a pane: the lifetime view
-    # renders timestamps for a human, and an ssh command carries no zone of its
-    # own, so without this the host's own runs would be dated in UTC.
-    REMOTE="HOST_TIMEZONE=$(sq "$HOST_TIMEZONE") TZ=$(sq "$HOST_TIMEZONE") node $HOST_CONTROL_DIR/workflows/usage-report.mjs"
+    # Read-only: the report script only reads the usage log. The host loads its
+    # OWN registry first, the way .agents/skills/toliki/scripts/host-clock.sh
+    # does: the lifetime view renders timestamps for a human, and etc/lib.sh
+    # clears any inherited HOST_TIMEZONE before reading repos.conf, so this
+    # laptop's zone can never decide how the host's runs are dated.
+    REMOTE="source $(sq "$HOST_CONTROL_DIR/etc/lib.sh") && node $HOST_CONTROL_DIR/workflows/usage-report.mjs"
     [[ -z "$USAGE_DAYS" ]] || REMOTE+=" --since $(sq "${USAGE_DAYS}d")"
     [[ -z "$USAGE_ENGINE" ]] || REMOTE+=" --engine $(sq "$USAGE_ENGINE")"
     ssh "$HOST" "$REMOTE"
