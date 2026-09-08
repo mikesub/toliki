@@ -8,7 +8,9 @@
 // is deliberately not a configurable workflow framework.
 //
 // Cause adapters retain the operations whose ordering is part of their safety
-// contract: conflict rebase/autoresolve and evidence-before-push, CI failure
+// contract: conflict rebase/autoresolve, its scripted `settle` step (marker
+// check, staging and rebase continuation, so a repair agent never advances the
+// branch itself) and evidence-before-push, CI failure
 // capture and local reproduction, and defect evidence binding, head readback,
 // evidence refresh and landing-only recovery. Once a partial push is observed,
 // state is monotonic: no exception can reach the ordinary requeueing blocker.
@@ -500,6 +502,14 @@ export async function runFixerLifecycle(spec) {
         const repaired = dispositions.filter(item => item.action === 'repaired')
         const declined = dispositions.filter(item => item.action === 'declined')
         if (!repaired.length) return { stopped: true, result: await fail(spec.repair.key, spec.repair.allDeclined(declined)) }
+        // The scripted finish of whatever repository state the repair agent was
+        // left sitting in — the conflict fixer's staging and rebase
+        // continuation. It runs only once every item has a disposition and at
+        // least one is a repair, and its first problem blocks: work the
+        // orchestrator could not carry forward itself is never a finished
+        // repair, whatever the agent claimed.
+        const settleProblem = await spec.repair.settle?.(ctx, prep, dispositions)
+        if (settleProblem) return { stopped: true, result: await fail(spec.repair.key, settleProblem) }
         const treeProblem = await spec.repair.treeProblem?.(ctx, prep, repairResult, dispositions)
         if (treeProblem) return { stopped: true, result: await fail(spec.repair.key, treeProblem) }
         spec.repair.log(ctx, prep, repairResult, repaired, declined)

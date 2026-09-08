@@ -585,11 +585,16 @@ when both paths are needed.
    captured brief: both sides' diffs of exactly the marked files, the commit
    subjects behind main's side, and the issue bodies stating what each side set
    out to do (up to five of main's, since that list is parsed out of arbitrary
-   commit messages; the subjects always carry the rest). It must account for each hunk by either preserving both sides'
-   intent or declining it without guessing. The acceptance check and any scoped
-   correction receive that same captured brief.
-4. The orchestrator validates every indexed disposition, completed rebase
-   shape, marker cleanup, and allowed edit boundary.
+   commit messages; the subjects always carry the rest). It edits nothing but
+   the conflict text it was given, and must account for each hunk by either
+   preserving both sides' intent or declining it without guessing. It never
+   stages, continues the rebase, or judges the branch. The acceptance check and
+   any scoped correction receive that same captured brief.
+4. The orchestrator validates every indexed disposition, then finishes the stop
+   itself: no marker survives, exactly the judgment files are staged, one
+   `git rebase --continue` runs, and the completed branch's shape and edit
+   boundary are checked. A stop that survives that continuation blocks — it is
+   never a completed repair.
 5. It runs `npm run verify`; a red result and its captured diagnostics go back
    to one fresh resolver before the full gate runs again. Only a green tree
    reaches the acceptance check, which tries to refute every repaired hunk and
