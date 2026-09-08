@@ -537,6 +537,11 @@ printf '%s\n' "$*" >> "${STUB_NPM_LOG:-/dev/null}"
 case "$*" in
   ci) mkdir -p node_modules; exit 0 ;;
   "run verify")
+    if [[ "${STUB_VERIFY_ANSI:-}" == "1" ]]; then
+      printf '\033[2mTests\033[22m \033[1m\033[31m5 failed\033[39m\033[22m\r\033[32m15779 passed\033[39m\a\n'
+      printf '\033[90mwidget.test.ts: expected 2 got 1\033[39m\n' >&2
+      exit 1
+    fi
     if [[ "${STUB_VERIFY_MIXED_STREAM:-}" == "1" ]]; then
       printf 'VERIFY_STDOUT_ASSERTION expected 2 got 1\n'
       noise_line=1
@@ -642,6 +647,12 @@ assert_contains "runVerify tail preserves the stdout assertion past forty stderr
 assert_contains "runVerify tail keeps stderr represented" "$VERIFY_TAIL" "verify stderr noise 45"
 assert_not_contains "runVerify tail bounds stderr independently" "$VERIFY_TAIL" "verify stderr noise 05"
 assert_matches "runVerify tail orders stdout before stderr" "$VERIFY_TAIL" 'VERIFY_STDOUT_ASSERTION expected 2 got 1.*verify stderr noise 45'
+
+VERIFY_ANSI_OUT="$(PATH="$TMP/bin:$PATH" REPO_MODULE="$ROOT/workflows/lib/repo.mjs" VERIFY_DIR="$VERIFY_DIR" STUB_VERIFY_ANSI=1 node "$TMP/verify-check.mjs")"
+assert_contains "runVerify keeps readable text from colored verification output" "$VERIFY_ANSI_OUT" 'Tests 5 failed'
+assert_contains "runVerify normalizes carriage-return progress into readable lines" "$VERIFY_ANSI_OUT" '15779 passed'
+assert_not_contains "runVerify strips terminal escape bytes before diagnostics escape the transport" "$VERIFY_ANSI_OUT" $'\033'
+assert_not_contains "runVerify strips non-layout control bytes before GitHub Markdown" "$VERIFY_ANSI_OUT" $'\a'
 
 cat > "$TMP/hookless-git-env.mjs" <<'NODE'
 const { git } = await import(process.env.REPO_MODULE)

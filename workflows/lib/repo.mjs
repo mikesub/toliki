@@ -10,6 +10,7 @@
 
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync, appendFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
+import { stripVTControlCharacters } from 'node:util'
 import path from 'node:path'
 import { sh, must } from './proc.mjs'
 
@@ -118,9 +119,16 @@ export async function ensureDeps(packages, { pairs = [] } = {}) {
 // ───────────────────────── verify ─────────────────────────
 // The project's whole gate, package by package. The exit code is the verdict;
 // the detail and retry tail independently bound stdout and stderr so noise in
-// one stream cannot displace the useful failure from the other.
+// one stream cannot displace the useful failure from the other. Terminal
+// formatting is removed at this boundary: these diagnostics flow into model
+// prompts, logs and GitHub Markdown, where raw escape/control bytes are corrupt
+// markup rather than useful evidence.
 // Structured failures retain bounded output and process status so test-first
 // can match its expected assertion without treating a timeout or spawn failure as RED.
+const plainDiagnostic = value => stripVTControlCharacters(String(value || ''))
+  .replace(/\r\n?/gu, '\n')
+  .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/gu, '')
+
 export async function runVerify(packages, { timeoutMs = VERIFY_TIMEOUT_MS, tailLines = 40 } = {}) {
   const details = []
   const evidence = []
@@ -129,8 +137,10 @@ export async function runVerify(packages, { timeoutMs = VERIFY_TIMEOUT_MS, tailL
   let green = true
   for (const pkg of packages) {
     const r = await sh('npm', ['run', 'verify'], { cwd: pkg === '.' ? '.' : pkg, timeoutMs, stdoutCap: 256 * 1024 })
-    const stdoutLines = r.out.split('\n').filter(l => l.trim())
-    const stderrLines = r.err.split('\n').filter(l => l.trim())
+    const stdout = plainDiagnostic(r.out)
+    const stderr = plainDiagnostic(r.err)
+    const stdoutLines = stdout.split('\n').filter(l => l.trim())
+    const stderrLines = stderr.split('\n').filter(l => l.trim())
     const evidenceLines = [...stdoutLines.slice(-3), ...stderrLines.slice(-3)]
     evidence.push(`${pkg} — ${evidenceLines.join(' | ') || (r.ok ? 'exit 0' : `exit ${r.code}`)}`)
     if (r.ok) { details.push(`${pkg} — pass`); continue }
@@ -138,7 +148,7 @@ export async function runVerify(packages, { timeoutMs = VERIFY_TIMEOUT_MS, tailL
     const detailLines = [...stdoutLines.slice(-3), ...stderrLines.slice(-3)]
     const last = r.timedOut ? 'timed out' : (detailLines.join(' | ') || `exit ${r.code}`)
     details.push(`${pkg} — fail: ${last}`)
-    const output = `${r.out}\n${r.err}`.trim()
+    const output = `${stdout}\n${stderr}`.trim()
     const stdoutTail = tailLines > 0 ? stdoutLines.slice(-tailLines) : []
     const stderrTail = tailLines > 0 ? stderrLines.slice(-tailLines) : []
     tails.push(`--- ${pkg}: npm run verify ${r.timedOut ? 'timed out' : `exited ${r.code}`} ---\n${[...stdoutTail, ...stderrTail].join('\n')}`)

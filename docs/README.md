@@ -180,7 +180,8 @@ two logical calls, depending on resume state and verification mode.
 7. The coder may use `npm run verify` as its feedback loop, but it does not own
    the verdict and may not commit or push.
 8. The orchestrator runs `npm run verify` in every discovered package. The exit
-   codes and bounded output are the authoritative evidence.
+   codes and bounded, terminal-formatting-free output are the authoritative
+   evidence used in prompts, logs, and GitHub comments.
 9. If verification is red, the implementation process is respawned once with
    the actual failure output. A second red result blocks before Review.
 10. The orchestrator checkpoints all nonignored implementation work as
