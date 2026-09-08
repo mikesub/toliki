@@ -116,7 +116,7 @@ export async function runFixerLifecycle(spec) {
     throw error
   }
 
-  initRuntime({ scriptName: spec.scriptName, sessionName: args.session, defaultEngine: args.engine, issue: args.issue })
+  initRuntime({ scriptName: spec.scriptName, sessionName: args.session, defaultEngine: args.engine, issue: args.issue, repo: args.repo })
   initStatus({ issue: args.issue, script: spec.scriptName, session: args.session, phases: spec.phases })
   onPhase(statusPhase)
   // Once a terminal write opens reap's clock, only the final awaited edit may
@@ -130,6 +130,11 @@ export async function runFixerLifecycle(spec) {
     attempt: 0,
     terminalWindow: null,
     partialPushed: false,
+    // What the run's own terminal transition read back: whether it verified,
+    // which label the issue was left resting at, and whether the fixer queue
+    // is still on it. The outcome classification is derived from this and
+    // nothing else — a queue nobody confirmed is not a queued repair.
+    rest: null,
   }
 
   const ctx = {
@@ -151,6 +156,11 @@ export async function runFixerLifecycle(spec) {
     async finalizeIssue(options) {
       const settled = await finalizeFixerIssue(options)
       state.terminalWindow = settled.budget
+      state.rest = {
+        verified: settled.settled,
+        resting: options.add?.[0] || null,
+        queued: settled.labels.includes(spec.queue.label),
+      }
       return settled
     },
     async consumeAttempt({ labels, first, retry, remove }) {
@@ -175,13 +185,33 @@ export async function runFixerLifecycle(spec) {
     if (!settled.settled) log(`blocked: terminal label ${kind} failed (${settled.stateError})`)
   }
 
-  const blockedResult = (failedPhase, reason, extra = {}) => ({
+  // Which side of the handoff line a blocked run falls on, from the verified
+  // resting state alone:
+  //   - a pushed partial belongs to a person the moment it lands, and is a
+  //     human hold when the landing labels were confirmed;
+  //   - a transition the run could not verify is never an automated queue: the
+  //     next dispatch may not happen at all, so it waits for a person;
+  //   - a confirmed queue label with a rung left is the next fixer's work;
+  //   - a spent ladder, or a rest at `failed`, is a person's.
+  const outcomeForBlocker = (shipped = {}) => {
+    if (state.partialPushed) {
+      return (state.rest?.verified && state.rest.resting === 'ready-to-review') || shipped.labelled
+        ? 'human-review'
+        : 'human-blocked'
+    }
+    if (!state.rest?.verified) return 'human-blocked'
+    if (state.rest.queued && state.attempt < 2) return 'repair-queued'
+    return state.rest.resting === 'ready-to-review' ? 'human-review' : 'human-blocked'
+  }
+
+  const blockedResult = (failedPhase, reason, extra = {}, shipped = {}) => ({
     blocked: true,
     issue: ctx.issue,
     phase: failedPhase,
     reason,
     prUrl: state.prUrl || undefined,
     attempt: state.attempt,
+    outcome: outcomeForBlocker(shipped),
     ...extra,
   })
 
@@ -193,7 +223,7 @@ export async function runFixerLifecycle(spec) {
     } catch (error) {
       log(`blocked after partial push: could not finish the human hold (${message(error)})`)
     }
-    return blockedResult('ship', reason, { partialPushed: true })
+    return blockedResult('ship', reason, { partialPushed: true }, shipped)
   }
 
   async function postBlocker(failedPhase, reason) {
@@ -231,11 +261,18 @@ export async function runFixerLifecycle(spec) {
       state.terminalWindow = finalized.budget
       if (!finalized.held) {
         state.blockerPosted = true
+        // The hold could not be verified, so the fallback blocker transition is
+        // this run's resting state — classify from that readback, not the hold.
+        state.rest = {
+          verified: finalized.blockState.settled,
+          resting: (transitions.blocked.add || [])[0] || null,
+          queued: finalized.blockState.labels.includes(spec.queue.label),
+        }
         noteFinalization(finalized.blockState)
         return blockedResult(failedPhase,
           withAgentFailure(`${reason} Provider quota hold failed: ${finalized.holdState.stateError}.`, failure))
       }
-      return { held: true, issue: ctx.issue, phase: failedPhase, ...hostHold, ...trigger, attempt: state.attempt }
+      return { held: true, issue: ctx.issue, phase: failedPhase, ...hostHold, ...trigger, attempt: state.attempt, outcome: 'quota-held' }
     } catch (error) {
       return { error: message(error) }
     }
@@ -330,7 +367,7 @@ export async function runFixerLifecycle(spec) {
       spec.check.correction.prompt(ctx, prep, dispositions, {
         blockers: accepted.blockers, verdicts: accepted.verdicts, cumulative, verified,
       }),
-      spec.check.correction.agent)
+      { ...spec.check.correction.agent, retry: true })
     // The correction is a writable repair step: a death here is operational and
     // keeps the historical refund, ladder and blocker behavior.
     if (!raw) return stop(fail('check', spec.check.correction.noResult))
@@ -410,7 +447,15 @@ export async function runFixerLifecycle(spec) {
       }
       if (prep.refused) {
         log(`Prepare refused: ${prep.refused}`)
-        return { skipped: true, issue: ctx.issue, reason: prep.refused, refusalFinal: !!prep.refusalFinal }
+        // A final refusal has already made and read back its terminal human
+        // transition. Classifying it as a generic skip would let a later
+        // exhausted-ladder probe overwrite the issue lifetime's real handoff.
+        // Ordinary closed/missing-queue refusals did no such work and remain
+        // skipped. An unverified final transition is conservatively blocked.
+        const outcome = prep.refusalFinal
+          ? (state.rest?.verified && state.rest.resting === 'ready-to-review' ? 'human-review' : 'human-blocked')
+          : 'skipped'
+        return { skipped: true, issue: ctx.issue, reason: prep.refused, refusalFinal: !!prep.refusalFinal, outcome }
       }
       state.attempt = prep.attempt
       state.prUrl = prep.prUrl || null
@@ -492,7 +537,13 @@ export async function runFixerLifecycle(spec) {
       }
       if (!shipped.labelled) return fail('ship', spec.landingFailure(shipped))
       spec.shipLog(ctx, prep, declined, partial)
-      return spec.result(ctx, { prep, repairResult, dispositions, declined, verified: finalVerified, check, corrected, partial, shipped })
+      // A partial landing is a human hold by construction: its labelled and
+      // reported readbacks were both required above, so the issue is resting in
+      // front of a person rather than in any queue.
+      return {
+        ...spec.result(ctx, { prep, repairResult, dispositions, declined, verified: finalVerified, check, corrected, partial, shipped }),
+        outcome: partial ? 'human-review' : 'merge-queued',
+      }
     } catch (error) {
       return fail(state.phase, message(error))
     }

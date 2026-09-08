@@ -202,6 +202,63 @@ STUB
   assert_eq "operator UTC conversion runs in the host registry zone" "2026-09-05 14:31:14 CEST" "$OPERATOR_OUT"
 fi
 
+# ───────────────────────── laptop usage report over ssh ─────────────────────────
+# `remote-control.sh usage` runs on the laptop but reports on the host, and the
+# lifetime view renders human timestamps. Two registries with DIFFERENT zones,
+# so the laptop's value cannot pass for the host's: the forwarded command must
+# resolve the zone on the host, from the host's own repos.conf.
+CONTROL_LOCAL="$TMP/control-local"
+CONTROL_HOST="$TMP/control-host"
+CONTROL_BIN="$TMP/control-bin"
+mkdir -p "$CONTROL_LOCAL/etc" "$CONTROL_HOST/etc" "$CONTROL_BIN"
+cp "$ROOT/remote-control.sh" "$CONTROL_LOCAL/"
+cp "$ROOT/etc/lib.sh" "$ROOT/etc/engines.json" "$CONTROL_LOCAL/etc/"
+cp "$ROOT/etc/lib.sh" "$ROOT/etc/engines.json" "$CONTROL_HOST/etc/"
+cat > "$CONTROL_LOCAL/etc/repos.conf" <<CONF
+REPOS=( testrepo=/tmp/testrepo )
+REPO_ORIGINS=( testrepo=owner/testrepo )
+HOST_CONTROL_DIR="$CONTROL_HOST"
+SSH_HOST="stub-host"
+NAMES=(alpha)
+NAME_MAX_LEN=40
+MAX_PARALLEL_EPICS=2
+HOST_TIMEZONE="UTC"
+CONF
+cat > "$CONTROL_HOST/etc/repos.conf" <<'CONF'
+REPOS=( testrepo=/tmp/testrepo )
+REPO_ORIGINS=( testrepo=owner/testrepo )
+HOST_CONTROL_DIR="/remote/toliki"
+SSH_HOST="irrelevant-on-host"
+NAMES=(alpha)
+NAME_MAX_LEN=40
+MAX_PARALLEL_EPICS=2
+HOST_TIMEZONE="Europe/Amsterdam"
+CONF
+cat > "$CONTROL_BIN/ssh" <<'STUB'
+#!/usr/bin/env bash
+[[ "$1" == "stub-host" ]] || exit 91
+shift
+bash -c "$1"
+STUB
+# Stands in for the report itself: what it prints is exactly the environment the
+# host's node process would render its timestamps in.
+cat > "$CONTROL_BIN/node" <<'STUB'
+#!/usr/bin/env bash
+printf 'zone=%s tz=%s args=%s\n' "${HOST_TIMEZONE:-unset}" "${TZ:-unset}" "$*"
+STUB
+chmod +x "$CONTROL_BIN/ssh" "$CONTROL_BIN/node"
+
+CONTROL_RC=0
+CONTROL_OUT="$(
+  PATH="$CONTROL_BIN:$PATH" HOST_TIMEZONE=Pacific/Honolulu TZ=Pacific/Honolulu \
+    bash "$CONTROL_LOCAL/remote-control.sh" usage 7 codex 2>&1
+)" || CONTROL_RC=$?
+assert_rc "the laptop usage report reaches the host" 0 "$CONTROL_RC"
+assert_contains "the host report runs in the host registry's zone" "$CONTROL_OUT" "zone=Europe/Amsterdam tz=Europe/Amsterdam"
+assert_not_contains "the laptop registry never dates the host's runs" "$CONTROL_OUT" "zone=UTC"
+assert_not_contains "nor does the caller's environment" "$CONTROL_OUT" "Pacific/Honolulu"
+assert_contains "the operator's window and engine still reach the report" "$CONTROL_OUT" "workflows/usage-report.mjs --since 7d --engine codex"
+
 # ───────────────────────── Node formatter API ─────────────────────────
 TIME_MODULE="$ROOT/workflows/lib/time.mjs"
 assert_file "the shared Node formatter exists" "$TIME_MODULE"

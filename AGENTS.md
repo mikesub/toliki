@@ -149,13 +149,27 @@ than made launchable against a main without the code it describes.
   source issue is specification plus append-only run record; generated PR
   prose is only deterministic technical linkage. Gated by
   `tests/epic-run.test.sh`.
-- `workflows/lib/usage.mjs` appends one JSON line per agent spawn (step,
-  vendor, model, effort, tokens, seconds, cost, and the failure kind/reason when
-  a spawn fails) to `EPIC_USAGE_LOG`, default
-  `~/epic-usage.jsonl` on whichever machine ran the pipeline. Tuning data for
-  `etc/engines.json`, host-local, never written to GitHub.
-  `node workflows/usage-report.mjs` summarizes it per step;
-  `./remote-control.sh usage` runs that on the host.
+- `workflows/lib/usage.mjs` appends typed JSON lines to `EPIC_USAGE_LOG`,
+  default `~/epic-usage.jsonl` on whichever machine ran the pipeline:
+  `type:"spawn"` per agent spawn (step, vendor, model, effort, tokens, seconds,
+  cost, `retry`, and the failure kind/reason when a spawn fails) plus
+  `type:"run-start"` and `type:"run-finish"` bracketing every invocation of all
+  four pipelines, including one that spawned nothing. A start carries the run's
+  identity — `runId`, script, engine, session, issue and the registered
+  repository key `--repo` supplies (null when absent, never split out of the
+  session name); its finish adds wall-clock `ms` and the pipeline's own
+  `outcome`: `merge-queued`, `repair-queued`, `quota-held`, `human-review`,
+  `human-blocked`, `skipped`, `error` or `manual`, with `handoff` derived from
+  it. Every `RESULT` carries that same `outcome`, set at the return site from the
+  transition the run read back — the report classifies nothing itself. Rows
+  without a `type` are legacy spawns and stay readable. Host-local, best effort
+  (a failed append never changes a verdict or exit code), never written to
+  GitHub. `node workflows/usage-report.mjs` prints two views: the per-step
+  tuning table (record-level `--since`/`--engine`/`--script` filters, its summed
+  spawn time labelled model-active) and the issue-lifetime view, where `--since`
+  selects a `(repository, issue)` lifetime by its latest activity and then totals
+  every retained record of it, and `--engine`/`--script` select by the latest
+  completed run. `./remote-control.sh usage` runs that on the host.
 - `workflows/quota-hold.mjs` owns the host-wide vendor-keyed provider-quota
   holds: reset-time parsing, schema validation, atomic per-vendor monotonic
   writes under dispatch's lock, independent expiry, and the read-only operator
@@ -556,7 +570,7 @@ than made launchable against a main without the code it describes.
    path and update it when needed. When the contract or rationale changes,
    update this file, DOCTRINE.md, the root README, the template or the script
    header too. Never leave an invariant only in a commit message.
-5. Run every relevant suite; run all eleven before handing off a broad change.
+5. Run every relevant suite; run all twelve before handing off a broad change.
 
 Trunk-based: when asked to commit or push, commit straight to `main` and push.
 No feature branches or PRs unless explicitly requested. Never commit or push
@@ -576,7 +590,7 @@ merely because the code is ready.
 
 ## Tests
 
-All eleven suites are hermetic and need no network or credentials:
+All twelve suites are hermetic and need no network or credentials:
 
 ```bash
 for t in tests/*.test.sh; do bash "$t" || exit; done

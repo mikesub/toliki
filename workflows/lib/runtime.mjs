@@ -43,7 +43,7 @@ import os from 'node:os'
 import { resolveEngine, resolveVendor, STEPS, terminateAll, isTransient } from './engine.mjs'
 import { terminalSpend } from './github.mjs'
 import { validate } from './schema.mjs'
-import { recordUsage } from './usage.mjs'
+import { OUTCOMES, recordUsage, recordRunStart, recordRunFinish, outcomeOf } from './usage.mjs'
 import { humanTimestamp } from './time.mjs'
 
 // The run's engine: a name in etc/engines.json, chosen by --engine (dispatch
@@ -73,8 +73,13 @@ const FAST_DEATH_MS = Number(process.env.EPIC_FAST_DEATH_MS) || 60 * 1000
 let SCRIPT = 'run'
 let SESSION = ''
 let ISSUE = null
+// The registered repository key, given by bin/launch.sh and never derived from
+// the session name: the same issue number in two repositories is two issues.
+let REPO = null
 // Groups the usage records of one run; unique per process, and a relaunch is a new run.
 const RUN_ID = `${Date.now().toString(36)}-${process.pid}`
+// When this process started doing work, for the run-finish record's own clock.
+let RUN_STARTED_AT = null
 let shuttingDown = false
 let lastAgentFailure = null
 
@@ -122,17 +127,45 @@ export function withAgentFailure(reason, failure = takeAgentFailure()) {
   return `${reason} ${category}: ${f.label} failed after ${tries} [${f.vendor} ${f.model}/${f.effort}] — ${f.reason}`
 }
 
-export function initRuntime({ scriptName, sessionName, defaultEngine, issue } = {}) {
+export function initRuntime({ scriptName, sessionName, defaultEngine, issue, repo } = {}) {
   if (scriptName) SCRIPT = scriptName
   if (sessionName) SESSION = sessionName
   if (defaultEngine) ENGINE_NAME = defaultEngine
   if (issue != null) ISSUE = issue
+  if (repo) REPO = repo
   // Resolve — and so validate the whole engines file — before status hooks or
   // the first phase can touch GitHub. Letting a bad table degrade to a null
   // first step would also leave the blocker reporter on that same table,
   // stranding the issue without a label.
   ENGINE = resolveEngine(ENGINE_NAME)
+  // The invocation's own record opens here: after the engines file is accepted
+  // (a refused table did nothing and is no run) and before prepare, so a run
+  // killed mid-flight is visible as exactly what it is — a start with no finish.
+  RUN_STARTED_AT = Date.now()
+  recordRunStart({ ts: new Date(RUN_STARTED_AT).toISOString(), ...runIdentity() })
   installSignalHandlers()
+}
+
+// Who this process is, for every record it writes.
+export function runIdentity() {
+  return { runId: RUN_ID, script: SCRIPT, engine: ENGINE_NAME, session: SESSION || null, issue: ISSUE, repo: REPO }
+}
+
+// The closing half of the run record, written by cli.mjs finish() once the
+// RESULT line exists. The outcome is the pipeline's own classification of its
+// verified resting state; nothing here re-derives it from the result's prose.
+export function recordRunEnd(result, exit) {
+  if (RUN_STARTED_AT === null) return  // never started: there is no run to close
+  const outcome = outcomeOf(result)
+  recordRunFinish(runIdentity(), {
+    ts: new Date().toISOString(),
+    startedAt: new Date(RUN_STARTED_AT).toISOString(),
+    ms: Date.now() - RUN_STARTED_AT,
+    outcome,
+    handoff: OUTCOMES[outcome].handoff,
+    exit,
+    attempt: result?.attempt ?? null,
+  })
 }
 
 // Observers of the run's own narration. The pane is the primary record; a hook
@@ -193,8 +226,11 @@ function release() {
 //              the vendor, model and effort, and fixes the tool boundary
 //   schema     JSON Schema; its presence is what makes the return value an object
 //   timeoutMs  per-step ceiling
+//   retry      true when the call site is a bounded in-run retry of a step that
+//              already ran — recorded so the report can tell that apart from a
+//              transient respawn inside this call
 export async function agent(prompt, opts = {}) {
-  const { label = 'agent', step, schema, timeoutMs = DEFAULT_TIMEOUT_MS } = opts
+  const { label = 'agent', step, schema, timeoutMs = DEFAULT_TIMEOUT_MS, retry = false } = opts
   lastAgentFailure = null
   const agentType = STEPS[step]
   if (!ENGINE || !agentType) {
@@ -256,8 +292,8 @@ export async function agent(prompt, opts = {}) {
     // One line in the usage log per spawn, failed ones included: they cost
     // tokens too, and a retry that always costs a second spawn should show.
     recordUsage({
-      ts: new Date(started).toISOString(), runId: RUN_ID, script: SCRIPT, session: SESSION || null, issue: ISSUE,
-      engine: ENGINE_NAME, step, label, attempt: attempts, vendor: vendorName, model, effort,
+      type: 'spawn', ts: new Date(started).toISOString(), ...runIdentity(),
+      step, label, attempt: attempts, retry: !!retry, vendor: vendorName, model, effort,
       ok: !!r.ok, timedOut: !!r.timedOut, ms: r.elapsedMs,
       tokens: r.usage?.tokens || { input: null, output: null, cacheRead: null, cacheCreate: null, total: null },
       costUsd: r.usage?.costUsd ?? null, costSource: r.usage?.costSource ?? null, turns: r.usage?.turns ?? null,

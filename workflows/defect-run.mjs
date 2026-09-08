@@ -60,11 +60,12 @@ import {
   renderAcceptanceVerdicts, renderBlockerBatch,
 } from './lib/repair-acceptance.mjs'
 
-const USAGE = `Usage: defect-run.mjs --issue <N> [--session <name>] [--engine <name>]
+const USAGE = `Usage: defect-run.mjs --issue <N> [--session <name>] [--engine <name>] [--repo <key>]
 
   --issue <N>  the needs-defect-fix issue whose completed PR is held for review
   --session    name for log lines (the tmux session bin/launch.sh created)
   --engine     registered coding-agent engine for every phase
+  --repo       registered repository key, for usage telemetry identity only
 
 Exit: 0 fixed or provider-held, 1 usage/crash, 2 skipped/refused, 3 blocked.
 The final line is RESULT <json>.`
@@ -630,6 +631,9 @@ await runFixerLifecycle({
         checkConfidence: prep.landing.checkConfidence,
         note: `the repair on ${prep.prHead} was already verified and checked by attempt ${prep.landing.attempt || 1}; only the landing was redone`,
         readyToMerge: true,
+        // land() read the ready-to-merge swap back above, so the merge worker
+        // owns this issue next exactly as it does after a full repair round.
+        outcome: 'merge-queued',
       }
     },
   },

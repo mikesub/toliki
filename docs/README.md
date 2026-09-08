@@ -73,7 +73,9 @@ An agent's report that one of those operations succeeded is never the gate.
    updates the registered clone, creates or reuses the issue worktree, and
    starts `<repo>-epic-<N>` in tmux.
 4. The pane runs `node workflows/epic-run.mjs --issue <N> --session <name>
-   --engine <name>`; its scrollback becomes the complete phase log.
+   --engine <name> --repo <registered-key>`; its scrollback becomes the complete
+   phase log. The explicit repository key also keeps host telemetry for equal
+   issue numbers in different repositories separate.
 5. The orchestrator starts one best-effort live status comment on the issue.
    Phase changes edit that comment in place; reporting failure never decides a
    pipeline gate.
@@ -585,6 +587,47 @@ manual launch stays available.
 9. If a verified complete repair was pushed but landing confirmation failed, a
    trusted audit record allows the next attempt to redo only the label landing;
    it does not edit already-repaired defects a second time.
+
+## Run telemetry and usage report
+
+`workflows/lib/usage.mjs` appends best-effort host telemetry to
+`EPIC_USAGE_LOG` (normally `~/epic-usage.jsonl`). A failed append never changes
+a pipeline result or exit code. Every model process writes a typed `spawn`
+record. Every epic, conflict-fixer, CI-fixer, and defect-fixer invocation also
+writes a `run-start` after engine validation and before Prepare, then a
+`run-finish` after final status reporting and its `RESULT` line. A killed or
+crashed process can therefore remain as a visible start with no finish. All
+stored timestamps are canonical UTC ISO 8601.
+
+The finish records the pipeline's confirmed result: queued for merge, queued
+for another automated repair, held for provider quota, held for human review,
+blocked for a human, skipped/refused, error, or unknown. That result describes
+where the invocation left the issue; it does not query or imply whether GitHub
+later merged the PR or closed the issue.
+
+`./remote-control.sh usage [days] [engine]` renders two views from the host's
+log:
+
+- The per-step tuning view preserves record-level `--since`, `--engine`, and
+  `--script` filtering. Its duration is **model-active time**, the sum of model
+  spawn durations; parallel spawns can make it exceed wall time.
+- The issue-lifetime view joins every retained invocation for one
+  `(repository, issue)` pair. It reports cumulative completed-run **wall time**
+  separately from the **elapsed lifetime span** between first start and latest
+  finish, along with launches, fixer attempts, relaunches, in-run retries,
+  runtime respawns, tokens, cost provenance, latest result, and human handoff.
+  Its `--since` selects by latest lifecycle activity and then totals the whole
+  retained lifetime. Engine and script filters select by the latest completed
+  run without truncating that lifetime.
+
+The handoff rate counts each issue once and only when its latest completed
+result conclusively queued merge or handed the issue to a human. Repair queues,
+quota holds, skips, errors, and incomplete/unknown histories are listed outside
+the denominator. Legacy untyped spawn rows remain in the tuning totals but
+cannot acquire repository identity, wall time, or a result. The report labels
+all history log-known, keeps unattributed runs separate, shows missing usage or
+price data, and reports malformed interior JSONL records; only a torn final
+line is ignored as a possible concurrent append.
 
 ## Shared failure behavior
 
