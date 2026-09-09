@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# The laptop-side operator CLI, and the only primary entry point at the repo
+# root. It runs on the LAPTOP: everything in bin/ runs ON the host and never
+# sshes, and this boundary is the reason there is exactly one root script.
+#
+# This file only navigates. Each command group is an implementation in
+# operator/<concern>.sh with its own `--help`, so a group can be read, changed
+# and tested on its own, and adding one never grows this dispatcher beyond a
+# line. Nothing here loads the registry: `setup` has to work on a laptop that
+# has no etc/repos.conf yet, and each group sources operator/lib.sh itself.
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OPERATOR="$ROOT/operator"
+
+usage() {
+  cat <<'EOF'
+toliki — the laptop-side operator CLI for the harness.
+
+Usage: ./toliki <command> [args]
+
+Getting set up
+  setup                    Wire this laptop: /spec and spec-explorer for Claude
+                           and Codex, seed the machine-local etc/repos.conf.
+  sync                     Pull/rebase this checkout and the host's checkout.
+
+Host settings
+  config show              Print the host's default engine, the engines it can
+                           be set to, and the maximum concurrent runs.
+  config set               Change either of those: --engine <name>, --max <count>.
+
+Sessions on the host
+  session list             Every session with its repo, engine and status.
+  session start|stop       Start or stop an interactive claude session.
+  session restart          Stop and start one, optionally re-prompting.
+  session stop-all         Stop every session on the host.
+
+Pipeline work
+  run epic|task|fix|ci|defect <issue>
+                           Launch a pipeline by hand — the operator's override
+                           for what dispatch would pick up on its own tick.
+  route next <engine>      Route the next ready issue to an engine, starting
+                           nothing; the next tick picks it up.
+  usage [days] [engine]    Token, time and outcome report from the host's log.
+
+  help [command]           This help, or one command group's own help
+                           (same as: ./toliki <command> --help).
+
+Every command but `setup` (and the laptop half of `sync`) reaches the host over
+ssh, at the SSH_HOST named in etc/repos.conf. The host-side scripts in bin/ are
+run there by cron and by this CLI; they are not operator entry points.
+EOF
+}
+
+# The one place a command name maps to an implementation.
+command_script() { # command name; prints its script path, non-zero if unknown
+  case "$1" in
+    setup)   printf '%s' "$OPERATOR/setup.sh" ;;
+    config)  printf '%s' "$OPERATOR/config.sh" ;;
+    session) printf '%s' "$OPERATOR/sessions.sh" ;;
+    run)     printf '%s' "$OPERATOR/run.sh" ;;
+    route)   printf '%s' "$OPERATOR/route.sh" ;;
+    usage)   printf '%s' "$OPERATOR/usage.sh" ;;
+    sync)    printf '%s' "$OPERATOR/sync.sh" ;;
+    *)       return 1 ;;
+  esac
+}
+
+unknown() { # command name
+  echo "[toliki] unknown command '$1' — run './toliki help' for the command list" >&2
+  exit 1
+}
+
+COMMAND="${1:-}"
+[[ $# -eq 0 ]] || shift
+
+case "$COMMAND" in
+  ""|-h|--help)
+    usage
+    exit 0
+    ;;
+  help)
+    if [[ $# -eq 0 ]]; then
+      usage
+      exit 0
+    fi
+    SCRIPT="$(command_script "$1")" || unknown "$1"
+    exec bash "$SCRIPT" --help
+    ;;
+esac
+
+SCRIPT="$(command_script "$COMMAND")" || unknown "$COMMAND"
+exec bash "$SCRIPT" "$@"

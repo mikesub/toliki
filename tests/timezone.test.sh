@@ -203,7 +203,7 @@ STUB
 fi
 
 # ───────────────────────── laptop usage report over ssh ─────────────────────────
-# `remote-control.sh usage` runs on the laptop but reports on the host, and the
+# `./toliki usage` runs on the laptop but reports on the host, and the
 # lifetime view renders human timestamps. Two registries with DIFFERENT zones,
 # so the laptop's value cannot pass for the host's: the forwarded command must
 # resolve the zone on the host, from the host's own repos.conf.
@@ -211,7 +211,8 @@ CONTROL_LOCAL="$TMP/control-local"
 CONTROL_HOST="$TMP/control-host"
 CONTROL_BIN="$TMP/control-bin"
 mkdir -p "$CONTROL_LOCAL/etc" "$CONTROL_HOST/etc" "$CONTROL_BIN"
-cp "$ROOT/remote-control.sh" "$CONTROL_LOCAL/"
+cp "$ROOT/toliki" "$CONTROL_LOCAL/"
+cp -R "$ROOT/operator" "$CONTROL_LOCAL/"
 cp "$ROOT/etc/lib.sh" "$ROOT/etc/engines.json" "$CONTROL_LOCAL/etc/"
 cp "$ROOT/etc/lib.sh" "$ROOT/etc/engines.json" "$CONTROL_HOST/etc/"
 cat > "$CONTROL_LOCAL/etc/repos.conf" <<CONF
@@ -251,7 +252,7 @@ chmod +x "$CONTROL_BIN/ssh" "$CONTROL_BIN/node"
 CONTROL_RC=0
 CONTROL_OUT="$(
   PATH="$CONTROL_BIN:$PATH" HOST_TIMEZONE=Pacific/Honolulu TZ=Pacific/Honolulu \
-    bash "$CONTROL_LOCAL/remote-control.sh" usage 7 codex 2>&1
+    bash "$CONTROL_LOCAL/toliki" usage 7 codex 2>&1
 )" || CONTROL_RC=$?
 assert_rc "the laptop usage report reaches the host" 0 "$CONTROL_RC"
 assert_contains "the host report runs in the host registry's zone" "$CONTROL_OUT" "zone=Europe/Amsterdam tz=Europe/Amsterdam"

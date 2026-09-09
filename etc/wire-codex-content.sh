@@ -6,7 +6,7 @@
 # on spawn. Retire our old discovery link only after registration succeeds:
 # keeping both definitions makes Codex report a duplicate role.
 #
-# Sourced by setup.sh. The caller provides ok, changed, and blocked.
+# Sourced by operator/setup.sh. The caller provides ok, changed, and blocked.
 
 wire_codex_content() {
   local harness_dir="$1"
@@ -75,7 +75,7 @@ wire_codex_content() {
   fi
 
   if ! command -v node >/dev/null 2>&1 || ! command -v codex >/dev/null 2>&1; then
-    blocked "node and codex are required to register spec-explorer — install them and re-run setup.sh"
+    blocked "node and codex are required to register spec-explorer — install them and re-run ./toliki setup"
     return
   fi
   if registration="$(node "$harness_dir/etc/register-codex-agent.mjs" "$HOME/.codex/config.toml" "$agent_item" 2>&1)"; then

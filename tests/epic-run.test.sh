@@ -2375,7 +2375,7 @@ assert_eq "the reviewer was respawned exactly once" 2 "$(calls review-general)"
 assert_contains "the respawn was announced as transient" "$RUN_OUT" "respawning once (transient)"
 assert_contains "a blocker comment was posted" "$(gh_comments)" "🤖 epic-run blocked"
 assert_contains "it names the phase" "$(gh_comments)" "- phase: review"
-assert_contains "it says how to resume with the operator launch command" "$(gh_comments)" 're-running the epic pipeline on #42 (`./remote-control.sh epic 42`) resumes from it'
+assert_contains "it says how to resume with the operator launch command" "$(gh_comments)" 're-running the epic pipeline on #42 (`./toliki run epic 42`) resumes from it'
 assert_contains "it carries the phase log" "$(gh_comments)" "## Phase log"
 assert_eq "the issue ends failed and nothing else" "failed," "$(gh_labels)"
 assert_eq "nothing shipped a PR" "" "$(gh_pr_created)"

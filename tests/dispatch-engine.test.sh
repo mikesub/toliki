@@ -38,8 +38,8 @@ HARNESS="$TMP/harness"
 REPO="$TMP/repo"
 mkdir -p "$HARNESS" "$REPO/.git" "$TMP/bin" "$TMP/labels" "$TMP/blockers" "$TMP/locks"
 cp -R "$ROOT/bin" "$ROOT/etc" "$HARNESS/"
-cp "$ROOT/remote-control.sh" "$HARNESS/"
-cp "$ROOT/config.sh" "$HARNESS/"
+cp "$ROOT/toliki" "$HARNESS/"
+cp -R "$ROOT/operator" "$HARNESS/"
 # dispatch resolves the shared hold CLI relative to its own copied harness.
 # During RED the module intentionally does not exist yet.
 mkdir -p "$HARNESS/workflows"
@@ -240,7 +240,7 @@ run_dispatch() {
 }
 
 # The laptop-to-host flow, end to end and hermetic: the ssh stub's
-# EXEC_SSH_STDIN path runs remote-control.sh's remote heredoc in place, so the
+# EXEC_SSH_STDIN path runs the operator CLI's remote heredoc in place, so the
 # real dispatch.sh and the stub launch.sh see the same fake host the tick
 # scenarios use.
 CONTROL_OUT=""
@@ -261,7 +261,7 @@ run_control() {
     STUB_AT_CAPACITY="${STUB_AT_CAPACITY:-}" \
     EPIC_PROVIDER_HOLD_FILE="$TMP/provider-hold.json" \
     HOST_TIMEZONE="Pacific/Honolulu" TZ="Pacific/Honolulu" \
-    bash "$HARNESS/remote-control.sh" "$@" >"$TMP/control.out" 2>&1
+    bash "$HARNESS/toliki" "$@" >"$TMP/control.out" 2>&1
   CONTROL_RC=$?
   set -e
   CONTROL_OUT="$(cat "$TMP/control.out")"
@@ -297,30 +297,41 @@ ENGINE_CRON="$TMP/harness-dispatch"
 CONFIG_REPOS="$TMP/host-repos.conf"
 cp "$HARNESS/etc/dispatch.cron" "$ENGINE_CRON"
 cp "$HARNESS/etc/repos.conf" "$CONFIG_REPOS"
-ENGINE_OUT="$(PATH="$TMP/bin:$PATH" EXEC_SSH_STDIN=1 DEFAULT_ENGINE_CRON="$ENGINE_CRON" CONFIG_REPOS_FILE="$CONFIG_REPOS" bash "$HARNESS/config.sh")"
+ENGINE_OUT="$(PATH="$TMP/bin:$PATH" EXEC_SSH_STDIN=1 DEFAULT_ENGINE_CRON="$ENGINE_CRON" CONFIG_REPOS_FILE="$CONFIG_REPOS" bash "$HARNESS/toliki" config show)"
 assert_contains "the current installed default is shown" "$ENGINE_OUT" "default: codex"
 assert_contains "every configured engine is shown" "$ENGINE_OUT" "available: claude codex codex+claude"
 assert_contains "the current concurrent run limit is shown" "$ENGINE_OUT" "max concurrent runs: 2"
-assert_contains "a bare report reminds the operator how to select an engine" "$ENGINE_OUT" "config.sh --engine <name>"
-assert_contains "a bare report reminds the operator how to set capacity" "$ENGINE_OUT" "config.sh --max <count>"
-ENGINE_OUT="$(PATH="$TMP/bin:$PATH" EXEC_SSH_STDIN=1 DEFAULT_ENGINE_CRON="$ENGINE_CRON" CONFIG_REPOS_FILE="$CONFIG_REPOS" bash "$HARNESS/config.sh" --engine claude --max 3)"
+assert_contains "a bare report reminds the operator how to select an engine" "$ENGINE_OUT" "./toliki config set --engine <name>"
+assert_contains "a bare report reminds the operator how to set capacity" "$ENGINE_OUT" "./toliki config set --max <count>"
+# `config` with no subcommand is the report, so the habit of just looking costs
+# nothing and can change nothing.
+BARE_CONFIG="$(PATH="$TMP/bin:$PATH" EXEC_SSH_STDIN=1 DEFAULT_ENGINE_CRON="$ENGINE_CRON" CONFIG_REPOS_FILE="$CONFIG_REPOS" bash "$HARNESS/toliki" config)"
+assert_contains "a bare config reports without changing anything" "$BARE_CONFIG" "default: codex"
+set +e
+ENGINE_OUT="$(PATH="$TMP/bin:$PATH" EXEC_SSH_STDIN=1 DEFAULT_ENGINE_CRON="$ENGINE_CRON" CONFIG_REPOS_FILE="$CONFIG_REPOS" bash "$HARNESS/toliki" config set 2>&1)"
+ENGINE_RC=$?
+set -e
+assert_rc "a set with nothing to set is refused" 1 "$ENGINE_RC"
+assert_contains "and says what it needs" "$ENGINE_OUT" "needs --engine <name>, --max <count>, or both"
+assert_eq "a refused set changes nothing" "EPIC_ENGINE=codex" "$(grep '^EPIC_ENGINE=' "$ENGINE_CRON")"
+ENGINE_OUT="$(PATH="$TMP/bin:$PATH" EXEC_SSH_STDIN=1 DEFAULT_ENGINE_CRON="$ENGINE_CRON" CONFIG_REPOS_FILE="$CONFIG_REPOS" bash "$HARNESS/toliki" config set --engine claude --max 3)"
 assert_eq "the selected engine is written once" "EPIC_ENGINE=claude" "$(grep '^EPIC_ENGINE=' "$ENGINE_CRON")"
 assert_contains "the rest of the cron file is preserved" "$(cat "$ENGINE_CRON")" "bin/merge-tick.sh"
 assert_eq "the selected concurrent run limit is written once" "MAX_PARALLEL_EPICS=3" "$(grep '^MAX_PARALLEL_EPICS=' "$CONFIG_REPOS")"
 assert_contains "an update reports the resulting engine" "$ENGINE_OUT" "default: claude"
 assert_contains "an update reports the resulting concurrent run limit" "$ENGINE_OUT" "max concurrent runs: 3"
-ENGINE_OUT="$(PATH="$TMP/bin:$PATH" EXEC_SSH_STDIN=1 DROP_EMPTY_SSH_ARGS=1 DEFAULT_ENGINE_CRON="$ENGINE_CRON" CONFIG_REPOS_FILE="$CONFIG_REPOS" bash "$HARNESS/config.sh" --max 4)"
+ENGINE_OUT="$(PATH="$TMP/bin:$PATH" EXEC_SSH_STDIN=1 DROP_EMPTY_SSH_ARGS=1 DEFAULT_ENGINE_CRON="$ENGINE_CRON" CONFIG_REPOS_FILE="$CONFIG_REPOS" bash "$HARNESS/toliki" config set --max 4)"
 assert_contains "a max-only update survives SSH dropping empty arguments" "$ENGINE_OUT" "max concurrent runs: 4"
 assert_eq "a max-only update does not become an engine choice" "EPIC_ENGINE=claude" "$(grep '^EPIC_ENGINE=' "$ENGINE_CRON")"
 set +e
-ENGINE_OUT="$(PATH="$TMP/bin:$PATH" EXEC_SSH_STDIN=1 DEFAULT_ENGINE_CRON="$ENGINE_CRON" CONFIG_REPOS_FILE="$CONFIG_REPOS" bash "$HARNESS/config.sh" --engine missing 2>&1)"
+ENGINE_OUT="$(PATH="$TMP/bin:$PATH" EXEC_SSH_STDIN=1 DEFAULT_ENGINE_CRON="$ENGINE_CRON" CONFIG_REPOS_FILE="$CONFIG_REPOS" bash "$HARNESS/toliki" config set --engine missing 2>&1)"
 ENGINE_RC=$?
 set -e
 assert_rc "an unknown engine is rejected" 1 "$ENGINE_RC"
 assert_contains "the rejection lists valid choices" "$ENGINE_OUT" "available: claude codex codex+claude"
 assert_eq "a rejected engine leaves the default unchanged" "EPIC_ENGINE=claude" "$(grep '^EPIC_ENGINE=' "$ENGINE_CRON")"
 set +e
-ENGINE_OUT="$(PATH="$TMP/bin:$PATH" EXEC_SSH_STDIN=1 DEFAULT_ENGINE_CRON="$ENGINE_CRON" CONFIG_REPOS_FILE="$CONFIG_REPOS" bash "$HARNESS/config.sh" --max 0 2>&1)"
+ENGINE_OUT="$(PATH="$TMP/bin:$PATH" EXEC_SSH_STDIN=1 DEFAULT_ENGINE_CRON="$ENGINE_CRON" CONFIG_REPOS_FILE="$CONFIG_REPOS" bash "$HARNESS/toliki" config set --max 0 2>&1)"
 ENGINE_RC=$?
 set -e
 assert_rc "a non-positive concurrent run limit is rejected" 1 "$ENGINE_RC"
@@ -328,7 +339,7 @@ assert_contains "the capacity rejection names the constraint" "$ENGINE_OUT" "max
 assert_eq "a rejected capacity leaves the limit unchanged" "MAX_PARALLEL_EPICS=4" "$(grep '^MAX_PARALLEL_EPICS=' "$CONFIG_REPOS")"
 printf 'MAX_PARALLEL_EPICS=5\n' >> "$CONFIG_REPOS"
 set +e
-ENGINE_OUT="$(PATH="$TMP/bin:$PATH" EXEC_SSH_STDIN=1 DEFAULT_ENGINE_CRON="$ENGINE_CRON" CONFIG_REPOS_FILE="$CONFIG_REPOS" bash "$HARNESS/config.sh" 2>&1)"
+ENGINE_OUT="$(PATH="$TMP/bin:$PATH" EXEC_SSH_STDIN=1 DEFAULT_ENGINE_CRON="$ENGINE_CRON" CONFIG_REPOS_FILE="$CONFIG_REPOS" bash "$HARNESS/toliki" config show 2>&1)"
 ENGINE_RC=$?
 set -e
 assert_rc "an ambiguous installed capacity is rejected" 1 "$ENGINE_RC"
@@ -535,7 +546,7 @@ assert_contains "dry-run names the ordinary epic separately" "$RUN_OUT" "would l
 
 printf '\ndispatch: with no installed cron file both paths take the built-in claude\n'
 # The tick's own EPIC_ENGINE must not select anything. A queue tick inherits it
-# from cron's environment and a manual `remote-control.sh epic N` over ssh does
+# from cron's environment and a manual `./toliki run epic N` over ssh does
 # not, so honouring it here would make the same unlabeled issue resolve to two
 # different vendors a second apart. No installed file means nothing is
 # configured, and both paths get claude.
@@ -550,7 +561,7 @@ assert_contains "the tick ignores its own EPIC_ENGINE" "$(cat "$TMP/launch.log")
 
 reset_state
 printf 'ready' > "$TMP/labels/9"
-run_control epic 9 -r testrepo
+run_control run epic 9 -r testrepo
 assert_rc "a manual launch with no forwarded EPIC_ENGINE exits 0" 0 "$CONTROL_RC"
 assert_contains "and lands on the same built-in default" "$(cat "$TMP/launch.log")" '--epic 9 --repo testrepo --engine claude'
 assert_contains "which the operator is told is the built-in one" "$CONTROL_OUT" "engine claude selected by the built-in claude default"
@@ -1003,34 +1014,34 @@ export EPIC_ENGINE=claude
 resolve_refuses "an env default disagreeing with the cron file" --resolve-issue 31 --repo testrepo
 unset EPIC_ENGINE
 
-printf '\nremote control: next preserves host-wide selection unless narrowed\n'
-SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/remote-control.sh" next codex
+printf '\noperator CLI: route next preserves host-wide selection unless narrowed\n'
+SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/toliki" route next codex
 assert_contains "host-wide next omits a repo filter" "$(cat "$TMP/ssh.log")" 'dispatch.sh --route-next'
 assert_not_contains "host-wide next does not default to the first repo" "$(cat "$TMP/ssh.log")" '--repo'
-SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/remote-control.sh" next claude -r testrepo
+SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/toliki" route next claude -r testrepo
 assert_contains "an explicit repo is forwarded" "$(cat "$TMP/ssh.log")" "--repo 'testrepo'"
 
 # The laptop hands the report only what an operator asked for. The zone the
 # lifetime view renders in is the HOST's, resolved on the host by sourcing its
 # own etc/lib.sh — which clears any inherited HOST_TIMEZONE first, so no laptop
 # value can ride along. tests/timezone.test.sh gates that with two registries.
-printf '\nremote control: usage forwards the report filters and loads the host registry\n'
-SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/remote-control.sh" usage 7 codex
+printf '\noperator CLI: usage forwards the report filters and loads the host registry\n'
+SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/toliki" usage 7 codex
 USAGE_CMD="$(cat "$TMP/ssh.log")"
 assert_contains "the window and engine reach the report" "$USAGE_CMD" "usage-report.mjs --since '7d' --engine 'codex'"
 assert_contains "the host's own registry is loaded before the report" "$USAGE_CMD" "source '$HARNESS/etc/lib.sh' && node"
 assert_not_contains "the laptop never ships a zone for the host to use" "$USAGE_CMD" "HOST_TIMEZONE="
 assert_not_contains "nor a TZ" "$USAGE_CMD" "TZ="
-SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/remote-control.sh" usage
+SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/toliki" usage
 BARE_USAGE="$(cat "$TMP/ssh.log")"
 assert_contains "a bare usage still runs the report" "$BARE_USAGE" "workflows/usage-report.mjs"
 assert_not_contains "an unasked-for window is never invented" "$BARE_USAGE" "--since"
 assert_not_contains "nor an engine filter" "$BARE_USAGE" "--engine"
 
-printf '\nremote control: an omitted engine is inherited, never written back\n'
+printf '\noperator CLI: an omitted engine is inherited, never written back\n'
 reset_state
 printf 'ready,engine:codex' > "$TMP/labels/10"
-run_control epic 10 -r testrepo
+run_control run epic 10 -r testrepo
 assert_rc "a manual epic without --engine launches" 0 "$CONTROL_RC"
 assert_contains "the issue's own route reaches launch.sh" "$(cat "$TMP/launch.log")" '--epic 10 --repo testrepo --engine codex'
 assert_eq "an inherited launch writes no label" "" "$(grep 'issue edit' "$TMP/gh.log" || true)"
@@ -1041,7 +1052,7 @@ assert_contains "and that nothing was persisted" "$CONTROL_OUT" "no label writte
 for kind in task fix ci defect; do
   reset_state
   printf 'ready,engine:codex' > "$TMP/labels/11"
-  run_control "$kind" 11 -r testrepo
+  run_control run "$kind" 11 -r testrepo
   assert_rc "a manual $kind without --engine launches" 0 "$CONTROL_RC"
   assert_contains "the inherited engine reaches launch.sh for $kind" "$(cat "$TMP/launch.log")" "--$kind 11 --repo testrepo --engine codex"
   assert_eq "an inherited $kind launch writes no label" "" "$(grep 'issue edit' "$TMP/gh.log" || true)"
@@ -1050,7 +1061,7 @@ done
 reset_state
 printf 'ready' > "$TMP/labels/12"
 set_cron_engine codex
-run_control epic 12 -r testrepo
+run_control run epic 12 -r testrepo
 assert_rc "an unlabeled issue inherits the host default" 0 "$CONTROL_RC"
 assert_contains "the host default reaches launch.sh" "$(cat "$TMP/launch.log")" '--epic 12 --repo testrepo --engine codex'
 assert_contains "the operator is told the host default chose it" "$CONTROL_OUT" "engine codex selected by the host's EPIC_ENGINE default"
@@ -1059,35 +1070,35 @@ assert_eq "and leaves the issue unlabeled" "ready" "$(cat "$TMP/labels/12")"
 
 reset_state
 printf 'ready' > "$TMP/labels/13"
-run_control epic 13 -r testrepo
+run_control run epic 13 -r testrepo
 assert_rc "a host with no configured default still launches" 0 "$CONTROL_RC"
 assert_contains "the built-in engine reaches launch.sh" "$(cat "$TMP/launch.log")" '--epic 13 --repo testrepo --engine claude'
 assert_contains "the operator is told it is the built-in default" "$CONTROL_OUT" "engine claude selected by the built-in claude default"
 
 reset_state
 printf 'ready,engine:claude,engine:codex' > "$TMP/labels/14"
-run_control epic 14 -r testrepo
+run_control run epic 14 -r testrepo
 assert_rc "conflicting labels refuse the manual launch" 1 "$CONTROL_RC"
 assert_eq "a refused inherit launches nothing" "" "$(cat "$TMP/launch.log")"
 assert_eq "a refused inherit writes no label" "" "$(grep 'issue edit' "$TMP/gh.log" || true)"
 
 reset_state
-run_control start --engine codex -r testrepo
+run_control session start --engine codex -r testrepo
 assert_rc "--engine is still refused for interactive sessions" 1 "$CONTROL_RC"
-assert_contains "and says it is pipeline-only" "$CONTROL_OUT" "only applies to manual epic/task/fix/ci/defect launches"
+assert_contains "and says it is pipeline-only" "$CONTROL_OUT" "--engine only applies to manual './toliki run epic|task|fix|ci|defect <issue>' launches"
 assert_eq "a refused interactive --engine launches nothing" "" "$(cat "$TMP/launch.log")"
 
 reset_state
-SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/remote-control.sh" epic 10 --engine codex
+SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/toliki" run epic 10 --engine codex
 assert_contains "manual epic forwards its explicit engine" "$(cat "$TMP/ssh.log")" "--engine 'codex'"
 assert_contains "manual epic persists the engine first" "$(cat "$TMP/ssh.log")" "--route-issue '10' 'codex'"
 : > "$TMP/ssh.log"
-SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/remote-control.sh" task 10 --engine codex -r testrepo >/dev/null 2>&1
+SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/toliki" run task 10 --engine codex -r testrepo >/dev/null 2>&1
 assert_contains "manual task persists the engine before launching" "$(cat "$TMP/ssh.log")" "--route-issue '10' 'codex'"
 assert_contains "manual task uses the dedicated launch mode" "$(cat "$TMP/ssh.log")" "--task '10' --engine 'codex'"
 : > "$TMP/ssh.log"
 set +e
-SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/remote-control.sh" defect 10 --engine codex -r testrepo >/dev/null 2>&1
+SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/toliki" run defect 10 --engine codex -r testrepo >/dev/null 2>&1
 CONTROL_RC=$?
 set -e
 assert_rc "manual defect repair is accepted even without repo opt-in" 0 "$CONTROL_RC"
@@ -1095,21 +1106,21 @@ assert_contains "manual defect repair persists the engine before launching" "$(c
 assert_contains "manual defect repair uses the dedicated launch mode" "$(cat "$TMP/ssh.log")" "--defect '10' --engine 'codex'"
 : > "$TMP/ssh.log"
 set +e
-SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/remote-control.sh" epic '#' --engine codex >/dev/null 2>&1
+SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/toliki" run epic '#' --engine codex >/dev/null 2>&1
 CONTROL_RC=$?
 set -e
 assert_rc "a bare # manual ref is rejected locally" 1 "$CONTROL_RC"
 assert_not_contains "no remote command is sent" "$(cat "$TMP/ssh.log")" 'unused'
 
 
-printf '\nremote control: --over-capacity is manual, pipeline-only and never routed\n'
+printf '\noperator CLI: --over-capacity is manual, pipeline-only and never routed\n'
 # The override may ride only the launch.sh segment of a named pipeline launch.
 # On the --route-issue segment it would be an unknown flag to dispatch.sh; on
 # any other command it would either be swallowed as a session name or reach a
 # queue-driven path, which is the leak the cap cannot survive.
 : > "$TMP/ssh.log"
 set +e
-SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/remote-control.sh" epic 10 --engine codex --over-capacity >/dev/null 2>&1
+SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/toliki" run epic 10 --engine codex --over-capacity >/dev/null 2>&1
 CONTROL_RC=$?
 set -e
 assert_rc "manual epic accepts the override" 0 "$CONTROL_RC"
@@ -1117,33 +1128,36 @@ assert_contains "manual epic forwards the override on the launch segment" "$(cat
 assert_contains "and the routing segment ends before it" "$(cat "$TMP/ssh.log")" "--route-issue '10' 'codex' --repo 'testrepo' &&"
 : > "$TMP/ssh.log"
 set +e
-SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/remote-control.sh" fix 10 --engine codex --over-capacity >/dev/null 2>&1
+SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/toliki" run fix 10 --engine codex --over-capacity >/dev/null 2>&1
 CONTROL_RC=$?
 set -e
 assert_rc "a manual fixer accepts it too" 0 "$CONTROL_RC"
 assert_contains "the fixer forwards it on the launch segment" "$(cat "$TMP/ssh.log")" "--fix '10' --engine 'codex' --over-capacity"
 assert_contains "and its routing segment ends before it" "$(cat "$TMP/ssh.log")" "--route-issue '10' 'codex' --repo 'testrepo' &&"
-for bad in "next codex" "start" "ls" "-m hello"; do
+for bad in "route next codex" "session start" "session list" "session -m hello" "usage 7"; do
   : > "$TMP/ssh.log"
   set +e
-  SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/remote-control.sh" $bad --over-capacity >/dev/null 2>&1
+  SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/toliki" $bad --over-capacity >/dev/null 2>&1
   CONTROL_RC=$?
   set -e
   assert_rc "'$bad' cannot carry the override" 1 "$CONTROL_RC"
   assert_eq "'$bad' sends nothing to the host" "" "$(cat "$TMP/ssh.log")"
 done
-# The flag on its own leaves no command behind, and the no-command path prints
-# usage and exits 0. That success would report the one cap bypass as accepted
-# usage, so it is refused before the usage exit like every other non-pipeline use.
-: > "$TMP/ssh.log"
-set +e
-SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/remote-control.sh" --over-capacity >/dev/null 2>&1
-CONTROL_RC=$?
-set -e
-assert_rc "a bare --over-capacity is refused, not usage" 1 "$CONTROL_RC"
-assert_eq "and sends nothing to the host" "" "$(cat "$TMP/ssh.log")"
+# The flag on its own leaves no command behind, and every group's no-command
+# path prints usage and exits 0. That success would report the one cap bypass as
+# accepted usage, so it is refused before the usage exit — including inside
+# `run`, whose bare form is the friendliest place for it to leak.
+for bare in "" "run" "session" "route"; do
+  : > "$TMP/ssh.log"
+  set +e
+  SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/toliki" $bare --over-capacity >/dev/null 2>&1
+  CONTROL_RC=$?
+  set -e
+  assert_rc "a bare '$bare --over-capacity' is refused, not usage" 1 "$CONTROL_RC"
+  assert_eq "and '$bare' sends nothing to the host" "" "$(cat "$TMP/ssh.log")"
+done
 
-printf '\nremote control: the override reaches an inherited-engine launch too\n'
+printf '\noperator CLI: the override reaches an inherited-engine launch too\n'
 # Omitting --engine takes the other remote path: the heredoc that resolves the
 # engine on the host and then launches. Its launch.sh call is a separate
 # invocation from the explicit-engine one above, so the override has to be
@@ -1153,7 +1167,7 @@ printf '\nremote control: the override reaches an inherited-engine launch too\n'
 STUB_AT_CAPACITY=1
 reset_state
 printf 'ready,engine:codex' > "$TMP/labels/10"
-run_control epic 10 -r testrepo --over-capacity
+run_control run epic 10 -r testrepo --over-capacity
 assert_rc "an inherited-engine epic is admitted over the cap" 0 "$CONTROL_RC"
 assert_contains "the override reaches launch.sh beside the inherited engine" "$(cat "$TMP/launch.log")" '--epic 10 --repo testrepo --engine codex --over-capacity'
 assert_not_contains "the read-only resolve step is never given it" "$CONTROL_OUT" "unknown argument"
@@ -1164,7 +1178,7 @@ for kind in fix ci defect; do
   reset_state
   printf 'ready' > "$TMP/labels/11"
   set_cron_engine codex
-  run_control "$kind" 11 -r testrepo --over-capacity
+  run_control run "$kind" 11 -r testrepo --over-capacity
   assert_rc "an inherited-engine $kind is admitted over the cap" 0 "$CONTROL_RC"
   assert_contains "the override reaches launch.sh for $kind" "$(cat "$TMP/launch.log")" "--$kind 11 --repo testrepo --engine codex --over-capacity"
 done
@@ -1173,7 +1187,7 @@ done
 # say something about the override rather than about the stub.
 reset_state
 printf 'ready,engine:codex' > "$TMP/labels/10"
-run_control epic 10 -r testrepo
+run_control run epic 10 -r testrepo
 assert_rc "the same inherited launch without the flag is refused at capacity" 3 "$CONTROL_RC"
 assert_eq "and nothing forged the flag for it" "" "$(grep -- '--over-capacity' "$TMP/launch.log" || true)"
 STUB_AT_CAPACITY=""

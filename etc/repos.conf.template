@@ -23,11 +23,11 @@ REPO_ORIGINS=(
   myapp=your-github-user/myapp
 )
 
-# Where this control repo is cloned on the host. remote-control.sh invokes
+# Where this control repo is cloned on the host. The laptop's ./toliki invokes
 # bin/launch.sh under this path over ssh; provision.sh clones the repo here.
 HOST_CONTROL_DIR="/home/ubuntu/toliki"
 
-# ssh destination of the host, as remote-control.sh (laptop-side) dials it.
+# ssh destination of the host, as ./toliki (laptop-side) dials it.
 # An alias from your ~/.ssh/config or anything ssh accepts (user@host).
 SSH_HOST="vps"
 
@@ -54,11 +54,11 @@ NAME_MAX_LEN=40
 # pipeline bug.
 #
 # An operator can exceed it for one run at a time with
-# `./remote-control.sh epic|task|fix|ci|defect N [--engine <e>] --over-capacity`.
+# `./toliki run epic|task|fix|ci|defect N [--engine <e>] --over-capacity`.
 # Nothing else can: dispatch never passes the flag, and no environment variable
-# grants it. From the laptop, `./config.sh --max <count>` updates
-# this installed value with validation and readback; `./config.sh` reports it
-# alongside the default and available engines.
+# grants it. From the laptop, `./toliki config set --max <count>` updates
+# this installed value with validation and readback; `./toliki config show`
+# reports it alongside the default and available engines.
 MAX_PARALLEL_EPICS=2
 
 # IANA zone used for every timestamp rendered for a human (pane/status/script
@@ -69,7 +69,7 @@ HOST_TIMEZONE="UTC"
 
 # Repositories allowed to run the bounded ship-gate defect fixer
 # autonomously. Empty/unset means the defect queue is only descriptive; an
-# operator can still launch one explicitly with `remote-control.sh defect`.
+# operator can still launch one explicitly with `./toliki run defect`.
 # Every name must also appear in REPOS, or dispatch refuses the whole tick
 # before reading or changing any GitHub issue.
 DEFECT_FIX_REPOS=()

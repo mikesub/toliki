@@ -4,7 +4,7 @@ set -euo pipefail
 # Runs ON the host. The single launch primitive: resolves the session name,
 # enforces the host's slot budget, pulls the repo, creates the detached tmux
 # session, tags it with its repo and starts the run inside it.
-# remote-control.sh calls this over ssh; bin/dispatch.sh (host-side, cron)
+# The laptop's ./toliki calls this over ssh; bin/dispatch.sh (host-side, cron)
 # calls it directly — keep it free of any ssh/laptop assumptions.
 # It writes the registry's HOST_TIMEZONE and TZ into every pane command rather
 # than trusting the ssh caller or a long-lived tmux server's cached environment.
@@ -364,7 +364,7 @@ if tmux has-session -t "=$SESSION" 2>/dev/null; then
   current="$(tmux list-panes -t "$SESSION" -F '#{pane_current_command}' | head -n1)"
   case "$current" in
     bash|zsh|sh|dash)
-      echo "[launch] session '$SESSION' exists but its process isn't running (pane at a $current prompt) — restart it (from the laptop): ./remote-control.sh restart $SESSION" ;;
+      echo "[launch] session '$SESSION' exists but its process isn't running (pane at a $current prompt) — restart it (from the laptop): ./toliki session restart $SESSION" ;;
     *)
       echo "[launch] session '$SESSION' already running (pane: $current)" ;;
   esac
@@ -372,9 +372,9 @@ if tmux has-session -t "=$SESSION" 2>/dev/null; then
 fi
 
 # The slot budget is enforced HERE rather than in dispatch.sh because this is
-# the primitive both callers share: remote-control.sh reaches it over ssh,
+# the primitive both callers share: ./toliki run reaches it over ssh,
 # dispatch.sh calls it directly. A cap counted by the dispatcher would bound
-# only the dispatcher, and every manual `./remote-control.sh epic N` would walk past
+# only the dispatcher, and every manual `./toliki run epic N` would walk past
 # it — so the two callers together could overrun the box while each believed it
 # was under the cap. Counting at the one place that actually creates sessions
 # is the only version that can't be bypassed. It sits after the has-session
@@ -384,7 +384,7 @@ fi
 # Counting and creating are ONE critical section, or the cap is advisory: two
 # launches that both read cap-1 both start, and the box runs cap+1. dispatch
 # serialises its own launches under the tick lock, but a manual
-# `./remote-control.sh epic N` reaches this script by another path, and that is
+# `./toliki run epic N` reaches this script by another path, and that is
 # exactly the pair that can race. Blocking (no -n): a launch that waits a few
 # seconds for the one ahead of it is the correct outcome, not a refusal.
 # Released as soon as the session exists, since from then on running_count sees

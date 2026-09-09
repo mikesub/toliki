@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Two read-only views over the usage log lib/usage.mjs writes. Runs wherever
-// the log is (the host, via `./remote-control.sh usage`, or a laptop that ran
+// the log is (the host, via `./toliki usage`, or a laptop that ran
 // a pipeline itself), reads that one file and nothing else — no GitHub, no
 // network.
 //

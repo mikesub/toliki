@@ -559,7 +559,7 @@ fi
 say "~/.claude wiring"
 # Host launchers execute pipeline scripts directly, and the engine reads its
 # charters from the control clone. Only /spec and its spec-explorer are useful as
-# user-level content, matching laptop-side setup.sh exactly.
+# user-level content, matching laptop-side operator/setup.sh exactly.
 wire_claude_content "$HOST_CONTROL_DIR"
 
 # ------------------------------------------------------- the interactive gates --
@@ -640,4 +640,4 @@ if [[ ${#BLOCKERS[@]} -gt 0 ]]; then
   exit 1
 fi
 
-printf '\n  Host is provisioned. Launch a session from the laptop with ./remote-control.sh\n'
+printf '\n  Host is provisioned. Launch a session from the laptop with ./toliki\n'

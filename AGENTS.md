@@ -32,7 +32,8 @@ Two session kinds exist, and they must never be conflated:
   a config file, relaxing a gate or reopening a settled trade-off.
 - [skills/spec/ISSUE-TRACKING.md](skills/spec/ISSUE-TRACKING.md): authoritative
   on how work is sliced and filed.
-- Script and module headers. Every `bin/*.sh` and `workflows/**/*.mjs` header
+- Script and module headers. Every `bin/*.sh`, `operator/*.sh` and
+  `workflows/**/*.mjs` header
   states its contract, its ordering choices and the incident behind them. The
   code and its comments are the operational manual; this file holds only what
   the code cannot show.
@@ -222,7 +223,7 @@ than made launchable against a main without the code it describes.
   spawn time labelled model-active) and the issue-lifetime view, where `--since`
   selects a `(repository, issue)` lifetime by its latest activity and then totals
   every retained record of it, and `--engine`/`--script` select by the latest
-  completed run. `./remote-control.sh usage` runs that on the host.
+  completed run. `./toliki usage` runs that on the host.
 - `workflows/quota-hold.mjs` owns the host-wide vendor-keyed provider-quota
   holds: reset-time parsing, schema validation, atomic per-vendor monotonic
   writes under dispatch's lock, independent expiry, and the read-only operator
@@ -240,7 +241,7 @@ than made launchable against a main without the code it describes.
   cost, never a zero. Adding a Codex model to `etc/engines.json` means adding
   its row here too.
 - `bin/launch.sh` is the only session-creation primitive; `bin/dispatch.sh` and
-  `remote-control.sh` both go through it. It owns the pipeline worktree and
+  the laptop's `./toliki session|run` both go through it. It owns the pipeline worktree and
   the slot cap, refusing with exit 3. Gated by `tests/launch-epic.test.sh`.
 - `bin/dispatch.sh`, `bin/reap.sh` and `bin/merge-tick.sh` are one operating
   loop on a one-minute cron. Check a change to one against the other two.
@@ -253,7 +254,7 @@ than made launchable against a main without the code it describes.
   issue is ambiguous and merges nothing. Gated by
   `tests/merge-autoresolve.test.sh` for the resolver and
   `tests/merge-worker.test.sh` for the state machine around it.
-- `setup.sh` (laptop) and `bin/provision.sh` (host) both source
+- `operator/setup.sh` (laptop, `./toliki setup`) and `bin/provision.sh` (host) both source
   `etc/wire-claude-content.sh`, which exposes only `/spec` and `spec-explorer` as
   user-level Claude content. Laptop setup also links `/spec` into Codex's
   user-level skill directory and registers `agents/spec-explorer.toml` through
@@ -265,8 +266,17 @@ than made launchable against a main without the code it describes.
   succeeds does setup remove its old agent symlink, avoiding duplicate role
   definitions. Pipeline entry points and charters stay internal; Codex's
   built-in `explorer` remains unshadowed.
-- `remote-control.sh` is the one script that runs on the laptop; everything in
-  `bin/` runs on the host and never sshes.
+- `./toliki` is the one primary entry point at the repo root and the only thing
+  that runs on the laptop; everything in `bin/` runs on the host and never
+  sshes. `./toliki` only navigates: each command group is implemented in
+  `operator/<concern>.sh` (setup, config, sessions, run, route, usage, sync)
+  with its own `--help`, and every one of them sources `operator/lib.sh` for the
+  registry, the ssh destination and the shared refusals — except
+  `operator/setup.sh`, which seeds the registry and so must run without one.
+  A laptop-side implementation never moves into `bin/`, and a host-side one
+  never gains an `ssh`; that is the whole split. Gated by
+  `tests/operator-cli.test.sh` for the surface and
+  `tests/dispatch-engine.test.sh` for what it sends the host.
 - `.agents/skills/toliki` is the cross-client project-level source of the
   operator-only pipeline triage skill; `.claude/skills/toliki` is a relative
   symlink to it for Claude discovery. It stays project-level so it does not
@@ -643,7 +653,7 @@ than made launchable against a main without the code it describes.
   launch refuses. It is read from the installed cron file, not the process
   environment: the file must hold exactly one `EPIC_ENGINE=` line, and if the
   environment also names one it must agree — a malformed file or a disagreement
-  refuses to launch (`config.sh` edits that file and reports this setting with
+  refuses to launch (`./toliki config set` edits that file and reports this setting with
   `MAX_PARALLEL_EPICS`, so the minute after an edit can log one loud tick).
 - Every name in `DEFECT_FIX_REPOS` must be registered in `REPOS`; empty or
   unset disables autonomous defect repair without disabling manual launches.
@@ -721,15 +731,17 @@ cannot export them, so a child Bash calls the real `ssh`.
 The user's tmux sessions and GitHub queues are live production state. Without
 an explicit request, never run:
 
-- `remote-control.sh start`, `epic`, `fix`, `ci`, `defect`, `next`, `stop`, `restart`,
-  `stop-all`, or a bare `<name>`;
+- `./toliki session start|stop|restart|stop-all` or a bare `session <name>`,
+  `./toliki run epic|task|fix|ci|defect`, `./toliki route next`,
+  `./toliki config set`, or `./toliki sync`;
 - `bin/dispatch.sh` except `--dry-run` (`--route-next` and `--route-issue`
   mutate labels);
 - `bin/reap.sh` except `-n`;
 - `bin/update-claude.sh` except `-n`;
 - `bin/merge-worker.sh` or `bin/merge-tick.sh` in any mode.
 
-Safe on your own initiative: `remote-control.sh ls`, `remote-control.sh usage`, `bin/reap.sh -n`,
+Safe on your own initiative: `./toliki session list`, `./toliki usage`,
+`./toliki config show`, `bin/reap.sh -n`,
 `bin/update-claude.sh -n`, `bin/resource-report.sh`, GitHub reads, and
 read-only tmux inspection (`ssh toliki 'tmux capture-pane -p -t <session>'`).
 If you think you may have touched the host, `ls` shows what is running and a

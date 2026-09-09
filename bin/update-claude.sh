@@ -22,7 +22,7 @@ set -euo pipefail
 #
 # It holds dispatch's lock across the check and the install so a tick cannot
 # launch into the window between "idle" and "installed". A manual
-# `remote-control.sh start` does not take that lock; the window is one
+# `./toliki session start` does not take that lock; the window is one
 # download long and the cost is one run on mixed CLI versions, so that is
 # accepted rather than guarded. While the lock is held a dispatch tick logs
 # "previous tick still running — skipping": that is this script, not a stuck
