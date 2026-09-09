@@ -68,6 +68,16 @@ Git, GitHub, labels, dependency installation, verification, checkpointing,
 pushes, PR creation, and merging are always performed by deterministic code.
 An agent's report that one of those operations succeeded is never the gate.
 
+The epic pipeline's and the three fixers' prompts are one module per model
+step under [`workflows/prompts/`](workflows/prompts): `prompts/epic/`,
+`prompts/conflict/`, `prompts/ci/`, `prompts/defect/`, and `prompts/shared/`
+for the verification retry every fixer appends. Task-run builds its own two
+prompts in [`workflows/task-run.mjs`](workflows/task-run.mjs). Each module exports a builder function taking that step's runtime
+arguments; the orchestrator imports it and keeps the capture, the execution and
+the control flow around it. Charters and schemas are unchanged by that split:
+the standing rules stay in `agents/*.md` and the shape of an answer stays in
+the phase's schema.
+
 ## Lightweight task path
 
 The persistent `task` label is an explicit human workflow choice, not a

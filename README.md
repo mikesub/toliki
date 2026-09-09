@@ -240,7 +240,8 @@ load the registration. Node and Codex must be installed for this registration st
 - **`WORKFLOW.md`** — the executable path from queue selection through merge,
   including the full epic, lightweight task and fixer call counts and gates.
 - **`workflows/`** — the epic and task pipelines plus three fixer entry points
-  (`epic-run`, `task-run`, `fix-run`, `ci-run`, and `defect-run`). The epic and
+  (`epic-run`, `task-run`, `fix-run`, `ci-run`, and `defect-run`), with every
+  model step's prompt in its own module under `workflows/prompts/`. The epic and
   task paths share their safety-critical issue-delivery transport. The fixers share one fixed lifecycle
   runner for execution, verification/check gates, failure and final reporting,
   while each entry point keeps its cause-specific preparation, evidence,
