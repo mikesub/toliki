@@ -233,8 +233,8 @@ it comes back failed again with the fixer's own blocker comment."
     next="The PR is open and NOT merged; the change itself is complete. Fix the cause
 above, push, and swap \`failed\` → \`ready-to-merge\`: the worker does not retry on
 its own, and that swap is the retry — it rebases, re-runs the checks and lands
-the PR itself. Do not merge by hand. Re-running /epic on this issue will skip it
-while the PR is open."
+the PR itself. Do not merge by hand. Re-running the epic pipeline on this issue
+will skip it while the PR is open."
   fi
   gh issue comment "$issue" -R "$ORIGIN" --body-file - <<EOF || say "$REPO: could not comment on #$issue"
 🤖 merge-worker blocked

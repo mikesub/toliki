@@ -118,6 +118,9 @@ mkdir -p "$HOME/.claude/skills" "$HOME/.claude/agents" "$TMP/other"
 printf '{"env":{"KEEP_ME":"yes","CLAUDE_HARNESS_DIR":"legacy"}}\n' > "$HOME/.claude/settings.json"
 printf 'mine\n' > "$HOME/.claude/skills/mine"
 ln -s "$TMP/other" "$HOME/.claude/skills/other-source"
+# Historical names this checkout once published, including ones it no longer
+# holds: an install left behind by an older version must still be pruned,
+# dangling or not.
 for name in epic fix-ci fix-conflict commit bugreport; do
   ln -s "$ROOT/skills/$name" "$HOME/.claude/skills/$name"
 done

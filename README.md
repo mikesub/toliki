@@ -250,7 +250,7 @@ load the registration. Node and Codex must be installed for this registration st
   for step tuning, plus the run-start/run-finish records behind its
   issue-lifetime view of cost, elapsed time, retries and recorded result.
 - **`skills/`, `agents/`** — `/spec` and its `spec-explorer` are exposed to local
-  Claude and Codex sessions; pipeline entry contracts and phase charters stay
+  Claude and Codex sessions; pipeline entry points and phase charters stay
   internal. Each client gets the same read-only charter in its native format,
   without shadowing Codex's built-in `explorer`.
 - **`.agents/skills/toliki`** — the project-local, cross-client operator skill

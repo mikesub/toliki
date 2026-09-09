@@ -226,8 +226,8 @@ full_name() {
 
 # Turn arbitrary message text into a tmux/session-safe slug: lowercase, each
 # run of non-[a-z0-9] collapses to a single '-', ends trimmed, capped at
-# NAME_MAX_LEN (e.g. "/epic #42" -> "epic-42"). Prints "" if nothing usable
-# remains, so the caller can fall back to the pool.
+# NAME_MAX_LEN (e.g. "Fix #42 flaky test" -> "fix-42-flaky-test"). Prints ""
+# if nothing usable remains, so the caller can fall back to the pool.
 slugify() {
   local s
   s="$(printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]' \

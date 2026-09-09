@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // Two read-only views over the usage log lib/usage.mjs writes. Runs wherever
 // the log is (the host, via `./remote-control.sh usage`, or a laptop that ran
-// /epic), reads that one file and nothing else — no GitHub, no network.
+// a pipeline itself), reads that one file and nothing else — no GitHub, no
+// network.
 //
 // Usage: usage-report.mjs [--log <file>] [--since <N>d] [--engine <name>] [--script epic-run|task-run|fix-run|ci-run|defect-run]
 //

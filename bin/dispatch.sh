@@ -663,7 +663,7 @@ fi
 # ───────────────────────── Ready walk ─────────────────────────
 # The `ready` queue for one repo, oldest first. gh runs inside the clone so it
 # resolves the GitHub repo from that checkout's own origin — which is why this
-# script never reads REPO_ORIGINS. Same query as the /epic skill's queue walk:
+# script never reads REPO_ORIGINS. The exclusions are load-bearing:
 # in-progress and failed are excluded because a run already owns those, and the
 # two terminal success labels are excluded because prepare's label swap is
 # best-effort — a stale `ready` can survive beside ready-to-merge/-review, and

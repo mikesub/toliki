@@ -981,7 +981,7 @@ async function postBlocker({ issue, slug, phase, reason, prUrl, candidate }) {
   } else if (prUrl) {
     // A block AFTER ship: the PR is open, pushed and complete — the work needs a human, not
     // preservation, and a re-run would skip it (prepare's open-PR guard) rather than resume.
-    branchLine = `- PR: ${prUrl} — open on ${branch}, NOT merged and NOT queued for the merge worker; the change itself is complete. Fix the cause above, push, and swap \`failed\` → \`ready-to-merge\` if the deferred record on this issue lists no defect (else \`ready-to-review\`); the merge worker rebases, re-checks and lands it. Do not merge by hand. A re-run of /epic #${issue} will skip (an open PR already delivers this issue).`
+    branchLine = `- PR: ${prUrl} — open on ${branch}, NOT merged and NOT queued for the merge worker; the change itself is complete. Fix the cause above, push, and swap \`failed\` → \`ready-to-merge\` if the deferred record on this issue lists no defect (else \`ready-to-review\`); the merge worker rebases, re-checks and lands it. Do not merge by hand. A re-run of the epic pipeline on #${issue} will skip (an open PR already delivers this issue).`
   } else if (branch) {
     // Checkpoint commits on the branch are durable; only uncommitted changes are at risk. The WIP
     // commit never carries "Closes #N" (unfinished work must not auto-close the issue on an accidental
@@ -991,9 +991,9 @@ async function postBlocker({ issue, slug, phase, reason, prUrl, candidate }) {
     } catch (e) {
       log(`blocked: could not preserve the work (${e && e.message || e})`)
     }
-    branchLine = `- branch: ${branch} — re-running /epic #${issue} resumes from it; delete the branch (locally AND on origin) to force a fresh build`
+    branchLine = `- branch: ${branch} — re-running the epic pipeline on #${issue} (\`./remote-control.sh epic ${issue}\`) resumes from it; delete the branch (locally AND on origin) to force a fresh build`
   } else {
-    branchLine = `- branch: none (blocked before branch creation; a re-run of /epic #${issue} starts fresh)`
+    branchLine = `- branch: none (blocked before branch creation; a re-run of the epic pipeline on #${issue} starts fresh)`
   }
   let body = `🤖 epic-run blocked\n- phase: ${phase}\n- reason: ${reason}\n${branchLine}\n`
   // .epics/ is gitignored and dies with the worktree; the phase log survives in this comment.
@@ -1856,7 +1856,7 @@ try {
         log(`Ship: deps checked after rebase (${depLines.join('; ')})`)
         const rebased = await verifyGate('Ship: verify gate after rebase')
         if (!rebased.green) {
-          return await fail('ship', `origin/main moved by ${landed} commit(s) during the run and npm run verify is red after rebasing onto it (${rebased.detail}) — refusing to open a PR whose green belongs to the base this run started from. The rebased branch is preserved with its checkpoint chain: a re-run of /epic #${issue} resumes from that checkpoint, rebases again in prepare, and repairs from this failure.`)
+          return await fail('ship', `origin/main moved by ${landed} commit(s) during the run and npm run verify is red after rebasing onto it (${rebased.detail}) — refusing to open a PR whose green belongs to the base this run started from. The rebased branch is preserved with its checkpoint chain: a re-run of the epic pipeline on #${issue} resumes from that checkpoint, rebases again in prepare, and repairs from this failure.`)
         }
       }
     }
