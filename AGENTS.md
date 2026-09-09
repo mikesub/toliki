@@ -157,6 +157,21 @@ than made launchable against a main without the code it describes.
   its own evidence. A diff that cannot be captured fails closed; an issue body
   that cannot be read says so where the model reads it, exactly as an
   unretrievable job log already does. Gated by `tests/epic-run.test.sh`.
+- `workflows/prompts/**` holds the epic pipeline's and the three fixers'
+  runtime prompts, one module per model step: `prompts/epic/`,
+  `prompts/conflict/`, `prompts/ci/`, `prompts/defect/`, and `prompts/shared/`
+  for text every fixer sends. Task-run keeps its own two prompts inline. A
+  module exports a builder function taking that step's runtime arguments and
+  returns a string — nothing there executes a command, captures evidence or
+  decides control flow, and the orchestrator that spawns the step imports it.
+  A sentence more than one prompt needs lives in exactly one place
+  (`prompts/epic/shared.mjs`, `prompts/conflict/evidence.mjs`, the shared
+  repair contracts in `lib/repair-acceptance.mjs`), because two copies of one
+  consequence are how the wording starts to disagree with itself. Those repair
+  contracts stay beside the fail-closed gate that enforces them: the wording
+  asking for an answer and the validator refusing a malformed one are one
+  contract, and splitting them is how a schema change stops reaching the
+  prompt that describes it. Gated by `tests/workflow-prompts.test.sh`.
 - `workflows/lib/engine.mjs` is the only file that knows how a vendor CLI is
   invoked. Its loader validates `etc/engines.json` before any phase touches
   GitHub. A Codex phase is ephemeral, sandboxed from the charter's tools, and
@@ -657,7 +672,7 @@ than made launchable against a main without the code it describes.
    path and update it when needed. When the contract or rationale changes,
    update this file, DOCTRINE.md, the root README, the template or the script
    header too. Never leave an invariant only in a commit message.
-5. Run every relevant suite; run all twelve before handing off a broad change.
+5. Run every relevant suite; run all fourteen before handing off a broad change.
 
 Trunk-based: when asked to commit or push, commit straight to `main` and push.
 No feature branches or PRs unless explicitly requested. Never commit or push
@@ -673,7 +688,8 @@ merely because the code is ready.
 - Runtime instructions live in exactly one layer. A role's standing rules belong
   in its `agents/*.md` charter, which every phase of that role receives; the
   shape of an answer belongs in the phase's schema, field by field; a prompt
-  carries only that step's task and the orchestrator's captured evidence.
+  carries only that step's task and the orchestrator's captured evidence, and
+  lives in its own module under `workflows/prompts/`.
   Restating one layer inside another is how the three drift into contradicting
   each other — which is what happened to the `.epics/` boundary, now stated once
   per charter. Evidence is rendered once per prompt too: a requirement that also
@@ -685,7 +701,7 @@ merely because the code is ready.
 
 ## Tests
 
-All thirteen suites are hermetic and need no network or credentials. The test
+All fourteen suites are hermetic and need no network or credentials. The test
 runner runs up to four suites together, suppresses passing assertion chatter
 and prints one line per green suite. Set `TEST_JOBS=1` for a serial run:
 

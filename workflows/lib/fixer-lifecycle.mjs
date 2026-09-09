@@ -53,22 +53,9 @@ import {
   validateCorrection,
 } from './repair-acceptance.mjs'
 import { recordQuotaHold } from '../quota-hold.mjs'
+import { verificationRetryPrompt } from '../prompts/shared/verification-retry.mjs'
 
 const message = error => error?.message || String(error)
-
-// Writable agents do not execute project gates. When their first repair leaves
-// the tree red, the orchestrator gives one fresh process its own bounded,
-// sanitized output and then runs the complete gate once more. This is separate
-// from a provider/process respawn inside agent() and from the fixer's durable
-// two-rung attempt ladder.
-const verificationRetryPrompt = verified => `
-
-The orchestrator ran the project's full verification command after your repair and it is RED. This is the one verification-driven repair retry in this run; a second red result blocks before the acceptance check.
-
-Captured failure diagnostics:
-${verified.tail || verified.detail}
-
-Repair the reported cause without weakening, skipping, deleting or loosening a test, assertion, type, lint rule, check, or security guard. Do not run tests or verification yourself. Leave the updated working tree for the orchestrator to verify, and return the complete structured result requested above again.`
 
 // Exact indexed coverage is the common contract between every repair agent and
 // its blind checker. `legacy` preserves the entry point's existing safe
