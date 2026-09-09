@@ -5,12 +5,23 @@
 // publishes evidence and hands the candidate to the ordinary merge worker.
 // There is no architect, RED step, independent review or correction.
 // Runtime respawns are disabled for every call. The one bounded exception is
-// a fresh tasker given captured diagnostics after the first project verify is
-// genuinely red; its full second verify is final and can never spawn a third.
+// the verification repair below; its full second verify is final and can never
+// spawn a third.
+//
+// That repair CONTINUES the tasker's own conversation (lib/runtime.mjs) instead
+// of briefing a stranger on work that is minutes old: the initial tasker still
+// holds why it wrote what the gate just rejected, which is the context a fresh
+// process would spend its first minutes rebuilding from the same tree. Nothing
+// else changes shape. The prompt below stays a complete standalone brief — the
+// requirement, the sanitized diagnostics and the in-place worktree — so the run
+// behaves identically when the conversation is unavailable, and the ceiling is
+// unchanged: two invocations, never three. Malformed output, a tasker blocker,
+// a provider or process failure, a timeout and a rebase-time verify failure all
+// still block after the process they happened in, resumed or not.
 
 import path from 'node:path'
 import { existsSync, readFileSync } from 'node:fs'
-import { agent, phase, log, initRuntime, onPhase, onLog, takeAgentFailure, withAgentFailure } from './lib/runtime.mjs'
+import { agent, phase, log, initRuntime, onPhase, onLog, takeAgentFailure, withAgentFailure, conversation } from './lib/runtime.mjs'
 import { parseArgs, finish, UsageError, EXIT } from './lib/cli.mjs'
 import { initStatus, statusPhase, statusNote, statusFinish } from './lib/status.mjs'
 import { failureReason } from './lib/proc.mjs'
@@ -52,6 +63,10 @@ onPhase(statusPhase)
 onLog(statusNote)
 
 const issue = ARGS.issue
+// The run's one writable conversation: opened by the initial tasker and
+// continued by the single verification repair. Scoped to this process and this
+// worktree, so nothing crosses issues or invocations.
+const tasker = conversation('tasker')
 let slug = null
 let currentPhase = 'prepare'
 let blockerPosted = false
@@ -224,6 +239,7 @@ async function main() {
     phase('Task')
     let implemented = await agent(prompt(prep), {
       label: 'task', phase: 'Task', step: 'task', schema: TASK_SCHEMA, respawn: false,
+      conversation: tasker,
     })
     if (!implemented) return fail('task', 'the initial tasker process failed or returned malformed output; the one-process contract forbids a respawn for runtime or schema failure.')
     const problem = resultProblem(implemented)
@@ -239,12 +255,12 @@ async function main() {
     log(`Verify: ${finalVerify.green ? 'green' : 'RED'} — ${finalVerify.detail}`)
     if (!finalVerify.green && repairableVerifyFailure(finalVerify)) {
       const firstVerify = finalVerify
-      log('Verify: RED — starting the one fresh task repair process with captured diagnostics.')
+      log('Verify: RED — continuing the tasker conversation for the one repair process with captured diagnostics.')
       currentPhase = 'task'
       phase('Task')
       const repaired = await agent(verifyRepairPrompt(prep, firstVerify), {
         label: 'task:verify-repair', phase: 'Task', step: 'task', schema: TASK_SCHEMA,
-        retry: true, respawn: false,
+        retry: true, respawn: false, conversation: tasker,
       })
       if (!repaired) {
         return fail('task', `the verification repair tasker failed or returned malformed output; no third task process is permitted. Initial verification diagnostics:\n${verifyDiagnostic(firstVerify)}`)

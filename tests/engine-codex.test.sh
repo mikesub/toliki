@@ -72,6 +72,13 @@ case "${CODEX_STUB_MODE:-structured}" in
     printf '{"type":"turn.failed","error":{"message":"You have hit your usage limit; resets 3:50pm (Europe/Amsterdam)"}}\n'
     exit 1 ;;
   timeout) trap 'exit 143' TERM; sleep 5 ;;
+  # A resume whose session the CLI no longer has. The adapter must tell this
+  # apart from an ordinary failure so the caller can start fresh instead of
+  # blocking on a conversation nobody can continue.
+  lost-session)
+    printf '{"type":"error","message":"No conversation found for thread t1"}\n'
+    printf '{"type":"turn.failed","error":{"message":"No conversation found for thread t1"}}\n'
+    exit 1 ;;
 esac
 STUB
 chmod +x "$TMP/bin/codex"
@@ -86,6 +93,10 @@ const schema = process.env.USE_SCHEMA === '1' ? {
     maybe: { type: ['string', 'null'] },
   },
 } : undefined
+// CONVERSATION: unset for the ephemeral phases every judging step still runs,
+// "new" to open a persisted session, or an id to continue that exact one.
+const requested = process.env.CONVERSATION || ''
+const conversation = requested === '' ? null : { id: requested === 'new' ? null : requested }
 const result = await resolveVendor('codex').run({
   prompt: 'adapter probe',
   agentType: process.env.AGENT_TYPE,
@@ -94,6 +105,7 @@ const result = await resolveVendor('codex').run({
   schema,
   cwd: process.cwd(),
   timeoutMs: Number(process.env.TIMEOUT_MS || 5000),
+  conversation,
 })
 console.log(JSON.stringify(result))
 NODE
@@ -114,6 +126,7 @@ run_adapter() {
     CODEX_SCHEMA_LOG="$TMP/schema" \
     AGENT_TYPE="$1" MODEL="$2" EFFORT="$3" USE_SCHEMA="$4" \
     CODEX_STUB_MODE="${5:-structured}" TIMEOUT_MS="${6:-5000}" \
+    CONVERSATION="${CONVERSATION:-}" \
     node "$TMP/run.mjs" 2>&1
   )" || RUN_RC=$?
 }
@@ -215,6 +228,48 @@ run_adapter coder gpt-5.6-sol xhigh 1 no-output
 assert_contains "a missing final file fails" "$RUN_OUT" 'final output file was not written'
 run_adapter coder gpt-5.6-sol xhigh 1 timeout 50
 assert_contains "a timed-out process is marked" "$RUN_OUT" '"timedOut":true'
+
+# One builder conversation per run: a writable phase opens a persisted session
+# and its later retries and repairs continue that exact id. `exec resume` is a
+# different subcommand with a smaller flag surface than `exec`, so what it
+# cannot take on the command line has to survive as config or the resumed phase
+# would silently lose it.
+printf '\nCodex adapter: a phase that carries a conversation persists its session\n'
+CONVERSATION=new run_adapter coder gpt-5.6-sol xhigh 1
+ARGS="$(cat "$TMP/args")"
+assert_not_contains "a conversation-carrying phase is not ephemeral" "$ARGS" 'ARG:--ephemeral'
+assert_not_contains "and it opens rather than resumes" "$ARGS" 'ARG:resume'
+assert_contains "the id the CLI ran under comes back" "$RUN_OUT" '"sessionId":"t1"'
+assert_contains "a phase that opened nothing cannot be missing a session" "$RUN_OUT" '"sessionMissing":false'
+
+printf '\nCodex adapter: an ephemeral phase reports no session at all\n'
+run_adapter reviewer gpt-5.6-sol xhigh 0 text
+assert_contains "the judging phase stays ephemeral" "$(cat "$TMP/args")" 'ARG:--ephemeral'
+assert_contains "and records no session to continue" "$RUN_OUT" '"sessionId":null'
+
+printf '\nCodex adapter: continuing a conversation keeps the phase intact\n'
+CONVERSATION=t1 run_adapter coder gpt-5.6-sol xhigh 1
+ARGS="$(cat "$TMP/args")"
+assert_contains "the resume subcommand is used" "$ARGS" 'ARG:resume'
+assert_contains "with the exact session id, never a most-recent picker" "$ARGS" 'ARG:t1'
+assert_not_contains "no --last shortcut is ever passed" "$ARGS" 'ARG:--last'
+assert_not_contains "no exec-only sandbox flag reaches the resume subcommand" "$ARGS" 'ARG:--sandbox'
+assert_contains "the write charter's sandbox survives as config" "$ARGS" 'ARG:sandbox_mode="danger-full-access"'
+assert_contains "the engine row is still passed explicitly" "$ARGS" 'ARG:model_reasoning_effort="xhigh"'
+assert_contains "the charter is re-sent rather than assumed" "$ARGS" 'ARG:developer_instructions='
+assert_contains "the prompt still goes on stdin" "$(cat "$TMP/prompt")" 'adapter probe'
+assert_contains "the continuation is still ordinary output" "$RUN_OUT" '"output":{"name":"ok"'
+
+printf '\nCodex adapter: a read-only charter resumes read-only\n'
+CONVERSATION=t1 run_adapter reviewer gpt-5.6-sol xhigh 0 text
+assert_contains "the sandbox is derived from the charter, not the session" "$(cat "$TMP/args")" 'ARG:sandbox_mode="read-only"'
+
+printf '\nCodex adapter: a session the CLI lost is told apart from a failed phase\n'
+CONVERSATION=t1 run_adapter coder gpt-5.6-sol xhigh 1 lost-session
+assert_contains "the phase still fails closed" "$RUN_OUT" '"ok":false'
+assert_contains "and the caller is told the session is what is missing" "$RUN_OUT" '"sessionMissing":true'
+run_adapter coder gpt-5.6-sol xhigh 1 api-error
+assert_contains "an ordinary failure is never mistaken for a lost session" "$RUN_OUT" '"sessionMissing":false'
 
 printf '\nCodex adapter: missing project instructions fail closed\n'
 mv "$TMP/AGENTS.md" "$TMP/AGENTS.saved"

@@ -6,8 +6,28 @@
 //
 // The contract every adapter implements:
 //
-//   run({ prompt, agentType, model, effort, schema, cwd, timeoutMs, label, step })
-//     -> { ok, output, exitCode, timedOut, reason, stderrTail, usage }
+//   run({ prompt, agentType, model, effort, schema, cwd, timeoutMs, label, step,
+//         conversation })
+//     -> { ok, output, exitCode, timedOut, reason, stderrTail, usage,
+//          sessionId, sessionMissing }
+//
+// `conversation` is how ONE run keeps one builder conversation instead of
+// making every writable retry and repair rediscover the implementation:
+//
+//   absent/null   nothing in this run will ever continue the process: it is
+//                 given no id to resume and its own id is discarded (Codex
+//                 additionally persists no session file at all). Every judging
+//                 phase runs this way, so a reviewer never inherits the
+//                 builder's own account of what it did.
+//   { id: null }  open a persisted session; the id it ran under comes back as
+//                 `sessionId`.
+//   { id: '…' }   resume exactly that session and append this prompt to it.
+//
+// The id is held in memory by the caller (runtime.mjs) and never read off disk,
+// so a conversation cannot outlive its run or reach another worktree, and no
+// adapter ever asks a CLI for "the most recent session". `sessionMissing` is
+// true only when a resume failed BECAUSE the session was gone — the one
+// failure a caller answers by starting fresh rather than by blocking.
 //
 // Every spawned process gets EPIC_STEP (the engines.json row) and
 // EPIC_STEP_LABEL (the pipeline's label, e.g. review:2) in its environment.
@@ -91,6 +111,29 @@ function codexUsage(events, model) {
   // count Claude reports has no honest equivalent and is left unknown.
   const costUsd = codexCostUsd(model, tokens)
   return { tokens, costUsd, costSource: costUsd === null ? null : 'table', turns: null }
+}
+
+// The conversation a Codex process ran under. `codex exec --json` opens its
+// event stream with thread.started, and a resume re-announces the same thread,
+// so this is read on every call rather than only on the one that opened it.
+function codexSessionId(events) {
+  for (const e of events) {
+    if (e?.type !== 'thread.started') continue
+    const id = e.thread_id ?? e.id ?? e.thread?.id
+    if (typeof id === 'string' && id.trim()) return id.trim()
+  }
+  return null
+}
+
+// A resume that failed because the session itself is gone: a rollout the CLI
+// no longer has, an id from a process that never persisted one, a vendor that
+// dropped the conversation. It is not a verdict on the work and it is not
+// transient — the caller answers it by starting a fresh, fully briefed process
+// where its own contract allows one. Kept narrow on purpose: anything else
+// stays an ordinary failure for the caller's existing fail-closed branch.
+const SESSION_MISSING = /\bno (?:conversation|session|thread)s?\b|\b(?:conversation|session|thread|rollout)\b[^\n]{0,80}\bnot found\b|\b(?:could not|cannot|unable to|failed to) resume\b/i
+function isSessionMissing(reason, stderrTail) {
+  return SESSION_MISSING.test(`${reason || ''}\n${stderrTail || ''}`)
 }
 
 // Why a Codex phase failed, for the blocker comment: its own error events, or
@@ -448,8 +491,15 @@ const claudeVendor = {
   // What --effort accepts on the 2.1.x CLI; loadEngines checks the file against it.
   efforts: ['low', 'medium', 'high', 'xhigh', 'max'],
 
-  buildArgs({ agentType, model, effort, schema }) {
+  buildArgs({ agentType, model, effort, schema, resumeId }) {
     const args = ['-p', '--output-format', 'json', '--dangerously-skip-permissions']
+    // Continue this run's own builder conversation. No --fork-session, so the
+    // resumed conversation keeps the id it was opened under and one builder
+    // stays one id for the whole run. The charter is re-sent rather than
+    // snapshotted: passing --append-system-prompt turns --system-prompt-snapshot
+    // off, so a resumed phase runs under exactly the charter bytes a fresh one
+    // would get, and a charter edit between phases cannot be silently ignored.
+    if (resumeId) args.push('--resume', resumeId)
     // Charter + tool restrictions, applied as a system prompt plus an explicit
     // tool list rather than with `--agent <name>`.
     //
@@ -485,49 +535,60 @@ const claudeVendor = {
     return args
   },
 
-  async run({ prompt, agentType, model, effort, schema, cwd, timeoutMs, onStart, label, step }) {
-    const args = this.buildArgs({ agentType, model, effort, schema })
+  async run({ prompt, agentType, model, effort, schema, cwd, timeoutMs, onStart, label, step, conversation }) {
+    const resumeId = conversation?.id || null
+    const args = this.buildArgs({ agentType, model, effort, schema, resumeId })
     const r = await execute({ bin: this.bin, args, prompt, cwd, timeoutMs, onStart, label, step })
     const stderrTail = String(r.stderr || '').trim().slice(-2000)
     const envelope = parseJsonLoose(r.stdout)
     const usage = claudeUsage(envelope)
     const diagnostic = claudeDiagnostic(envelope, r.stdout, r.stderr)
+    // The envelope names the conversation the CLI actually ran under. Read back
+    // rather than assumed: a caller that never sees an id learns its context is
+    // not resumable instead of resuming something that does not exist.
+    const reported = typeof envelope?.session_id === 'string' ? envelope.session_id.trim() : ''
+    const sessionId = conversation ? (reported || null) : null
+    const conversed = (result) => ({
+      ...result,
+      sessionId,
+      sessionMissing: !!resumeId && !result.ok && isSessionMissing(result.reason, result.stderrTail),
+    })
 
     if (r.spawnError) {
       const enoent = r.spawnError.code === 'ENOENT'
-      return {
+      return conversed({
         ok: false, output: null, exitCode: null, timedOut: false, stderrTail,
         reason: enoent
           // Loud and specific: mid-run this would otherwise look exactly like a
           // model that produced nothing, and the cause is a PATH line.
           ? `'${this.bin}' not found on PATH — a cron-launched pane inherits the PATH set in etc/dispatch.cron, which must include the directory holding it`
           : `could not spawn '${this.bin}': ${r.spawnError.message}`,
-      }
+      })
     }
     if (r.timedOut) {
-      return { ok: false, output: null, exitCode: r.code, timedOut: true, stderrTail, reason: `timed out after ${Math.round(timeoutMs / 60000)} min (process group killed)`, usage }
+      return conversed({ ok: false, output: null, exitCode: r.code, timedOut: true, stderrTail, reason: `timed out after ${Math.round(timeoutMs / 60000)} min (process group killed)`, usage })
     }
     if (r.code !== 0) {
-      return { ok: false, output: null, exitCode: r.code, timedOut: false, stderrTail, reason: `exited ${r.code}${diagnostic ? `: ${diagnostic}` : ''}`, usage }
+      return conversed({ ok: false, output: null, exitCode: r.code, timedOut: false, stderrTail, reason: `exited ${r.code}${diagnostic ? `: ${diagnostic}` : ''}`, usage })
     }
 
     if (!envelope || typeof envelope !== 'object') {
-      return { ok: false, output: null, exitCode: 0, timedOut: false, stderrTail, reason: 'output was not the expected JSON envelope' }
+      return conversed({ ok: false, output: null, exitCode: 0, timedOut: false, stderrTail, reason: 'output was not the expected JSON envelope' })
     }
     if (envelope.is_error) {
       const detail = diagnostic || 'unknown error'
-      return { ok: false, output: null, exitCode: 0, timedOut: false, stderrTail, reason: `${claudeErrorName(envelope)}: ${detail}`, usage }
+      return conversed({ ok: false, output: null, exitCode: 0, timedOut: false, stderrTail, reason: `${claudeErrorName(envelope)}: ${detail}`, usage })
     }
 
     if (schema) {
       const structured = envelope.structured_output ?? jsonFromText(envelope.result)
       if (!structured || typeof structured !== 'object') {
-        return { ok: false, output: null, exitCode: 0, timedOut: false, stderrTail, reason: 'no structured output in a schema-carrying result', usage }
+        return conversed({ ok: false, output: null, exitCode: 0, timedOut: false, stderrTail, reason: 'no structured output in a schema-carrying result', usage })
       }
-      return { ok: true, output: structured, exitCode: 0, timedOut: false, stderrTail, reason: null, usage }
+      return conversed({ ok: true, output: structured, exitCode: 0, timedOut: false, stderrTail, reason: null, usage })
     }
 
-    return { ok: true, output: String(envelope.result ?? ''), exitCode: 0, timedOut: false, stderrTail, reason: null, usage }
+    return conversed({ ok: true, output: String(envelope.result ?? ''), exitCode: 0, timedOut: false, stderrTail, reason: null, usage })
   },
 }
 
@@ -554,91 +615,117 @@ const claudeVendor = {
 // and the payload comes from --output-last-message, so a bounded tail is whole.
 const CODEX_STDOUT_CAP = 1024 * 1024
 
+// A conversation-carrying phase cannot run --ephemeral: that flag is exactly
+// "persist no session file", so the process that opened the conversation has to
+// keep its rollout for the process that continues it. Every judging phase keeps
+// the flag and leaves nothing behind.
+//
+// `exec resume` is its own subcommand with a smaller flag surface than `exec`
+// (measured against codex-cli 0.152.1's own --help): it takes no -C, no
+// --sandbox and no --color, and its positional order is
+// `resume [OPTIONS] <SESSION_ID> [PROMPT]`. What those flags carried is set
+// through -c overrides instead — sandbox_mode is the config key behind
+// --sandbox — and the working directory rides on the spawned process itself,
+// which lib/proc.mjs already sets to the run's worktree. Anything the resumed
+// phase must not inherit silently (its model and effort) is still passed
+// explicitly, and runtime.mjs refuses to resume across a changed engine row.
+
 const codexVendor = {
   name: 'codex',
   bin: process.env.CODEX_BIN || 'codex',
   // The CLI's ReasoningEffort enum (0.152.x); loadEngines checks the file against it.
   efforts: ['minimal', 'low', 'medium', 'high', 'xhigh'],
 
-  buildArgs({ charter, developerInstructions, model, effort, schemaFile, outputFile, cwd }) {
+  buildArgs({ charter, developerInstructions, model, effort, schemaFile, outputFile, cwd, conversation, resumeId }) {
     // Derive write authority from the charter itself. A new charter therefore
     // starts read-only unless it explicitly names Edit or Write.
     const sandbox = charter?.tools.some(tool => tool === 'Edit' || tool === 'Write')
       ? 'danger-full-access'
       : 'read-only'
-    const args = [
-      'exec', '--ephemeral', '--ignore-user-config', '--color', 'never', '--json',
-      '--disable', 'multi_agent', '--disable', 'enable_fanout',
-      '--sandbox', sandbox,
+    const args = ['exec']
+    if (resumeId) args.push('resume')
+    if (!conversation) args.push('--ephemeral')
+    args.push('--ignore-user-config', '--json', '--disable', 'multi_agent', '--disable', 'enable_fanout')
+    if (resumeId) args.push('-c', `sandbox_mode="${sandbox}"`)
+    else args.push('--color', 'never', '--sandbox', sandbox, '-C', cwd)
+    args.push(
       '-c', 'approval_policy="never"',
       // The project's own AGENTS.md is discovered by the CLI, not injected
       // here; this raises its silent 32 KiB truncation point to the bound
       // preflightProjectInstructions enforces.
       '-c', `project_doc_max_bytes=${PROJECT_DOC_MAX_BYTES}`,
-      '-C', cwd,
       '--model', model,
       '-c', `model_reasoning_effort="${effort}"`,
       '--output-last-message', outputFile,
-    ]
+    )
     // Empty only for a phase with no charter and a project with no always-on
     // rules; an empty developer message is worth nothing and is left out.
     if (developerInstructions) {
       args.push('-c', `developer_instructions=${JSON.stringify(developerInstructions)}`)
     }
     if (schemaFile) args.push('--output-schema', schemaFile)
+    if (resumeId) args.push(resumeId)
     args.push('-')
     return args
   },
 
-  async run({ prompt, agentType, model, effort, schema, cwd, timeoutMs, onStart, label, step }) {
+  async run({ prompt, agentType, model, effort, schema, cwd, timeoutMs, onStart, label, step, conversation }) {
     const work = mkdtempSync(path.join(tmpdir(), 'toliki-codex-'))
     const outputFile = path.join(work, 'final.txt')
     const schemaFile = schema ? path.join(work, 'schema.json') : null
+    const resumeId = conversation?.id || null
     try {
       if (schemaFile) writeFileSync(schemaFile, JSON.stringify(codexOutputSchema(schema)))
       const charter = agentType ? loadCharter(agentType) : null
       preflightProjectInstructions(cwd)
       const developerInstructions = [charter?.body, loadCompatRules(cwd)].filter(Boolean).join('\n\n')
-      const args = this.buildArgs({ charter, developerInstructions, model, effort, schemaFile, outputFile, cwd })
+      const args = this.buildArgs({ charter, developerInstructions, model, effort, schemaFile, outputFile, cwd, conversation, resumeId })
       const r = await execute({ bin: this.bin, args, prompt, cwd, timeoutMs, onStart, label, step, stdoutCap: CODEX_STDOUT_CAP })
       const events = codexEvents(r.stdout)
       const stderrTail = codexDiagnostic(events, r.stderr)
       const usage = codexUsage(events, model)
+      const sessionId = conversation ? codexSessionId(events) : null
+      const conversed = (result) => ({
+        ...result,
+        sessionId,
+        sessionMissing: !!resumeId && !result.ok && isSessionMissing(result.reason, result.stderrTail),
+      })
 
       if (r.spawnError) {
         const enoent = r.spawnError.code === 'ENOENT'
-        return {
+        return conversed({
           ok: false, output: null, exitCode: null, timedOut: false, stderrTail,
           reason: enoent
             ? `'${this.bin}' not found on PATH — a cron-launched pane inherits the PATH set in etc/dispatch.cron, which must include the directory holding it`
             : `could not spawn '${this.bin}': ${r.spawnError.message}`,
-        }
+        })
       }
       if (r.timedOut) {
-        return { ok: false, output: null, exitCode: r.code, timedOut: true, stderrTail, reason: `timed out after ${Math.round(timeoutMs / 60000)} min (process group killed)`, usage }
+        return conversed({ ok: false, output: null, exitCode: r.code, timedOut: true, stderrTail, reason: `timed out after ${Math.round(timeoutMs / 60000)} min (process group killed)`, usage })
       }
       if (r.code !== 0) {
-        return { ok: false, output: null, exitCode: r.code, timedOut: false, stderrTail, reason: `exited ${r.code}${stderrTail ? `: ${stderrTail.split('\n').pop()}` : ''}`, usage }
+        return conversed({ ok: false, output: null, exitCode: r.code, timedOut: false, stderrTail, reason: `exited ${r.code}${stderrTail ? `: ${stderrTail.split('\n').pop()}` : ''}`, usage })
       }
 
       let finalText
       try {
         finalText = readFileSync(outputFile, 'utf8')
       } catch (e) {
-        return { ok: false, output: null, exitCode: 0, timedOut: false, stderrTail, reason: `final output file was not written: ${e.message}`, usage }
+        return conversed({ ok: false, output: null, exitCode: 0, timedOut: false, stderrTail, reason: `final output file was not written: ${e.message}`, usage })
       }
       if (schema) {
         const structured = jsonFromText(finalText)
         if (!structured) {
-          return { ok: false, output: null, exitCode: 0, timedOut: false, stderrTail, reason: 'final output was not the expected schema JSON', usage }
+          return conversed({ ok: false, output: null, exitCode: 0, timedOut: false, stderrTail, reason: 'final output was not the expected schema JSON', usage })
         }
-        return { ok: true, output: stripCodexOptionalNulls(structured, schema), exitCode: 0, timedOut: false, stderrTail, reason: null, usage }
+        return conversed({ ok: true, output: stripCodexOptionalNulls(structured, schema), exitCode: 0, timedOut: false, stderrTail, reason: null, usage })
       }
-      return { ok: true, output: finalText.trim(), exitCode: 0, timedOut: false, stderrTail, reason: null, usage }
+      return conversed({ ok: true, output: finalText.trim(), exitCode: 0, timedOut: false, stderrTail, reason: null, usage })
     } catch (e) {
       return {
         ok: false, output: null, exitCode: null, timedOut: false, stderrTail: '',
         reason: `Codex adapter setup failed: ${e.message}`,
+        sessionId: null, sessionMissing: false,
       }
     } finally {
       rmSync(work, { recursive: true, force: true })

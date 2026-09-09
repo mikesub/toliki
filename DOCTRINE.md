@@ -56,8 +56,8 @@ don't get re-litigated from memory.
   disproportionate. Malformed output, a tasker blocker, non-quota
   provider/process failure or timeout still blocks after that one process. A
   genuine red first verification is the bounded exception: its sanitized
-  failure diagnostics go to one fresh tasker in the same worktree, followed by
-  one final full verify.
+  failure diagnostics go back to the SAME tasker conversation in the same
+  worktree, followed by one final full verify.
   This spends at most two model processes, never applies to rebase-time verify,
   and never becomes a retry loop. A hard quota from either tasker preserves the
   work and restores `ready` with the selector and route intact. Plain `ready`
@@ -87,7 +87,7 @@ don't get re-litigated from memory.
   Git configuration, hooks and ancestry metadata around review, final review
   and the narrow confirmation, blocking when a phase changed what it was
   judging. Orchestrator Git calls neutralize repository hooks. Their
-  findings are actionable as they stand: one fresh fixer either repairs each
+  findings are actionable as they stand: one fixer either repairs each
   one, disputes it with code evidence, or defers it as unsafe to repair.
   Assessment and repair share that one pass rather than confirming every
   finding first, and the accepted cost is
@@ -103,11 +103,38 @@ don't get re-litigated from memory.
   record. There is no second repair round: what the final review leaves open
   ends the epic at a human, because another round is a round that is not
   converging. What it may earn instead is ONE scoped correction — see the
-  bounded repair contract below. Both the fixer and the final reviewer are fresh processes that
-  reconstruct their context and end when they return, which repeats some
+  bounded repair contract below. The final reviewer is a fresh process that
+  reconstructs its context and ends when it returns, which repeats some
   exploration and buys an adjudication that owes the previous process nothing.
+  The fixer is not: it continues the run's builder conversation, so the findings
+  reach the process that wrote the code instead of a stranger re-reading it.
   The strong model goes to design and adjudication, where being wrong is
   expensive; implementation runs on a cheaper model under the test gate.
+- **One builder conversation per run; judgment always fresh.** A writable retry
+  used to be a stranger to work that was minutes old. The verify failure, the
+  review findings and the authorized correction all went to a new process that
+  re-read the tree to rediscover an implementation this same run had just
+  written, and paid for that rediscovery in tokens, wall time and occasionally
+  in a repair that misread its own change. Inside one epic-run or task-run
+  invocation the writable steps now continue one conversation. Four boundaries
+  are what make that safe, and each was chosen against a cheaper alternative.
+  Judgment never joins it: an architect, reviewer, final reviewer or confirmer
+  that inherited the builder's account of its own work would be agreeing
+  with a narrative, which is the one thing the adjudication exists not to do.
+  Routing is never bent to keep talking: a phase whose `etc/engines.json` row
+  differs opens its own conversation rather than being silently retiered into an
+  existing one, so a mixed engine keeps two compatible builders instead of one
+  wrong model. Identity is scoped to the run and the worktree and lives only in
+  the running process — no cross-issue reuse, no persisted id, and no CLI ever
+  asked for "its most recent session", because context from another change is
+  contamination, not economy. And the prompts did not shrink: every phase still
+  carries its complete captured brief, so a session a CLI never reported or can
+  no longer find is dropped with a stated reason and the phase simply pays the
+  old price. Reuse buys context, never correctness, and never another attempt:
+  every repair, correction and retry limit is exactly what it was, task's
+  two-invocation ceiling included. The standalone conflict, CI and defect fixers
+  stay fully ephemeral for now — the same handle would fit their repair ladder,
+  and extending it there is a separate change that has to argue its own case.
 - **Repairs stay proportional.** Fix the named defect and add meaningful
   regression coverage. A review finding does not automatically require a new
   abstraction, lint rule or instruction to prevent an entire class of problems.
@@ -149,7 +176,7 @@ don't get re-litigated from memory.
   unsafe, or a decision rather than an implementation). Malformed, incomplete,
   duplicate, extra, ambiguous or low-confidence evidence authorizes nothing.
   On `correction-required` the current unpushed repair is preserved exactly as
-  it is and one fresh writable correction runs over the whole batch inside the
+  it is and one writable correction runs over the whole batch inside the
   same invocation — no cleanup, no restored queue, no consumed retry rung, no
   second whole fixer — followed by the full verification contract again and one
   narrow read-only confirmation that receives both deltas but not the

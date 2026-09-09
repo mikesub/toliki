@@ -20,8 +20,12 @@
 //   { type:'spawn', ts, runId, script, session, issue, repo, engine, step,
 //     label, attempt, retry, vendor, model, effort, ok, timedOut, ms,
 //     tokens: { input, output, cacheRead, cacheCreate, total },
-//     costUsd, costSource, turns, failureKind, failureReason }
-//     one per agent spawn, failed ones included.
+//     costUsd, costSource, turns, conversation, resumed,
+//     failureKind, failureReason }
+//     one per agent spawn, failed ones included. `conversation` names the
+//     builder conversation the spawn belonged to (null for every judging
+//     phase, which is ephemeral by contract) and `resumed` says whether it
+//     continued that conversation or paid to rediscover the work.
 //
 // Rows written before lifecycle records existed carry no `type` and are read
 // as spawns; their wall time, repository and result are simply unknown.

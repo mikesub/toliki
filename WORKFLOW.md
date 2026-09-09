@@ -46,10 +46,26 @@ failure behavior.
 | 8. Ship | `epic-run.mjs` and transport libraries | None |
 | 9. Merge gate | Node orchestrator | None |
 | 10. Merge worker | Shell scripts | None |
-| Task path | `tasker` charter plus orchestrator | One; at most one fresh diagnostics-driven repair after a genuinely red first verify |
+| Task path | `tasker` charter plus orchestrator | One; at most one diagnostics-driven repair after a genuinely red first verify, continuing the same conversation |
 
-Every LLM call is a new, short-lived process. The selected `engine:<name>` maps
-each step to a vendor, model, and effort in [`etc/engines.json`](etc/engines.json).
+Every LLM call is a new, short-lived process. Within one epic-run or task-run
+invocation the WRITABLE calls share one builder conversation, so a verification
+retry, a review repair or the bounded correction continues the process that
+wrote the code instead of rediscovering it. Every judging call — architect,
+review, final review, narrow confirmation — is ephemeral and inherits nothing,
+the ship phase spawns nothing at all, and the standalone conflict, CI and
+defect fixers keep every call ephemeral. A conversation is held only in the
+running process, per engine row, scoped to that run and worktree: a phase
+routed to a different vendor, model or effort opens its own rather than being
+retiered into an existing one, and a session a CLI never reported or can no
+longer find is dropped with a stated reason. A killed or crashed run takes its
+conversation with it, because the ids existed only in that process; the
+relaunch that resumes the branch starts a new builder. Every prompt remains a
+complete standalone brief, so an unavailable conversation costs re-exploration
+and never correctness.
+
+The selected `engine:<name>` maps each step to a vendor, model, and effort in
+[`etc/engines.json`](etc/engines.json).
 The eight engine step keys and their charters are fixed in
 [`workflows/lib/engine.mjs`](workflows/lib/engine.mjs):
 
@@ -90,9 +106,11 @@ Task-run starts one writable `tasker` process. It receives the settled issue
 and must implement it, add meaningful coverage and return structured title,
 summary, commit rationale, test, self-review and unresolved-work fields. The
 orchestrator then runs every discovered package's `npm run verify`. If that
-first gate is genuinely red, one fresh tasker receives the original requirement
-and the bounded, sanitized failure diagnostics, inspects the existing worktree,
-and repairs it in place; the worktree diff is not duplicated into its prompt.
+first gate is genuinely red, the same tasker conversation continues: it receives
+the original requirement and the bounded, sanitized failure diagnostics,
+inspects the existing worktree, and repairs it in place; the worktree diff is
+not duplicated into its prompt. A conversation the CLI cannot continue is
+reported and never bought back with a third process.
 The orchestrator runs the complete gate once more and that verdict is final. A
 clean moved base is rebased and verified again before the candidate is formed;
 a conflicting base is left to the merge worker and its conflict fixer. The
@@ -302,15 +320,18 @@ one.
 
 ## 5. Repair
 
-**Owner:** a fresh `coder` process using the `fixes-after-review` step, plus the
-orchestrator. **LLM calls:** none when Review found nothing; otherwise one
-logical call, with one verification-driven retry available.
+**Owner:** a `coder` process using the `fixes-after-review` step, continuing the
+run's builder conversation, plus the orchestrator. **LLM calls:** none when
+Review found nothing; otherwise one logical call, with one verification-driven
+retry available.
 
 1. Every review finding is immediately actionable; there is no separate model
    confirmation pass before repair.
-2. One fresh fixer receives the pinned requirement and the same
+2. One fixer receives the pinned requirement and the same
    orchestrator-captured diff the reviewer judged, inline, plus the source tree
-   and the numbered findings. It is never told to run a Git command for that
+   and the numbered findings. It continues the builder conversation when the
+   `fixes-after-review` row matches the row Code ran on, and opens its own when
+   it does not; either way its prompt carries the complete brief. It is never told to run a Git command for that
    diff or to open the requirement file, so it and the final review that judges
    it read the same bytes.
 3. For every index it must return exactly one disposition:
@@ -327,7 +348,7 @@ logical call, with one verification-driven retry available.
 5. The fixer may make only the smallest change required by the findings and
    may not weaken tests or expand the feature.
 6. The orchestrator runs `npm run verify` in every package. A red result starts
-   one fresh fixer retry with the real failure output.
+   one fixer retry with the real failure output, in the same conversation.
 7. If verify remains red after that retry, the run blocks and never asks Final
    review to judge an unverified tree.
 8. The orchestrator checkpoints the repaired tree as the triage checkpoint and
@@ -375,9 +396,9 @@ refutation. That batch is what the next step can act on.
 
 ## 7. Correction
 
-**Owner:** a fresh `coder` process using the `fixes-after-review` step and a
-fresh `reviewer` process using the `final-review` step, plus the orchestrator's
-verify contract. **LLM calls:** none unless every remaining blocker is a
+**Owner:** a `coder` process using the `fixes-after-review` step, continuing the
+run's builder conversation, and a fresh `reviewer` process using the
+`final-review` step, plus the orchestrator's verify contract. **LLM calls:** none unless every remaining blocker is a
 concrete defect; otherwise one correction and one narrow confirmation.
 
 1. The stage runs only when the merge gate's blockers exist and **every** one of
@@ -387,10 +408,10 @@ concrete defect; otherwise one correction and one narrow confirmation.
 2. Each blocker gets a run-local opaque identity, its kind (`original-defect` or
    `repair-regression`), location, concrete code evidence, and the observable
    outcome required to clear it. Titles are never identities.
-3. The orchestrator snapshots the pre-correction tree, then starts ONE fresh
-   writable `coder` process with the pinned requirement, the exact repair delta
-   Final review judged, the successful verification evidence, and the complete
-   blocker batch. The existing repair is preserved exactly as it is: nothing is
+3. The orchestrator snapshots the pre-correction tree, then starts ONE writable
+   `coder` process — continuing the builder conversation — with the pinned
+   requirement, the exact repair delta Final review judged, the successful
+   verification evidence, and the complete blocker batch. The existing repair is preserved exactly as it is: nothing is
    cleaned, rebuilt, or re-reviewed.
 4. The correction may address only those blockers and must return exactly one
    disposition per blocker id — no missing, duplicate, extra, or unknown ids.
@@ -576,8 +597,9 @@ the same contract epic-run's Final review and Correction use:
   evidence authorizes nothing: it can neither start a correction nor release an
   unattended merge.
 - On `correction-required` the current unpushed repair is preserved in place and
-  ONE fresh writable correction runs in the same invocation over the whole
-  batch. Nothing is cleaned, no queue is restored, no retry rung is consumed,
+  ONE writable correction runs in the same invocation over the whole batch —
+  epic-run continues its builder conversation for it; the three standalone
+  fixers keep spawning a fresh process. Nothing is cleaned, no queue is restored, no retry rung is consumed,
   and no second whole fixer is launched. The correction may address only those
   blockers, returns one indexed disposition per blocker id, and must produce a
   relevant delta; a decline, a missing disposition, or no change ends human-held.
@@ -719,7 +741,9 @@ manual launch stays available.
 `workflows/lib/usage.mjs` appends best-effort host telemetry to
 `EPIC_USAGE_LOG` (normally `~/epic-usage.jsonl`). A failed append never changes
 a pipeline result or exit code. Every model process writes a typed `spawn`
-record. Every epic, task, conflict-fixer, CI-fixer, and defect-fixer invocation also
+record, which names the builder `conversation` it belonged to (null for every
+judging phase) and whether it `resumed` one.
+Every epic, task, conflict-fixer, CI-fixer, and defect-fixer invocation also
 writes a `run-start` after engine validation and before Prepare, then a
 `run-finish` after final status reporting and its `RESULT` line. A killed or
 crashed process can therefore remain as a visible start with no finish. All
@@ -762,17 +786,24 @@ line is ignored as a possible concurrent append.
    hard provider-quota failures are not transiently retried. Task-run disables
    both respawns for each call; its only second call is the explicit bounded
    repair after a normal red first project verify.
-2. On a hard provider quota failure, an epic or task checkpoints and pushes
+2. A writable call that cannot continue the run's builder conversation — the
+   CLI reported no session, or can no longer find the one it reported — drops
+   it with a logged reason and runs on the complete brief its prompt already
+   carries. That fallback spends a second process only where the call site
+   already permits a respawn, so task-run's two-invocation ceiling is unchanged
+   and no judging phase is affected.
+3. On a hard provider quota failure, an epic or task checkpoints and pushes
    resumable work before restoring `ready`; task retains its selector. A fixer
    cleans unpushed edits and refunds its current rung. All record a
    vendor-specific host hold and accept it only after the required label state
    is verified.
-3. Queries fail closed: an unreadable dependency, route, PR head, review result,
+4. Queries fail closed: an unreadable dependency, route, PR head, review result,
    CI conclusion, or write readback is never interpreted as success.
-4. A model phase that judges a change is read-only. The orchestrator hashes the
-   tree and protected Git state around Review, Final review, and the narrow
-   confirmation and blocks if either moved. Ship spawns no model at all, so the
-   last process a run starts is one of those judging phases.
-5. Pipeline sessions are not interactive agent sessions. They contain a plain
+5. A model phase that judges a change is read-only, and never inherits a
+   builder conversation. The orchestrator hashes the tree and protected Git
+   state around Review, Final review, and the narrow confirmation and blocks if
+   either moved. Ship spawns no model at all, so the last process a run starts
+   is one of those judging phases.
+6. Pipeline sessions are not interactive agent sessions. They contain a plain
    Node orchestrator which spawns disposable headless model processes; they
    cannot be steered and may only be inspected or killed.
