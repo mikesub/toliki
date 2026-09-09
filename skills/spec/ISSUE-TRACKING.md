@@ -21,8 +21,8 @@ an issue that fails the test is an issue neither workflow can deliver.
 
 Order and gating live in GitHub's **issue dependencies** — their own primitive,
 not a label, a sub-issue, or a comment. Any issue can be `blocked_by` any
-other. Reach for it whenever one issue gates another: the `/epic` queue queries
-dependencies and skips a blocked issue rather than burning a run on it.
+other. Reach for it whenever one issue gates another: the dispatch queue walk
+queries dependencies and skips a blocked issue rather than burning a run on it.
 
 ## Relating without gating: a plain `#N` cross-reference
 

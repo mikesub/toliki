@@ -3,9 +3,9 @@
 // The pipelines used to be handed an `args` value by the workflow engine and
 // to end by returning an object. Both ends move here: argv becomes that value,
 // and the returned object becomes a single machine-readable line plus an exit
-// code. The line is what the skill wrappers grep for and what stays in the
-// pane's scrollback after the process is gone — the same surface
-// `tmux capture-pane` already reads to diagnose a session.
+// code. The line is what an operator reads back: it stays in the pane's
+// scrollback after the process is gone — the same surface `tmux capture-pane`
+// already reads to diagnose a session.
 
 import { engineNames } from './engine.mjs'
 import { recordRunEnd } from './runtime.mjs'

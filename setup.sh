@@ -12,7 +12,7 @@ set -euo pipefail
 #
 # Selected Claude content and the Codex skill use individual links so content
 # from other sources can coexist; Codex's role points at the shared charter
-# through its user configuration. Pipeline skills and charters stay
+# through its user configuration. Pipeline entry points and charters stay
 # private to the harness: host scripts launch pipelines, and the engine reads
 # its charters directly from this checkout.
 

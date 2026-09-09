@@ -641,8 +641,8 @@ than made launchable against a main without the code it describes.
   are dropped silently. Verify with `docker buildx inspect`.
 - Only `spec` and `spec-explorer` are user-level Claude symlinks; laptop setup
   links the Codex skill and registers its agent's real repo path in user config.
-  A project-local copy silently shadows shared content. Pipeline skills and
-  charters are not published.
+  A project-local copy silently shadows shared content. Pipeline entry points
+  and charters are not published.
 - Never invent a second session-name pattern: reap, dispatch and the cap all key
   on `<repo>-epic-<N>`.
 
