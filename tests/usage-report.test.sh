@@ -438,7 +438,7 @@ assert_rc "a newline-terminated malformed final record is still reportable" 0 "$
 assert_contains "only an unterminated final fragment is silently ignored" "$REPORT_OUT" 'malformed records skipped: 1'
 
 # A populated log filtered down to nothing is still an answer. Printing nothing
-# at the end of `remote-control.sh usage 7` on a quiet week is indistinguishable
+# at the end of `./toliki usage 7` on a quiet week is indistinguishable
 # from a broken ssh or a crashed node, so every filter that selects nothing says
 # so and names itself.
 QUIET="$TMP/quiet.jsonl"

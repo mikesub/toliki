@@ -5,7 +5,7 @@
 # and are launched by the host scripts, so exposing those as user-level Claude
 # content creates a second, misleading entry path.
 #
-# Sourced by setup.sh and bin/provision.sh. The caller provides the reporting
+# Sourced by operator/setup.sh and bin/provision.sh. The caller provides the reporting
 # functions used below: ok, changed, and blocked.
 
 wire_claude_content() {

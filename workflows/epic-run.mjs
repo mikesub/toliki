@@ -768,7 +768,7 @@ async function postBlocker({ issue, slug, phase, reason, prUrl, candidate }) {
     } catch (e) {
       log(`blocked: could not preserve the work (${e && e.message || e})`)
     }
-    branchLine = `- branch: ${branch} — re-running the epic pipeline on #${issue} (\`./remote-control.sh epic ${issue}\`) resumes from it; delete the branch (locally AND on origin) to force a fresh build`
+    branchLine = `- branch: ${branch} — re-running the epic pipeline on #${issue} (\`./toliki run epic ${issue}\`) resumes from it; delete the branch (locally AND on origin) to force a fresh build`
   } else {
     branchLine = `- branch: none (blocked before branch creation; a re-run of the epic pipeline on #${issue} starts fresh)`
   }

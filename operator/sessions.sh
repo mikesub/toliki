@@ -1,0 +1,275 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# `./toliki session` — the interactive tmux sessions on the host: list, start,
+# stop, restart, stop-all. Session launching itself lives in bin/launch.sh,
+# which runs ON the host (so the dispatcher can reuse it without ssh); this
+# script parses the operator's intent, resolves names/repos locally where it
+# can, and sshes the rest over.
+#
+# Pipeline sessions are NOT started here — '$CLI run' owns those, because a
+# <repo>-epic-<N> session is a node orchestrator, not a claude to attach to.
+
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+SELF="$OPERATOR_DIR/sessions.sh"
+
+usage() {
+  cat <<EOF
+Usage: $CLI session <command> [name] [-m <message>] [-r <repo>]
+
+Commands:
+  list                     List every session on the host with its repo, engine
+                           and running/dead status. Host-wide. (alias: ls)
+  start [name] [-m msg]    Start an interactive claude session. Name resolution
+                           when no name given: with -m, the session is named
+                           after the message (slugified); otherwise auto-picks
+                           the first pool name free for the repo: ${NAMES[*]}
+                           With -m, sends <msg> to claude as its initial prompt.
+  stop <name>...           Stop the named session(s). (alias: rm)
+  restart <name> [-m msg]  Restart the named session (optionally re-prompting).
+                           Refuses on a <repo>-epic-<N> session: use an explicit
+                           '$CLI run' command instead.
+  stop-all                 Stop every tmux session on the host. Host-wide.
+  <name> [-m msg]          Shorthand for: start <name> [-m msg]
+
+Options:
+  -m, --message <msg>      Initial prompt to send to claude (start/restart only).
+                           Passed as claude's positional prompt, not -p (which
+                           is non-interactive and would exit immediately). Also
+                           names the session when no explicit name is given.
+  -r, --repo <name>        Repo to run in: $(repo_names | tr '\n' ' ')(default: $DEFAULT_REPO).
+                           Applies to start/restart/stop; list and stop-all are
+                           host-wide. Every session is named <repo>-<name>, so
+                           "start review -r otherapp" -> otherapp-review. Names
+                           are given short (review) or full (otherapp-review)
+                           interchangeably.
+EOF
+}
+
+ACTION="start"
+SESSION=""
+SESSIONS=()
+MESSAGE=""
+HAVE_MESSAGE=0
+REPO=""
+HAVE_REPO=0
+
+# Pull optional -m/--message and -r/--repo (any position) out of the args.
+# --engine and --over-capacity belong to '$CLI run' alone and are refused here
+# rather than on the host, so no session command can ever put either on the
+# wire — including the bare-flag forms, which are refused before the
+# no-command branch below can exit 0 on them.
+POSITIONAL=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -m|--message)
+      [[ $# -ge 2 ]] || die "$1 requires a value"
+      HAVE_MESSAGE=1
+      MESSAGE="$2"
+      shift 2
+      ;;
+    -m=*|--message=*)
+      HAVE_MESSAGE=1
+      MESSAGE="${1#*=}"
+      shift
+      ;;
+    -r|--repo)
+      [[ $# -ge 2 ]] || die "$1 requires a value"
+      HAVE_REPO=1
+      REPO="$2"
+      shift 2
+      ;;
+    -r=*|--repo=*)
+      HAVE_REPO=1
+      REPO="${1#*=}"
+      shift
+      ;;
+    --engine|--engine=*)
+      refuse_engine_flag
+      ;;
+    --over-capacity)
+      refuse_over_capacity
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      POSITIONAL+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [[ ${#POSITIONAL[@]} -eq 0 ]]; then
+  if [[ $HAVE_MESSAGE -eq 1 ]]; then
+    ACTION="start"          # bare `-m <msg>` starts an auto-named session
+  elif [[ $HAVE_REPO -eq 1 ]]; then
+    ACTION="start"          # bare `-r <repo>` starts an auto-named session there
+  else
+    usage
+    exit 0
+  fi
+else
+  case "${POSITIONAL[0]}" in
+    list|ls)
+      ACTION="list"
+      ;;
+    start|restart|stop-all)
+      ACTION="${POSITIONAL[0]}"
+      SESSION="${POSITIONAL[1]:-}"
+      ;;
+    stop|rm)
+      ACTION="stop"                         # `rm` is an alias for stop
+      SESSIONS=("${POSITIONAL[@]:1}")       # stop takes one or more session names
+      ;;
+    epic|task|fix|ci|defect)
+      # These were session commands before the CLI grew groups. They start a
+      # pipeline, not a claude, so name the command that does.
+      die "'${POSITIONAL[0]}' is a pipeline launch: $CLI run ${POSITIONAL[0]} ${POSITIONAL[1]:-<issue>}"
+      ;;
+    *)
+      SESSION="${POSITIONAL[0]}"   # bare <name> is shorthand for: start <name>
+      ;;
+  esac
+fi
+
+# --message only makes sense when we're launching claude.
+if [[ $HAVE_MESSAGE -eq 1 && "$ACTION" != "start" && "$ACTION" != "restart" ]]; then
+  refuse_message_flag
+fi
+
+# list and stop-all are host-wide, so a repo would be meaningless there.
+if [[ $HAVE_REPO -eq 1 && "$ACTION" != "start" && "$ACTION" != "restart" && "$ACTION" != "stop" ]]; then
+  refuse_repo_flag "$CLI session $ACTION"
+fi
+
+if [[ $HAVE_REPO -eq 1 ]]; then
+  require_known_repo "$REPO"
+fi
+
+require_ssh_host
+LAUNCH="$HOST_CONTROL_DIR/bin/launch.sh"
+
+# Resolve the repo. A full session name (as `list` prints it) already carries
+# its own repo, so honour that for restart when -r wasn't given.
+if [[ $HAVE_REPO -eq 0 ]]; then
+  REPO="$DEFAULT_REPO"
+  if [[ "$ACTION" == "restart" && -n "$SESSION" ]]; then
+    if derived="$(repo_of_session "$SESSION")"; then
+      REPO="$derived"
+    fi
+  fi
+fi
+
+# Resolve session name(s) locally where an action needs them here. `start`
+# passes whatever it was given straight through — launch.sh owns naming
+# (explicit name > message slug > free pool name) since only the host can
+# check which names are taken.
+case "$ACTION" in
+  stop)
+    if [[ ${#SESSIONS[@]} -eq 0 ]]; then
+      die "'$CLI session stop' requires at least one session name"
+    fi
+    # A full name from `list` passes through untouched; a short one gets $REPO's prefix.
+    for i in "${!SESSIONS[@]}"; do
+      R="$(repo_of_session "${SESSIONS[$i]}" || printf '%s' "$REPO")"
+      SESSIONS[$i]="$(full_name "$R" "${SESSIONS[$i]}")"
+    done
+    ;;
+  restart)
+    if [[ -z "$SESSION" ]]; then
+      die "'$CLI session restart' requires a session name"
+    fi
+    SESSION="$(full_name "$REPO" "$SESSION")"
+    ;;
+esac
+
+case "$ACTION" in
+  start)
+    # Each arg is shell-quoted with sq() since ssh mashes the remote command
+    # into one string and hands it to the remote shell.
+    REMOTE="$LAUNCH --repo $(sq "$REPO")"
+    if [[ -n "$SESSION" ]]; then
+      REMOTE+=" $(sq "$SESSION")"
+    fi
+    if [[ $HAVE_MESSAGE -eq 1 ]]; then
+      REMOTE+=" --message $(sq "$MESSAGE")"
+    fi
+    ssh "$HOST" "$REMOTE"
+    ;;
+  stop)
+    # Shell-quote each name into one list the remote loop iterates over.
+    QUOTED=""
+    for s in "${SESSIONS[@]}"; do
+      QUOTED+=" $(sq "$s")"
+    done
+    ssh "$HOST" bash -s <<EOF
+set -euo pipefail
+for s in$QUOTED; do
+  if tmux has-session -t "\$s" 2>/dev/null; then
+    tmux kill-session -t "\$s"
+    echo "[remote] killed session '\$s'"
+  else
+    echo "[remote] no session '\$s' to kill"
+  fi
+done
+EOF
+    ;;
+  restart)
+    # A pipeline session's name says which issue it is but not whether it was
+    # an epic or a fixer, and restarting it as an interactive claude would
+    # silently produce something else entirely — a live session in the epic's
+    # worktree that nothing is driving. Name the real intention instead.
+    if [[ $HAVE_MESSAGE -eq 0 && "$SESSION" =~ -epic-([0-9]+)$ ]]; then
+      N="${BASH_REMATCH[1]}"
+      warn "'$SESSION' is a pipeline session — 'restart' can't tell an epic from a fixer."
+      warn "Relaunch it explicitly:  $CLI session stop $SESSION && $CLI run epic $N [--engine <engine>]"
+      warn "Or use: $CLI run fix $N [--engine <engine>]"
+      warn "Or use: $CLI run ci $N [--engine <engine>]"
+      warn "Or use: $CLI run defect $N [--engine <engine>]"
+      warn "Or just stop it: dispatch relaunches an unfinished issue on its next tick."
+      exit 1
+    fi
+    bash "$SELF" stop "$SESSION"
+    if [[ $HAVE_MESSAGE -eq 1 ]]; then
+      bash "$SELF" start "$SESSION" --repo "$REPO" --message "$MESSAGE"
+    else
+      bash "$SELF" start "$SESSION" --repo "$REPO"
+    fi
+    ;;
+  stop-all)
+    ssh "$HOST" bash -s <<'EOF'
+set -euo pipefail
+if ! sessions=$(tmux list-sessions -F '#{session_name}' 2>/dev/null); then
+  echo "[remote] no tmux sessions to kill"
+  exit 0
+fi
+while IFS= read -r s; do
+  tmux kill-session -t "$s"
+  echo "[remote] killed session '$s'"
+done <<<"$sessions"
+EOF
+    ;;
+  list)
+    ssh "$HOST" bash -s <<'EOF'
+set -euo pipefail
+if ! sessions=$(tmux list-sessions -F '#{session_name}' 2>/dev/null); then
+  echo "[remote] no tmux sessions"
+  exit 0
+fi
+while IFS= read -r s; do
+  current=$(tmux list-panes -t "$s" -F '#{pane_current_command}' | head -n1)
+  case "$current" in
+    bash|zsh|sh|dash) status="dead (at $current prompt)" ;;
+    *) status="running ($current)" ;;
+  esac
+  # Sessions started before repo tagging (or by hand) have no @repo option.
+  repo=$(tmux show-options -t "$s" -v @repo 2>/dev/null || true)
+  engine=$(tmux show-options -t "$s" -v @engine 2>/dev/null || true)
+  printf '%-28s %-10s %-7s %s\n' "$s" "${repo:--}" "${engine:--}" "$status"
+done <<<"$sessions"
+EOF
+    ;;
+esac

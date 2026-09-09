@@ -120,8 +120,8 @@ to it.
    sessions, including settled dead quota-held sessions at `ready`, and stale
    claim refs), so the slot budget keeps rotating.
 
-The operator watches from a laptop with `./remote-control.sh ls` (and
-`./remote-control.sh usage` for what the steps cost, what each issue's whole
+The operator watches from a laptop with `./toliki session list` (and
+`./toliki usage` for what the steps cost, what each issue's whole
 lifetime cost and how it ended, and how often automation handed off to a human),
 and reads a completed run from its source issue: the body is the specification, the
 candidate delivery summary is the immutable run snapshot, and later status,
@@ -169,18 +169,19 @@ comparisons—remain canonical UTC ISO 8601.
 few interactive steps it cannot do for you (logins, per-clone workspace
 trust, the bypass-permissions consent). It installs and authenticates both
 agent CLIs. Route the next unassigned epic with
-`./remote-control.sh next codex` or `./remote-control.sh next claude`; add
+`./toliki route next codex` or `./toliki route next claude`; add
 `-r <repo>` to restrict selection. An engine is a named table in
 `etc/engines.json` saying which vendor, model and effort runs each pipeline
 step, so one engine can code on Claude and review on Codex. Unlabeled issues
 run on the host's `EPIC_ENGINE` default, read from the installed copy of
 `etc/dispatch.cron` (claude when that file is absent, and a file whose value
 disagrees with the environment refuses to launch anything rather than guess).
-From the laptop, `./config.sh` prints the VM's installed default, available
-engines, and maximum concurrent runs. Use `--engine <name>` or
-`--max <count>` (or both together) to change those host settings; a bare
-`./config.sh` reports both and prints the usage keys. For example,
-`./config.sh --engine codex --max 3`. An unlabeled
+From the laptop, `./toliki config show` prints the VM's installed default,
+available engines, and maximum concurrent runs. `./toliki config set` takes
+`--engine <name>` or `--max <count>` (or both together) to change those host
+settings, validates and reads them back; the report ends by naming both, so
+looking costs nothing. For example, `./toliki config set --engine codex --max 3`.
+An unlabeled
 issue consults the engine default only for
 its first claim. Once the claim succeeds, the run snapshots its selection as
 the issue's sole `engine:<name>` label and reads it back before any model starts.
@@ -189,7 +190,7 @@ same exact pin rather than falling back to a later host default, and missing,
 mismatched, or conflicting pins stop for an operator without being rewritten.
 Turning the box autonomous is a deliberate last step: install the cron file
 per the comment at the top of `etc/dispatch.cron`.
-`--engine` is optional on every manual `./remote-control.sh epic|task|fix|ci|defect`
+`--engine` is optional on every manual `./toliki run epic|task|fix|ci|defect`
 launch. Given, it is persisted as the issue's durable `engine:<name>` label and
 verified before the run starts, so the choice survives resumes and fixer
 retries. Omitted, the host resolves it and writes nothing: the issue's own
@@ -201,8 +202,8 @@ conflicting routing label, or an unreadable host default refuses without
 launching.
 Defect repair is empty-by-default: add selected registered repo names to
 `DEFECT_FIX_REPOS=(...)` in the host's `etc/repos.conf`, or launch a marked
-issue explicitly with `./remote-control.sh defect N -r <repo>`.
-All explicit `remote-control.sh epic|task|fix|ci|defect` launches bypass an active
+issue explicitly with `./toliki run defect N -r <repo>`.
+All explicit `./toliki run epic|task|fix|ci|defect` launches bypass an active
 provider hold as a deliberate operator override. An epic or fixer on a mixed
 engine waits if any vendor it uses is held; a task waits only on its configured
 `task` step vendor. Admission never reroutes an issue to a different engine.
@@ -215,8 +216,24 @@ On the laptop:
 
 ```
 gh repo clone mikesub/toliki && cd toliki
-./setup.sh              # exposes /spec + spec-explorer to both clients; seeds local config
-./remote-control.sh ls
+./toliki setup          # exposes /spec + spec-explorer to both clients; seeds local config
+./toliki session list
+```
+
+`./toliki` is the only entry point at the root, and everything it does runs
+from the laptop; `bin/` is the host's. Its implementations live in `operator/`,
+one file per concern, and `./toliki help` (or `<command> --help`) prints the
+same groups:
+
+```
+./toliki setup                                   # wire this laptop
+./toliki sync                                    # pull/rebase this checkout and the host's
+./toliki config show                             # host default engine + max concurrent runs
+./toliki config set --engine <name> --max <count>
+./toliki session list|start|stop|restart|stop-all
+./toliki run epic|task|fix|ci|defect <issue>     # manual pipeline launch
+./toliki route next <engine>                     # route the next ready issue
+./toliki usage [days] [engine]                   # what runs cost and how they ended
 ```
 
 Setup links `/spec` into both clients and its charter into Claude. For Codex it
@@ -225,7 +242,7 @@ lists a
 symlinked agent but refuses that symlink when launching it. This keeps the repo
 charter as the shared source without copying it. Setup removes its old Codex agent
 symlink after registration succeeds, avoiding duplicate definitions. Re-run
-`./setup.sh` after updating an older setup, then start a fresh Codex session to
+`./toliki setup` after updating an older setup, then start a fresh Codex session to
 load the registration. Node and Codex must be installed for this registration step.
 
 ## Reading order
@@ -237,6 +254,8 @@ load the registration. Node and Codex must be installed for this registration st
   that were considered and rejected, with reasons.
 - **`bin/`, `etc/`** — the host-side scripts and config; each header states
   its contract and the incident behind it.
+- **`operator/`** — the laptop-side implementations behind `./toliki`, one file
+  per command group.
 - **`WORKFLOW.md`** — the executable path from queue selection through merge,
   including the full epic, lightweight task and fixer call counts and gates.
 - **`workflows/`** — the epic and task pipelines plus three fixer entry points

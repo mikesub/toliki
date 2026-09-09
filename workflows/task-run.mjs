@@ -176,8 +176,8 @@ async function postBlocker(phaseName, reason) {
   const location = openCandidate
     ? `- PR: ${openCandidate.prUrl} on ${openCandidate.branch}; candidate \`${openCandidate.prHead}\` is pushed but NOT queued for merge\n- next: inspect the evidence and labels by hand; do not rerun task-run while this PR is open`
     : branch
-      ? `- branch: ${branch} — re-running remote-control.sh task ${issue} resumes it; delete the local and remote branch only to force a fresh build`
-      : `- branch: none — re-running remote-control.sh task ${issue} starts fresh`
+      ? `- branch: ${branch} — re-running ./toliki run task ${issue} resumes it; delete the local and remote branch only to force a fresh build`
+      : `- branch: none — re-running ./toliki run task ${issue} starts fresh`
   let body = `🤖 task-run blocked\n- phase: ${phaseName}\n- reason: ${reason}\n${location}\n`
   if (slug && existsSync(path.join(epicDir(slug), 'epic.md'))) {
     const match = readFileSync(path.join(epicDir(slug), 'epic.md'), 'utf8').match(/## Phase log[\s\S]*$/)

@@ -179,8 +179,8 @@ epic/task entry points. **LLM calls:** none.
 Manual `--slug` mode does not run Prepare. It uses the current working tree and
 requires an existing `.epics/<slug>/requirements.md`.
 
-An operator may launch issue mode through `remote-control.sh epic <N>` or
-`remote-control.sh task <N>` instead of waiting for dispatch. It still goes
+An operator may launch issue mode through `./toliki run epic <N>` or
+`./toliki run task <N>` instead of waiting for dispatch. It still goes
 through `launch.sh` and the same shared Prepare transport. An omitted engine is
 resolved read-only from the issue pin or host default; an explicitly selected engine is persisted before
 launch. Only this manual pipeline path can request `--over-capacity`.
@@ -731,7 +731,7 @@ blocked for a human, skipped/refused, error, or unknown. That result describes
 where the invocation left the issue; it does not query or imply whether GitHub
 later merged the PR or closed the issue.
 
-`./remote-control.sh usage [days] [engine]` renders two views from the host's
+`./toliki usage [days] [engine]` renders two views from the host's
 log:
 
 - The per-step tuning view preserves record-level `--since`, `--engine`, and

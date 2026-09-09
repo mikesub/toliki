@@ -9,8 +9,8 @@ from current state, and nothing is written anywhere. This skill surfaces and
 suggests; it never relabels, merges, kills or launches sessions, and never runs
 `dispatch.sh`, `merge-worker.sh`, or `reap.sh` without `-n`. The allowed
 surface is exactly the harness AGENTS.md's safe list: `gh` reads,
-`./remote-control.sh ls`, `bin/reap.sh -n`, and read-only `ssh` queries
-(`tmux capture-pane`, log greps). Laptop-side, like `remote-control.sh`.
+`./toliki session list`, `bin/reap.sh -n`, and read-only `ssh` queries
+(`tmux capture-pane`, log greps). Laptop-side, like every `./toliki` command.
 
 ## 0. Setup
 
@@ -48,7 +48,7 @@ leave those values as GitHub returned or rendered them.
 
 Run all three first; §3 and §4 read their output.
 
-- `./remote-control.sh ls`, run locally and never wrapped in `ssh` (it sshes
+- `./toliki session list`, run locally and never wrapped in `ssh` (it sshes
   to `SSH_HOST` itself). One line per session: name, repo, engine,
   `running`/`dead`.
 - `ssh $SSH_HOST "$HOST_CONTROL_DIR/bin/reap.sh -n"`: the reaper's own sweep,
@@ -122,7 +122,7 @@ gh issue view <N> -R <owner/repo> --json comments --jq '.comments[] | select(.bo
   and nothing automated recovers it (reap never relabels; dispatch skips an
   issue whose session still exists, dead or not). Report the phase and
   `updated` time from the status comment, the scrollback line from §4, and
-  what finishing takes: `./remote-control.sh stop <session>`, then swap
+  what finishing takes: `./toliki session stop <session>`, then swap
   `in-progress` → `ready` (a fixer run: → `failed`, its queue label is still
   on). A branch with checkpoints resumes on the next tick; one holding only
   the claim commit is refused as claimed elsewhere until reap clears it
@@ -137,7 +137,7 @@ not "is broken".
   naming the vendor and its `holdUntil`; append “fallback reset” only when that
   entry's `fallback` is true. An automatic candidate waits only when its engine
   uses that vendor; a mixed engine waits on every vendor it uses and is not
-  rerouted. Manual `remote-control.sh epic|fix|ci|defect` launches are still an
+  rerouted. Manual `./toliki run epic|fix|ci|defect` launches are still an
   explicit override. Say nothing when no vendor is active.
 - **`ready-to-merge` open for over ~1h**: the worker drains in minutes.
   `grep "#<N>" ~/merge.log | tail` for the why; infrastructure aborts log

@@ -1,62 +1,110 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Laptop-side operator helper. Reports the VM's installed default engine and
-# host-wide pipeline slot budget. Optional flags validate, update, and read back
-# either setting at its source of truth: EPIC_ENGINE in the installed cron file
-# and MAX_PARALLEL_EPICS in the host checkout's machine-local repos.conf.
+# `./toliki config` — reports the host's installed default engine and its
+# host-wide pipeline slot budget, and updates either at its source of truth:
+# EPIC_ENGINE in the installed cron file and MAX_PARALLEL_EPICS in the host
+# checkout's machine-local repos.conf. Every value is validated and read back
+# on the host after the write, so a report is never a guess about what landed.
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$HERE/etc/lib.sh"
-
-HOST="${SSH_HOST:-}"
-if [[ -z "$HOST" ]]; then
-  echo "SSH_HOST is not set — add it to etc/repos.conf" >&2
-  exit 1
-fi
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 usage() {
-  local name
-  name="$(basename "$0")"
-  printf '%s\n' \
-    "Usage:" \
-    "  $name" \
-    "  $name --engine <name>" \
-    "  $name --max <count>" \
-    "  $name --engine <name> --max <count>"
+  cat <<EOF
+Usage:
+  $CLI config show
+  $CLI config set --engine <name>
+  $CLI config set --max <count>
+  $CLI config set --engine <name> --max <count>
+
+  show                     Print the host's default engine, the engines it can
+                           be set to, and the maximum number of concurrent runs.
+  set                      Change either setting, or both at once, then report
+                           the values read back from the host.
+
+  --engine <name>          Default engine for issues carrying no engine:<name>
+                           label. A key of etc/engines.json.
+  --max <count>            Maximum concurrent pipeline runs on the host, a
+                           positive integer. Automatic dispatch pauses at it;
+                           '$CLI run ... --over-capacity' is the one bypass.
+EOF
 }
 
-show_usage=0
-if [[ $# -eq 0 ]]; then show_usage=1; fi
+if [[ $# -eq 0 ]]; then
+  SUBCOMMAND="show"
+else
+  SUBCOMMAND="$1"
+  shift
+fi
+
+show_hint=0
 requested_engine=""
 requested_max=""
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --engine)
-      [[ $# -ge 2 ]] || { usage >&2; exit 1; }
-      requested_engine="$2"
-      shift 2
-      ;;
-    --max)
-      [[ $# -ge 2 ]] || { usage >&2; exit 1; }
-      requested_max="$2"
-      shift 2
-      ;;
-    -h|--help)
-      usage
-      exit 0
-      ;;
-    *)
+
+case "$SUBCOMMAND" in
+  -h|--help|help)
+    usage
+    exit 0
+    ;;
+  show)
+    [[ $# -eq 0 ]] || die "'$CLI config show' takes no arguments, got '$1'"
+    # A bare report ends by naming the commands that change what it just
+    # printed: the report is where an operator looks before deciding to.
+    show_hint=1
+    ;;
+  set)
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --engine)
+          [[ $# -ge 2 ]] || die "--engine requires a value"
+          requested_engine="$2"
+          shift 2
+          ;;
+        --engine=*)
+          requested_engine="${1#*=}"
+          shift
+          ;;
+        --max)
+          [[ $# -ge 2 ]] || die "--max requires a value"
+          requested_max="$2"
+          shift 2
+          ;;
+        --max=*)
+          requested_max="${1#*=}"
+          shift
+          ;;
+        -h|--help)
+          usage
+          exit 0
+          ;;
+        *)
+          warn "unknown argument '$1' for '$CLI config set'"
+          usage >&2
+          exit 1
+          ;;
+      esac
+    done
+    if [[ -z "$requested_engine" && -z "$requested_max" ]]; then
+      warn "'$CLI config set' needs --engine <name>, --max <count>, or both"
       usage >&2
       exit 1
-      ;;
-  esac
-done
+    fi
+    ;;
+  *)
+    warn "unknown config command '$SUBCOMMAND'"
+    usage >&2
+    exit 1
+    ;;
+esac
+
+require_ssh_host
 
 # Overrides are only for hermetic tests. Real runs edit the installed cron and
 # the machine-local registry in the VM checkout, never either tracked template.
 cron_file="${DEFAULT_ENGINE_CRON:-/etc/cron.d/harness-dispatch}"
 repos_file="${CONFIG_REPOS_FILE:-$HOST_CONTROL_DIR/etc/repos.conf}"
+# SSH implementations drop empty arguments, which would shift every argument
+# after an unset one; the sentinel keeps the positions fixed.
 remote_engine="${requested_engine:-__UNCHANGED__}"
 remote_max="${requested_max:-__UNCHANGED__}"
 
@@ -176,6 +224,10 @@ fi
 printf 'default: %s\navailable: %s\nmax concurrent runs: %s\n' "$current_engine" "$available" "$current_max"
 REMOTE
 
-if (( show_usage )); then
-  usage
+if (( show_hint )); then
+  printf '%s\n' \
+    "" \
+    "Change either with:" \
+    "  $CLI config set --engine <name>" \
+    "  $CLI config set --max <count>"
 fi

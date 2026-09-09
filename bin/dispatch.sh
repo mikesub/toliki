@@ -5,7 +5,7 @@ set -euo pipefail
 # launch path: it walks each repo's `ready` issue queue oldest-first and starts
 # a task run when the persistent `task` selector is present, otherwise an epic,
 # until the host is at capacity, then exits.
-# `./remote-control.sh epic N` or `task N` (laptop-side) remains the manual
+# `./toliki run epic N` or `run task N` (laptop-side) remains the manual
 # override for jumping the queue.
 #
 # It walks three repair queues first: two filled by the merge worker and one
@@ -85,12 +85,12 @@ until the host hits MAX_PARALLEL_EPICS ($MAX_PARALLEL_EPICS).
                       chose it, as a single line "<engine> <source>" on stdout
                       (source: label, host-default, builtin). Requires -r.
                       Read-only: no label is written, nothing is launched.
-                      remote-control.sh uses it for a manual launch that named
+                      ./toliki run uses it for a manual launch that named
                       no engine, so an inherited default never becomes a label.
 
 An active host provider-quota hold skips ordinary and dry-run candidates whose
 engine uses that vendor; other engines keep walking. Routing-only modes and
-explicit remote-control launches remain available as operator overrides.
+explicit ./toliki run launches remain available as operator overrides.
 EOF
 }
 
@@ -340,7 +340,7 @@ if (( HAVE_ROUTE_ISSUE )); then
 fi
 
 # The read-only twin of --route-issue: report the engine one issue would run on
-# and what chose it, writing nothing at all. remote-control.sh calls this for a
+# and what chose it, writing nothing at all. ./toliki run calls this for a
 # manual launch that named no engine and passes the answer straight into
 # launch.sh, so an inherited label or host default stays inherited — the
 # distinction between an explicit per-issue route and a host-wide fallback is
