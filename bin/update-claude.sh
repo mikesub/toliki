@@ -17,8 +17,9 @@ set -euo pipefail
 # update under a live run hands its later phases a different CLI than its
 # earlier ones got. provision.sh refuses to move the CLI under live sessions
 # for that reason; this script is the one place it does move, and only when
-# launch.sh's own count says nothing is running — the same function that
-# enforces MAX_PARALLEL_EPICS, so "busy" cannot mean two different things.
+# launch.sh's all-session count says nothing is running. Capacity uses the same
+# pane observation but exempts proven manual sessions; idle intentionally does
+# not, because an interactive Claude/Codex process is active work too.
 #
 # It holds dispatch's lock across the check and the install so a tick cannot
 # launch into the window between "idle" and "installed". A manual

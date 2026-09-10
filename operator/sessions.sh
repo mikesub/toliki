@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # `./toliki session` — the interactive tmux sessions on the host: list, start,
-# stop, restart, stop-all. Session launching itself lives in bin/launch.sh,
+# stop, restart, manual cleanup and stop-all. Session launching itself lives in bin/launch.sh,
 # which runs ON the host (so the dispatcher can reuse it without ssh); this
 # script parses the operator's intent, resolves names/repos locally where it
 # can, and sshes the rest over.
@@ -12,32 +12,35 @@ set -euo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-SELF="$OPERATOR_DIR/sessions.sh"
-
 usage() {
   cat <<EOF
-Usage: $CLI session <command> [name] [-m <message>] [-r <repo>]
+Usage: $CLI session <command> [name] [-m <message>] [-r <repo>] [--engine claude|codex]
 
 Commands:
-  list                     List every session on the host with its repo, engine
-                           and running/dead status. Host-wide. (alias: ls)
-  start [name] [-m msg]    Start an interactive claude session. Name resolution
+  list                     List every session with repo, actual client,
+                           manual/pipeline identity and state. (alias: ls)
+  start [name] [-m msg]    Start an interactive Claude or Codex session. Name resolution
                            when no name given: with -m, the session is named
                            after the message (slugified); otherwise auto-picks
                            the first pool name free for the repo: ${NAMES[*]}
-                           With -m, sends <msg> to claude as its initial prompt.
-  stop <name>...           Stop the named session(s). (alias: rm)
+                           With -m, sends <msg> as the client's initial prompt.
+  stop <name>...           Stop exact named session(s); manual code is retained. (alias: rm)
   restart <name> [-m msg]  Restart the named session (optionally re-prompting).
                            Refuses on a <repo>-epic-<N> session: use an explicit
                            '$CLI run' command instead.
+  stop-manual              Stop all proven Toliki manual sessions and owned
+                           processes. Pipelines and unrelated tmux are untouched.
+  remove-workspace <name>  Safely remove one stopped manual worktree and branch;
+                           refuses dirty, untracked, unmerged or ambiguous work.
   stop-all                 Stop every tmux session on the host. Host-wide.
   <name> [-m msg]          Shorthand for: start <name> [-m msg]
 
 Options:
-  -m, --message <msg>      Initial prompt to send to claude (start/restart only).
-                           Passed as claude's positional prompt, not -p (which
-                           is non-interactive and would exit immediately). Also
+  -m, --message <msg>      Initial interactive prompt (start/restart only).
+                           Passed positionally, never as a headless invocation. Also
                            names the session when no explicit name is given.
+  --engine claude|codex    Interactive client. New sessions default to Claude;
+                           restart inherits unless explicitly overridden.
   -r, --repo <name>        Repo to run in: $(repo_names | tr '\n' ' ')(default: $DEFAULT_REPO).
                            Applies to start/restart/stop; list and stop-all are
                            host-wide. Every session is named <repo>-<name>, so
@@ -54,12 +57,11 @@ MESSAGE=""
 HAVE_MESSAGE=0
 REPO=""
 HAVE_REPO=0
+ENGINE=""
+HAVE_ENGINE=0
 
-# Pull optional -m/--message and -r/--repo (any position) out of the args.
-# --engine and --over-capacity belong to '$CLI run' alone and are refused here
-# rather than on the host, so no session command can ever put either on the
-# wire — including the bare-flag forms, which are refused before the
-# no-command branch below can exit 0 on them.
+# Pull session options out in any position; ssh receives individually quoted
+# values so multiline prompts and metacharacters remain data.
 POSITIONAL=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -85,9 +87,10 @@ while [[ $# -gt 0 ]]; do
       REPO="${1#*=}"
       shift
       ;;
-    --engine|--engine=*)
-      refuse_engine_flag
-      ;;
+    --engine)
+      [[ $# -ge 2 ]] || die "$1 requires a value"
+      HAVE_ENGINE=1; ENGINE="$2"; shift 2 ;;
+    --engine=*) HAVE_ENGINE=1; ENGINE="${1#*=}"; shift ;;
     --over-capacity)
       refuse_over_capacity
       ;;
@@ -107,6 +110,8 @@ if [[ ${#POSITIONAL[@]} -eq 0 ]]; then
     ACTION="start"          # bare `-m <msg>` starts an auto-named session
   elif [[ $HAVE_REPO -eq 1 ]]; then
     ACTION="start"          # bare `-r <repo>` starts an auto-named session there
+  elif [[ $HAVE_ENGINE -eq 1 ]]; then
+    ACTION="start"          # bare `--engine <client>` starts a pool session
   else
     usage
     exit 0
@@ -116,7 +121,7 @@ else
     list|ls)
       ACTION="list"
       ;;
-    start|restart|stop-all)
+    start|restart|stop-all|stop-manual|remove-workspace)
       ACTION="${POSITIONAL[0]}"
       SESSION="${POSITIONAL[1]:-}"
       ;;
@@ -135,14 +140,30 @@ else
   esac
 fi
 
-# --message only makes sense when we're launching claude.
+case "$ACTION" in
+  start|restart|remove-workspace|stop-all|stop-manual)
+    [[ ${#POSITIONAL[@]} -le 2 ]] || die "'$CLI session $ACTION' takes at most one session name"
+    ;;
+  list)
+    [[ ${#POSITIONAL[@]} -eq 1 ]] || die "'$CLI session list' takes no session name"
+    ;;
+esac
+if [[ ( "$ACTION" == list || "$ACTION" == stop-all || "$ACTION" == stop-manual ) && -n "$SESSION" ]]; then
+  die "'$CLI session $ACTION' takes no session name"
+fi
+
+# --message only makes sense when launching an interactive client.
 if [[ $HAVE_MESSAGE -eq 1 && "$ACTION" != "start" && "$ACTION" != "restart" ]]; then
   refuse_message_flag
 fi
 
 # list and stop-all are host-wide, so a repo would be meaningless there.
-if [[ $HAVE_REPO -eq 1 && "$ACTION" != "start" && "$ACTION" != "restart" && "$ACTION" != "stop" ]]; then
+if [[ $HAVE_REPO -eq 1 && "$ACTION" != "start" && "$ACTION" != "restart" && "$ACTION" != "stop" && "$ACTION" != "remove-workspace" ]]; then
   refuse_repo_flag "$CLI session $ACTION"
+fi
+if [[ $HAVE_ENGINE -eq 1 ]]; then
+  [[ "$ACTION" == start || "$ACTION" == restart ]] || die "--engine only applies to '$CLI session start' and '$CLI session restart'"
+  [[ "$ENGINE" == claude || "$ENGINE" == codex ]] || die "--engine must be claude or codex, got '$ENGINE'"
 fi
 
 if [[ $HAVE_REPO -eq 1 ]]; then
@@ -156,7 +177,7 @@ LAUNCH="$HOST_CONTROL_DIR/bin/launch.sh"
 # its own repo, so honour that for restart when -r wasn't given.
 if [[ $HAVE_REPO -eq 0 ]]; then
   REPO="$DEFAULT_REPO"
-  if [[ "$ACTION" == "restart" && -n "$SESSION" ]]; then
+  if [[ ( "$ACTION" == "start" || "$ACTION" == "restart" || "$ACTION" == "remove-workspace" ) && -n "$SESSION" ]]; then
     if derived="$(repo_of_session "$SESSION")"; then
       REPO="$derived"
     fi
@@ -184,7 +205,31 @@ case "$ACTION" in
     fi
     SESSION="$(full_name "$REPO" "$SESSION")"
     ;;
+  remove-workspace)
+    [[ -n "$SESSION" ]] || die "'$CLI session remove-workspace' requires a session name"
+    SESSION="$(full_name "$REPO" "$SESSION")"
+    ;;
 esac
+
+case "$ACTION" in
+  start) names_to_validate="${SESSION:-}" ;;
+  restart|remove-workspace) names_to_validate="$SESSION" ;;
+  stop) names_to_validate="${SESSIONS[*]}" ;;
+  *) names_to_validate="" ;;
+esac
+for candidate in $names_to_validate; do
+  [[ "$candidate" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || die "invalid session name '$candidate' (use letters, digits, '-' or '_')"
+done
+
+# A pipeline-shaped manual name is forbidden before any host mutation, even
+# when a prompt or engine was supplied.
+if [[ ( "$ACTION" == start || "$ACTION" == restart ) && -n "$SESSION" && "$SESSION" =~ ^${REPO}-epic-([0-9]+)$ ]]; then
+  N="${BASH_REMATCH[1]}"
+  warn "'$SESSION' is reserved for pipeline sessions and cannot be started or restarted interactively."
+  warn "Use: $CLI run epic $N [--engine <engine>]"
+  warn "Or choose a fixer explicitly: $CLI run fix $N, $CLI run ci $N, or $CLI run defect $N [--engine <engine>]"
+  exit 1
+fi
 
 case "$ACTION" in
   start)
@@ -197,47 +242,46 @@ case "$ACTION" in
     if [[ $HAVE_MESSAGE -eq 1 ]]; then
       REMOTE+=" --message $(sq "$MESSAGE")"
     fi
-    ssh "$HOST" "$REMOTE"
-    ;;
-  stop)
-    # Shell-quote each name into one list the remote loop iterates over.
-    QUOTED=""
-    for s in "${SESSIONS[@]}"; do
-      QUOTED+=" $(sq "$s")"
-    done
+    if [[ $HAVE_ENGINE -eq 1 ]]; then
+      REMOTE+=" --engine $(sq "$ENGINE")"
+    fi
+    # Use a remote script rather than one argv containing the whole command.
+    # OpenSSH still hands the script to Bash, while hermetic/operator transports
+    # that preserve argv can execute `bash -s` directly. Values remain encoded
+    # by sq() in REMOTE, including newlines and shell metacharacters.
     ssh "$HOST" bash -s <<EOF
 set -euo pipefail
-for s in$QUOTED; do
-  if tmux has-session -t "\$s" 2>/dev/null; then
-    tmux kill-session -t "\$s"
-    echo "[remote] killed session '\$s'"
-  else
-    echo "[remote] no session '\$s' to kill"
-  fi
-done
+exec $REMOTE
 EOF
+    ;;
+  stop)
+    stop_rc=0
+    for s in "${SESSIONS[@]}"; do
+      R="$(repo_of_session "$s" || printf '%s' "$REPO")"
+      ssh "$HOST" "$HOST_CONTROL_DIR/bin/manual-session.sh stop --repo $(sq "$R") $(sq "$s")" || stop_rc=1
+    done
+    exit "$stop_rc"
     ;;
   restart)
     # A pipeline session's name says which issue it is but not whether it was
     # an epic or a fixer, and restarting it as an interactive claude would
     # silently produce something else entirely — a live session in the epic's
     # worktree that nothing is driving. Name the real intention instead.
-    if [[ $HAVE_MESSAGE -eq 0 && "$SESSION" =~ -epic-([0-9]+)$ ]]; then
-      N="${BASH_REMATCH[1]}"
-      warn "'$SESSION' is a pipeline session — 'restart' can't tell an epic from a fixer."
-      warn "Relaunch it explicitly:  $CLI session stop $SESSION && $CLI run epic $N [--engine <engine>]"
-      warn "Or use: $CLI run fix $N [--engine <engine>]"
-      warn "Or use: $CLI run ci $N [--engine <engine>]"
-      warn "Or use: $CLI run defect $N [--engine <engine>]"
-      warn "Or just stop it: dispatch relaunches an unfinished issue on its next tick."
-      exit 1
-    fi
-    bash "$SELF" stop "$SESSION"
+    REMOTE="$LAUNCH --repo $(sq "$REPO") $(sq "$SESSION") --restart"
     if [[ $HAVE_MESSAGE -eq 1 ]]; then
-      bash "$SELF" start "$SESSION" --repo "$REPO" --message "$MESSAGE"
-    else
-      bash "$SELF" start "$SESSION" --repo "$REPO"
+      REMOTE+=" --message $(sq "$MESSAGE")"
     fi
+    if [[ $HAVE_ENGINE -eq 1 ]]; then REMOTE+=" --engine $(sq "$ENGINE")"; fi
+    ssh "$HOST" bash -s <<EOF
+set -euo pipefail
+exec $REMOTE
+EOF
+    ;;
+  stop-manual)
+    ssh "$HOST" "$HOST_CONTROL_DIR/bin/manual-session.sh stop-manual"
+    ;;
+  remove-workspace)
+    ssh "$HOST" "$HOST_CONTROL_DIR/bin/manual-session.sh remove-workspace --repo $(sq "$REPO") $(sq "$SESSION")"
     ;;
   stop-all)
     ssh "$HOST" bash -s <<'EOF'
@@ -253,23 +297,6 @@ done <<<"$sessions"
 EOF
     ;;
   list)
-    ssh "$HOST" bash -s <<'EOF'
-set -euo pipefail
-if ! sessions=$(tmux list-sessions -F '#{session_name}' 2>/dev/null); then
-  echo "[remote] no tmux sessions"
-  exit 0
-fi
-while IFS= read -r s; do
-  current=$(tmux list-panes -t "$s" -F '#{pane_current_command}' | head -n1)
-  case "$current" in
-    bash|zsh|sh|dash) status="dead (at $current prompt)" ;;
-    *) status="running ($current)" ;;
-  esac
-  # Sessions started before repo tagging (or by hand) have no @repo option.
-  repo=$(tmux show-options -t "$s" -v @repo 2>/dev/null || true)
-  engine=$(tmux show-options -t "$s" -v @engine 2>/dev/null || true)
-  printf '%-28s %-10s %-7s %s\n' "$s" "${repo:--}" "${engine:--}" "$status"
-done <<<"$sessions"
-EOF
+    ssh "$HOST" "$HOST_CONTROL_DIR/bin/manual-session.sh list"
     ;;
 esac

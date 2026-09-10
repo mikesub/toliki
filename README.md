@@ -94,7 +94,7 @@ Everything in `bin/` runs on the host. Use `./toliki help` or a command's
 ```bash
 ./toliki config show
 ./toliki config set --engine codex --max 3
-./toliki session list|start|stop|restart|stop-all
+./toliki session list|start|stop|restart|stop-manual|remove-workspace|stop-all
 ./toliki run epic|task|fix|ci|defect <issue>
 ./toliki route next <engine>
 ./toliki usage [days] [engine]
@@ -108,6 +108,18 @@ issue route. The exact pin and admission contracts are linked from
 Manual pipeline launches can explicitly override capacity with
 `--over-capacity` and bypass a provider hold; automatic dispatch cannot.
 
+`session start [name] --engine claude|codex` opens the actual interactive
+client over tmux (Claude is the independent default). Toliki creates a local
+`manual/<session>` branch and retained worktree from current `origin/main` on
+first use; stop/start and restart preserve dirty files, commits, and the chosen
+client. Manual sessions neither enter pipeline automation nor consume
+`MAX_PARALLEL_EPICS`, though they keep the host non-idle for CLI updates.
+Every successful start prints exact attach, detach, stop, batch-manual-stop and
+safe workspace-removal commands. `session stop-manual` never touches pipelines
+or unrelated tmux; `session stop-all` retains its older host-wide meaning.
+Workspace removal is deliberately separate from process stopping and refuses
+dirty, untracked, unmerged, active, or ambiguously-owned work.
+
 Autonomous defect repair is opt-in through `DEFECT_FIX_REPOS` in the host
 registry. Every entry must name a registered repo; an empty list disables its
 automatic admission without removing the explicit manual command.
@@ -117,8 +129,9 @@ automatic admission without removing the explicit manual command.
 Read this before adding a repo or changing host configuration:
 
 - Add both `REPOS` and `REPO_ORIGINS` entries, re-run provisioning, and accept
-  workspace trust interactively in the clone. Missing trust can make an
-  interactive session die immediately while launch reports success.
+  workspace trust when the interactive client asks in a new manual worktree.
+  Login and consent prompts remain visible in the tmux pane; Toliki does not
+  accept them automatically.
 - Accept bypass-permissions consent once by hand on the host. Provisioning
   detects it but must never set it; a waiting consent dialog can look stalled.
 - Enable GitHub's automatic deletion of merged branches for every registered
@@ -139,8 +152,9 @@ candidate delivery summary and later status/fixer history. The PR holds the
 diff and checks.
 
 A pipeline pane contains its phase log and final `RESULT` line; inspect with
-read-only tmux commands. It is not an interactive agent. Remote Control applies
-only to interactive sessions started separately.
+read-only tmux commands. It is not an interactive agent. Manual panes run
+Claude or Codex directly; SSH/tmux reconnects to either, while Claude also
+retains its Remote Control integration.
 [The project triage skill](.agents/skills/toliki/SKILL.md) collects stuck work
 using read-only probes.
 

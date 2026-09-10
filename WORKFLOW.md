@@ -35,8 +35,12 @@ Step-to-charter boundaries and vendor/model/effort routing are defined by
 
 Pipeline sessions use `<repo>-epic-<N>` for epic, task and all fixers. Their
 tmux pane runs a plain Node orchestrator, displays the phase log and ends with
-`RESULT <json>`; it has no interactive steering channel. Interactive sessions
-are normal remotely controlled Claude sessions. Do not confuse the two.
+`RESULT <json>`; it has no interactive steering channel. Manual sessions use a
+reserved non-pipeline name, durable `manual/<session>` branch and retained
+worktree, and run Claude or Codex directly. They are exempt from pipeline
+capacity and automation but still make CLI-update idle checks busy. SSH/tmux is
+the common connection; Claude also supports Remote Control. Do not confuse the
+two lifecycles.
 
 The source issue holds the specification, append-only delivery/audit records
 and a mutable live status comment.
@@ -237,7 +241,7 @@ are navigation, not extra gates.
 | Work slicing, issue relationships and filing | [ISSUE-TRACKING.md](skills/spec/ISSUE-TRACKING.md) |
 | Laptop CLI, registry and host boundary | [operator/lib.sh](operator/lib.sh) and the selected `operator/<command>.sh` |
 | Host configuration values/validation | [repos.conf.template](etc/repos.conf.template), [etc/lib.sh](etc/lib.sh); installed default format in [dispatch.cron](etc/dispatch.cron) |
-| Session admission and worktree creation | [launch.sh](bin/launch.sh) |
+| Pipeline admission; manual session/worktree creation | [launch.sh](bin/launch.sh), [manual-session.sh](bin/manual-session.sh) |
 | Queue selection | [dispatch.sh](bin/dispatch.sh) |
 | Shared claim, engine pin, candidate and issue preservation | [issue-delivery.mjs](workflows/lib/issue-delivery.mjs) |
 | Interrupted checkpoint integration | [resume-recovery.mjs](workflows/lib/resume-recovery.mjs) |

@@ -38,10 +38,9 @@ require_ssh_host() {
     die "SSH_HOST is not set — add it to etc/repos.conf (see etc/repos.conf.template)"
 }
 
-# The five manual pipeline launches are the only commands that may carry
-# --engine or the capacity override. Both are refused HERE, on the laptop, by
-# every other command, so a session, a route, a report or a bare flag can never
-# put either on the wire.
+# The five manual pipeline launches own the capacity override. Pipeline engine
+# routing is validated here too; operator/sessions.sh separately accepts the
+# two interactive client names for manual sessions.
 PIPELINE_KINDS="epic|task|fix|ci|defect"
 refuse_engine_flag() {
   die "--engine only applies to manual '$CLI run $PIPELINE_KINDS <issue>' launches"

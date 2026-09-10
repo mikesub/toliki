@@ -125,6 +125,8 @@ assert_contains "'run --help' is the same text" "$OUT" "--over-capacity"
 
 run_cli help session
 assert_contains "session help documents stop-all" "$OUT" "stop-all"
+assert_contains "session help documents manual-only cleanup" "$OUT" "stop-manual"
+assert_contains "session help documents safe workspace removal" "$OUT" "remove-workspace"
 assert_contains "session help documents the pool names" "$OUT" "alpha beta"
 run_cli help config
 assert_contains "config help documents the setter" "$OUT" "config set --engine <name>"
@@ -148,10 +150,10 @@ printf '\nsession: host-wide views, repo-scoped names\n'
 run_cli session list
 assert_rc "list exits 0" 0 "$RC"
 assert_contains "list dials the configured host" "$SSH_SENT" "host=stub-host"
-assert_contains "and asks the host for its sessions" "$SSH_SENT" "tmux list-sessions"
+assert_contains "and asks the host session owner for its sessions" "$SSH_SENT" "manual-session.sh list"
 
 run_cli session ls
-assert_contains "ls is the same command" "$SSH_SENT" "tmux list-sessions"
+assert_contains "ls is the same command" "$SSH_SENT" "manual-session.sh list"
 
 run_cli session list -r testrepo
 assert_rc "a repo is refused on the host-wide list" 1 "$RC"
@@ -169,14 +171,25 @@ assert_contains "and says so" "$OUT" "requires at least one session name"
 run_cli session stop epic-7 -r testrepo
 assert_contains "a short name is prefixed with its repo" "$SSH_SENT" "'testrepo-epic-7'"
 run_cli session rm otherapp-alpha
-assert_contains "rm is an alias for stop" "$SSH_SENT" "kill-session"
+assert_contains "rm is an alias for stop" "$SSH_SENT" "manual-session.sh stop"
 assert_contains "and a full name from list passes through" "$SSH_SENT" "'otherapp-alpha'"
+
+run_cli session stop-manual
+assert_contains "manual-only batch cleanup reaches its narrow host action" "$SSH_SENT" "manual-session.sh stop-manual"
+assert_not_contains "manual cleanup does not invoke host-wide stop-all" "$SSH_SENT" "kill-server"
+
+run_cli session remove-workspace otherapp-alpha
+assert_contains "workspace removal targets the exact retained session" "$SSH_SENT" "remove-workspace --repo 'otherapp' 'otherapp-alpha'"
 
 run_cli session start review -m "look at the logs"
 assert_contains "start reaches the host's launch primitive" "$SSH_SENT" "/remote/toliki/bin/launch.sh"
 assert_contains "in the default repo" "$SSH_SENT" "--repo 'testrepo'"
 assert_contains "with the requested name" "$SSH_SENT" "'review'"
 assert_contains "and the initial prompt" "$SSH_SENT" "--message 'look at the logs'"
+
+run_cli session start review --engine codex
+assert_rc "Codex is accepted for an interactive session" 0 "$RC"
+assert_contains "and reaches the host launch" "$SSH_SENT" "--engine 'codex'"
 
 run_cli session start -r nosuchrepo
 assert_rc "an unknown repo is refused locally" 1 "$RC"
@@ -189,13 +202,17 @@ assert_contains "and names the epic relaunch" "$OUT" "./toliki run epic 7"
 assert_contains "and the fixer relaunch" "$OUT" "./toliki run fix 7"
 assert_eq "and nothing is stopped" "" "$SSH_SENT"
 
+run_cli session restart testrepo-epic-7 -m "keep this" --engine codex
+assert_rc "pipeline restart is still refused when prompt and engine are present" 1 "$RC"
+assert_eq "and remains mutation-free" "" "$SSH_SENT"
+
 run_cli session epic 7
 assert_rc "a pipeline name under session is refused" 1 "$RC"
 assert_contains "and redirects to the run group" "$OUT" "./toliki run epic 7"
 
-run_cli session start --engine claude
-assert_rc "--engine is refused for interactive sessions" 1 "$RC"
-assert_contains "and says it is pipeline-only" "$OUT" "only applies to manual"
+run_cli session start --engine nope
+assert_rc "an unknown interactive engine is refused" 1 "$RC"
+assert_contains "and names the choices" "$OUT" "claude or codex"
 assert_eq "and nothing is sent" "" "$SSH_SENT"
 
 run_cli session list -m hello
