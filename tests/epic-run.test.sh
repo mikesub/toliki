@@ -893,6 +893,9 @@ assert_eq "an IANA wall time honours the zone offset" "2026-09-05T13:50:00.000Z"
 assert_eq "a parsed IANA reset is not a fallback" "false" "$(printf '%s' "$DERIVED" | jq -r '.fallback' 2>/dev/null)"
 DERIVED="$(quota_probe derive 'You have hit your usage limit; resets 7:50pm (UTC)' 1788638400000)"
 assert_eq "a reset minute already past rolls to its next occurrence" "2026-09-06T19:50:00.000Z" "$(printf '%s' "$DERIVED" | jq -r '.holdUntil // empty' 2>/dev/null)"
+DERIVED="$(quota_probe derive "You've hit your weekly limit · resets 1pm (UTC)" 1788609600000)"
+assert_eq "a reset time without minutes is parsed as the top of the hour" "2026-09-05T13:00:00.000Z" "$(printf '%s' "$DERIVED" | jq -r '.holdUntil // empty' 2>/dev/null)"
+assert_eq "a parsed hour-only reset is not a fallback" "false" "$(printf '%s' "$DERIVED" | jq -r '.fallback' 2>/dev/null)"
 
 printf '\nquota hold parser: missing or invalid reset data gets exactly thirty minutes\n'
 DERIVED="$(quota_probe derive 'You have hit your usage limit; try again later' 1788609600000)"
@@ -3087,7 +3090,7 @@ assert_contains "it blocks in the architect phase" "$RUN_OUT" '"phase":"architec
 scenario 'provider quota: a hard limit holds the epic without a respawn or blocker'
 QUOTA="$TMP/fixtures-quota"; cp -R "$BASE" "$QUOTA"
 rm -f "$QUOTA/red.sh"
-fixture_error "$QUOTA" red '{"type":"result","subtype":"success","is_error":true,"terminal_reason":"api_error","api_error_status":429,"result":"You\u0027ve hit your session limit · resets 3:50pm (Europe/Amsterdam)","duration_ms":386,"num_turns":1,"total_cost_usd":0,"usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
+fixture_error "$QUOTA" red '{"type":"result","subtype":"success","is_error":true,"terminal_reason":"api_error","api_error_status":429,"result":"You\u0027ve hit your weekly limit · resets 1pm (UTC)","duration_ms":386,"num_turns":1,"total_cost_usd":0,"usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
 EXPECT_HOLD_BEFORE_LABEL=ready run_pipeline "$EPIC_RUN" "$QUOTA" --issue 42
 assert_rc "a hold is a successful run outcome" 0 "$RUN_RC"
 assert_eq "the rejected step is tried exactly once" 1 "$(calls red)"
@@ -3102,21 +3105,21 @@ assert_contains "RESULT names the provider vendor" "$RUN_OUT" '"vendor":"claude"
 assert_eq "RESULT names the resumable slug" "42-add-widget" "$(result_json | jq -r '.slug // empty' 2>/dev/null)"
 assert_eq "RESULT carries the durable holdUntil" "$(jq -r '.claude.holdUntil' "$HOLD_FILE" 2>/dev/null || true)" "$(result_json | jq -r '.holdUntil // empty' 2>/dev/null)"
   assert_eq "RESULT records that parsing succeeded" "false" "$(result_json | jq -r '.fallback' 2>/dev/null)"
-assert_contains "Claude's exact message survives in RESULT" "$RUN_OUT" "You've hit your session limit"
-assert_contains "the provider's reset time survives in RESULT" "$RUN_OUT" "resets 3:50pm (Europe/Amsterdam)"
+assert_contains "Claude's exact message survives in RESULT" "$RUN_OUT" "You've hit your weekly limit"
+assert_contains "the provider's reset time survives in RESULT" "$RUN_OUT" "resets 1pm (UTC)"
 assert_contains "the status comment ends in the held outcome" "$(cat "$GH_LOG")" "**held**: provider quota exhausted, resumes after"
 assert_contains "the status names the vendor and quoted provider field" "$(cat "$GH_LOG")" "vendor: claude; provider reason: \""
-assert_contains "the status quotes the provider reset reason" "$(cat "$GH_LOG")" "resets 3:50pm (Europe/Amsterdam)"
+assert_contains "the status quotes the provider reset reason" "$(cat "$GH_LOG")" "resets 1pm (UTC)"
 assert_not_contains "no blocker comment is posted" "$(gh_comments)" "🤖 epic-run blocked"
 assert_eq "the issue returns to ready with no failed state" "ready," "$(gh_labels)"
 assert_eq "the hold is durable before ready is exposed" "" "$(hold_order_error)"
 assert_eq "the hold file is keyed only by the triggering vendor" "claude" "$(jq -r 'keys | sort | join(",")' "$HOLD_FILE" 2>/dev/null || true)"
 assert_eq "the vendor entry has the exact durable schema" "fallback,holdUntil,reason" "$(jq -r '.claude | keys | sort | join(",")' "$HOLD_FILE" 2>/dev/null || true)"
 assert_eq "the provider reset was parsed without fallback" "false" "$(jq -r '.claude.fallback' "$HOLD_FILE" 2>/dev/null || true)"
-assert_contains "the host record retains the provider reason" "$(jq -r '.claude.reason' "$HOLD_FILE" 2>/dev/null || true)" "resets 3:50pm (Europe/Amsterdam)"
+assert_contains "the host record retains the provider reason" "$(jq -r '.claude.reason' "$HOLD_FILE" 2>/dev/null || true)" "resets 1pm (UTC)"
 assert_eq "the hold timestamp is canonical UTC" "valid" "$(jq -r '.claude.holdUntil' "$HOLD_FILE" 2>/dev/null | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:00\.000Z$' && echo valid || echo invalid)"
 assert_eq "one failed usage record is classified durably" "quota-exhausted" "$(usage_log | jq -r 'select(.label=="code:red") | .failureKind')"
-assert_contains "usage retains the provider reason" "$(usage_log)" "resets 3:50pm (Europe/Amsterdam)"
+assert_contains "usage retains the provider reason" "$(usage_log)" "resets 1pm (UTC)"
 
 scenario 'provider quota: a reason with no reset time records the thirty-minute fallback'
 QUOTA_FALLBACK="$TMP/fixtures-quota-fallback"; cp -R "$BASE" "$QUOTA_FALLBACK"
@@ -3168,7 +3171,7 @@ assert_eq "the current vendor is added beside it" "claude,codex" "$(jq -r 'keys 
 assert_eq "RESULT uses only the current vendor's winning deadline" "$(jq -r '.claude.holdUntil' "$HOLD_FILE" 2>/dev/null || true)" "$(result_json | jq -r '.holdUntil // empty' 2>/dev/null)"
 assert_not_contains "another vendor's later deadline does not leak into RESULT" "$(result_json)" "2099-01-01T00:00:00.000Z"
 assert_eq "RESULT names the current run's vendor" "claude" "$(result_json | jq -r '.vendor // empty' 2>/dev/null)"
-assert_contains "RESULT keeps the current provider diagnosis" "$(result_json | jq -r '.reason // empty' 2>/dev/null)" "resets 3:50pm (Europe/Amsterdam)"
+assert_contains "RESULT keeps the current provider diagnosis" "$(result_json | jq -r '.reason // empty' 2>/dev/null)" "resets 1pm (UTC)"
 assert_not_contains "RESULT does not leak the other repository's diagnosis" "$(result_json)" "PRIVATE_REPO_A_SENTINEL"
 assert_not_contains "the issue status does not leak the other repository's diagnosis" "$(cat "$GH_LOG")" "PRIVATE_REPO_A_SENTINEL"
 

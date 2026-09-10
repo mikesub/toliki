@@ -116,7 +116,7 @@ let lastAgentFailure = null
 // explicit category. The raw reason remains attached because it carries the
 // reset time or credit detail when the CLI supplies one. Toliki #11 exposed
 // that this previously survived only in tmux and the vendor's own transcript.
-const QUOTA_EXHAUSTED = /you(?:'ve| have) hit your (?:session|usage) limit|(?:session|usage) (?:limit|quota) (?:was )?(?:reached|exhausted)|quota (?:was )?(?:exceeded|exhausted)|out[_ -]of[_ -]credits|insufficient[_ -]quota|credit balance/i
+const QUOTA_EXHAUSTED = /you(?:'ve| have) hit your (?:session|usage|weekly) limit|(?:session|usage|weekly) (?:limit|quota) (?:was )?(?:reached|exhausted)|quota (?:was )?(?:exceeded|exhausted)|out[_ -]of[_ -]credits|insufficient[_ -]quota|credit balance/i
 const failureKind = (r) => QUOTA_EXHAUSTED.test(`${r?.reason || ''}\n${r?.stderrTail || ''}`)
   ? 'quota-exhausted'
   : r?.timedOut ? 'timeout' : 'agent-failure'

@@ -22,7 +22,7 @@ const LOCK_FILE = resolve(process.env.TMPDIR || tmpdir(), 'harness-dispatch.lock
 const MODULE_FILE = fileURLToPath(import.meta.url)
 const FALLBACK_MS = 30 * 60 * 1000
 
-const RESET = /\bresets\s+(1[0-2]|[1-9]):([0-5]\d)\s*(am|pm)\s*\(([^)]+)\)/i
+const RESET = /\bresets\s+(1[0-2]|[1-9])(?::([0-5]\d))?\s*(am|pm)\s*\(([^)]+)\)/i
 
 function canonicalInstant(value) {
   if (typeof value !== 'string') return null
@@ -87,7 +87,7 @@ export function deriveQuotaHold(reason, nowMs = Date.now()) {
 
   let hour = Number(match[1]) % 12
   if (match[3].toLowerCase() === 'pm') hour += 12
-  const minute = Number(match[2])
+  const minute = Number(match[2] || 0)
   const zone = match[4].trim()
   try {
     // Search absolute minutes rather than hand-rolling zone offsets. It finds
