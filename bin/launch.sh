@@ -280,13 +280,13 @@ running_count() { # all|pipeline
   local scope="$1" s current n=0 kind repo
   while IFS= read -r s; do
     [[ -n "$s" ]] || continue
-    current="$(tmux list-panes -t "$s" -F '#{pane_current_command}' 2>/dev/null | head -n1)"
+    current="$(tmux list-panes -t "=$s:" -F '#{pane_current_command}' 2>/dev/null | head -n1)"
     case "$current" in
       bash|zsh|sh|dash|'') ;;
       *)
         if [[ "$scope" == pipeline ]]; then
-          kind="$(tmux show-options -t "=$s" -qv @toliki_kind 2>/dev/null || true)"
-          repo="$(tmux show-options -t "=$s" -qv @repo 2>/dev/null || true)"
+          kind="$(tmux show-options -t "=$s:" -qv @toliki_kind 2>/dev/null || true)"
+          repo="$(tmux show-options -t "=$s:" -qv @repo 2>/dev/null || true)"
           if [[ "$kind" == manual && -n "$repo" ]] && manual_load "$repo" "$s" 2>/dev/null; then
             continue
           fi
@@ -521,7 +521,7 @@ prepare_manual_workspace() {
 # PREFIXES, so launching epic-26 while epic-263 is live would report "already
 # running" and start nothing at all.
 if tmux has-session -t "=$SESSION" 2>/dev/null && [[ -n "$MODE" ]]; then
-  current="$(tmux list-panes -t "$SESSION" -F '#{pane_current_command}' | head -n1)"
+  current="$(tmux list-panes -t "=$SESSION:" -F '#{pane_current_command}' | head -n1)"
   case "$current" in
     bash|zsh|sh|dash)
       echo "[launch] session '$SESSION' exists but its process isn't running (pane at a $current prompt) — restart it (from the laptop): ./toliki session restart $SESSION" ;;
@@ -536,8 +536,8 @@ if [[ -z "$MODE" ]]; then
   command -v tmux >/dev/null 2>&1 || { echo "[launch] tmux is not installed or not on PATH" >&2; exit 1; }
   command -v git >/dev/null 2>&1 || { echo "[launch] git is not installed or not on PATH" >&2; exit 1; }
   if tmux has-session -t "=$SESSION" 2>/dev/null; then
-    pre_kind="$(tmux show-options -t "=$SESSION" -qv @toliki_kind 2>/dev/null || true)"
-    pre_pane="$(tmux list-panes -t "=$SESSION" -F '#{pane_current_command}' 2>/dev/null | head -n1 || true)"
+    pre_kind="$(tmux show-options -t "=$SESSION:" -qv @toliki_kind 2>/dev/null || true)"
+    pre_pane="$(tmux list-panes -t "=$SESSION:" -F '#{pane_current_command}' 2>/dev/null | head -n1 || true)"
     case "$pre_kind" in
       manual)
         if ! manual_load "$REPO" "$SESSION"; then
@@ -571,17 +571,17 @@ if [[ -z "$MODE" ]]; then
   # before restart is allowed to stop anything.
   prepare_manual_workspace || exit 1
   if tmux has-session -t "=$SESSION" 2>/dev/null; then
-    kind="$(tmux show-options -t "=$SESSION" -qv @toliki_kind 2>/dev/null || true)"
-    actual_engine="$(tmux show-options -t "=$SESSION" -qv @engine 2>/dev/null || true)"
+    kind="$(tmux show-options -t "=$SESSION:" -qv @toliki_kind 2>/dev/null || true)"
+    actual_engine="$(tmux show-options -t "=$SESSION:" -qv @engine 2>/dev/null || true)"
     # A recognized legacy Claude pane may be tagged now that its workspace was
     # safely adopted. Anything else with this name remains untouchable.
-    pane="$(tmux list-panes -t "=$SESSION" -F '#{pane_current_command}' 2>/dev/null | head -n1 || true)"
+    pane="$(tmux list-panes -t "=$SESSION:" -F '#{pane_current_command}' 2>/dev/null | head -n1 || true)"
     if [[ -z "$kind" && "$MANUAL_ENGINE" == claude && \
           ( "$pane" == claude || "$pane" == bash || "$pane" == zsh || "$pane" == sh || "$pane" == dash ) ]]; then
-      tmux set-option -t "=$SESSION" @toliki_kind manual &&
-        tmux set-option -t "=$SESSION" @engine claude &&
-        tmux set-option -t "=$SESSION" @worktree "$MANUAL_WORKTREE" &&
-        tmux set-option -t "=$SESSION" @branch "$MANUAL_BRANCH" || {
+      tmux set-option -t "=$SESSION:" @toliki_kind manual &&
+        tmux set-option -t "=$SESSION:" @engine claude &&
+        tmux set-option -t "=$SESSION:" @worktree "$MANUAL_WORKTREE" &&
+        tmux set-option -t "=$SESSION:" @branch "$MANUAL_BRANCH" || {
           echo "[launch] could not tag recognized legacy session '$SESSION'; leaving it running" >&2; exit 1;
         }
       kind=manual actual_engine=claude
@@ -701,12 +701,12 @@ fi
 KIND="pipeline"
 [[ -n "$MODE" ]] || KIND="manual"
 set_session_tags() {
-  tmux set-option -t "=$SESSION" @repo "$REPO" || return 1
-  tmux set-option -t "=$SESSION" @engine "$ENGINE" || return 1
-  tmux set-option -t "=$SESSION" @toliki_kind "$KIND" || return 1
+  tmux set-option -t "=$SESSION:" @repo "$REPO" || return 1
+  tmux set-option -t "=$SESSION:" @engine "$ENGINE" || return 1
+  tmux set-option -t "=$SESSION:" @toliki_kind "$KIND" || return 1
   if [[ -z "$MODE" ]]; then
-    tmux set-option -t "=$SESSION" @worktree "$MANUAL_WORKTREE" || return 1
-    tmux set-option -t "=$SESSION" @branch "$MANUAL_BRANCH" || return 1
+    tmux set-option -t "=$SESSION:" @worktree "$MANUAL_WORKTREE" || return 1
+    tmux set-option -t "=$SESSION:" @branch "$MANUAL_BRANCH" || return 1
   fi
 }
 if ! set_session_tags; then
@@ -747,7 +747,7 @@ fi
 # command) so the pane survives the process exiting: `ls` reports it as dead,
 # and capture-pane can still show the scrollback — which for a pipeline run is
 # the whole phase log and its final RESULT line.
-if ! tmux send-keys -t "=$SESSION" -- "$LINE" Enter; then
+if ! tmux send-keys -t "=$SESSION:" -- "$LINE" Enter; then
   tmux kill-session -t "=$SESSION" 2>/dev/null || true
   echo "[launch] could not start $ENGINE in '$SESSION'; removed the tmux session and retained $CWD" >&2
   exit 1
@@ -755,12 +755,12 @@ fi
 if [[ -z "$MODE" ]]; then
   started=0
   for _ in {1..20}; do
-    current="$(tmux list-panes -t "=$SESSION" -F '#{pane_current_command}' 2>/dev/null | head -n1 || true)"
+    current="$(tmux list-panes -t "=$SESSION:" -F '#{pane_current_command}' 2>/dev/null | head -n1 || true)"
     if [[ "$current" == "$ENGINE" || -n "$(manual_owned_pids "$MANUAL_TOKEN")" ]]; then started=1; break; fi
     case "$current" in bash|zsh|sh|dash|'') sleep 0.1 ;; *) break ;; esac
   done
   if (( started == 0 )); then
-    failure_output="$(tmux capture-pane -p -t "=$SESSION" -S -40 2>/dev/null || true)"
+    failure_output="$(tmux capture-pane -p -t "=$SESSION:" -S -40 2>/dev/null || true)"
     tmux kill-session -t "=$SESSION" 2>/dev/null || true
     echo "[launch] $ENGINE did not remain running in '$SESSION' (pane: ${current:-unknown}); no startup success is claimed" >&2
     [[ -z "$failure_output" ]] || printf '%s\n' "$failure_output" | sed 's/^/[client] /' >&2

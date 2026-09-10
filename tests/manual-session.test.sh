@@ -49,7 +49,7 @@ case "$1" in
     for s in ${LIVE_SESSIONS:-}; do [[ "${3#=}" == "$s" ]] && exit 0; done
     exit 1 ;;
   show-options)
-    s="${3#=}"; key="${5:-}"
+    s="${3#=}"; s="${s%:}"; key="${5:-}"
     [[ "$s" == testrepo-alpha && "$key" == @toliki_kind ]] && { echo manual; exit 0; }
     [[ "$s" == testrepo-alpha && "$key" == @repo ]] && { echo testrepo; exit 0; }
     [[ "$s" == testrepo-alpha && "$key" == @engine ]] && { echo claude; exit 0; }

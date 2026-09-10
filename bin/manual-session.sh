@@ -34,7 +34,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-tmux_kind() { tmux show-options -t "=$1" -qv @toliki_kind 2>/dev/null || true; }
+tmux_kind() { tmux show-options -t "=$1:" -qv @toliki_kind 2>/dev/null || true; }
 
 stop_manual() { # repo, exact session
   local repo="$1" session="$2" kind rc=0
@@ -95,7 +95,7 @@ case "$ACTION" in
     while IFS= read -r session; do
       [[ -n "$session" ]] || continue
       [[ "$(tmux_kind "$session")" == manual ]] || continue
-      repo="$(tmux show-options -t "=$session" -qv @repo 2>/dev/null || true)"
+      repo="$(tmux show-options -t "=$session:" -qv @repo 2>/dev/null || true)"
       if [[ -z "$repo" ]] || ! manual_load "$repo" "$session" 2>/dev/null; then
         echo "[manual] '$session' is tagged manual but has no recognizable workspace metadata; leaving it untouched" >&2
         rc=1
@@ -145,10 +145,10 @@ case "$ACTION" in
     seen=$'\n'
     while IFS= read -r session; do
       [[ -n "$session" ]] || continue
-      repo="$(tmux show-options -t "=$session" -qv @repo 2>/dev/null || true)"
-      engine="$(tmux show-options -t "=$session" -qv @engine 2>/dev/null || true)"
+      repo="$(tmux show-options -t "=$session:" -qv @repo 2>/dev/null || true)"
+      engine="$(tmux show-options -t "=$session:" -qv @engine 2>/dev/null || true)"
       kind="$(tmux_kind "$session")"
-      pane="$(tmux list-panes -t "=$session" -F '#{pane_current_command}' 2>/dev/null | head -n1 || true)"
+      pane="$(tmux list-panes -t "=$session:" -F '#{pane_current_command}' 2>/dev/null | head -n1 || true)"
       case "$pane" in bash|zsh|sh|dash|'') state=stopped ;; *) state=running ;; esac
       if [[ -z "$kind" && "$session" =~ -epic-[0-9]+$ ]]; then kind=pipeline; fi
       if [[ -z "$kind" && -n "$repo" ]] && project="$(repo_path "$repo" 2>/dev/null)" && manual_find_legacy_worktree "$project" "$session"; then

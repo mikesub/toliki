@@ -73,7 +73,9 @@ case "${1:-}" in
   list-sessions) [[ -n "${STUB_SESSIONS:-}" ]] && printf '%s\n' $STUB_SESSIONS; exit 0 ;;
   list-panes) echo "${STUB_PANE_CMD:-claude}"; exit 0 ;;
   show-options)
+    [[ "${3:-}" != =* || "${3:-}" == *: ]] || exit 1
     target="${3#=}"
+    target="${target%:}"
     for s in ${STUB_MANUAL_SESSIONS:-}; do
       [[ "$target" == "$s" ]] || continue
       case "${5:-}" in
@@ -85,7 +87,10 @@ case "${1:-}" in
     done
     exit 0 ;;
   set-option)
+    [[ "${3:-}" != =* || "${3:-}" == *: ]] || exit 1
     [[ "${STUB_FAIL_SET_OPTION:-}" != "${4:-}" ]] || exit 1 ;;
+  send-keys)
+    [[ "${3:-}" != =* || "${3:-}" == *: ]] || exit 1 ;;
   new-session)
     [[ "${STUB_FAIL_NEW_SESSION:-0}" != 1 ]] || exit 1 ;;
 esac
@@ -169,8 +174,8 @@ run_launch --epic 63 --repo testrepo
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_contains "session is named <repo>-epic-<N>" "$(tmux_log)" "new-session -d -s testrepo-epic-63"
 assert_contains "the pane starts in the worktree" "$(tmux_log)" "-c $WT_ROOT/testrepo/testrepo-epic-63"
-assert_contains "the repo tag is set" "$(tmux_log)" "set-option -t =testrepo-epic-63 @repo testrepo"
-assert_contains "the default engine tag is Claude" "$(tmux_log)" "set-option -t =testrepo-epic-63 @engine claude"
+assert_contains "the repo tag is set" "$(tmux_log)" "set-option -t =testrepo-epic-63: @repo testrepo"
+assert_contains "the default engine tag is Claude" "$(tmux_log)" "set-option -t =testrepo-epic-63: @engine claude"
 assert_contains "the pane runs the epic orchestrator" "$(tmux_log)" "workflows/epic-run.mjs' --issue 63"
 # The registered key, on the pane line: the run's usage telemetry has to say
 # which repository an issue number belongs to, and the session name is not a
@@ -249,7 +254,7 @@ assert_contains "and the defect fixer carries the same repository identity" "$(t
 printf '\nlaunch --epic --engine codex: engine is tagged and forwarded\n'
 run_launch --epic 64 --repo testrepo --engine codex
 assert_rc "exits 0" 0 "$RUN_RC"
-assert_contains "the Codex engine tag is set" "$(tmux_log)" "set-option -t =testrepo-epic-64 @engine codex"
+assert_contains "the Codex engine tag is set" "$(tmux_log)" "set-option -t =testrepo-epic-64: @engine codex"
 assert_contains "Codex reaches the orchestrator" "$(tmux_log)" "--engine 'codex'"
 
 printf '\nlaunch --epic: with no installed cron file the default is the built-in claude\n'
@@ -259,7 +264,7 @@ export EPIC_ENGINE=codex
 run_launch --epic 65 --repo testrepo
 unset EPIC_ENGINE
 assert_rc "exits 0" 0 "$RUN_RC"
-assert_contains "an ambient EPIC_ENGINE is ignored" "$(tmux_log)" "set-option -t =testrepo-epic-65 @engine claude"
+assert_contains "an ambient EPIC_ENGINE is ignored" "$(tmux_log)" "set-option -t =testrepo-epic-65: @engine claude"
 assert_contains "and claude reaches the orchestrator" "$(tmux_log)" "--engine 'claude'"
 printf 'EPIC_ENGINE=nope\n' > "$INSTALLED_CRON"
 run_launch --epic 66 --repo testrepo
@@ -275,7 +280,7 @@ printf '\nlaunch --epic: the installed cron file is the host default\n'
 printf 'EPIC_ENGINE=codex\n' > "$INSTALLED_CRON"
 run_launch --epic 67 --repo testrepo
 assert_rc "exits 0" 0 "$RUN_RC"
-assert_contains "the installed default is tagged" "$(tmux_log)" "set-option -t =testrepo-epic-67 @engine codex"
+assert_contains "the installed default is tagged" "$(tmux_log)" "set-option -t =testrepo-epic-67: @engine codex"
 assert_contains "and reaches the orchestrator" "$(tmux_log)" "--engine 'codex'"
 
 export EPIC_ENGINE=claude
@@ -361,7 +366,7 @@ git -C "$CLONE" worktree add -q -b claude/testrepo-legacy "$CLONE/.claude/worktr
 STUB_LIVE_SESSIONS=testrepo-legacy STUB_PANE_CMD=claude run_launch --repo testrepo testrepo-legacy
 assert_rc "legacy adoption exits 0" 0 "$RUN_RC"
 assert_contains "the existing workspace is adopted" "$RUN_OUT" "adopted existing Claude workspace"
-assert_contains "the legacy session receives manual identity" "$(tmux_log)" "set-option -t =testrepo-legacy @toliki_kind manual"
+assert_contains "the legacy session receives manual identity" "$(tmux_log)" "set-option -t =testrepo-legacy: @toliki_kind manual"
 assert_contains "the adopted branch is retained in metadata" "$(git -C "$CLONE" config --get toliki-manual.testrepo-legacy.branch)" "claude/testrepo-legacy"
 
 printf '\nlaunch: an unowned manual workspace path is preserved\n'
@@ -480,7 +485,7 @@ assert_contains "the count still happens under the admission lock" \
   "$(grep -E '^(flock 8$|new-session)' "$TMUX_LOG_FILE" | head -n 1)" "flock 8"
 assert_contains "the session is created" "$(tmux_log)" "new-session -d -s testrepo-epic-70"
 assert_contains "and the lock is released once it exists" "$(tmux_log)" "flock -u 8"
-assert_contains "the engine tag is the ordinary one" "$(tmux_log)" "set-option -t =testrepo-epic-70 @engine claude"
+assert_contains "the engine tag is the ordinary one" "$(tmux_log)" "set-option -t =testrepo-epic-70: @engine claude"
 assert_contains "and the pane line is an ordinary epic run" "$(tmux_log)" "workflows/epic-run.mjs' --issue 70"
 
 run_launch --fix 72 --repo testrepo --over-capacity --engine codex
