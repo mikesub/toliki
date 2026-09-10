@@ -1,63 +1,30 @@
 #!/usr/bin/env node
-// fix-run — judgment-conflict fixer for a finished epic PR (dispatch launches
-// it for `needs-judgment` issues; `--issue N` is the only argument).
+// fix-run — judgment-conflict adapter for a finished PR (needs-judgment).
+// This file owns rebase/autoresolve, conflict evidence, scripted settlement,
+// partial-conflict records and publication ordering. Shared phase sequencing,
+// verify retries, human/operational failure handling and RESULT are owned by
+// lib/fixer-lifecycle.mjs; acceptance/correction semantics by
+// lib/repair-acceptance.mjs.
 //
-// Rebases the PR onto current origin/main, lets the deterministic rung settle
-// every mechanical hunk (merge-autoresolve.sh --partial, containment-gated),
-// has a model resolve the hunks left marked — stating what each side intended
-// and how both survive, editing outside a marker block only where that is what
-// carries a side's intent to lines the other side moved, escalating instead of
-// guessing, and editing nothing but that text — then checks the markers are
-// gone, stages exactly those files, continues the rebase itself and validates
-// the completed branch, re-runs npm run verify, has a blind adversarial agent
-// try to refute the resolution, and force-pushes. A complete repair lands the issue
-// ready-to-merge; a verified partial repair preserves the repaired hunks but
-// rests at ready-to-review with the fixer queue removed. Its authenticated,
-// head-bound record names only the declined hunks and their original diff3
-// sides. An automatic redispatch of that head is refused; after a human clears
-// both ladder labels and restores the queue, one bounded round consumes only
-// those declines, and only while the captured main head is unchanged. A stale
-// captured main returns to human review without spending that granted rung.
-// The merge worker rebases a complete repair again and
-// RE-RUNS THE REAL CHECKS before anything lands. That re-run is what makes the
-// landing safe: a resolution that breaks a check cannot merge. What it cannot
-// catch is a resolution that is green and wrong, which is what the adversarial
-// check is for.
-// Attempt ladder in labels: fix-attempted, then fix-retried (one retry);
-// exhausted → refuses and stays failed. Trusted-evidence reads that fail before
-// a rung can be consumed remove the queue label and also stay failed for a
-// human, rather than becoming an unbounded uncounted retry.
+// Prepare captures both sides' intent, marked-file diffs and main's delivered
+// issue context, then lets merge-autoresolve.sh --partial settle mechanical
+// hunks. A failed diff capture blocks; an unreadable issue body is explicit.
+// Every judging call sees the same captured brief, not its own GitHub fetch.
 //
-// Its skeptic is the bounded repair contract (lib/repair-acceptance.mjs): one
-// exhaustive acceptance check over every numbered judgment hunk and the
-// complete resolution delta, then — only when every blocker it returns is a
-// concrete implementation defect — one scoped correction inside this same
-// invocation, the verify contract again, and one narrow confirmation. A
-// correction must keep both sides' authenticated intent and its edits go into
-// the same amended commit as the resolution. A semantic dead end removes
-// needs-judgment and rests with a human without spending a ladder rung; only
-// operational failures relaunch a fixer.
+// The resolver edits the supplied conflict text. An edit outside a marker is
+// allowed only to carry a side's intent to lines the other side moved.
+// Settlement checks markers, stages exactly the judgment files, continues the
+// rebase once and validates the completed branch; another stop is not success.
 //
-// Up to five model steps: the resolver, one diagnostics-driven resolver retry,
-// its acceptance check, one scoped correction and its narrow confirmation. The
-// shared fixed-purpose fixer
-// lifecycle owns their sequencing, common gates, failure/refund handling and
-// final RESULT. This adapter retains rebase/autoresolve, conflict evidence,
-// continuation and publication ordering.
-//
-// Every one of those steps reads the SAME captured brief: both sides' diffs of
-// exactly the marked files, the commit subjects behind main's side, and the
-// issue bodies stating what each side set out to do, all captured in prepare()
-// before the first call. They used to be `git diff` and `gh issue view` command
-// lines each step was told to run for itself, which meant the checker that
-// refutes a resolution gathered its own view of what the two sides meant. A
-// failed diff capture is stated in the prompt, an unreadable issue body says so
-// where the model reads it, and the working tree stays open for context.
-// A hard provider-quota death aborts any in-progress rebase and records the
-// host-wide hold before labels move. A verified hold refunds this invocation's
-// rung; an unverified transition restores it and blocks inside the same
-// terminal-report window. Neither path pushes.
-
+// Complete verified/accepted work returns to the merge worker for fresh checks.
+// Partial work retains exact PR-side text for declines and publishes its
+// authenticated head-bound evidence BEFORE pushing. Automatic redispatch of
+// that partial head is refused. A human-granted round after clearing both
+// ladder labels consumes only those declines, while captured main is unchanged;
+// a stale main holds for a human without spending the newly granted rung.
+// The conflict ladder is fix-attempted then fix-retried. Trusted-evidence
+// failures before a rung remove the queue instead of creating uncounted retries.
+// Quota cleanup aborts an in-progress rebase and never pushes.
 import { readFileSync } from 'node:fs'
 import { log } from './lib/runtime.mjs'
 import { HARNESS_DIR } from './lib/engine.mjs'

@@ -15,12 +15,9 @@
 // evidence refresh and landing-only recovery. Once a partial push is observed,
 // state is monotonic: no exception can reach the ordinary requeueing blocker.
 //
-// The check stage is the bounded repair contract (see lib/repair-acceptance.mjs):
-// ONE exhaustive acceptance check over every original disposition and the
-// complete repair delta, then — only when every blocker it returns is a
-// concrete implementation defect — ONE scoped correction inside this same
-// invocation, the orchestrator's full verify contract again, and ONE narrow
-// read-only confirmation. There is no second correction batch.
+// The check stage implements the bounded repair contract owned by
+// repair-acceptance.mjs. Keep its verdict/correction/confirmation rules there;
+// this runner owns execution order, verification and terminal behavior.
 // Both judging calls receive the latest orchestrator-run verification command,
 // status, measured wall duration and bounded output for the tree they examine.
 //

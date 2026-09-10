@@ -2,293 +2,162 @@
 
 # toliki
 
-A self-hosted coding-agent harness that turns GitHub issues into merged PRs unattended.
-A VPS runs detached pipelines in tmux; cron drains the issue queue, runs either
-a reviewed epic or an explicitly selected lightweight task to an open green PR,
-and a serial merge worker
-rebases, re-verifies and lands them. You write specs; the box does the rest.
+A self-hosted coding-agent harness that turns settled GitHub issues into
+verified pull requests and merges eligible ones unattended. A VPS runs plain
+Node pipelines in tmux; cron admits work, checks delivery and reaps completed
+sessions. Claude Code and Codex are supported.
 
-The pipeline is a plain Node script. It does everything deterministic itself —
-the claim, the labels, the commits, the push, the PR, `npm run verify` — and
-spawns a short-lived headless agent process, behind a small engine adapter,
-only where a judgment is needed. Claude Code and Codex are both supported.
-It also does the fetching and the bookkeeping around each of those calls: the
-issue bodies, the pinned diffs, both sides of a conflict, the failing jobs'
-logs and the review ledger are captured before the call and pasted into the
-prompt, and the changed-file lists, verification results and the run's phase log
-are written from what the script observed rather than from what a step said. A
-step is asked for a decision and its reasons; exploring the codebase stays open
-to it.
+You write specifications with `/spec`. An ordinary issue gets the independently
+reviewed epic workflow; a human may explicitly choose the cheaper, self-reviewed
+task workflow. Deterministic code owns Git/GitHub operations and the project's
+verification gate. Models supply implementation and judgment.
 
 ## The loop
 
-1. **`/spec`** (interactive, the one human gate) — design a change,
-   file it as one or more GitHub issues labeled `ready`, ordered by real
-   `blocked_by` dependencies. A human may explicitly add `task` to clear,
-   low-risk work whose implementation approach is already settled.
-2. **`bin/dispatch.sh`** (cron, on the VPS) — walks each repo's `ready` queue
-   and launches a tmux session per unblocked issue, up to the host's slot
-   budget. Repair queues run first; ship-gate defect repair is walked only for
-   repositories listed in the machine-local `DEFECT_FIX_REPOS` allowlist. A
-   provider quota hold skips ordinary or dry-run candidates whose engine uses
-   that vendor until its UTC reset time, while candidates on other vendors keep
-   launching; routing-only operations bypass the hold. Plain `ready` selects
-   epic; `ready` plus the persistent, human-selected `task` label selects task.
-3. **The issue workflow** (the session's pane) — `workflows/epic-run.mjs`
-   claims an ordinary issue,
-   makes a proportional architecture plan, then implements through either
-   test-first red/green or a direct coding step. Both paths pass the project's
-   verify gate run by the orchestrator. ONE broad reviewer runs, and it is the
-   only broad review of the change.
-   Findings go to one fixer, which repairs, disputes or defers each one; it
-   continues the run's own builder conversation rather than rediscovering an
-   implementation this run wrote minutes earlier, and its prompt still carries
-   the complete captured brief.
-   The orchestrator then re-runs the verify gate. One fresh read-only final
-   review — a process that inherits nothing from the builder — decides every
-   finding against the final tree, the complete diff and
-   the exact repair delta, and names any repair regression or unmet
-   requirement — one exhaustive answer, not the first refutation it finds.
-   There is no second repair round. When everything it leaves open is a
-   concrete defect it positively showed, the run takes ONE scoped correction
-   over that whole batch, re-runs verify, and has a narrow read-only
-   confirmation prove it; anything else, and any correction that does not
-   confirm, holds the PR for a human. The scripted ship phase then
-   rebases the run's checkpoint chain onto current `main` and re-runs verify
-   before squashing, so a base that moved during the run is met here rather
-   than by the merge worker; a conflict or a failed fetch ships on the run's
-   own base and leaves it to the worker. No model runs there: the coding phase
-   already returned the title, the durable commit rationale, the project's own
-   legal marker and what it left undone, and the fixer already decided the
-   follow-up for anything it deferred. After the PR exists, the run appends one
-   candidate-bound delivery summary to the source issue with that rationale,
-   the actual verification, the review/repair tally and each finding's verdict,
-   the derived changed-file list, remaining work, and the pre-handoff gate
-   state. The issue body remains the specification; the PR description is
-   only deterministic linkage back to that issue plus required project markers
-   and the closing relationship. The run ends at an open PR with
-   `ready-to-merge` (gates cleared, lands unattended)
-   or `ready-to-review` (a human decides). A hard provider quota is a successful
-   held outcome instead: the resumable branch is preserved, the issue returns
-   to its queue without spending a fixer attempt, and automatic dispatch waits
-   only for the failed step's vendor hold. Ordinary transient 429s still retry
-   once. For clear, low-risk work whose requirements and approach are already
-   settled, `workflows/task-run.mjs` instead starts one writable tasker process
-   to implement and self-review. The same deterministic transport
-   claims and pins the issue, installs dependencies, runs the real verify gate,
-   rebases and re-verifies a moved clean base, creates the `Closes #N`
-   candidate, publishes its evidence and hands it to the merge worker. It
-   intentionally omits architecture and independent review. Malformed output,
-   a tasker blocker or a non-quota provider/process failure blocks without a
-   respawn. A normal red first verification continues the same tasker
-   conversation with the captured diagnostics and runs one final full verify;
-   no third tasker or rebase-time repair is allowed. A hard quota preserves the
-   work and restores `ready` with `task` and its route intact.
-4. **`bin/merge-worker.sh`** (cron) — one PR at a time per repo: rebase onto
-   current main, give checks time to register, then wait for every published
-   check on the rebased head and squash-merge. It explicitly supplies the full
-   commit subject/body read from that exact checked candidate, so repository
-   squash defaults and mutable PR text cannot replace the durable rationale or
-   closing metadata; an unreadable message fails closed. An empty rollup after
-   the grace is accepted for repos with no CI.
-   Mechanical rebase conflicts it resolves itself under a line-containment
-   gate; a conflict that needs judgment is labeled for **`fix-run.mjs`**, a
-   dispatched fixer run that resolves it under an adversarial check and puts a
-   complete repair back in the merge queue. A red check on the rebased head is labeled
-   for **`ci-run.mjs`**, which reads the failing job logs, repairs the cause
-   under its own adversarial check, and puts the PR back in the merge queue —
-   where its checks are re-run before anything lands.
-   **`defect-run.mjs`** is the third fixer, working from one
-   automation-authored repair envelope bound to the PR head. Epic-run no longer
-   creates that envelope — a concrete-defect hold takes its one scoped
-   correction inside the run instead — so this fixer now services evidence
-   older runs published and explicit manual launches. All three fixers share
-   one bounded repair contract: their checker returns an exact verdict per item
-   and the COMPLETE blocker batch rather than one refutation, and when every
-   blocker is a concrete implementation defect the run takes ONE scoped
-   correction in the same invocation, re-verifies, and has a narrow
-   confirmation prove it. A semantic dead end removes that fixer's queue and
-   rests with a human without spending a retry rung; only operational failures
-   relaunch a whole fixer. Any of
-   the three fixers that repairs some named items and declines others still
-   verifies and checks the exact delta, then pushes the repairs and holds the PR
-   at `ready-to-review` with its fixer queue removed. A partial defect repair
-   reissues its authenticated envelope on the amended head with only the
-   declines, so a human-granted later round does not repeat pushed work. Mixed,
-   missing or stale ship-gate evidence stays with a human. Every readback that confirms one of the
-   run's own writes — the PR head after a force push, the labels after a swap —
-   is retried over a bounded window rather than read once, and an attempt that
-   pushed a complete repair it could not label leaves a record that lets the
-   next attempt redo only the landing.
-5. **`bin/reap.sh`** (cron) — frees what finished runs leave behind (idle
-   sessions, including settled dead quota-held sessions at `ready`, and stale
-   claim refs), so the slot budget keeps rotating.
+```text
+/spec -> ready issue -> dispatch -> epic or task -> open PR
+                                                   |
+                                      merge worker + fresh checks
+                                                   |
+                                                  main
+```
 
-The operator watches from a laptop with `./toliki session list` (and
-`./toliki usage` for what the steps cost, what each issue's whole
-lifetime cost and how it ended, and how often automation handed off to a human),
-and reads a completed run from its source issue: the body is the specification, the
-candidate delivery summary is the immutable run snapshot, and later status,
-deferral, blocker, and fixer comments preserve subsequent history. The PR is
-the technical surface for its diff and checks. For a live process,
-`tmux attach` / `capture-pane` carries its phase log and a final `RESULT` line.
-(Interactive sessions, started by hand, still connect via
-the Claude Code Desktop app's remote control; pipeline runs have no such
-channel, by design — the only mid-run lever is kill.) Everything
-else is scripts — no daemon, no database, no web UI; GitHub issues, labels and
-refs are the durable work store. Host facts stay local: lock files, usage
-telemetry, and the expiring provider hold at `~/epic-provider-hold.json`.
+Conflicts and failing CI can enter bounded fixer runs; unresolved judgment
+holds for a human. [WORKFLOW.md](WORKFLOW.md) maps the phases, labels and
+contract owners. [DOCTRINE.md](DOCTRINE.md) explains the trade-offs.
+Neither setup nor this overview redefines those contracts.
 
 ## What it expects
 
-- An Ubuntu VPS you can ssh into.
-- `gh` authenticated on the VPS; a Claude Code and/or Codex subscription for pipeline runs.
-- Projects that define verification as a contract: a *package* is any
-  directory whose `package.json` declares `scripts.verify`, and that script is
-  the gate an epic must turn green.
+- An Ubuntu VPS you can SSH into.
+- Authenticated `gh` and the agent CLIs you intend to use on that host.
+- Projects whose `package.json` declares `scripts.verify`: the project's
+  complete verification contract.
+- Settled issue requirements; pipeline sessions have no steering channel.
 
 ## Setup
 
-On the VPS:
+The commands below change the host and its queues. Agent authorization rules
+are in [AGENTS.md](AGENTS.md#live-host-safety).
 
-```
+### On the VPS
+
+```bash
 sudo apt-get update && sudo apt-get install -y git gh
 gh auth login
 gh repo clone mikesub/toliki /home/ubuntu/toliki
 cd /home/ubuntu/toliki
-cp etc/repos.conf.template etc/repos.conf   # then edit: your repos + origins
-bin/provision.sh                            # idempotent; repeats until green
+cp etc/repos.conf.template etc/repos.conf   # initial setup only; edit your registry
+bin/provision.sh
 ```
 
-Set `HOST_TIMEZONE` in the host's `etc/repos.conf` to an IANA zone such as
-`Europe/Amsterdam`; empty or unset means UTC. Provisioning applies that zone to
-the host and verifies the readback. Pane logs, live status comments, cron-script
-logs, and resource-report bounds then use `YYYY-MM-DD HH:mm:ss ABBR` with the
-abbreviation valid at that instant. The launcher passes the registry value into
-manual and dispatched tmux panes, so an SSH caller's timezone cannot override
-it. Parsed records—usage and resource JSON, hold deadlines, and GitHub time
-comparisons—remain canonical UTC ISO 8601.
+[repos.conf.template](etc/repos.conf.template) documents the configuration
+values. The actual `etc/repos.conf` is machine-local and must never be committed
+or overwritten during an update. Set `HOST_TIMEZONE` there before provisioning
+when UTC is not the desired host clock.
 
-`provision.sh` installs everything else and prints an exact checklist of the
-few interactive steps it cannot do for you (logins, per-clone workspace
-trust, the bypass-permissions consent). It installs and authenticates both
-agent CLIs. Route the next unassigned epic with
-`./toliki route next codex` or `./toliki route next claude`; add
-`-r <repo>` to restrict selection. An engine is a named table in
-`etc/engines.json` saying which vendor, model and effort runs each pipeline
-step, so one engine can code on Claude and review on Codex. Unlabeled issues
-run on the host's `EPIC_ENGINE` default, read from the installed copy of
-`etc/dispatch.cron` (claude when that file is absent, and a file whose value
-disagrees with the environment refuses to launch anything rather than guess).
-From the laptop, `./toliki config show` prints the VM's installed default,
-available engines, and maximum concurrent runs. `./toliki config set` takes
-`--engine <name>` or `--max <count>` (or both together) to change those host
-settings, validates and reads them back; the report ends by naming both, so
-looking costs nothing. For example, `./toliki config set --engine codex --max 3`.
-An unlabeled
-issue consults the engine default only for
-its first claim. Once the claim succeeds, the run snapshots its selection as
-the issue's sole `engine:<name>` label and reads it back before any model starts.
-That GitHub write/readback is a hard gate: resumes and every fixer require the
-same exact pin rather than falling back to a later host default, and missing,
-mismatched, or conflicting pins stop for an operator without being rewritten.
-Turning the box autonomous is a deliberate last step: install the cron file
-per the comment at the top of `etc/dispatch.cron`.
-`--engine` is optional on every manual `./toliki run epic|task|fix|ci|defect`
-launch. Given, it is persisted as the issue's durable `engine:<name>` label and
-verified before the run starts, so the choice survives resumes and fixer
-retries. Omitted, the host resolves it and writes nothing: the issue's own
-`engine:<name>` label, else the host default above, else claude — and the
-launch reports which of the three chose it. Inheriting never creates, replaces
-or removes a label, which is what keeps a host-wide fallback distinguishable
-from a per-issue decision; a closed or unreadable issue, an unknown or
-conflicting routing label, or an unreadable host default refuses without
-launching.
-Defect repair is empty-by-default: add selected registered repo names to
-`DEFECT_FIX_REPOS=(...)` in the host's `etc/repos.conf`, or launch a marked
-issue explicitly with `./toliki run defect N -r <repo>`.
-All explicit `./toliki run epic|task|fix|ci|defect` launches bypass an active
-provider hold as a deliberate operator override. An epic or fixer on a mixed
-engine waits if any vendor it uses is held; a task waits only on its configured
-`task` step vendor. Admission never reroutes an issue to a different engine.
-Adding `--over-capacity` to one of those four commands (and only those four)
-starts it even when the host is already at `MAX_PARALLEL_EPICS`; it counts as a
-slot once up, so automatic dispatch stays paused until usage drops back below
-the limit.
+[provision.sh](bin/provision.sh) is repeatable and reports the interactive steps
+it cannot perform: authentication, per-clone workspace trust and
+bypass-permissions consent. It does not accept consent or upgrade an already
+installed agent CLI on your behalf.
 
-On the laptop:
+Turn on autonomous work only after provisioning is green: install
+[dispatch.cron](etc/dispatch.cron) using the instructions at its top. Install
+all three pipeline cron lines or none. Its `PATH` must reach `node`, `claude`
+and `codex`, plus `bun` if any project's verify script uses it. The installed
+cron file—not an SSH caller's environment—owns the host's `EPIC_ENGINE`
+default and must contain exactly one assignment.
 
-```
-gh repo clone mikesub/toliki && cd toliki
-./toliki setup          # exposes /spec + spec-explorer to both clients; seeds local config
+### On the laptop
+
+```bash
+gh repo clone mikesub/toliki
+cd toliki
+./toliki setup
 ./toliki session list
 ```
 
-`./toliki` is the only entry point at the root, and everything it does runs
-from the laptop; `bin/` is the host's. Its implementations live in `operator/`,
-one file per concern, and `./toliki help` (or `<command> --help`) prints the
-same groups:
+Setup wires `/spec` and `spec-explorer` into both supported clients and seeds
+the laptop registry. Node and Codex are required for Codex agent registration.
+Re-run setup after an older installation is updated, then start a fresh client
+session. [operator/setup.sh](operator/setup.sh) owns registration and migration;
+[wire-claude-content.sh](etc/wire-claude-content.sh) owns shared content links.
+Project-local copies can shadow those shared skills/agents; never copy them
+into target repositories. Pipeline charters stay internal.
 
-```
-./toliki setup                                   # wire this laptop
-./toliki sync                                    # pull/rebase this checkout and the host's
-./toliki config show                             # host default engine + max concurrent runs
-./toliki config set --engine <name> --max <count>
+### Operating commands
+
+`./toliki` runs on the laptop; its implementations live in `operator/`.
+Everything in `bin/` runs on the host. Use `./toliki help` or a command's
+`--help` for its current options.
+
+```bash
+./toliki config show
+./toliki config set --engine codex --max 3
 ./toliki session list|start|stop|restart|stop-all
-./toliki run epic|task|fix|ci|defect <issue>     # manual pipeline launch
-./toliki route next <engine>                     # route the next ready issue
-./toliki usage [days] [engine]                   # what runs cost and how they ended
+./toliki run epic|task|fix|ci|defect <issue>
+./toliki route next <engine>
+./toliki usage [days] [engine]
+./toliki sync
 ```
 
-Setup links `/spec` into both clients and its charter into Claude. For Codex it
-registers the charter's real repo path in `~/.codex/config.toml`: Codex 0.153.4
-lists a
-symlinked agent but refuses that symlink when launching it. This keeps the repo
-charter as the shared source without copying it. Setup removes its old Codex agent
-symlink after registration succeeds, avoiding duplicate definitions. Re-run
-`./toliki setup` after updating an older setup, then start a fresh Codex session to
-load the registration. Node and Codex must be installed for this registration step.
+Engines are named tables in [engines.json](etc/engines.json). Manual `run`
+accepts an optional `--engine`: omission inherits; specifying it persists the
+issue route. The exact pin and admission contracts are linked from
+[Prepare](WORKFLOW.md#1-prepare).
+Manual pipeline launches can explicitly override capacity with
+`--over-capacity` and bypass a provider hold; automatic dispatch cannot.
+
+Autonomous defect repair is opt-in through `DEFECT_FIX_REPOS` in the host
+registry. Every entry must name a registered repo; an empty list disables its
+automatic admission without removing the explicit manual command.
+
+### Host traps
+
+Read this before adding a repo or changing host configuration:
+
+- Add both `REPOS` and `REPO_ORIGINS` entries, re-run provisioning, and accept
+  workspace trust interactively in the clone. Missing trust can make an
+  interactive session die immediately while launch reports success.
+- Accept bypass-permissions consent once by hand on the host. Provisioning
+  detects it but must never set it; a waiting consent dialog can look stalled.
+- Enable GitHub's automatic deletion of merged branches for every registered
+  repo. Retained remote refs prevent worktree collection and leak disk.
+- Re-run provisioning after changing `HOST_TIMEZONE`. Existing panes keep
+  their launched zone; new panes receive the registry value.
+- Claude model aliases depend on the installed CLI. Use the idle-host
+  [CLI updater](bin/update-claude.sh), not an upgrade during active runs.
+- Docker GC changes require a full daemon restart, not reload; check effective
+  policy with `docker buildx inspect`. Unknown keys may be silently ignored.
+  Provisioning owns the installation and readback.
+
+### Inspecting work
+
+`./toliki session list` shows live sessions; `./toliki usage` shows model cost
+and issue-lifetime outcomes. The source issue holds the specification, immutable
+candidate delivery summary and later status/fixer history. The PR holds the
+diff and checks.
+
+A pipeline pane contains its phase log and final `RESULT` line; inspect with
+read-only tmux commands. It is not an interactive agent. Remote Control applies
+only to interactive sessions started separately.
+[The project triage skill](.agents/skills/toliki/SKILL.md) collects stuck work
+using read-only probes.
 
 ## Reading order
 
-- **`AGENTS.md`** — the project instructions for any agent (`CLAUDE.md` is a
-  pointer to it): reading order, glossary, boundaries, invariants, the
-  operational traps the code cannot show, and live-host safety.
-- **`DOCTRINE.md`** — why this exists, the principles, and the alternatives
-  that were considered and rejected, with reasons.
-- **`bin/`, `etc/`** — the host-side scripts and config; each header states
-  its contract and the incident behind it.
-- **`operator/`** — the laptop-side implementations behind `./toliki`, one file
-  per command group.
-- **`WORKFLOW.md`** — the executable path from queue selection through merge,
-  including the full epic, lightweight task and fixer call counts and gates.
-- **`workflows/`** — the epic and task pipelines plus three fixer entry points
-  (`epic-run`, `task-run`, `fix-run`, `ci-run`, and `defect-run`), with every
-  model step's prompt in its own module under `workflows/prompts/`. The epic and
-  task paths share their safety-critical issue-delivery transport. The fixers share one fixed lifecycle
-  runner for execution, verification/check gates, failure and final reporting,
-  while each entry point keeps its cause-specific preparation, evidence,
-  publication and recovery ordering. The surrounding runtime provides the
-  engine adapter, git/gh/npm transport, concurrency gate, structured-output
-  validation, and the usage log `usage-report.mjs` summarizes — per-spawn rows
-  for step tuning, plus the run-start/run-finish records behind its
-  issue-lifetime view of cost, elapsed time, retries and recorded result.
-- **`skills/`, `agents/`** — `/spec` and its `spec-explorer` are exposed to local
-  Claude and Codex sessions; pipeline entry points and phase charters stay
-  internal. Each client gets the same read-only charter in its native format,
-  without shadowing Codex's built-in `explorer`.
-- **`.agents/skills/toliki`** — the project-local, cross-client operator skill
-  for checking stuck pipeline work; Claude discovers the same source through
-  `.claude/skills/toliki`.
+- [AGENTS.md](AGENTS.md): short maintenance, testing and live-host safety rules;
+  `CLAUDE.md` is only its pointer.
+- [WORKFLOW.md](WORKFLOW.md): flow map and authoritative contract-owner index.
+- [DOCTRINE.md](DOCTRINE.md): design rationale and rejected alternatives.
+- [Issue tracking](skills/spec/ISSUE-TRACKING.md): work slicing and filing.
+- The relevant source owner and its tests: exact behavior, schema, ordering and
+  local incident notes. Do not synchronize copied manuals in several places.
 
 ## Caveats
 
-This is a working personal setup shared as-is, not a product. Sessions run
-with `--dangerously-skip-permissions` inside git worktrees on your own VPS —
-read `DOCTRINE.md` and decide for yourself before pointing it at anything you
-care about.
+This is a personal setup shared as-is, not a hosted product. Agent sessions can
+run with permission bypass on your VPS; git worktrees are not a security
+boundary. Read the doctrine before pointing it at a project you care about.
 
-It might not work with your setup — if so, ask Claude/Codex to fix it; the docs
-here are written to give it everything it needs. If the fix is something
-others would benefit from (not just local customization), a PR here is a
-welcome courtesy.
+If a fix benefits more than your local setup, a PR is welcome.

@@ -1,26 +1,20 @@
 #!/usr/bin/env node
-// task-run — explicitly opted-in lightweight issue delivery. One writable
-// tasker process implements and self-reviews the settled requirement; when an
-// interrupted checkpoint chain conflicts, that same primary process first
-// integrates its captured diff3 stop and no extra task call is added. The
-// orchestrator alone claims, verifies, rebases, commits, pushes, opens the PR,
-// publishes evidence and hands the candidate to the ordinary merge worker.
-// There is no architect, RED step, independent review or correction.
-// Runtime respawns are disabled for every call. The one bounded exception is
-// the verification repair below; its full second verify is final and can never
-// spawn a third.
+// task-run — explicitly opted-in lightweight issue delivery.
+// This file owns the one primary tasker, structured delivery validation and
+// the single permitted diagnostics-driven repair after a normal red first
+// verify. That full second verify is final; no third tasker is allowed.
+// Invalid output, a tasker blocker, non-quota provider/process failure,
+// timeout or rebase-time verify failure does not authorize another process.
 //
-// That repair CONTINUES the tasker's own conversation (lib/runtime.mjs) instead
-// of briefing a stranger on work that is minutes old: the initial tasker still
-// holds why it wrote what the gate just rejected, which is the context a fresh
-// process would spend its first minutes rebuilding from the same tree. Nothing
-// else changes shape. The prompt below stays a complete standalone brief — the
-// requirement, the sanitized diagnostics and the in-place worktree — so the run
-// behaves identically when the conversation is unavailable, and the ceiling is
-// unchanged: two invocations, never three. Malformed output, a tasker blocker,
-// a provider or process failure, a timeout and a rebase-time verify failure all
-// still block after the process they happened in, resumed or not.
-
+// An interrupted conflict is integrated inside the ordinary primary tasker
+// before it finishes and self-reviews the task; no extra task call is added.
+// There is no architect, RED step, independent review or correction.
+//
+// lib/issue-delivery.mjs owns shared claim/pin, preparation, candidate and
+// handoff; lib/resume-recovery.mjs owns interrupted-branch settlement.
+// lib/runtime.mjs owns conversation identity/fallback. Both task call sites
+// disable runtime respawns and carry a complete brief, so conversation reuse
+// changes neither authority nor the two-invocation ceiling.
 import path from 'node:path'
 import { existsSync, readFileSync } from 'node:fs'
 import { agent, phase, log, initRuntime, onPhase, onLog, takeAgentFailure, withAgentFailure, conversation } from './lib/runtime.mjs'

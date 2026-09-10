@@ -1,59 +1,27 @@
 #!/usr/bin/env node
-// defect-run — bounded repair for a finished epic PR whose deterministic ship
-// gate held only on concrete defects (`needs-defect-fix`). This is a separate
-// session, never a continuation of epic-run's own two fix rounds, which end at
-// that gate: it reads the authenticated, PR/head-bound gate envelope epic-run
-// persisted on GitHub, edits exactly those defects, runs the project's real
-// verify contract, and intent-adds new files before giving the exact delta to a
-// blind adversarial checker.
-// Only a verified fix is amended and force-pushed under a lease. A complete
-// repair returns to ready-to-merge; a verified partial repair is preserved but
-// rests at ready-to-review with fresh head-bound evidence containing only its
-// declines. Everything else rests with a human.
+// defect-run — authenticated named-defect adapter for a finished PR
+// (needs-defect-fix). Current epic-run corrects eligible defects inside its own
+// invocation and publishes no new queue envelope. This adapter services durable
+// evidence from older runs and explicit manual launches.
 //
-// Its skeptic is the bounded repair contract (lib/repair-acceptance.mjs): one
-// exhaustive acceptance check over every numbered defect and the complete
-// repair delta, then — only when every blocker it returns is a concrete
-// implementation defect — one scoped correction inside this same invocation,
-// the verify contract again, and one narrow confirmation. A correction stays
-// bound to the authenticated issue/PR/branch/head evidence and may not weaken a
-// gate or reclassify a named defect. A semantic dead end removes
-// needs-defect-fix and rests with a human without spending a ladder rung; only
-// operational failures relaunch a fixer.
+// This file owns evidence/identity preparation, head readback, partial evidence
+// refresh and landing-only recovery. Shared phase sequencing, verify retries,
+// failure/refund handling and RESULT live in lib/fixer-lifecycle.mjs;
+// lib/repair-acceptance.mjs owns acceptance/correction/confirmation semantics.
 //
-// The shared fixed-purpose fixer lifecycle owns normal phase sequencing,
-// common gates, failure/refund handling and final RESULT. This adapter retains
-// evidence/identity preparation, publication and landing-only recovery.
+// The requirement is pinned to the authenticated issue/PR/branch/head envelope,
+// not mutable issue prose. The captured reviewed diff accompanies it for both
+// repair and judging. The adapter's boundary forbids reclassifying named defects
+// or weakening gates. Envelope/landing-record formats live in
+// lib/defect-evidence.mjs. The ladder is defect-attempted then defect-retried.
 //
-// The requirement stays pinned to the authenticated envelope — never re-read
-// from mutable issue prose — and prepare now captures the reviewed change under
-// repair beside it, so the repair and its blind checker read the same pinned
-// bytes instead of each running `git diff` for its own view. The audit
-// comment's file list is derived from the repair's delta for the same reason.
-// Every readback that verifies one of this run's own writes — the PR head after
-// the force push, the labels after the landing swap — is bounded rather than
-// single-shot (readBack in lib/github.mjs): GitHub shows a force push seconds
-// after it lands, and one immediate read reported two complete repairs as
-// unverified landings. Retries change timing, never verdicts.
-//
-// Landing-only retry: an attempt that pushed a verified and checked repair and
-// then could not confirm the landing — the head readback or the label swap —
-// leaves the evidence envelope bound to the PRE-push head, so a relaunch finds
-// no matching evidence for the head the PR now carries. What is unfinished
-// there is the LANDING, not the repair: re-running the fixer would send a
-// second repair at defects already repaired. So the audit comment carries a
-// landing record bound to the amended head (see lib/defect-evidence.mjs) and is
-// posted as soon as the push is a fact, and a relaunch that finds one whose
-// priorHead has a matching evidence envelope skips Fix, Verify and Check and
-// redoes only the landing swap. The trust model is otherwise unchanged.
-//
-// Attempt ladder in labels: defect-attempted, then defect-retried. The labels
-// are never reset by automation, so this repair session cannot become a loop.
-// A hard provider-quota death cleans the unpushed edit and records the
-// host-wide hold before labels move. A verified hold refunds this invocation's
-// rung; an unverified transition restores it and blocks inside the same
-// terminal-report window.
-
+// A complete verified/accepted repair returns to the merge worker. A partial
+// repair remains human-held and refreshes evidence with only declined items.
+// After a complete push the audit/landing record is posted BEFORE confirming
+// the new head, so failed head/label readback cannot lose recovery evidence.
+// A trusted record matching that pushed head and its prior evidence allows a
+// later attempt to redo only landing, never repair already-pushed code again.
+// Readback timing and terminal budgets are owned by lib/github.mjs.
 import { log } from './lib/runtime.mjs'
 import { failureReason } from './lib/proc.mjs'
 import { ensureLabels, editLabels, issueLabels, issueView, comment, openPrs, prView, repositoryView, authenticatedLogin, readBack, waitedFor, terminalTransition } from './lib/github.mjs'

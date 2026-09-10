@@ -392,8 +392,8 @@ function loadCharter(agentType) {
 //
 //   * project_doc_max_bytes caps the discovered documents and truncates past
 //     it SILENTLY — no event, no warning, the tail is just gone. Its default is
-//     32 KiB and this harness's own AGENTS.md is already past that, so the cap
-//     is set explicitly on the command line (--ignore-user-config means the
+//     32 KiB; a target project can exceed it (Toliki did before its manual was
+//     shortened), so the cap is set explicitly (--ignore-user-config means the
 //     host's config.toml can neither raise nor zero it) and the preflight below
 //     refuses a project file bigger than it. A phase never runs on half its
 //     instructions, and never silently.

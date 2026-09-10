@@ -1,125 +1,51 @@
 #!/usr/bin/env node
-// epic-run — autonomous issue-to-PR delivery: prepare → architect → code →
-// review → fixes after review → final review → correction → ship, no sign-offs.
+// epic-run — autonomous issue-to-PR delivery: prepare -> architect -> code ->
+// review -> repair -> final review -> optional correction -> ship -> merge gate.
 //
-// Issue mode (`--issue N`): preflight (closed? blocked_by?) → branch
-// epic/<N>-<slug> off origin/main and claim it by pushing the ref (atomic; a
-// run that loses the race skips), resuming an existing branch when one is left
-// over — flattening a conflicted interrupted checkpoint chain for one bounded,
-// SHA-evidenced integration — and skipping completed code when that branch
-// already carries a code checkpoint (recovering its structured review plan and
-// delivery record when needed) → checkpoint commits after code/fixes → squashed single-commit PR at
-// ship + an append-only delivery summary on the source issue → merge gate labels
-// the issue ready-to-merge when the final review cleared every finding, or
-// ready-to-review when the PR is held; a hold made exclusively of concrete
-// defects also enters the separate bounded fixer queue.
-// Manual mode (`--slug S`): builds on the current tree, no git; needs
-// .epics/<slug>/requirements.md to already exist.
+// This file owns epic sequencing, phase schemas, review-state integrity,
+// delivery rendering and the structured merge-blocker calculation. It never
+// merges; bin/merge-worker.sh owns landing.
 //
-// The run never merges: bin/merge-worker.sh drains ready-to-merge serially per
-// repo. Each model step below is one engine process (see lib/engine.mjs); this
-// file names no vendor. Everything deterministic — git, gh, npm, the layout
-// discovery, the artifacts rendered from structured output — runs here in the
-// orchestrator through lib/github.mjs and lib/repo.mjs, so a claim, a label, a
-// checkpoint or an open PR is a fact the script established, never a claim a
-// model reported. A model runs only where a judgment is needed: design, code,
-// the independent reviewer(s), the fixes and the final review. There is no
-// separate delivery-prose step: the coding phase returns the title, the durable
-// commit rationale, the project's own legal marker and what it left undone —
-// the phase that made the change is the one that can say why — and the ship
-// phase below renders every artifact from that beside evidence the orchestrator
-// captured itself. The PR body itself is deterministic linkage back to the
-// issue specification and run record.
+// --issue N uses lib/issue-delivery.mjs for claim, engine pin, branch resume,
+// candidate and terminal handoff. Interrupted integration is owned by
+// lib/resume-recovery.mjs. --slug S instead uses the current tree and existing
+// .epics/<slug>/requirements.md, without commits or GitHub publication.
 //
-// The same line runs through the prompts. Nothing below asks a step to go and
-// fetch a known input: the requirement, every diff a step judges and the final
-// review ledger are captured here and pasted in, so a builder and the blind
-// checker that later judges it read the same bytes and a capture that failed is
-// visible to the orchestrator instead of to nobody. Source EXPLORATION stays
-// open — writable steps still read the tree and reviewers still grep it. And no
-// step maintains the run record: .epics/<slug>/epic.md is written from what
-// each step RETURNS, because a factual log kept by the models it describes is
-// a claim, and one of them forgetting to append is a hole in the record.
-// A hard provider-quota death is not a project blocker: the branch is
-// checkpointed and pushed, the host-wide hold is recorded under dispatch's
-// lock, then the issue returns to ready so the next run resumes it.
+// Architecture chooses direct or test-first verification. A completed code
+// checkpoint reuses or reconstructs its plan/delivery artifacts read-only;
+// partial work continues directly. Test-first requires a clean baseline and
+// the declared assertion failure, never an unrelated failure or timeout.
+// Both paths require orchestrator-run green before review. Code and review
+// repair each have one verification-driven retry before a blocker.
 //
-// `npm run verify` is likewise the orchestrator's to run. Test-first plans
-// require a clean baseline, a meaningful red regression, then green; direct
-// plans skip artificial RED but still require green after implementation.
-// After fixes it must be green too. An agent's word that it ran a gate is
-// never the gate; a wrong answer is handed back once, then blocks the run.
-// Every independent review/confirmation receives that tree's captured command
-// status, measured wall duration and bounded verification output.
+// One broad review returns the finding ledger. Repair must account for every
+// index. Final review runs after changed code or disputed/deferred findings,
+// judges the requirement and both deltas without the repair narrative, and
+// returns every finding's verdict plus regressions and unmet requirements.
+// An empty claimed repair cannot clear a finding. Tree/index/Git-metadata
+// changes around a judging call fail closed.
 //
-// ONE broad review, and it is the only broad look this change gets: the
-// architect-selected focused reviewer is gone, because a second pre-repair
-// opinion bought less than one exhaustive acceptance check after the repair.
-// Its findings are actionable as they stand — there is no pre-repair
-// confirmation pass. Findings go to ONE fixer, which continues the run's
-// builder conversation and accounts for every finding as fixed, disputed with
-// code evidence, or deferred as unsafe to repair. The orchestrator then runs
-// verify (one retry, exactly as after code) and, when the fixer changed code or
-// disputed/deferred anything, spawns ONE fresh read-only final review over the
-// original requirement, every original finding, the complete diff and the exact
-// repair delta — never the fixer's explanation, so it judges the code rather
-// than agreeing with the story. That final review IS this repair's exhaustive
-// acceptance check: it decides every finding, names everything the repair broke
-// and everything the requirement still lacks, in one answer rather than one
-// sufficient refutation.
+// The gate below converts those results into blockers. The shared correction
+// and confirmation contract lives in lib/repair-acceptance.mjs; this file adapts
+// the epic verdicts to it. A concrete-only batch gets its bounded correction
+// here before ship, not a separately queued defect fixer. No needs-defect-fix
+// is written; defect-run services legacy evidence and explicit manual launches.
 //
-// When the batch it leaves is made ENTIRELY of concrete defects it positively
-// showed, one scoped correction runs right here — in this run's builder
-// conversation, on this worktree, before the PR exists — over exactly those
-// blockers, followed by the full verify contract again and ONE narrow read-only
-// confirmation, itself a fresh process, that proves the batch cleared and
-// nothing else broke. That is why nothing here queues needs-defect-fix any
-// more: the concrete-only hold is the case the correction takes, and a mixed or
-// uncertain hold never earned an automated repair. There is no second
-// correction batch; every other way this can end holds the PR at
-// ready-to-review for a human. defect-run remains, for durable evidence older
-// runs already published.
+// lib/runtime.mjs owns builder conversations, judging isolation and respawns;
+// lib/engine.mjs owns vendor invocation. lib/evidence.mjs and the repo/github
+// transports capture known inputs; models never maintain the run record.
+// Independent judges also receive the tree's latest verification evidence.
 //
-// The merge gate is computed here from the final review's structured result
-// plus that correction's outcome: every finding resolved or disproved, no
-// repair regression, no unmet requirement.
+// Coding returns the delivery judgment; ship renders it and the captured facts
+// without another model. Follow-ups require a model-authored delivery unit,
+// never script-invented judgment. Candidate creation precedes the confirmed
+// summary, deferral record and follow-ups. Deferrals do not gate merge.
 //
-// Every model process here is short-lived: each agent() call is a new process
-// that ends when it returns. What can outlive one is the run's BUILDER
-// CONVERSATION — a session lib/runtime.mjs opens on the first writable call and
-// continues on the writable ones after it: the RED and implementation retries,
-// the fixer that answers the review's findings, its own verify retry, and the
-// one scoped correction. A repair used to be a stranger to work that was
-// minutes old, re-reading the tree to rediscover an implementation this run had
-// just written; now the process that wrote it is the one that answers for it.
-// The prompts below did not shrink for that: each still carries the complete
-// captured brief, so a conversation that could not be continued costs context
-// and never correctness.
-//
-// The judging steps are deliberately NOT in it. The architect, the broad
-// reviewer, the final review and the narrow confirmation each start a fresh
-// ephemeral process that owes the builder nothing and never sees its account of
-// what it did — that independence is the whole value of the adjudication, and
-// it is why reuse stops exactly at the writable steps. Ship starts no model.
-// Routing is never bent to keep a conversation either: a phase whose
-// etc/engines.json row differs from the one the conversation was opened on
-// starts its own rather than being retiered into it.
-//
-// Deferrals are a record, not a gate: what the coding phase and the fixer class
-// as deferred work becomes follow-up prose and at most three follow-up issues,
-// and can neither hold nor release the merge the final review already decided.
-// A follow-up issue is filed only where a model wrote one; a script renders a
-// judgment and never invents the missing half of one.
-//
-// Ship then rebases the checkpoint chain onto current origin/main BEFORE the
-// squash: a run takes an hour and its PR is often held for hours more, so the
-// base has usually moved by the time it ships. A clean rebase re-runs the
-// verify gate against what actually landed, and a red one blocks with the
-// chain intact so a re-run resumes from it. A fetch that failed or a rebase
-// that conflicted ships on the run's own base exactly as before — the merge
-// worker rebases and re-checks before anything lands, and its fixers own that
-// conflict.
-
+// Ship refreshes main before squashing and re-verifies a clean moved base.
+// A red rebase-time verify preserves the chain and blocks; a failed fetch or
+// conflicted rebase ships on the old base for the merge worker to integrate.
+// Exact transport/preservation behavior is in lib/issue-delivery.mjs.
+// Architectural reasons for these choices are in ../DOCTRINE.md.
 import { existsSync, lstatSync, readFileSync, readdirSync, readlinkSync, writeFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import path from 'node:path'

@@ -1,50 +1,19 @@
 #!/usr/bin/env node
-// ci-run — red-check fixer for a finished epic PR (dispatch launches it for
-// `needs-ci-fix` issues; `--issue N` is the only argument).
+// ci-run — red-check adapter for a finished PR (needs-ci-fix).
+// The merge worker found red checks on the rebased head. This file owns
+// failing-check/job-log capture, pinned issue/change evidence, local
+// reproduction, the CI-specific repair boundary and publication.
 //
-// The merge worker rebased the PR onto current main, re-ran its checks, and
-// they came back RED. That is the one decline class where the code is
-// genuinely wrong and there is something to act on. This run reads the failing
-// checks' logs, fixes the cause, re-verifies, has a blind adversarial agent
-// try to refute the fix, amends the branch's single commit, and force-pushes.
-// A complete repair lands ready-to-merge; a verified partial repair keeps its
-// safe work but rests at ready-to-review with the CI-fixer queue removed. The
-// merge worker rebases it again and RE-RUNS THE REAL CHECKS before anything
-// lands. That last re-run is what makes this landing safe: a fix that is still
-// red cannot merge. What it cannot catch is a fix that is green and wrong,
-// which is what the adversarial check below is for.
+// Shared phase sequencing, verify retries, failure/refund handling and RESULT
+// live in lib/fixer-lifecycle.mjs. Acceptance/correction/confirmation semantics
+// live in lib/repair-acceptance.mjs; this adapter bounds them to the captured
+// failures and forbids weakening gates. The repair and independent checker
+// receive the same captured bytes, not retrieval commands.
 //
-// Attempt ladder in labels: ci-attempted, then ci-retried (one retry);
-// exhausted → refuses and stays failed. Its own ladder, not the conflict
-// fixer's: a PR can need both, and one budget would starve the other.
-//
-// Its skeptic is the bounded repair contract (lib/repair-acceptance.mjs): one
-// exhaustive acceptance check over every numbered failed check and the complete
-// repair delta, then — only when every blocker it returns is a concrete
-// implementation defect — one scoped correction inside this same invocation,
-// the verify contract again, and one narrow confirmation. A correction stays
-// inside the captured failing checks and may not weaken a gate to clear a
-// blocker. A semantic dead end removes needs-ci-fix and rests with a human
-// without spending a ladder rung; only operational failures relaunch a fixer.
-//
-// Up to five model steps: the fixer, one diagnostics-driven fixer retry, its
-// acceptance check, one scoped correction and its narrow confirmation. The
-// shared fixed-purpose fixer
-// lifecycle owns their sequencing, common gates, failure/refund handling and
-// final RESULT; this adapter owns red-check capture, prompts and publication.
-//
-// Prepare captures the WHOLE brief before the first call — the failing check
-// names, their job logs, the local verify result, the change under repair and
-// the issue body it was built against — so the fixer and the blind checker that
-// judges it read the same bytes. The fixer used to be handed `git diff` and
-// `gh issue view` command lines instead, which is evidence nothing proved it
-// received. The audit comment's file list is derived from the repair's delta
-// for the same reason: a durable record states facts, not the fixer's account.
-// A hard provider-quota death cleans the unpushed edit and records the
-// host-wide hold before labels move. A verified hold refunds this invocation's
-// rung; an unverified transition restores it and blocks inside the same
-// terminal-report window.
-
+// The independent ladder is ci-attempted then ci-retried. A complete accepted
+// repair rejoins the merge worker for fresh checks; a verified partial repair
+// keeps its work but remains human-held. Audit file lists come from the actual
+// delta. Quota cleanup discards only the unpushed repair.
 import { log } from './lib/runtime.mjs'
 import { failureReason } from './lib/proc.mjs'
 import { gh, ensureLabels, editLabels, issueLabels, comment, openPrs, readBack, terminalTransition } from './lib/github.mjs'
