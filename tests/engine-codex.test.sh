@@ -224,8 +224,11 @@ assert_contains "a Codex quota error reaches the failure reason" "$RUN_OUT" 'You
 assert_contains "a Codex reset time is preserved when the CLI supplies one" "$RUN_OUT" 'resets 3:50pm (Europe/Amsterdam)'
 run_adapter coder gpt-5.6-sol xhigh 1 malformed
 assert_contains "malformed structured output fails" "$RUN_OUT" 'final output was not the expected schema JSON'
+assert_contains "malformed structured output is typed without parsing prose" "$RUN_OUT" '"outputFailure":"invalid-structured-output"'
+assert_contains "the rejected model answer is retained for a bounded repair brief" "$RUN_OUT" '"rejectedOutput":"not json'
 run_adapter coder gpt-5.6-sol xhigh 1 no-output
 assert_contains "a missing final file fails" "$RUN_OUT" 'final output file was not written'
+assert_not_contains "a missing output file is not misclassified as a checker answer" "$RUN_OUT" '"outputFailure"'
 run_adapter coder gpt-5.6-sol xhigh 1 timeout 50
 assert_contains "a timed-out process is marked" "$RUN_OUT" '"timedOut":true'
 

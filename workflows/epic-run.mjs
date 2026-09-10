@@ -46,8 +46,7 @@
 // conflicted rebase ships on the old base for the merge worker to integrate.
 // Exact transport/preservation behavior is in lib/issue-delivery.mjs.
 // Architectural reasons for these choices are in ../DOCTRINE.md.
-import { existsSync, lstatSync, readFileSync, readdirSync, readlinkSync, writeFileSync } from 'node:fs'
-import { createHash } from 'node:crypto'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { agent, phase, log, initRuntime, onPhase, onLog, takeAgentFailure, withAgentFailure, conversation } from './lib/runtime.mjs'
 import { parseArgs, finish, UsageError, EXIT } from './lib/cli.mjs'
@@ -89,6 +88,7 @@ import { redRetryPrompt } from './prompts/epic/red-retry.mjs'
 import { reviewPrompt } from './prompts/epic/review.mjs'
 import { verifyRetryPrompt } from './prompts/epic/verify-retry.mjs'
 import { verificationEvidencePrompt } from './prompts/shared/verification-evidence.mjs'
+import { judgedState, readOnlyViolation } from './lib/judged-state.mjs'
 import { resumeConflictPrompt } from './prompts/shared/resume-conflict.mjs'
 
 const USAGE = `Usage: epic-run.mjs (--issue <N> | --slug <slug>) [--session <name>] [--engine <name>] [--repo <key>]
@@ -802,98 +802,6 @@ async function fail(phase, reason, suppliedFailure = undefined) {
 // ready-to-review and opens no repair queue: its concrete blockers already had
 // their one scoped correction inside the run.
 
-// ───────────────────────── The read-only boundary around judging phases ─────────────────────────
-// Review, final review and the narrow confirmation judge a change; none may
-// alter it. Claude gets
-// a charter without Bash/Edit/Write and Codex gets a read-only sandbox, while
-// the orchestrator supplies their diff evidence. The snapshot below is the
-// independent defense: a boundary regression or unexpected tool side effect
-// still blocks before unreviewed bytes or Git metadata can reach transport.
-//
-// The state is a real tree of the whole worktree — tracked content whether
-// staged or not, plus untracked files — written through a THROWAWAY index, so
-// neither the run's index nor manual mode's user index is disturbed. .epics/ is
-// ignored (ensureEpicsIgnored) and untracked, so it is in neither HEAD nor the
-// staging pass and stays invisible here, which is right: the orchestrator writes
-// the phase log during these phases and none of that directory ever ships. HEAD
-// rides along, so a phase that commits is caught too. The real index, Git
-// config, hooks and ancestry-affecting replacement/graft metadata are also
-// sampled because all can change what a later deterministic Git command sees.
-function filesystemDigest(roots) {
-  const hash = createHash('sha256')
-  const visit = file => {
-    let stat
-    try { stat = lstatSync(file) } catch (error) {
-      if (error.code === 'ENOENT') { hash.update(`missing\0${file}\0`); return }
-      throw error
-    }
-    hash.update(`${file}\0${stat.mode}\0`)
-    if (stat.isSymbolicLink()) { hash.update(`link\0${readlinkSync(file)}\0`); return }
-    if (stat.isDirectory()) {
-      hash.update('dir\0')
-      for (const entry of readdirSync(file).sort()) visit(path.join(file, entry))
-      return
-    }
-    if (stat.isFile()) { hash.update('file\0'); hash.update(readFileSync(file)); return }
-    hash.update('other\0')
-  }
-  for (const root of roots) visit(root)
-  return hash.digest('hex')
-}
-
-async function shippableState() {
-  const head = await git(['rev-parse', 'HEAD'])
-  if (!head.ok) return null
-  const indexPath = await git(['rev-parse', '--git-path', 'index'])
-  const config = await git(['config', '--null', '--show-origin', '--list'])
-  const common = await git(['rev-parse', '--git-common-dir'])
-  if (!indexPath.ok || !config.ok || !common.ok) return null
-  const commonDir = path.resolve(process.cwd(), common.out)
-  const realIndex = path.resolve(process.cwd(), indexPath.out)
-  // The tree half is lib/repo.mjs's worktreeTree(): tracked content whether
-  // staged or not, plus untracked, written through a throwaway index seeded
-  // from HEAD so a path that is tracked AND matched by an ignore rule is in the
-  // snapshot. The real index, Git config, hooks and ancestry metadata are
-  // sampled here because all of them change what a later deterministic Git
-  // command sees, which the tree alone would not show.
-  const tree = await worktreeTree()
-  if (tree === null) return null
-  let metadata
-  try {
-    metadata = filesystemDigest([
-      path.join(commonDir, 'hooks'),
-      path.join(commonDir, 'refs', 'replace'),
-      path.join(commonDir, 'info', 'grafts'),
-    ])
-  } catch { return null }
-  let index
-  try { index = filesystemDigest([realIndex]) } catch { return null }
-  return { head: head.out, tree, index, config: config.out, metadata }
-}
-
-// Why a judging phase must block the run, or null when it left the shippable
-// bytes exactly as it found them. A state that could not be read is a violation
-// too: an invariant nobody could check has not held.
-async function readOnlyViolation(before, what) {
-  const after = await shippableState()
-  if (!before || !after) {
-    return `the worktree could not be read around ${what} — refusing to ship bytes when that phase cannot be shown to have left them alone.`
-  }
-  if (before.head === after.head && before.tree === after.tree &&
-      before.index === after.index && before.config === after.config &&
-      before.metadata === after.metadata) return null
-  const touched = await git(['diff', '--name-only', before.tree, after.tree])
-  const detail = [
-    touched.ok && touched.out ? `touched ${touched.out.split('\n').join(', ')}` : null,
-    before.head === after.head ? null : `moved HEAD ${before.head.slice(0, 7)} → ${after.head.slice(0, 7)}`,
-    before.index === after.index ? null : 'changed the Git index',
-    before.config === after.config ? null : 'changed Git configuration',
-    before.metadata === after.metadata ? null : 'changed hooks or ancestry metadata',
-  ].filter(Boolean).join('; ') || 'the worktree tree hash changed'
-  return `${what} changed the tree it was judging (${detail}) — that phase is read-only under every engine, and an edit it makes is neither reviewed nor verified. Refusing to fold it into the shipment.`
-}
-
-
 let requirement
 let requirementTitle = ''
 let requirementBody = ''
@@ -1177,7 +1085,7 @@ try {
   currentPhase = 'review'
   phase('Review')
 
-  const reviewState = await shippableState()
+  const reviewState = await judgedState()
   const reviewDiff = await captureDiff(DIFF_REFS)
   if (!reviewState || reviewDiff === null) {
     return await fail('review', 'The reviewed tree or its diff could not be captured — refusing to ask a reviewer to judge incomplete evidence.')
@@ -1304,7 +1212,7 @@ try {
     } else {
       currentPhase = 'final-review'
       phase('Final review')
-      const finalState = await shippableState()
+      const finalState = await judgedState()
       if (!finalState) return await fail('final-review', 'The repaired tree could not be captured — refusing to ask a final reviewer to judge incomplete evidence.')
       const repairDiff = await captureDiff(gitMode ? [codeSha, fixSha] : [reviewState.tree, finalState.tree])
       const finalDiff = await captureDiff(gitMode ? ['origin/main...HEAD'] : ['HEAD'])
@@ -1481,7 +1389,7 @@ try {
         return { blocked: `npm run verify is red after the scoped correction (${gate.detail}) — refusing to ship an unverified change, and no further correction or automated repair round runs.` }
       }
 
-      const confirmState = await shippableState()
+      const confirmState = await judgedState()
       const confirmDiff = await captureDiff(gitMode ? ['origin/main...HEAD'] : ['HEAD'])
       if (!confirmState || confirmDiff === null) {
         return { blocked: 'The corrected tree or its diff could not be captured — refusing to ask a confirmer to judge incomplete evidence.' }

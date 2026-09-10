@@ -32,6 +32,10 @@
 // carries a run-local identity precisely so the correction and the narrow
 // confirmation that follows can be matched to it exactly, rather than by title
 // — two blockers may describe the same file and read almost the same.
+// Standalone fixers may ask one fresh checker to replace mechanically malformed
+// acceptance output; low confidence remains substantive uncertainty and earns
+// no such retry. Runtime owns that opt-in budget, while the structured
+// classification below tells it which domain failures are mechanical.
 //
 // There is no second correction batch. Semantic failure at any stage after
 // acceptance ends in a human-held terminal state inside the same invocation;
@@ -41,10 +45,13 @@
 import { validate } from './schema.mjs'
 
 const nonblank = value => typeof value === 'string' && value.trim().length > 0
-const matchesSchema = (schema, value) => {
+const matchesSchema = (schema, value, strict = false) => {
+  if (strict) return validate(schema, value).length === 0
   try { return validate(schema, value).length === 0 } catch { return false }
 }
 const percent = value => Number.isFinite(value) && value >= 0 && value <= 100
+const malformed = problem => ({ problem, outputFailure: 'mechanically-invalid' })
+const uncertain = problem => ({ problem, outputFailure: 'insufficient-confidence' })
 
 // The same bar epic-run's final review and every fixer checker already used.
 // Below it the evidence is not a verdict, whichever way it points.
@@ -237,24 +244,24 @@ Default to not cleared. Return cleared=true only when you positively established
 // Each returns either { problem } — never an authorization — or the validated
 // structure. A caller may not act on anything a gate did not return.
 
-export function validateAcceptance(result, itemCount) {
-  if (!result) return { problem: 'the acceptance check produced no result' }
-  if (!matchesSchema(ACCEPTANCE_SCHEMA, result)) return { problem: 'the acceptance check returned output that does not match its schema' }
+export function validateAcceptance(result, itemCount, { strictSchema = false } = {}) {
+  if (!result) return malformed('the acceptance check produced no result')
+  if (!matchesSchema(ACCEPTANCE_SCHEMA, result, strictSchema)) return malformed('the acceptance check returned output that does not match its schema')
 
   const { outcome, verdicts, blockers } = result
   if (verdicts.length !== itemCount) {
-    return { problem: `the acceptance check returned ${verdicts.length} verdict(s) for ${itemCount} original item(s)` }
+    return malformed(`the acceptance check returned ${verdicts.length} verdict(s) for ${itemCount} original item(s)`)
   }
   const byIndex = new Map()
   for (const verdict of verdicts) {
     const index = Number(verdict.index)
     if (!Number.isInteger(index) || index < 1 || index > itemCount || byIndex.has(index)) {
-      return { problem: 'the acceptance check returned duplicate, missing, or out-of-range verdict indexes' }
+      return malformed('the acceptance check returned duplicate, missing, or out-of-range verdict indexes')
     }
-    if (!nonblank(verdict.reasoning)) return { problem: `acceptance verdict ${index} has no reasoning` }
-    if (!percent(verdict.confidence)) return { problem: `acceptance verdict ${index} has no usable confidence` }
+    if (!nonblank(verdict.reasoning)) return malformed(`acceptance verdict ${index} has no reasoning`)
+    if (!percent(verdict.confidence)) return malformed(`acceptance verdict ${index} has no usable confidence`)
     if (verdict.confidence < ACCEPTANCE_CONFIDENCE) {
-      return { problem: `acceptance verdict ${index} is below the ${ACCEPTANCE_CONFIDENCE} confidence bar (${verdict.confidence}) — low-confidence evidence authorizes nothing` }
+      return uncertain(`acceptance verdict ${index} is below the ${ACCEPTANCE_CONFIDENCE} confidence bar (${verdict.confidence}) — low-confidence evidence authorizes nothing`)
     }
     byIndex.set(index, verdict)
   }
@@ -263,26 +270,29 @@ export function validateAcceptance(result, itemCount) {
   const blockedItems = new Set()
   for (const blocker of blockers) {
     if (!nonblank(blocker.id) || !BLOCKER_ID.test(blocker.id.trim())) {
-      return { problem: 'the acceptance check returned a blocker without a usable run-local id' }
+      return malformed('the acceptance check returned a blocker without a usable run-local id')
     }
     const id = blocker.id.trim()
-    if (ids.has(id)) return { problem: `the acceptance check reused blocker id ${id}` }
+    if (ids.has(id)) return malformed(`the acceptance check reused blocker id ${id}`)
     ids.add(id)
-    if (!BLOCKER_KINDS.includes(blocker.kind)) return { problem: `blocker ${id} has no recognised kind` }
+    if (!BLOCKER_KINDS.includes(blocker.kind)) return malformed(`blocker ${id} has no recognised kind`)
     for (const field of ['location', 'evidence', 'required']) {
-      if (!nonblank(blocker[field])) return { problem: `blocker ${id} is missing its ${field}` }
+      if (!nonblank(blocker[field])) return malformed(`blocker ${id} is missing its ${field}`)
     }
-    if (!percent(blocker.confidence)) return { problem: `blocker ${id} has no usable confidence` }
+    if (!percent(blocker.confidence)) return malformed(`blocker ${id} has no usable confidence`)
     if (blocker.confidence < ACCEPTANCE_CONFIDENCE) {
-      return { problem: `blocker ${id} is below the ${ACCEPTANCE_CONFIDENCE} confidence bar (${blocker.confidence}) — low-confidence evidence authorizes nothing` }
+      return uncertain(`blocker ${id} is below the ${ACCEPTANCE_CONFIDENCE} confidence bar (${blocker.confidence}) — low-confidence evidence authorizes nothing`)
+    }
+    if (blocker.kind === 'original-defect' && blocker.item === undefined) {
+      return malformed(`blocker ${id} is an original defect but does not name its original item`)
     }
     if (blocker.item !== undefined) {
       const item = Number(blocker.item)
       if (!Number.isInteger(item) || item < 1 || item > itemCount) {
-        return { problem: `blocker ${id} names original item ${blocker.item}, which does not exist` }
+        return malformed(`blocker ${id} names original item ${blocker.item}, which does not exist`)
       }
       if (byIndex.get(item).verdict !== 'blocked') {
-        return { problem: `blocker ${id} names original item ${item}, which the same answer upheld — the verdicts and the batch contradict each other` }
+        return malformed(`blocker ${id} names original item ${item}, which the same answer upheld — the verdicts and the batch contradict each other`)
       }
       blockedItems.add(item)
     }
@@ -292,19 +302,19 @@ export function validateAcceptance(result, itemCount) {
   // worklist for it and the merge gate would have no evidence against it.
   for (const [index, verdict] of byIndex) {
     if (verdict.verdict === 'blocked' && !blockedItems.has(index)) {
-      return { problem: `original item ${index} is blocked but no blocker in the batch names it` }
+      return malformed(`original item ${index} is blocked but no blocker in the batch names it`)
     }
   }
 
   if (outcome === 'clear') {
-    if (blockers.length) return { problem: 'the acceptance check chose clear while returning blockers' }
+    if (blockers.length) return malformed('the acceptance check chose clear while returning blockers')
     if ([...byIndex.values()].some(verdict => verdict.verdict !== 'upheld')) {
-      return { problem: 'the acceptance check chose clear while leaving an original item blocked' }
+      return malformed('the acceptance check chose clear while leaving an original item blocked')
     }
   } else if (!blockers.length) {
-    return { problem: `the acceptance check chose ${outcome} without naming a single blocker` }
+    return malformed(`the acceptance check chose ${outcome} without naming a single blocker`)
   } else if (outcome === 'correction-required' && blockers.some(blocker => blocker.kind === 'human-judgment')) {
-    return { problem: 'the acceptance check asked for a correction over a blocker it classed as a human judgment call' }
+    return malformed('the acceptance check asked for a correction over a blocker it classed as a human judgment call')
   }
 
   return {
@@ -312,6 +322,47 @@ export function validateAcceptance(result, itemCount) {
     verdicts: [...byIndex.keys()].sort((a, b) => a - b).map(index => byIndex.get(index)),
     blockers: blockers.map(blocker => ({ ...blocker, id: blocker.id.trim() })),
   }
+}
+
+// A checker that explicitly defers to a person, or attaches confidence below
+// the evidence bar, has made a substantive refusal even if another part of its
+// answer is mechanically malformed. Inspect this before considering an answer
+// repair so malformed bookkeeping cannot buy a fresh opinion in search of
+// green. Exceptions deliberately propagate to runtime's fail-closed boundary.
+export function acceptanceSubstantiveRefusal(result) {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return null
+  if (result.outcome === 'human') return 'the acceptance check explicitly chose a human outcome'
+
+  if (Array.isArray(result.verdicts)) {
+    for (const verdict of result.verdicts) {
+      if (!verdict || typeof verdict !== 'object' || Array.isArray(verdict)) continue
+      if (percent(verdict.confidence) && verdict.confidence < ACCEPTANCE_CONFIDENCE) {
+        const index = Number.isInteger(verdict.index) ? verdict.index : '(unknown)'
+        return `acceptance verdict ${index} is below the ${ACCEPTANCE_CONFIDENCE} confidence bar (${verdict.confidence}) — low-confidence evidence authorizes nothing`
+      }
+    }
+  }
+
+  if (Array.isArray(result.blockers)) {
+    for (const blocker of result.blockers) {
+      if (!blocker || typeof blocker !== 'object' || Array.isArray(blocker)) continue
+      const id = nonblank(blocker.id) ? blocker.id.trim() : '(unknown)'
+      if (blocker.kind === 'human-judgment') return `blocker ${id} explicitly requires human judgment`
+      if (percent(blocker.confidence) && blocker.confidence < ACCEPTANCE_CONFIDENCE) {
+        return `blocker ${id} is below the ${ACCEPTANCE_CONFIDENCE} confidence bar (${blocker.confidence}) — low-confidence evidence authorizes nothing`
+      }
+    }
+  }
+  return null
+}
+
+// Runtime's opt-in answer-repair policy asks only for mechanical diagnostics.
+// A low-confidence answer is substantive uncertainty: it authorizes nothing,
+// but must not be retried in search of a more convenient green judgment.
+export function acceptanceOutputDiagnostics(result, itemCount) {
+  // Do not let a validator exception masquerade as repairable model output.
+  const checked = validateAcceptance(result, itemCount, { strictSchema: true })
+  return checked.outputFailure === 'mechanically-invalid' ? [checked.problem] : []
 }
 
 export function validateCorrection(result, blockers) {

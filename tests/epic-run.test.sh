@@ -646,7 +646,7 @@ exit 0
 STUB
 chmod +x "$TMP/bin/gh"
 
-# git wrapper: a transparent exec of the real git, with one knob. A local git
+# git wrapper: a transparent exec of the real git, with narrow scenario knobs. A local git
 # call is just as fatal to a terminal report as a stalled gh call once a landing
 # label is resting — reap's settle clock is running either way — so a scenario
 # can arm exactly one subcommand to hang, and only AFTER the landing swap has
@@ -664,6 +664,11 @@ fi
 if [[ -n "${GIT_SLOW_AFTER_LANDING:-}" && "${1:-}" == "${GIT_SLOW_AFTER_LANDING%%:*}" ]] &&
    grep -qx 'ready-to-merge' "${STUB_GH_STATE:-/nonexistent}/labels" 2>/dev/null; then
   sleep "${GIT_SLOW_AFTER_LANDING##*:}"
+fi
+if [[ "${GIT_FAIL_JUDGED_STATE:-}" == "1" && "${1:-} ${2:-}" == "config --null" &&
+   -f "${STUB_STATE:-/nonexistent}/fail-judged-state" ]]; then
+  printf '%s\n' 'simulated unreadable judged state' >&2
+  exit 1
 fi
 exec "$STUB_REAL_GIT" "$@"
 STUB
@@ -916,6 +921,14 @@ confirm_json() { # blocker-id [cleared] [confidence]
 }
 
 if [[ "$EPIC_TEST_GROUP" == contracts ]]; then
+STRICT_CHECK="$(ACCEPTANCE_MODULE="$ROOT/workflows/lib/repair-acceptance.mjs" node --input-type=module <<'NODE'
+const { acceptanceOutputDiagnostics } = await import(process.env.ACCEPTANCE_MODULE)
+const broken = { get outcome() { throw new Error('validator sentinel') } }
+try { acceptanceOutputDiagnostics(broken, 1); console.log('swallowed') }
+catch (error) { console.log(error.message) }
+NODE
+)"
+assert_eq "output repair does not swallow schema-validator exceptions" "validator sentinel" "$STRICT_CHECK"
 # ───────────────────────── provider quota hold: pure/shared contracts ─────────────────────────
 # Keep the clock injected through the public functions: none of these waits for
 # a wall-clock boundary, and the IANA case proves this is not a UTC-only parser.
@@ -1176,7 +1189,7 @@ run_pipeline() { # script fixtures-dir args...   (scenario knobs via GH_* env)
   # fixtures use a short ceiling so an intentionally stuck status child proves
   # the same ordering contract without turning one failure into minutes.
   local terminal_report_ms="${EPIC_TERMINAL_REPORT_MS:-2000}"
-  if [[ -n "${GIT_REJECT_FIXER_PUSH:-}" || -n "${GIT_SLOW_AFTER_LANDING:-}" ]]; then
+  if [[ -n "${GIT_REJECT_FIXER_PUSH:-}" || -n "${GIT_SLOW_AFTER_LANDING:-}" || -n "${GIT_FAIL_JUDGED_STATE:-}" ]]; then
     runtime_path="$TMP/git-bin:$runtime_path"
   fi
   PIPE_N=$((PIPE_N + 1))
@@ -1259,6 +1272,7 @@ run_pipeline() { # script fixtures-dir args...   (scenario knobs via GH_* env)
     STUB_REAL_GIT="$REAL_GIT" \
     GIT_REJECT_FIXER_PUSH="${GIT_REJECT_FIXER_PUSH:-}" \
     GIT_SLOW_AFTER_LANDING="${GIT_SLOW_AFTER_LANDING:-}" \
+    GIT_FAIL_JUDGED_STATE="${GIT_FAIL_JUDGED_STATE:-}" \
     EXPECT_HOLD_BEFORE_LABEL="${EXPECT_HOLD_BEFORE_LABEL:-}" \
     CODEX_QUOTA_STDERR_ONLY="${CODEX_QUOTA_STDERR_ONLY:-}" \
     STUB_NO_SESSION_ID="${STUB_NO_SESSION_ID:-}" \
@@ -4727,6 +4741,8 @@ assert_contains "the fix is in the pushed tree" "$(git -C "$ORIGIN" ls-tree -r -
 assert_eq "the issue is back on ready-to-merge, ladder kept" "ci-attempted,ready-to-merge," "$(gh_labels)"
 assert_contains "the audit comment names the cause" "$(gh_comments)" "Cause: createWidget was never exported"
 assert_contains "and records the exhaustive acceptance check" "$(gh_comments)" "returned 0 blocker(s) (confidence floor 90/100)"
+assert_eq "a healthy checker adds no answer-repair call" "1|false" \
+  "$(calls ci-check)|$(usage_log | jq -r 'select(.label=="ci-acceptance") | (.outputRepair // false)')"
 assert_contains "and says the merge worker re-runs the real checks" "$(gh_comments)" "re-runs the real checks before anything lands"
 FIXPROMPT="$(cat "$STATE_DIR/ci-fix.0.prompt")"
 assert_contains "the fixer is told which checks failed" "$FIXPROMPT" "Checks that failed: build"
@@ -4754,10 +4770,169 @@ fixture "$BAD_CI_CHECK" ci-check '{}'
 BEFORE="$(origin_ref epic/42-add-widget)"
 run_ci "$CI_RUN" "$BAD_CI_CHECK" --issue 42
 assert_rc "malformed CI checker output blocks" 3 "$RUN_RC"
-assert_contains "the malformed CI checker ends at the missing-result gate" "$RUN_OUT" "acceptance check produced no result"
-assert_eq "the malformed CI checker is respawned once and no more" 2 "$(calls ci-check)"
+assert_contains "the malformed CI checker exhausts its answer-repair budget" "$RUN_OUT" "single checker output-repair budget is exhausted"
+assert_eq "the malformed CI checker gets one replacement answer and no more" 2 "$(calls ci-check)"
 assert_eq "the unchecked CI repair is not pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
 assert_not_contains "the unchecked CI repair is never promoted" "$(gh_labels)" "ready-to-merge"
+assert_eq "invalid output twice is human-held without another whole fixer" "ci-attempted,failed," "$(gh_labels)"
+assert_eq "the answer retry is distinct from code retry in usage" "false|false,false|true" \
+  "$(usage_log | jq -r 'select(.label=="ci-acceptance") | [.retry,(.outputRepair // false)] | join("|")' | paste -sd ',' -)"
+
+scenario 'ci-run: a shape-invalid answer gets one complete corrected checker answer'
+seed_ci_pr
+SHAPE_REPAIR="$TMP/fixtures-ci-shape-repair"; cp -R "$CIBASE" "$SHAPE_REPAIR"
+fixture "$SHAPE_REPAIR" ci-check.0 '{}'
+accept_clear "$SHAPE_REPAIR" ci-check.1 1
+run_ci "$CI_RUN" "$SHAPE_REPAIR" --issue 42
+assert_rc "the corrected checker answer can ship" 0 "$RUN_RC"
+assert_eq "shape correction uses exactly two checker answers" 2 "$(calls ci-check)"
+assert_eq "answer correction reruns neither fixer nor verification" "1|2" "$(calls ci-fix)|$(grep -c '^run verify$' "$NPM_LOG")"
+FIRST_CHECK_PROMPT="$(cat "$STATE_DIR/ci-check.0.prompt")"
+REPAIRED_CHECK_PROMPT="$(cat "$STATE_DIR/ci-check.1.prompt")"
+assert_contains "the replacement keeps the entire original checker brief" "$REPAIRED_CHECK_PROMPT" "$FIRST_CHECK_PROMPT"
+assert_contains "the rejected shape is fenced as data" "$REPAIRED_CHECK_PROMPT" '<rejected-checker-answer-json>'
+assert_contains "the rejected answer itself is present" "$REPAIRED_CHECK_PROMPT" '{}'
+assert_contains "the exact schema diagnostic reaches the replacement" "$REPAIRED_CHECK_PROMPT" 'missing required field "outcome"'
+assert_contains "the replacement is explicitly complete" "$REPAIRED_CHECK_PROMPT" 'COMPLETE REPLACEMENT answer'
+assert_eq "the replacement stays on the selected route" "claude/opus/high" \
+  "$(usage_log | jq -r 'select(.label=="ci-acceptance" and .outputRepair==true) | "\(.vendor)/\(.model)/\(.effort)"')"
+assert_eq "the fresh replacement inherits no builder conversation" "true|false" \
+  "$(usage_log | jq -r 'select(.label=="ci-acceptance" and .outputRepair==true) | [(.conversation == null),.resumed] | join("|")')"
+
+for refusal_case in human-schema low-schema low-count judgment; do
+  scenario "ci-run: malformed $refusal_case evidence never buys another opinion"
+  seed_ci_pr
+  MIXED_REFUSAL="$TMP/fixtures-ci-mixed-refusal-$refusal_case"; cp -R "$CIBASE" "$MIXED_REFUSAL"
+  case "$refusal_case" in
+    human-schema) answer='{"outcome":"human"}' ;;
+    low-schema) answer='{"outcome":"clear","verdicts":[{"index":1,"confidence":74}],"blockers":[]}' ;;
+    low-count) answer='{"outcome":"clear","verdicts":[{"index":1,"verdict":"upheld","confidence":90,"reasoning":"a"},{"index":2,"verdict":"upheld","confidence":74,"reasoning":"uncertain"}],"blockers":[]}' ;;
+    judgment) answer='{"outcome":"clear","verdicts":[],"blockers":[{"kind":"human-judgment"}]}' ;;
+  esac
+  fixture "$MIXED_REFUSAL" ci-check.0 "$answer"
+  accept_clear "$MIXED_REFUSAL" ci-check.1 1
+  BEFORE="$(origin_ref epic/42-add-widget)"
+  run_ci "$CI_RUN" "$MIXED_REFUSAL" --issue 42
+  assert_rc "malformed $refusal_case evidence blocks" 3 "$RUN_RC"
+  assert_eq "malformed $refusal_case evidence gets no fresh opinion" 1 "$(calls ci-check)"
+  assert_eq "malformed $refusal_case evidence removes the fixer queue" "ci-attempted,failed," "$(gh_labels)"
+  assert_eq "malformed $refusal_case evidence pushes nothing" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+done
+
+scenario 'ci-run: a non-JSON Claude checker answer gets the same single repair budget'
+seed_ci_pr
+NONJSON_REPAIR="$TMP/fixtures-ci-nonjson-repair"; cp -R "$CIBASE" "$NONJSON_REPAIR"
+fixture_text "$NONJSON_REPAIR" ci-check.0 'REJECTED NONJSON CHECKER SENTINEL'
+accept_clear "$NONJSON_REPAIR" ci-check.1 1
+run_ci "$CI_RUN" "$NONJSON_REPAIR" --issue 42
+assert_rc "a replacement for non-JSON model text can ship" 0 "$RUN_RC"
+assert_eq "the typed adapter failure gets one replacement" 2 "$(calls ci-check)"
+NONJSON_PROMPT="$(cat "$STATE_DIR/ci-check.1.prompt")"
+assert_contains "the adapter retains the rejected model text" "$NONJSON_PROMPT" 'REJECTED NONJSON CHECKER SENTINEL'
+assert_contains "and supplies its structured-output diagnostic" "$NONJSON_PROMPT" 'no structured output in a schema-carrying result'
+assert_eq "the malformed adapter answer is structurally recorded" "invalid-output" \
+  "$(usage_log | jq -r 'select(.label=="ci-acceptance" and .attempt==1) | .failureKind')"
+
+scenario 'ci-run: a schema-valid contradiction gets one corrected checker answer'
+seed_ci_pr
+CONTRADICT_REPAIR="$TMP/fixtures-ci-contradict-repair"; cp -R "$CIBASE" "$CONTRADICT_REPAIR"
+fixture "$CONTRADICT_REPAIR" ci-check.0 "{\"outcome\":\"clear\",\"verdicts\":$(verdicts_json 1 0),\"blockers\":[{\"id\":\"b1\",\"kind\":\"original-defect\",\"item\":1,\"location\":\"frontend/src/widget.ts:1\",\"evidence\":\"still broken\",\"required\":\"export works\",\"confidence\":90}]}"
+accept_clear "$CONTRADICT_REPAIR" ci-check.1 1
+run_ci "$CI_RUN" "$CONTRADICT_REPAIR" --issue 42
+assert_rc "the corrected contradictory answer can ship" 0 "$RUN_RC"
+assert_eq "semantic consistency shares the same one-answer budget" 2 "$(calls ci-check)"
+CONTRADICT_PROMPT="$(cat "$STATE_DIR/ci-check.1.prompt")"
+assert_contains "the rejected blocker evidence reaches the fresh checker" "$CONTRADICT_PROMPT" 'still broken'
+assert_contains "the exact contradiction diagnostic reaches it too" "$CONTRADICT_PROMPT" 'which the same answer upheld — the verdicts and the batch contradict each other'
+
+scenario 'ci-run: schema failure followed by contradiction exhausts the same answer budget'
+seed_ci_pr
+STACKED_INVALID="$TMP/fixtures-ci-stacked-invalid"; cp -R "$CIBASE" "$STACKED_INVALID"
+fixture "$STACKED_INVALID" ci-check.0 '{}'
+fixture "$STACKED_INVALID" ci-check.1 "{\"outcome\":\"clear\",\"verdicts\":$(verdicts_json 1 0),\"blockers\":[{\"id\":\"b1\",\"kind\":\"original-defect\",\"item\":1,\"location\":\"frontend/src/widget.ts:1\",\"evidence\":\"still broken\",\"required\":\"export works\",\"confidence\":90}]}"
+BEFORE="$(origin_ref epic/42-add-widget)"
+run_ci "$CI_RUN" "$STACKED_INVALID" --issue 42
+assert_rc "two different invalid-output classes block" 3 "$RUN_RC"
+assert_eq "schema and semantic failures cannot stack into a third answer" 2 "$(calls ci-check)"
+assert_eq "exhausted invalid evidence removes the whole-fixer queue" "ci-attempted,failed," "$(gh_labels)"
+assert_eq "the never-validly-judged bytes are not pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+
+scenario 'ci-run: a valid negative answer after output repair remains negative'
+seed_ci_pr
+NEGATIVE_REPAIR="$TMP/fixtures-ci-negative-repair"; cp -R "$CIBASE" "$NEGATIVE_REPAIR"
+fixture "$NEGATIVE_REPAIR" ci-check.0 '{}'
+accept_human "$NEGATIVE_REPAIR" ci-check.1 1 "The assertion is still absent."
+run_ci "$CI_RUN" "$NEGATIVE_REPAIR" --issue 42
+assert_rc "a corrected negative judgment remains human-held" 3 "$RUN_RC"
+assert_eq "the valid negative earns no approval-seeking third answer" 2 "$(calls ci-check)"
+assert_eq "a valid corrected negative starts no code correction" "0|0" "$(calls ci-correction)|$(calls ci-confirm)"
+assert_eq "the negative result removes the whole-fixer queue" "ci-attempted,failed," "$(gh_labels)"
+
+for checker_drift in tree index git; do
+  scenario "ci-run: $checker_drift drift blocks the checker answer retry"
+  seed_ci_pr
+  DRIFT_CHECK="$TMP/fixtures-ci-check-drift-$checker_drift"; cp -R "$CIBASE" "$DRIFT_CHECK"
+  fixture "$DRIFT_CHECK" ci-check.0 '{}'
+  case "$checker_drift" in
+    tree) fixture_sh "$DRIFT_CHECK" ci-check.0 'printf "checker drift\n" >> frontend/src/widget.ts' ;;
+    index) fixture_sh "$DRIFT_CHECK" ci-check.0 'git add -A' ;;
+    git) fixture_sh "$DRIFT_CHECK" ci-check.0 'git config toliki.checker-drift true' ;;
+  esac
+  BEFORE="$(origin_ref epic/42-add-widget)"
+  run_ci "$CI_RUN" "$DRIFT_CHECK" --issue 42
+  assert_rc "$checker_drift drift blocks" 3 "$RUN_RC"
+  assert_eq "$checker_drift drift prevents the replacement spawn" 1 "$(calls ci-check)"
+  assert_matches "$checker_drift drift is named by the protected-state guard" "$RUN_OUT" 'changed the tree it was judging|changed the Git index|changed Git configuration'
+  assert_eq "$checker_drift drift cannot push" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+done
+
+scenario 'ci-run: checker drift also blocks an otherwise valid acceptance answer'
+seed_ci_pr
+VALID_DRIFT="$TMP/fixtures-ci-valid-check-drift"; cp -R "$CIBASE" "$VALID_DRIFT"
+fixture_sh "$VALID_DRIFT" ci-check.0 'printf "valid checker drift\n" >> frontend/src/widget.ts'
+BEFORE="$(origin_ref epic/42-add-widget)"
+run_ci "$CI_RUN" "$VALID_DRIFT" --issue 42
+assert_rc "a valid answer over changed bytes blocks" 3 "$RUN_RC"
+assert_eq "the valid checker is not needlessly called again" 1 "$(calls ci-check)"
+assert_contains "the post-answer guard names the changed tree" "$RUN_OUT" 'the acceptance check changed the tree it was judging'
+assert_eq "an answer over unverified drift cannot push" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+
+scenario 'ci-run: an unreadable protected snapshot prevents checker output repair'
+seed_ci_pr
+UNREADABLE_CHECK="$TMP/fixtures-ci-unreadable-check-state"; cp -R "$CIBASE" "$UNREADABLE_CHECK"
+fixture "$UNREADABLE_CHECK" ci-check.0 '{}'
+fixture_sh "$UNREADABLE_CHECK" ci-check.0 'touch "$STUB_STATE/fail-judged-state"'
+BEFORE="$(origin_ref epic/42-add-widget)"
+GIT_FAIL_JUDGED_STATE=1 run_ci "$CI_RUN" "$UNREADABLE_CHECK" --issue 42
+assert_rc "an unreadable between-answer snapshot blocks" 3 "$RUN_RC"
+assert_eq "unreadable state prevents the replacement spawn" 1 "$(calls ci-check)"
+assert_contains "the guard reports that protected state could not be read" "$RUN_OUT" 'worktree could not be read around the acceptance check before its checker output repair'
+assert_eq "unreadable checker state cannot push" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+
+scenario 'ci-run: a process failure during checker output repair remains operational'
+seed_ci_pr
+OUTPUT_PROCESS_FAIL="$TMP/fixtures-ci-output-process-fail"; cp -R "$CIBASE" "$OUTPUT_PROCESS_FAIL"
+fixture "$OUTPUT_PROCESS_FAIL" ci-check.0 '{}'
+printf '7\n' > "$OUTPUT_PROCESS_FAIL/ci-check.1.rc"
+BEFORE="$(origin_ref epic/42-add-widget)"
+run_ci "$CI_RUN" "$OUTPUT_PROCESS_FAIL" --issue 42
+assert_rc "a dead output-repair checker blocks" 3 "$RUN_RC"
+assert_eq "the dead replacement is never respawned into a third checker" 2 "$(calls ci-check)"
+assert_eq "operational failure retains the historical fixer queue" "ci-attempted,failed,needs-ci-fix," "$(gh_labels)"
+assert_eq "operational output-repair failure pushes nothing" "$BEFORE" "$(origin_ref epic/42-add-widget)"
+
+scenario 'ci-run: quota during checker output repair keeps the existing hold and refund path'
+seed_ci_pr
+OUTPUT_QUOTA="$TMP/fixtures-ci-output-quota"; cp -R "$CIBASE" "$OUTPUT_QUOTA"
+fixture "$OUTPUT_QUOTA" ci-check.0 '{}'
+fixture_error "$OUTPUT_QUOTA" ci-check.1 '{"type":"result","subtype":"success","is_error":true,"terminal_reason":"api_error","api_error_status":429,"result":"You have hit your usage limit; resets 7:50pm (UTC)","duration_ms":386,"num_turns":1,"total_cost_usd":0,"usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
+BEFORE="$(origin_ref epic/42-add-widget)"
+run_ci "$CI_RUN" "$OUTPUT_QUOTA" --issue 42
+assert_rc "quota on the replacement becomes a held outcome" 0 "$RUN_RC"
+assert_eq "quota never creates a third checker call" 2 "$(calls ci-check)"
+assert_contains "the replacement quota retains its provider diagnosis" "$RUN_OUT" 'resets 7:50pm (UTC)'
+assert_eq "the fixer's rung is refunded and its queue restored" "failed,needs-ci-fix," "$(gh_labels)"
+assert_eq "quota during output repair pushes nothing" "$BEFORE" "$(origin_ref epic/42-add-widget)"
 
 scenario 'ci-run: a rejected lease push leaves the captured branch and queue intact'
 seed_ci_pr
@@ -4939,6 +5114,7 @@ run_ci "$CI_RUN" "$REF" --issue 42
 assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
 assert_contains "the human-held batch reaches the blocker" "$RUN_OUT" 'the acceptance check held 1 blocker(s) for a human'
 assert_contains "and quotes its evidence" "$RUN_OUT" 'assertion was deleted'
+assert_eq "a valid human judgment is not retried toward approval" 1 "$(calls ci-check)"
 assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
 assert_not_contains "the issue never reaches the merge queue" "$(gh_labels)" "ready-to-merge"
 assert_eq "a semantic human hold removes the CI queue without a spent retry rung" "ci-attempted,failed," "$(gh_labels)"
@@ -5171,10 +5347,11 @@ fixture "$BAD_DEFECT_CHECK" defect-check '{}'
 BEFORE="$(origin_ref epic/42-add-widget)"
 run_defect "$DEFECT_RUN" "$BAD_DEFECT_CHECK" --issue 42
 assert_rc "malformed defect checker output blocks" 3 "$RUN_RC"
-assert_contains "the malformed defect checker ends at the missing-result gate" "$RUN_OUT" "acceptance check produced no result"
-assert_eq "the malformed defect checker is respawned once and no more" 2 "$(calls defect-check)"
+assert_contains "the malformed defect checker exhausts its answer-repair budget" "$RUN_OUT" "single checker output-repair budget is exhausted"
+assert_eq "the malformed defect checker gets one replacement answer and no more" 2 "$(calls defect-check)"
 assert_eq "the unchecked defect repair is not pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
 assert_not_contains "the unchecked defect repair is never promoted" "$(gh_labels)" "ready-to-merge"
+assert_eq "the invalid-answer path removes the defect fixer queue" "defect-attempted,ready-to-review," "$(gh_labels)"
 
 scenario 'defect-run: a rejected lease push leaves the captured branch and queue intact'
 seed_defect_pr
@@ -5456,6 +5633,7 @@ BEFORE="$(origin_ref epic/42-add-widget)"
 run_defect "$DEFECT_RUN" "$LOWDEFECT" --issue 42
 assert_rc "exits 3 (blocked)" 3 "$RUN_RC"
 assert_contains "the below-threshold confidence is reported" "$RUN_OUT" "below the 75 confidence bar (74)"
+assert_eq "low-confidence evidence is not retried toward approval" 1 "$(calls defect-check)"
 assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
 assert_not_contains "an uncertain fix never reaches the merge queue" "$(gh_labels)" "ready-to-merge"
 
@@ -6176,7 +6354,7 @@ assert_eq "nothing was pushed" "$BEFORE" "$(origin_ref epic/42-add-widget)"
 assert_eq "the defect queue is removed rather than left for another fixer" "defect-attempted,ready-to-review," "$(gh_labels)"
 assert_contains "the human-held comment says the queue is gone" "$(gh_comments)" "needs-defect-fix has been removed"
 
-for acceptance_case in missing-verdict duplicate-verdict extra-verdict unknown-kind duplicate-id blocked-without-blocker clear-with-blockers correction-with-judgment; do
+for acceptance_case in missing-verdict duplicate-verdict extra-verdict unknown-kind duplicate-id original-blocker-without-item blocked-without-blocker clear-with-blockers correction-with-judgment; do
   scenario "acceptance evidence: a $acceptance_case answer authorizes nothing"
   seed_ci_pr
   BADACCEPT="$TMP/fixtures-accept-$acceptance_case"; cp -R "$CIBASE" "$BADACCEPT"
@@ -6187,6 +6365,7 @@ for acceptance_case in missing-verdict duplicate-verdict extra-verdict unknown-k
     extra-verdict)     answer='{"outcome":"clear","verdicts":[{"index":1,"verdict":"upheld","confidence":90,"reasoning":"a"},{"index":2,"verdict":"upheld","confidence":90,"reasoning":"b"}],"blockers":[]}' ;;
     unknown-kind)      answer="{\"outcome\":\"human\",\"verdicts\":$(verdicts_json 1 1),\"blockers\":[{\"id\":\"b1\",\"kind\":\"mystery\",\"item\":1,\"location\":\"l\",\"evidence\":\"e\",\"required\":\"r\",\"confidence\":90}]}" ;;
     duplicate-id)      answer="{\"outcome\":\"human\",\"verdicts\":$(verdicts_json 1 1),\"blockers\":[$ok_blocker,$ok_blocker]}" ;;
+    original-blocker-without-item) answer='{"outcome":"correction-required","verdicts":[{"index":1,"verdict":"upheld","confidence":90,"reasoning":"claimed clear"}],"blockers":[{"id":"b1","kind":"original-defect","location":"l","evidence":"e","required":"r","confidence":90}]}' ;;
     blocked-without-blocker) answer="{\"outcome\":\"human\",\"verdicts\":$(verdicts_json 1 1),\"blockers\":[{\"id\":\"b9\",\"kind\":\"human-judgment\",\"location\":\"l\",\"evidence\":\"e\",\"required\":\"r\",\"confidence\":90}]}" ;;
     clear-with-blockers) answer="{\"outcome\":\"clear\",\"verdicts\":$(verdicts_json 1 0),\"blockers\":[$ok_blocker]}" ;;
     correction-with-judgment) answer="{\"outcome\":\"correction-required\",\"verdicts\":$(verdicts_json 1 1),\"blockers\":[{\"id\":\"b1\",\"kind\":\"human-judgment\",\"item\":1,\"location\":\"l\",\"evidence\":\"e\",\"required\":\"r\",\"confidence\":90}]}" ;;
@@ -6195,7 +6374,13 @@ for acceptance_case in missing-verdict duplicate-verdict extra-verdict unknown-k
   BEFORE="$(origin_ref epic/42-add-widget)"
   run_ci "$CI_RUN" "$BADACCEPT" --issue 42
   assert_rc "$acceptance_case acceptance evidence blocks" 3 "$RUN_RC"
-  assert_matches "$acceptance_case acceptance evidence decides nothing" "$RUN_OUT" "acceptance evidence that decides nothing|acceptance check produced no result"
+  case "$acceptance_case" in
+    unknown-kind|duplicate-id|blocked-without-blocker|correction-with-judgment)
+      assert_eq "$acceptance_case retains explicit human judgment without retry" 1 "$(calls ci-check)" ;;
+    *)
+      assert_matches "$acceptance_case acceptance evidence decides nothing" "$RUN_OUT" "acceptance evidence that decides nothing|single checker output-repair budget is exhausted"
+      assert_eq "$acceptance_case uses one shared output-repair budget" 2 "$(calls ci-check)" ;;
+  esac
   assert_eq "$acceptance_case acceptance evidence starts no correction" "0 0" "$(calls ci-correction) $(calls ci-confirm)"
   assert_eq "$acceptance_case acceptance evidence pushes nothing" "$BEFORE" "$(origin_ref epic/42-add-widget)"
   assert_not_contains "$acceptance_case acceptance evidence never exposes merge" "$(gh_labels)" "ready-to-merge"

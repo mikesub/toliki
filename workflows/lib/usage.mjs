@@ -18,7 +18,7 @@
 //     classification of where it came to rest (see OUTCOMES).
 //
 //   { type:'spawn', ts, runId, script, session, issue, repo, engine, step,
-//     label, attempt, retry, vendor, model, effort, ok, timedOut, ms,
+//     label, attempt, retry, outputRepair?, vendor, model, effort, ok, timedOut, ms,
 //     tokens: { input, output, cacheRead, cacheCreate, total },
 //     costUsd, costSource, turns, conversation, resumed,
 //     failureKind, failureReason }
@@ -26,6 +26,8 @@
 //     builder conversation the spawn belonged to (null for every judging
 //     phase, which is ephemeral by contract) and `resumed` says whether it
 //     continued that conversation or paid to rediscover the work.
+//     `outputRepair` distinguishes a fresh replacement checker answer from a
+//     code correction, call-site retry or operational respawn.
 //
 // Rows written before lifecycle records existed carry no `type` and are read
 // as spawns; their wall time, repository and result are simply unknown.

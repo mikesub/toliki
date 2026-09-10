@@ -98,6 +98,14 @@ The exact acceptance, correction and confirmation contract lives in
 [repair-acceptance](workflows/lib/repair-acceptance.mjs), and shared sequencing
 in [fixer-lifecycle](workflows/lib/fixer-lifecycle.mjs).
 
+A mechanically malformed checker answer is neither a code defect nor a valid
+negative judgment. Standalone fixers may ask one fresh independent checker for
+a complete replacement using the same captured evidence and exact validator
+diagnostics. Shape and internal-consistency failures spend the same budget;
+uncertainty and substantive refusal do not earn another opinion. The accepted
+cost is a human hold when the replacement is still invalid, rather than paying
+for another whole code repair against evidence no checker validly judged.
+
 ### Preserve useful work through interruption and partial repair
 
 Replaying historical checkpoints can conflict even when their cumulative

@@ -193,6 +193,15 @@ semantic human hold; [fixer-finalize.mjs](workflows/lib/fixer-finalize.mjs)
 implements terminal labels and quota refunds. Keep shared execution/finalization
 contracts there, not copied into each cause adapter.
 
+Their standalone acceptance call may replace one mechanically invalid checker
+answer once. JSON shape and exact coverage/identity/consistency diagnostics
+share that single answer-repair budget against the same captured diff,
+verification and protected Git snapshot; a second invalid answer is human-held,
+while a valid negative or uncertain judgment is never retried toward approval.
+[runtime.mjs](workflows/lib/runtime.mjs) owns the opt-in spawn budget and
+[repair-acceptance.mjs](workflows/lib/repair-acceptance.mjs) owns the structural
+classification. Task and other model calls retain their existing budgets.
+
 | Workflow | Cause-specific owner |
 | --- | --- |
 | Judgment-conflict fixer | [fix-run.mjs](workflows/fix-run.mjs): captured conflict sides, mechanical resolution, scripted rebase settlement and partial-conflict evidence |
@@ -245,6 +254,7 @@ are navigation, not extra gates.
 | Lightweight task economy and result validation | [task-run.mjs](workflows/task-run.mjs) |
 | Shared fixer execution and terminal finalization | [fixer-lifecycle.mjs](workflows/lib/fixer-lifecycle.mjs), [fixer-finalize.mjs](workflows/lib/fixer-finalize.mjs) |
 | Repair verdicts, correction and confirmation | [repair-acceptance.mjs](workflows/lib/repair-acceptance.mjs) |
+| Read-only judging state snapshots | [judged-state.mjs](workflows/lib/judged-state.mjs) |
 | Authenticated defect evidence | [defect-evidence.mjs](workflows/lib/defect-evidence.mjs) |
 | Run-local blocker identity | [blocker-identity.mjs](workflows/lib/blocker-identity.mjs) |
 | Evidence capture/rendering | [evidence.mjs](workflows/lib/evidence.mjs); diff/CI transport in [repo.mjs](workflows/lib/repo.mjs) and [github.mjs](workflows/lib/github.mjs) |

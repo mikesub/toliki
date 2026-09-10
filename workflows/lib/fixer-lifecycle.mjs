@@ -47,13 +47,17 @@ import { captureDiff, runVerify, worktreeTree } from './repo.mjs'
 import { finalizeFixerIssue, finalizeFixerQuotaHold } from './fixer-finalize.mjs'
 import {
   ACCEPTANCE_CONFIDENCE,
+  acceptanceOutputDiagnostics,
+  acceptanceSubstantiveRefusal,
   validateAcceptance,
   validateConfirmation,
   validateCorrection,
 } from './repair-acceptance.mjs'
+import { judgedState, readOnlyViolation } from './judged-state.mjs'
 import { recordQuotaHold } from '../quota-hold.mjs'
 import { verificationRetryPrompt } from '../prompts/shared/verification-retry.mjs'
 import { verificationEvidencePrompt } from '../prompts/shared/verification-evidence.mjs'
+import { outputRepairPrompt } from '../prompts/shared/output-repair.mjs'
 
 const message = error => error?.message || String(error)
 
@@ -540,9 +544,35 @@ export async function runFixerLifecycle(spec) {
           return fail('check', 'the complete repair delta could not be captured — refusing to check a repair on incomplete evidence.')
         }
 
-        const raw = await agent(verificationEvidencePrompt(
-          spec.check.prompt(ctx, prep, dispositions, { cumulative }), verified), spec.check.agent)
-        if (!raw) return fail('check', spec.check.noResult)
+        // Take the protected-state baseline only after all orchestrator evidence
+        // capture. The initial answer and its optional replacement must judge
+        // exactly these bytes; no writable step, verify, staging operation or
+        // recapture is allowed between them.
+        const checkState = await judgedState()
+        if (!checkState) {
+          return fail('check', 'the worktree could not be captured before the acceptance check — refusing to judge or ship bytes without a protected-state baseline.')
+        }
+        const checkPrompt = verificationEvidencePrompt(
+          spec.check.prompt(ctx, prep, dispositions, { cumulative }), verified)
+        const raw = await agent(checkPrompt, {
+          ...spec.check.agent,
+          outputRepair: {
+            validate: result => acceptanceOutputDiagnostics(result, dispositions.length),
+            refusal: acceptanceSubstantiveRefusal,
+            prompt: (rejected, diagnostics) => outputRepairPrompt(checkPrompt, rejected, diagnostics),
+            guard: () => readOnlyViolation(checkState, 'the acceptance check before its checker output repair'),
+          },
+        })
+        if (!raw) {
+          const failure = takeAgentFailure()
+          if (failure?.kind === 'invalid-output') {
+            return humanHold('check', `${failure.reason} — the single checker output-repair budget is exhausted, so no correction or whole fixer attempt will run.`)
+          }
+          if (failure?.kind === 'checker-refused') return humanHold('check', failure.reason)
+          return fail('check', spec.check.noResult, failure)
+        }
+        const checkDrift = await readOnlyViolation(checkState, 'the acceptance check')
+        if (checkDrift) return fail('check', checkDrift)
         const accepted = validateAcceptance(raw, dispositions.length)
         // Malformed, incomplete, duplicate, extra or low-confidence evidence
         // authorizes nothing — neither a correction nor an unattended merge —

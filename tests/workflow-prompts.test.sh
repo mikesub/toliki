@@ -231,6 +231,10 @@ const CASES = {
   'shared-verification-evidence': async () =>
     (await load('shared/verification-evidence.mjs')).verificationEvidencePrompt('Original judging brief',
       { evidence: 'frontend — npm run verify: exit 0; duration 3600123 ms | 12 tests passed' }),
+  'shared-output-repair': async () =>
+    (await load('shared/output-repair.mjs')).outputRepairPrompt('Original judging brief\n<change-diff>\nEXACT DIFF\n</change-diff>',
+      { outcome: 'clear', verdicts: [], blockers: [{ evidence: 'REJECTED SENTINEL' }] },
+      ['the acceptance check returned 0 verdict(s) for 2 original item(s)', 'clear contradicts its blocker batch']),
   'shared-verification-uncaptured': async () =>
     (await load('shared/verification-evidence.mjs')).verificationEvidencePrompt('Original judging brief', null),
 }
@@ -420,6 +424,17 @@ assert_contains "the command, exit, wall duration and summary survive verbatim" 
 assert_contains "green is not presented as proof of requirement coverage" "$SHARED_EVIDENCE" 'A passing command is not proof of requirement coverage'
 assert_contains "missing evidence is explicit rather than a claimed pass" "$(render shared-verification-uncaptured)" '(verification evidence was not captured)'
 
+section 'shared: checker output repair preserves evidence and fences diagnostics'
+OUTPUT_REPAIR="$(render shared-output-repair)"
+assert_contains "an output repair keeps the complete original brief" "$OUTPUT_REPAIR" 'Original judging brief'
+assert_contains "and reuses the exact captured diff" "$OUTPUT_REPAIR" 'EXACT DIFF'
+assert_contains "the rejected answer is fenced as JSON data" "$OUTPUT_REPAIR" '<rejected-checker-answer-json>'
+assert_contains "and includes its exact rejected content" "$OUTPUT_REPAIR" 'REJECTED SENTINEL'
+assert_contains "validator diagnostics are fenced separately" "$OUTPUT_REPAIR" '<validator-diagnostics>'
+assert_contains "and every diagnostic reaches the replacement checker" "$OUTPUT_REPAIR" 'the acceptance check returned 0 verdict(s) for 2 original item(s)'
+assert_contains "the checker must return a complete replacement" "$OUTPUT_REPAIR" 'COMPLETE REPLACEMENT answer'
+assert_contains "the repair cannot turn uncertainty into approval" "$OUTPUT_REPAIR" 'do not change a substantive judgment just to seek approval'
+
 # ───────────────────────── the split itself ─────────────────────────
 section 'prompt modules build strings and nothing else'
 MODULES="$(find "$ROOT/workflows/prompts" -name '*.mjs' | sort)"
@@ -449,6 +464,8 @@ for pipeline in epic:epic-run conflict:fix-run ci:ci-run defect:defect-run; do
 done
 assert_contains "the shared fixer retry is imported, not inlined" "$(cat "$ROOT/workflows/lib/fixer-lifecycle.mjs")" \
   "from '../prompts/shared/verification-retry.mjs'"
+assert_contains "the checker output repair is imported, not inlined" "$(cat "$ROOT/workflows/lib/fixer-lifecycle.mjs")" \
+  "from '../prompts/shared/output-repair.mjs'"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

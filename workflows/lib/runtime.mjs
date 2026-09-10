@@ -306,13 +306,22 @@ function dropConversation(convo, entry, label, why) {
 //              transient respawn inside this call
 //   respawn    false makes this call a strict one-process contract: transient
 //              failures and invalid structured output return null immediately
+//   outputRepair  optional policy for a judging call whose schema and domain
+//              diagnostics share one complete-answer repair budget. `validate`
+//              returns mechanical diagnostics, `prompt` builds the replacement
+//              brief, `refusal` vetoes repair of malformed substantive negatives,
+//              and `guard` proves protected state is unchanged before
+//              the fresh answer. Ordinary calls retain the schema retry below.
 //   conversation  a handle from conversation(): this call continues that
 //              builder's own session when the run already opened one on this
 //              step's engine row, and opens it when it did not. Judgment steps
 //              pass none and stay ephemeral. Every prompt remains a complete
 //              brief, so a dropped conversation costs context, never correctness
 export async function agent(prompt, opts = {}) {
-  const { label = 'agent', step, schema, timeoutMs = DEFAULT_TIMEOUT_MS, retry = false, respawn = true, conversation: convo = null } = opts
+  const {
+    label = 'agent', step, schema, timeoutMs = DEFAULT_TIMEOUT_MS, retry = false,
+    respawn = true, conversation: convo = null, outputRepair = null,
+  } = opts
   lastAgentFailure = null
   const agentType = STEPS[step]
   if (!ENGINE || !agentType) {
@@ -359,7 +368,7 @@ export async function agent(prompt, opts = {}) {
     // quota, a later ordinary failure must not hide the admission signal.
     if (lastAgentFailure?.kind !== 'quota-exhausted' || kind === 'quota-exhausted') lastAgentFailure = failure
   }
-  const attempt = async (why, { fresh = false } = {}) => {
+  const attempt = async (why, { fresh = false, inputPrompt = prompt, repairsOutput = false } = {}) => {
     await acquire()
     const started = Date.now()
     attempts++
@@ -370,7 +379,7 @@ export async function agent(prompt, opts = {}) {
     let r
     try {
       r = await vendor.run({
-        prompt, agentType, model, effort, schema, cwd: process.cwd(), timeoutMs, label, step,
+        prompt: inputPrompt, agentType, model, effort, schema, cwd: process.cwd(), timeoutMs, label, step,
         conversation: useEntry ? { id: useEntry.id } : null,
       })
       r = { ...r, elapsedMs: Date.now() - started }
@@ -399,11 +408,12 @@ export async function agent(prompt, opts = {}) {
     recordUsage({
       type: 'spawn', ts: new Date(started).toISOString(), ...runIdentity(),
       step, label, attempt: attempts, retry: !!retry, vendor: vendorName, model, effort,
+      ...(repairsOutput ? { outputRepair: true } : {}),
       ok: !!r.ok, timedOut: !!r.timedOut, ms: r.elapsedMs,
       tokens: r.usage?.tokens || { input: null, output: null, cacheRead: null, cacheCreate: null, total: null },
       costUsd: r.usage?.costUsd ?? null, costSource: r.usage?.costSource ?? null, turns: r.usage?.turns ?? null,
       conversation: convo ? convo.name : null, resumed,
-      failureKind: r.ok ? null : failureKind(r), failureReason: r.ok ? null : r.reason || null,
+      failureKind: r.ok ? null : (r.outputFailure ? 'invalid-output' : failureKind(r)), failureReason: r.ok ? null : r.reason || null,
     })
     return r
   }
@@ -415,6 +425,7 @@ export async function agent(prompt, opts = {}) {
   // that dies twice is a dead step.
   const retryable = (r) => {
     if (shuttingDown || r.timedOut) return false
+    if (outputRepair && r.outputFailure) return false
     if (failureKind(r) === 'quota-exhausted') return false
     const verdict = isTransient(r)
     return verdict === true || (verdict === undefined && r.elapsedMs < FAST_DEATH_MS)
@@ -437,6 +448,110 @@ export async function agent(prompt, opts = {}) {
     log(`${label}: ${r.reason} — respawning once (transient)`)
     r = await attempt('transient retry')
   }
+
+  // Selected checker calls use one answer-repair budget across BOTH schema
+  // shape and deterministic domain consistency. This branch replaces (rather
+  // than stacks with) the ordinary schema retry below. A provider/process
+  // failure is still operational; only the adapter's typed structured-output
+  // failure or a successful payload rejected by validators can buy the fresh
+  // replacement answer.
+  if (outputRepair) {
+    const inspect = (result) => {
+      if (!result.ok) {
+        return result.outputFailure === 'invalid-structured-output'
+          ? { kind: 'invalid', rejected: result.rejectedOutput ?? null, diagnostics: [result.reason] }
+          : { kind: 'operational' }
+      }
+      try {
+        const invalid = diagnostics => {
+          const refusal = outputRepair.refusal?.(result.output)
+          return refusal
+            ? { kind: 'refused', reason: refusal }
+            : { kind: 'invalid', rejected: result.output, diagnostics }
+        }
+        const schemaDiagnostics = schema ? validate(schema, result.output) : []
+        if (schemaDiagnostics.length) {
+          return invalid(schemaDiagnostics)
+        }
+        const domainDiagnostics = outputRepair.validate ? outputRepair.validate(result.output) : []
+        if (!Array.isArray(domainDiagnostics) || domainDiagnostics.some(item => typeof item !== 'string' || !item.trim())) {
+          return { kind: 'validation-failure', reason: 'the output-repair domain validator returned malformed diagnostics' }
+        }
+        return domainDiagnostics.length
+          ? invalid(domainDiagnostics)
+          : { kind: 'valid' }
+      } catch (error) {
+        return { kind: 'validation-failure', reason: `the output-repair validator failed: ${error?.message || error}` }
+      }
+    }
+
+    let inspected = inspect(r)
+    if (inspected.kind === 'refused') {
+      rememberFailure(r, inspected.reason, 'checker-refused')
+      return null
+    }
+    if (inspected.kind === 'operational') {
+      rememberFailure(r)
+      log(`${label}: FAILED — ${r.reason}`)
+      return null
+    }
+    if (inspected.kind === 'validation-failure') {
+      rememberFailure(r, inspected.reason, 'output-validation-failure')
+      log(`${label}: FAILED — ${inspected.reason}`)
+      return null
+    }
+    if (inspected.kind === 'valid') return r.output
+
+    let guardProblem = null
+    try {
+      guardProblem = outputRepair.guard ? await outputRepair.guard() : null
+    } catch (error) {
+      guardProblem = `the output-repair state guard failed: ${error?.message || error}`
+    }
+    if (guardProblem) {
+      rememberFailure(r, guardProblem, 'read-only-violation')
+      log(`${label}: FAILED — ${guardProblem}; refusing the checker output repair`)
+      return null
+    }
+
+    let repairPrompt
+    try {
+      if (typeof outputRepair.prompt !== 'function') throw new Error('no replacement prompt builder was provided')
+      repairPrompt = outputRepair.prompt(inspected.rejected, inspected.diagnostics)
+      if (typeof repairPrompt !== 'string' || !repairPrompt.trim()) throw new Error('the replacement prompt builder returned no brief')
+    } catch (error) {
+      const reason = `the output-repair prompt could not be built: ${error?.message || error}`
+      rememberFailure(r, reason, 'output-validation-failure')
+      log(`${label}: FAILED — ${reason}`)
+      return null
+    }
+
+    log(`${label}: mechanically invalid structured answer (${inspected.diagnostics.slice(0, 3).join('; ')}) — requesting one complete replacement answer`)
+    r = await attempt('checker output repair', { fresh: true, inputPrompt: repairPrompt, repairsOutput: true })
+    inspected = inspect(r)
+    if (inspected.kind === 'refused') {
+      rememberFailure(r, inspected.reason, 'checker-refused')
+      return null
+    }
+    if (inspected.kind === 'operational') {
+      rememberFailure(r)
+      log(`${label}: FAILED on the checker output repair — ${r.reason}`)
+      return null
+    }
+    if (inspected.kind === 'validation-failure') {
+      rememberFailure(r, inspected.reason, 'output-validation-failure')
+      log(`${label}: FAILED on the checker output repair — ${inspected.reason}`)
+      return null
+    }
+    if (inspected.kind === 'invalid') {
+      const reason = `replacement structured answer remained mechanically invalid (${inspected.diagnostics.slice(0, 3).join('; ')})`
+      rememberFailure(r, reason, 'invalid-output')
+      log(`${label}: FAILED — ${reason}; the single checker output-repair budget is exhausted`)
+      return null
+    }
+    return r.output
+  }
+
   if (!r.ok) {
     rememberFailure(r)
     log(`${label}: FAILED — ${r.reason}`)
@@ -478,6 +593,8 @@ export async function agent(prompt, opts = {}) {
 function validateOrEmpty(schema, value) {
   // A broken validator must never fail a good step: fall open here, since the
   // engine's own schema enforcement is the primary gate and this is the belt.
+  // The opt-in checker output-repair path above is different: its validators
+  // decide whether another answer may run, so an exception there fails closed.
   try {
     return validate(schema, value)
   } catch {

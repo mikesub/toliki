@@ -9,7 +9,11 @@
 //   run({ prompt, agentType, model, effort, schema, cwd, timeoutMs, label, step,
 //         conversation })
 //     -> { ok, output, exitCode, timedOut, reason, stderrTail, usage,
-//          sessionId, sessionMissing }
+//          sessionId, sessionMissing, outputFailure?, rejectedOutput? }
+// `outputFailure` is set only when a schema-carrying process completed normally
+// but its model answer was not structured JSON. Runtime uses that typed signal
+// for selected checker-answer repair; missing files and provider failures never
+// masquerade as rejected answers.
 //
 // `conversation` is how ONE run keeps one builder conversation instead of
 // making every writable retry and repair rediscover the implementation:
@@ -111,6 +115,14 @@ function codexUsage(events, model) {
   // count Claude reports has no honest equivalent and is left unknown.
   const costUsd = codexCostUsd(model, tokens)
   return { tokens, costUsd, costSource: costUsd === null ? null : 'table', turns: null }
+}
+
+// A malformed structured answer may be sent back to one fresh checker by the
+// runtime's opt-in output-repair policy. Bound what crosses that prompt boundary
+// independently of the adapter's stderr diagnostic cap.
+const rejectedOutput = value => {
+  const text = typeof value === 'string' ? value : JSON.stringify(value ?? null)
+  return text.length > 12000 ? `${text.slice(0, 12000)}\n[rejected output truncated]` : text
 }
 
 // The conversation a Codex process ran under. `codex exec --json` opens its
@@ -583,7 +595,11 @@ const claudeVendor = {
     if (schema) {
       const structured = envelope.structured_output ?? jsonFromText(envelope.result)
       if (!structured || typeof structured !== 'object') {
-        return conversed({ ok: false, output: null, exitCode: 0, timedOut: false, stderrTail, reason: 'no structured output in a schema-carrying result', usage })
+        return conversed({
+          ok: false, output: null, exitCode: 0, timedOut: false, stderrTail,
+          reason: 'no structured output in a schema-carrying result', usage,
+          outputFailure: 'invalid-structured-output', rejectedOutput: rejectedOutput(envelope.result),
+        })
       }
       return conversed({ ok: true, output: structured, exitCode: 0, timedOut: false, stderrTail, reason: null, usage })
     }
@@ -716,7 +732,11 @@ const codexVendor = {
       if (schema) {
         const structured = jsonFromText(finalText)
         if (!structured) {
-          return conversed({ ok: false, output: null, exitCode: 0, timedOut: false, stderrTail, reason: 'final output was not the expected schema JSON', usage })
+          return conversed({
+            ok: false, output: null, exitCode: 0, timedOut: false, stderrTail,
+            reason: 'final output was not the expected schema JSON', usage,
+            outputFailure: 'invalid-structured-output', rejectedOutput: rejectedOutput(finalText),
+          })
         }
         return conversed({ ok: true, output: stripCodexOptionalNulls(structured, schema), exitCode: 0, timedOut: false, stderrTail, reason: null, usage })
       }
