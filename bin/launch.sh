@@ -34,6 +34,14 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/../etc/lib.sh"
 source "$HERE/manual-session.lib.sh"
 
+# Laptop commands arrive through non-login SSH, which does not read Ubuntu's
+# ~/.profile. Provisioning installs agent CLIs in ~/.local/bin and Bun in
+# ~/.bun/bin, so make those owning locations available both to preflight checks
+# here and to the pane command below. The explicit pane PATH avoids depending
+# on whichever environment happened to start the long-lived tmux server.
+PATH="$HOME/.local/bin:$HOME/.bun/bin:$PATH"
+export PATH
+
 usage() {
   cat <<EOF
 Usage: $0 [session-name] [-m <message>] [-r <repo>] [--engine claude|codex] [--restart]
@@ -720,12 +728,12 @@ if [[ -n "$MODE" ]]; then
     ci)   SCRIPT="$HERE/../workflows/ci-run.mjs" ;;
     defect) SCRIPT="$HERE/../workflows/defect-run.mjs" ;;
   esac
-  LINE="TZ=$(sq "$HOST_TIMEZONE") HOST_TIMEZONE=$(sq "$HOST_TIMEZONE") node $(sq "$SCRIPT") --issue $ISSUE --session $(sq "$SESSION") --engine $(sq "$ENGINE") --repo $(sq "$REPO")"
+  LINE="PATH=$(sq "$PATH") TZ=$(sq "$HOST_TIMEZONE") HOST_TIMEZONE=$(sq "$HOST_TIMEZONE") node $(sq "$SCRIPT") --issue $ISSUE --session $(sq "$SESSION") --engine $(sq "$ENGINE") --repo $(sq "$REPO")"
 else
   # The wrapper gives every descendant an unforgeable-per-workspace ownership
   # token. It remains an interactive invocation: prompts are positional, never
   # Claude -p or Codex exec. Authentication and consent UI stay visible.
-  LINE="TZ=$(sq "$HOST_TIMEZONE") HOST_TIMEZONE=$(sq "$HOST_TIMEZONE") TOLIKI_MANUAL_SESSION=$(sq "$SESSION") TOLIKI_MANUAL_OWNER=$(sq "$MANUAL_TOKEN")"
+  LINE="PATH=$(sq "$PATH") TZ=$(sq "$HOST_TIMEZONE") HOST_TIMEZONE=$(sq "$HOST_TIMEZONE") TOLIKI_MANUAL_SESSION=$(sq "$SESSION") TOLIKI_MANUAL_OWNER=$(sq "$MANUAL_TOKEN")"
   if [[ "$ENGINE" == claude ]]; then
     LINE+=" claude --remote-control $(sq "$SESSION") --dangerously-skip-permissions"
   else

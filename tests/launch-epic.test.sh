@@ -95,7 +95,7 @@ STUB
 # node/claude: never actually run — the pane line is typed via send-keys, which
 # the tmux stub only records. These exist so a bug that EXECUTES them directly
 # fails loudly instead of reaching the real binaries.
-for b in node claude codex; do
+for b in node claude; do
   cat > "$TMP/bin/$b" <<STUB
 #!/usr/bin/env bash
 printf 'UNEXPECTED direct execution of $b: %s\n' "\$*" >> "\$TMUX_LOG"
@@ -103,6 +103,13 @@ exit 97
 STUB
   chmod +x "$TMP/bin/$b"
 done
+mkdir -p "$TMP/home/.local/bin"
+cat > "$TMP/home/.local/bin/codex" <<'STUB'
+#!/usr/bin/env bash
+printf 'UNEXPECTED direct execution of codex: %s\n' "$*" >> "$TMUX_LOG"
+exit 97
+STUB
+chmod +x "$TMP/home/.local/bin/codex"
 chmod +x "$TMP/bin/tmux"
 
 # A throwaway clone with an origin, so `git pull --rebase` and `worktree add` work.
@@ -171,6 +178,7 @@ assert_contains "the pane runs the epic orchestrator" "$(tmux_log)" "workflows/e
 assert_contains "the registered repository reaches the orchestrator" "$(tmux_log)" "--repo 'testrepo'"
 assert_contains "the session name is threaded through" "$(tmux_log)" "--session 'testrepo-epic-63'"
 assert_contains "the default engine reaches the orchestrator" "$(tmux_log)" "--engine 'claude'"
+assert_contains "the pane receives provisioned user tool directories" "$(tmux_log)" "PATH='$TMP/home/.local/bin:$TMP/home/.bun/bin:"
 assert_contains "the pane gets the registry zone despite hostile caller values" "$(tmux_log)" "TZ='Europe/Amsterdam' HOST_TIMEZONE='Europe/Amsterdam' node"
 assert_not_contains "no interactive claude is launched" "$(tmux_log)" "--remote-control"
 assert_file "the worktree exists" "$WT_ROOT/testrepo/testrepo-epic-63/frontend/package.json"
@@ -367,6 +375,7 @@ printf '\nlaunch: Codex is the same interactive lifecycle\n'
 STUB_PANE_CMD=codex run_launch --repo testrepo codex-review --engine codex -m $'first line\nsecond $(literal); *'
 assert_rc "Codex exits 0" 0 "$RUN_RC"
 assert_contains "Codex launches interactively" "$(tmux_log)" " codex 'first line"
+assert_contains "non-login SSH still finds the provisioned Codex binary" "$(tmux_log)" "PATH='$TMP/home/.local/bin:$TMP/home/.bun/bin:"
 assert_not_contains "Codex is not headless" "$(tmux_log)" "codex exec"
 assert_contains "Codex gets manual identity" "$(tmux_log)" "@toliki_kind manual"
 assert_contains "the actual Codex client is printed" "$RUN_OUT" "client:   codex"
