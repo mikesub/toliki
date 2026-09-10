@@ -167,6 +167,10 @@ unnecessary complexity.
 
 - **No steering channel.** Pipelines are scripts, not interactive agents.
   Specifications must settle product choices before unattended execution.
+- **Manual work is outside the pipeline.** Explicit interactive Claude/Codex
+  sessions keep an isolated local branch/worktree until safe operator cleanup.
+  They consume no pipeline slot and trigger no issue lifecycle, while their
+  real host load remains operator-owned and prevents binary updates mid-work.
 - **No model sign-off gate or cheerful default.** A model's confidence cannot
   turn missing evidence into a passed command, review or CI result.
 - **No per-project facts in harness configuration.** Discover what the repo

@@ -1090,9 +1090,8 @@ assert_eq "a refused inherit writes no label" "" "$(grep 'issue edit' "$TMP/gh.l
 
 reset_state
 run_control session start --engine codex -r testrepo
-assert_rc "--engine is still refused for interactive sessions" 1 "$CONTROL_RC"
-assert_contains "and says it is pipeline-only" "$CONTROL_OUT" "--engine only applies to manual './toliki run epic|task|fix|ci|defect <issue>' launches"
-assert_eq "a refused interactive --engine launches nothing" "" "$(cat "$TMP/launch.log")"
+assert_rc "Codex is accepted for interactive sessions" 0 "$CONTROL_RC"
+assert_contains "the interactive engine reaches launch.sh" "$(cat "$TMP/launch.log")" "--engine codex"
 
 reset_state
 SSH_LOG="$TMP/ssh.log" PATH="$TMP/bin:$PATH" bash "$HARNESS/toliki" run epic 10 --engine codex

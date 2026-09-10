@@ -71,7 +71,23 @@ case "${1:-}" in
     done
     exit 1 ;;
   list-sessions) [[ -n "${STUB_SESSIONS:-}" ]] && printf '%s\n' $STUB_SESSIONS; exit 0 ;;
-  list-panes) echo "${STUB_PANE_CMD:-}"; exit 0 ;;
+  list-panes) echo "${STUB_PANE_CMD:-claude}"; exit 0 ;;
+  show-options)
+    target="${3#=}"
+    for s in ${STUB_MANUAL_SESSIONS:-}; do
+      [[ "$target" == "$s" ]] || continue
+      case "${5:-}" in
+        @toliki_kind) echo manual ;;
+        @repo) echo testrepo ;;
+        @engine) echo "${STUB_MANUAL_ENGINE:-claude}" ;;
+      esac
+      exit 0
+    done
+    exit 0 ;;
+  set-option)
+    [[ "${STUB_FAIL_SET_OPTION:-}" != "${4:-}" ]] || exit 1 ;;
+  new-session)
+    [[ "${STUB_FAIL_NEW_SESSION:-0}" != 1 ]] || exit 1 ;;
 esac
 exit 0
 STUB
@@ -79,7 +95,7 @@ STUB
 # node/claude: never actually run — the pane line is typed via send-keys, which
 # the tmux stub only records. These exist so a bug that EXECUTES them directly
 # fails loudly instead of reaching the real binaries.
-for b in node claude; do
+for b in node claude codex; do
   cat > "$TMP/bin/$b" <<STUB
 #!/usr/bin/env bash
 printf 'UNEXPECTED direct execution of $b: %s\n' "\$*" >> "\$TMUX_LOG"
@@ -146,8 +162,8 @@ run_launch --epic 63 --repo testrepo
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_contains "session is named <repo>-epic-<N>" "$(tmux_log)" "new-session -d -s testrepo-epic-63"
 assert_contains "the pane starts in the worktree" "$(tmux_log)" "-c $WT_ROOT/testrepo/testrepo-epic-63"
-assert_contains "the repo tag is set" "$(tmux_log)" "set-option -t testrepo-epic-63 @repo testrepo"
-assert_contains "the default engine tag is Claude" "$(tmux_log)" "set-option -t testrepo-epic-63 @engine claude"
+assert_contains "the repo tag is set" "$(tmux_log)" "set-option -t =testrepo-epic-63 @repo testrepo"
+assert_contains "the default engine tag is Claude" "$(tmux_log)" "set-option -t =testrepo-epic-63 @engine claude"
 assert_contains "the pane runs the epic orchestrator" "$(tmux_log)" "workflows/epic-run.mjs' --issue 63"
 # The registered key, on the pane line: the run's usage telemetry has to say
 # which repository an issue number belongs to, and the session name is not a
@@ -158,6 +174,14 @@ assert_contains "the default engine reaches the orchestrator" "$(tmux_log)" "--e
 assert_contains "the pane gets the registry zone despite hostile caller values" "$(tmux_log)" "TZ='Europe/Amsterdam' HOST_TIMEZONE='Europe/Amsterdam' node"
 assert_not_contains "no interactive claude is launched" "$(tmux_log)" "--remote-control"
 assert_file "the worktree exists" "$WT_ROOT/testrepo/testrepo-epic-63/frontend/package.json"
+
+printf '\nlaunch: a tag failure removes the idle session before startup\n'
+STUB_FAIL_SET_OPTION="@engine" run_launch --epic 74 --repo testrepo
+assert_rc "a failed tag exits 1" 1 "$RUN_RC"
+assert_contains "the failure is actionable" "$RUN_OUT" "could not tag session 'testrepo-epic-74'"
+assert_contains "the untrusted session is removed" "$(tmux_log)" "kill-session -t =testrepo-epic-74"
+assert_not_contains "the orchestrator is never started" "$(tmux_log)" "send-keys"
+unset STUB_FAIL_SET_OPTION
 
 printf '\nlaunch --task: same session/worktree shape, one-agent task script\n'
 run_launch --task '#73' --repo testrepo --engine codex
@@ -217,7 +241,7 @@ assert_contains "and the defect fixer carries the same repository identity" "$(t
 printf '\nlaunch --epic --engine codex: engine is tagged and forwarded\n'
 run_launch --epic 64 --repo testrepo --engine codex
 assert_rc "exits 0" 0 "$RUN_RC"
-assert_contains "the Codex engine tag is set" "$(tmux_log)" "set-option -t testrepo-epic-64 @engine codex"
+assert_contains "the Codex engine tag is set" "$(tmux_log)" "set-option -t =testrepo-epic-64 @engine codex"
 assert_contains "Codex reaches the orchestrator" "$(tmux_log)" "--engine 'codex'"
 
 printf '\nlaunch --epic: with no installed cron file the default is the built-in claude\n'
@@ -227,7 +251,7 @@ export EPIC_ENGINE=codex
 run_launch --epic 65 --repo testrepo
 unset EPIC_ENGINE
 assert_rc "exits 0" 0 "$RUN_RC"
-assert_contains "an ambient EPIC_ENGINE is ignored" "$(tmux_log)" "set-option -t testrepo-epic-65 @engine claude"
+assert_contains "an ambient EPIC_ENGINE is ignored" "$(tmux_log)" "set-option -t =testrepo-epic-65 @engine claude"
 assert_contains "and claude reaches the orchestrator" "$(tmux_log)" "--engine 'claude'"
 printf 'EPIC_ENGINE=nope\n' > "$INSTALLED_CRON"
 run_launch --epic 66 --repo testrepo
@@ -243,7 +267,7 @@ printf '\nlaunch --epic: the installed cron file is the host default\n'
 printf 'EPIC_ENGINE=codex\n' > "$INSTALLED_CRON"
 run_launch --epic 67 --repo testrepo
 assert_rc "exits 0" 0 "$RUN_RC"
-assert_contains "the installed default is tagged" "$(tmux_log)" "set-option -t testrepo-epic-67 @engine codex"
+assert_contains "the installed default is tagged" "$(tmux_log)" "set-option -t =testrepo-epic-67 @engine codex"
 assert_contains "and reaches the orchestrator" "$(tmux_log)" "--engine 'codex'"
 
 export EPIC_ENGINE=claude
@@ -282,13 +306,77 @@ assert_file "node_modules survives the scrub" "$WT/frontend/node_modules/left-pa
 assert_file ".epics/ survives the scrub (resume appends to epic.md)" "$WT/.epics/63-slug/epic.md"
 assert_no_file "untracked non-ignored junk is cleaned" "$WT/frontend/scratch.ts"
 
-printf '\nlaunch: the interactive path is unchanged\n'
+printf '\nlaunch: persistent interactive Claude workspace and cheatsheet\n'
 run_launch --repo testrepo -m "look at the logs"
 assert_rc "exits 0" 0 "$RUN_RC"
-assert_contains "it launches interactive claude" "$(tmux_log)" "claude --remote-control testrepo-look-at-the-logs --dangerously-skip-permissions --worktree testrepo-look-at-the-logs"
-assert_contains "interactive panes get the same registry zone" "$(tmux_log)" "TZ='Europe/Amsterdam' HOST_TIMEZONE='Europe/Amsterdam' claude"
+assert_contains "it launches interactive claude" "$(tmux_log)" "claude --remote-control 'testrepo-look-at-the-logs' --dangerously-skip-permissions"
+assert_contains "interactive panes get the same registry zone" "$(tmux_log)" "TZ='Europe/Amsterdam' HOST_TIMEZONE='Europe/Amsterdam'"
 assert_contains "the message is passed as a positional prompt" "$(tmux_log)" "'look at the logs'"
-assert_contains "the pane starts in the clone, not a pipeline worktree" "$(tmux_log)" "-c $CLONE"
+MANUAL_WT="$TMP/home/.toliki-worktrees/testrepo/testrepo-look-at-the-logs"
+assert_contains "the pane starts in its manual worktree" "$(tmux_log)" "-c $MANUAL_WT"
+assert_file "the durable manual worktree exists" "$MANUAL_WT/frontend/package.json"
+assert_contains "the manual identity tag is set" "$(tmux_log)" "@toliki_kind manual"
+assert_contains "the actual branch is printed" "$RUN_OUT" "manual/testrepo-look-at-the-logs"
+assert_contains "the exact attach command is printed" "$RUN_OUT" "tmux attach-session -t =testrepo-look-at-the-logs"
+assert_contains "safe workspace cleanup is printed" "$RUN_OUT" "session remove-workspace 'testrepo-look-at-the-logs'"
+
+export STUB_LIVE_SESSIONS="testrepo-look-at-the-logs" STUB_MANUAL_SESSIONS="testrepo-look-at-the-logs" STUB_PANE_CMD=claude
+run_launch --repo testrepo testrepo-look-at-the-logs
+assert_rc "a duplicate start reports the existing manual client" 0 "$RUN_RC"
+assert_contains "the duplicate prints reconnect details" "$RUN_OUT" "tmux attach-session -t =testrepo-look-at-the-logs"
+assert_not_contains "the duplicate creates no second pane" "$(tmux_log)" "new-session"
+
+printf 'keep me\n' > "$MANUAL_WT/dirty-untracked"
+STUB_PANE_CMD=codex run_launch --repo testrepo testrepo-look-at-the-logs --restart --engine codex
+assert_rc "restart may switch the client" 0 "$RUN_RC"
+assert_contains "restart stops the old exact session" "$(tmux_log)" "kill-session -t =testrepo-look-at-the-logs"
+assert_contains "restart launches Codex in the same workspace" "$(tmux_log)" " codex"
+assert_file "restart preserves dirty and untracked work" "$MANUAL_WT/dirty-untracked"
+assert_contains "the switched client is durable" "$(git -C "$CLONE" config --get toliki-manual.testrepo-look-at-the-logs.engine)" "codex"
+unset STUB_LIVE_SESSIONS
+
+STUB_PANE_CMD=codex run_launch --repo testrepo testrepo-look-at-the-logs --restart
+assert_rc "a stopped restart inherits its client" 0 "$RUN_RC"
+assert_contains "the inherited client is launched" "$(tmux_log)" " codex"
+
+export STUB_SESSIONS="testrepo-look-at-the-logs" STUB_MANUAL_SESSIONS="testrepo-look-at-the-logs" STUB_MANUAL_ENGINE=codex STUB_PANE_CMD=codex
+run_launch --check-capacity
+assert_rc "an active proven manual session leaves pipeline capacity available" 0 "$RUN_RC"
+assert_contains "capacity reports zero pipeline slots occupied" "$RUN_OUT" "capacity 0/2"
+run_launch --check-idle
+assert_rc "the same active manual session still makes the updater probe busy" 3 "$RUN_RC"
+unset STUB_SESSIONS STUB_MANUAL_SESSIONS STUB_MANUAL_ENGINE STUB_PANE_CMD
+
+printf '\nlaunch: a recognizable legacy Claude workspace is adopted\n'
+mkdir -p "$CLONE/.claude/worktrees"
+git -C "$CLONE" worktree add -q -b claude/testrepo-legacy "$CLONE/.claude/worktrees/testrepo-legacy" origin/main
+STUB_LIVE_SESSIONS=testrepo-legacy STUB_PANE_CMD=claude run_launch --repo testrepo testrepo-legacy
+assert_rc "legacy adoption exits 0" 0 "$RUN_RC"
+assert_contains "the existing workspace is adopted" "$RUN_OUT" "adopted existing Claude workspace"
+assert_contains "the legacy session receives manual identity" "$(tmux_log)" "set-option -t =testrepo-legacy @toliki_kind manual"
+assert_contains "the adopted branch is retained in metadata" "$(git -C "$CLONE" config --get toliki-manual.testrepo-legacy.branch)" "claude/testrepo-legacy"
+
+printf '\nlaunch: an unowned manual workspace path is preserved\n'
+mkdir -p "$TMP/home/.toliki-worktrees/testrepo/testrepo-conflict"
+run_launch --repo testrepo testrepo-conflict
+assert_rc "an unowned path exits 1" 1 "$RUN_RC"
+assert_contains "the conflict is actionable" "$RUN_OUT" "already exists without recognizable manual ownership; leaving it untouched"
+assert_not_contains "the conflicting path starts no session" "$(tmux_log)" "new-session"
+
+printf '\nlaunch: Codex is the same interactive lifecycle\n'
+STUB_PANE_CMD=codex run_launch --repo testrepo codex-review --engine codex -m $'first line\nsecond $(literal); *'
+assert_rc "Codex exits 0" 0 "$RUN_RC"
+assert_contains "Codex launches interactively" "$(tmux_log)" " codex 'first line"
+assert_not_contains "Codex is not headless" "$(tmux_log)" "codex exec"
+assert_contains "Codex gets manual identity" "$(tmux_log)" "@toliki_kind manual"
+assert_contains "the actual Codex client is printed" "$RUN_OUT" "client:   codex"
+
+printf '\nlaunch: failed tmux creation retains the manual workspace\n'
+STUB_FAIL_NEW_SESSION=1 run_launch --repo testrepo startup-failure --engine codex
+assert_rc "tmux creation failure exits 1" 1 "$RUN_RC"
+assert_contains "the failure names the retained workspace" "$RUN_OUT" "tmux could not create session 'testrepo-startup-failure'; workspace retained"
+assert_file "the failed launch keeps its worktree" "$TMP/home/.toliki-worktrees/testrepo/testrepo-startup-failure/frontend/package.json"
+assert_not_contains "no startup success is printed" "$RUN_OUT" "manual session ready"
 
 printf '\nlaunch: conflicting flags are refused\n'
 run_launch --epic 63 --fix 64 --repo testrepo
@@ -328,9 +416,9 @@ assert_rc "an unknown engine exits 1" 1 "$RUN_RC"
 assert_contains "and names the allowed engines" "$RUN_OUT" "must name an engine"
 assert_not_contains "validation happens before any session is created" "$(tmux_log)" "new-session"
 
-run_launch --engine codex --repo testrepo
-assert_rc "--engine is refused for interactive sessions" 1 "$RUN_RC"
-assert_contains "and says it is pipeline-only" "$RUN_OUT" "only applies to --epic/--task/--fix/--ci/--defect"
+run_launch --engine unknown --repo testrepo
+assert_rc "an unknown manual engine is refused" 1 "$RUN_RC"
+assert_contains "and names the interactive choices" "$RUN_OUT" "claude or codex"
 
 printf '\nlaunch --check-idle: the cap'"'"'s own count, against zero\n'
 run_launch --check-idle
@@ -383,7 +471,7 @@ assert_contains "the count still happens under the admission lock" \
   "$(grep -E '^(flock 8$|new-session)' "$TMUX_LOG_FILE" | head -n 1)" "flock 8"
 assert_contains "the session is created" "$(tmux_log)" "new-session -d -s testrepo-epic-70"
 assert_contains "and the lock is released once it exists" "$(tmux_log)" "flock -u 8"
-assert_contains "the engine tag is the ordinary one" "$(tmux_log)" "set-option -t testrepo-epic-70 @engine claude"
+assert_contains "the engine tag is the ordinary one" "$(tmux_log)" "set-option -t =testrepo-epic-70 @engine claude"
 assert_contains "and the pane line is an ordinary epic run" "$(tmux_log)" "workflows/epic-run.mjs' --issue 70"
 
 run_launch --fix 72 --repo testrepo --over-capacity --engine codex

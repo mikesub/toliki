@@ -44,6 +44,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/../etc/lib.sh"
+source "$HERE/manual-session.lib.sh"
 
 # A claim ref stays claim-tipped for the WHOLE run, not for an instant: the
 # code and triage phases checkpoint locally and only Ship pushes, so the first
@@ -447,6 +448,17 @@ if ORPHANS="$(pgrep -af '(^|/)(claude -p|codex exec)( |$)' 2>/dev/null)"; then
   ORPHAN_N=0
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
+    pid="${line%% *}"
+    env=""
+    if [[ -r "/proc/$pid/environ" ]]; then
+      env="$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null || true)"
+    fi
+    manual_session="$(awk -F= '$1=="TOLIKI_MANUAL_SESSION" {sub(/^[^=]*=/, ""); print; exit}' <<<"$env")"
+    manual_token="$(awk -F= '$1=="TOLIKI_MANUAL_OWNER" {sub(/^[^=]*=/, ""); print; exit}' <<<"$env")"
+    manual_repo="$(repo_of_session "$manual_session" 2>/dev/null || true)"
+    if [[ -n "$manual_repo" && -n "$manual_token" ]] && manual_load "$manual_repo" "$manual_session" 2>/dev/null && [[ "$manual_token" == "$MANUAL_TOKEN" ]]; then
+      continue
+    fi
     ORPHAN_N=$((ORPHAN_N + 1))
   done <<<"$ORPHANS"
   # Only meaningful when no pipeline session is live to own them: with a run in

@@ -31,9 +31,11 @@ Host settings
   config set               Change either of those: --engine <name>, --max <count>.
 
 Sessions on the host
-  session list             Every session with its repo, engine and status.
-  session start|stop       Start or stop an interactive claude session.
-  session restart          Stop and start one, optionally re-prompting.
+  session list             Every session with repo, client, kind and status.
+  session start|stop       Start or stop a persistent Claude/Codex session.
+  session restart          Restart one in place, optionally switching client.
+  session stop-manual      Stop all Toliki manual clients; retain their code.
+  session remove-workspace Safely remove one stopped manual workspace.
   session stop-all         Stop every session on the host.
 
 Pipeline work

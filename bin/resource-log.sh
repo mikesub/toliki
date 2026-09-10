@@ -88,24 +88,21 @@ read -r _ CU CN CS CI CIO CIRQ CSIRQ CSTEAL _ < /proc/stat
 
 # Epic sessions, and the CPU each has burned. Derived from the command line
 # rather than from tmux because the session name is carried right there in argv
-# AND gives us the pid in the same pass; it also matches what the cap actually
-# counts (a pane sitting at a dead shell holds a tmux name but no process, and
-# costs nothing). Cumulative jiffies again, so the report can attribute a spike
-# to the epic that caused it.
+# AND gives us the pid in the same pass. It measures known pipeline concurrency
+# used to size the cap; admission additionally counts unknown live panes
+# conservatively. A dead shell has no process cost. Cumulative jiffies again,
+# so the report can attribute a spike to the epic that caused it.
 #
-# Two markers, because there are two kinds of session: a pipeline run is a node
-# orchestrator carrying `--session <name>`, an interactive session is claude
-# carrying `--remote-control <name>`. The orchestrator match is pinned to the
-# script path so an unrelated `--session` on some other command line can't
-# invent an epic. The agents an orchestrator spawns carry neither marker, so
-# they are never double-counted as sessions of their own.
+# Capacity counts only pipeline Node orchestrators carrying `--session <name>`.
+# Manual Claude/Codex clients still contribute to the host CPU/RSS samples, but
+# they are deliberately absent from the displayed pipeline concurrency table.
+# The script-path match prevents unrelated `--session` arguments inventing an
+# epic; spawned phase agents carry no marker and are not double-counted.
 EPICS_JSON="$(
   ps -eo pid=,args= 2>/dev/null |
   awk '{
-         if ($0 ~ /workflows\/(epic|fix)-run\.mjs/) {
+         if ($0 ~ /workflows\/(epic|task|fix|ci|defect)-run\.mjs/) {
            for (i=1;i<=NF;i++) if ($i=="--session") { print $1, $(i+1); break }
-         } else {
-           for (i=1;i<=NF;i++) if ($i=="--remote-control") { print $1, $(i+1); break }
          }
        }' |
   while read -r pid sess; do

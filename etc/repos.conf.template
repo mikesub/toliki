@@ -39,12 +39,11 @@ NAMES=(alpha bravo charlie delta echo foxtrot golf hotel)
 # Longest session name we'll derive from a message before truncating.
 NAME_MAX_LEN=40
 
-# How many sessions may run on the host at once — the host's slot
-# budget, enforced in bin/launch.sh (see the comment at its capacity check for
-# why there and not in dispatch.sh). Counts every *running* session, whoever
-# started it: a session idling at a shell prompt holds its name but no load,
-# so it doesn't count, and an interactive session does, because it is load
-# like any other.
+# How many pipeline sessions may run on the host at once — the host's pipeline
+# slot budget, enforced in bin/launch.sh. Proven Toliki manual Claude/Codex
+# sessions are deliberately exempt; unknown or ambiguous live panes count
+# conservatively. Manual load still exists, and any active pane (including a
+# manual one) makes the CLI update idle probe busy.
 #
 # Size it against the box, not against the queue: the orchestrator's own
 # concurrency gate is min(16, cores-2) agent processes, so each pipeline

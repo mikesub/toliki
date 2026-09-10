@@ -17,8 +17,8 @@ set -euo pipefail
 #                        interactive session wraps it, so there is no
 #                        --remote-control channel to attach to — watch it with
 #                        `tmux attach` / `capture-pane`, same as diagnosing one.
-#   everything else      an interactive claude session (pool names, -m), with
-#                        Remote Control and its own --worktree, unchanged.
+#   everything else      an interactive Claude or Codex client in a retained
+#                        Toliki-owned branch/worktree; Claude keeps Remote Control.
 #
 # Exit codes: 0 launched (or the session already existed), 1 usage/config
 # error, 3 refused because the host is at MAX_PARALLEL_EPICS. 3 is separate
@@ -32,10 +32,12 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/../etc/lib.sh"
+source "$HERE/manual-session.lib.sh"
 
 usage() {
   cat <<EOF
-Usage: $0 [session-name] [-m <message>] [-r <repo>] [--check-capacity|--check-idle]
+Usage: $0 [session-name] [-m <message>] [-r <repo>] [--engine claude|codex] [--restart]
+       $0 [--check-capacity|--check-idle]
        $0 --epic <N> [-r <repo>] [--engine <engine>] [--over-capacity]
        $0 --task <N> [-r <repo>] [--engine <engine>] [--over-capacity]
        $0 --fix <N>  [-r <repo>] [--engine <engine>] [--over-capacity]
@@ -48,23 +50,28 @@ Creates a detached tmux session in the named repo (default: $DEFAULT_REPO).
 this script creates its git worktree under \${EPIC_WORKTREE_ROOT:-\$HOME/.epic-worktrees},
 and the pane runs the corresponding workflows/*-run.mjs there. They take no
 session name and no -m — both are derived from the issue number.
---engine is pipeline-only: a name from etc/engines.json, the vendor/model/effort
-table the run uses per step. Omitted, a pipeline run takes the host default —
+For a manual session, --engine selects the interactive client (claude by
+default). A stopped workspace remembers its client; --restart without an
+override inherits it. For a pipeline, --engine names an etc/engines.json table.
+Omitted, a pipeline run takes the host default —
 the EPIC_ENGINE line of the installed cron file (/etc/cron.d/harness-dispatch),
 claude when that file is absent — and refuses if that file and this process's
 environment disagree. Currently: $(engine_names | tr '\n' ' ')
 
-Without them the session is an interactive claude. Name resolution when no name
+Without them the session is an interactive Claude or Codex client in a durable
+manual branch/worktree. Name resolution when no name
 is given: with -m, the session is named after the message (slugified); otherwise
 the first pool name free for the repo: ${NAMES[*]}
 If the session already exists, reports whether its process is still running and
 changes nothing (it never relaunches into a live session, and doesn't pull).
-Refuses with exit 3 when $MAX_PARALLEL_EPICS sessions are already running.
+Manual sessions are outside pipeline capacity. Pipelines refuse with exit 3
+when $MAX_PARALLEL_EPICS pipeline sessions are already running.
 --check-capacity answers ONLY that last question (exit 0 below the cap, 3 at
 it) and starts nothing — dispatch.sh probes it before work it would otherwise
 have to undo, so the counting stays in this one script.
---check-idle is the same count against zero (exit 0 with nothing running, 3
-otherwise) — bin/update-claude.sh asks it before moving the claude binary.
+--check-idle counts every active pane, including capacity-exempt manual work
+(exit 0 with nothing running, 3 otherwise) — bin/update-claude.sh asks it
+before moving the claude binary.
 --over-capacity admits ONE pipeline launch over that cap on purpose, and
 bypasses nothing else: the count still runs under the launch lock, the session
 counts like any other afterwards (so dispatch stays paused until usage drops
@@ -79,10 +86,11 @@ HAVE_MESSAGE=0
 CHECK_CAPACITY=0
 CHECK_IDLE=0
 REPO="$DEFAULT_REPO"
-MODE=""       # "" = interactive claude; otherwise the selected pipeline run
+MODE=""       # "" = interactive manual client; otherwise selected pipeline run
 ISSUE=""
 ENGINE=""     # a pipeline run with no --engine resolves the host default below
 HAVE_ENGINE=0
+RESTART=0
 OVER_CAPACITY=0            # hard-initialised: only the flag below may set it, never the environment
 
 POSITIONAL=()
@@ -128,6 +136,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --over-capacity)
       OVER_CAPACITY=1
+      shift
+      ;;
+    --restart)
+      RESTART=1
       shift
       ;;
     --engine)
@@ -194,14 +206,27 @@ SESSION="${POSITIONAL[0]:-}"
 # cron file would stop dispatch's capacity check and update-claude's idle check
 # along with the launches they gate.
 if [[ $HAVE_ENGINE -eq 1 ]]; then
-  if ! engine_known "$ENGINE"; then
-    echo "[launch] --engine must name an engine in etc/engines.json ($(engine_names | tr '\n' ' ')), got '$ENGINE'" >&2
+  if [[ -n "$MODE" ]]; then
+    if ! engine_known "$ENGINE"; then
+      echo "[launch] --engine must name an engine in etc/engines.json ($(engine_names | tr '\n' ' ')), got '$ENGINE'" >&2
+      exit 1
+    fi
+  elif [[ "$ENGINE" != claude && "$ENGINE" != codex ]]; then
+    echo "[launch] manual --engine must be claude or codex, got '$ENGINE'" >&2
     exit 1
   fi
-  if [[ -z "$MODE" ]]; then
-    echo "[launch] --engine only applies to --epic/--task/--fix/--ci/--defect pipeline runs" >&2
-    exit 1
-  fi
+fi
+if [[ $RESTART -eq 1 && -n "$MODE" ]]; then
+  echo "[launch] --restart applies only to interactive manual sessions" >&2
+  exit 1
+fi
+if [[ $RESTART -eq 1 && -z "$SESSION" ]]; then
+  echo "[launch] --restart requires an explicit manual session name" >&2
+  exit 1
+fi
+if [[ $HAVE_ENGINE -eq 1 && ( $CHECK_CAPACITY -eq 1 || $CHECK_IDLE -eq 1 ) ]]; then
+  echo "[launch] --engine cannot be combined with a capacity or idle probe" >&2
+  exit 1
 fi
 # The override may only ride a launch that actually starts a pipeline. A probe
 # answers a question other callers act on — dispatch.sh skips a whole tick on
@@ -239,19 +264,47 @@ if ! PROJECT="$(repo_path "$REPO")"; then
   exit 1
 fi
 
-# Sessions with claude actually up. A pane sitting at a shell prompt is a
-# session whose claude exited: it still owns its name (so pick_free_name skips
-# it) but it consumes no CPU, so it does not hold a slot.
-running_count() {
-  local s current n=0
+# Count live panes. Capacity excludes only sessions whose manual identity is
+# proved by both the tmux tag and durable workspace metadata; missing or stale
+# identity stays conservative and counts. Idle deliberately includes manual
+# sessions because replacing a CLI under interactive work is unsafe too.
+running_count() { # all|pipeline
+  local scope="$1" s current n=0 kind repo
   while IFS= read -r s; do
     [[ -n "$s" ]] || continue
     current="$(tmux list-panes -t "$s" -F '#{pane_current_command}' 2>/dev/null | head -n1)"
     case "$current" in
       bash|zsh|sh|dash|'') ;;
-      *) n=$((n + 1)) ;;
+      *)
+        if [[ "$scope" == pipeline ]]; then
+          kind="$(tmux show-options -t "=$s" -qv @toliki_kind 2>/dev/null || true)"
+          repo="$(tmux show-options -t "=$s" -qv @repo 2>/dev/null || true)"
+          if [[ "$kind" == manual && -n "$repo" ]] && manual_load "$repo" "$s" 2>/dev/null; then
+            continue
+          fi
+          if [[ -z "$kind" && -n "$repo" && "$s" != "$repo-epic-"* ]] &&
+             project="$(repo_path "$repo" 2>/dev/null)" && manual_find_legacy_worktree "$project" "$s"; then
+            continue
+          fi
+        fi
+        n=$((n + 1))
+        ;;
     esac
   done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null || true)
+  # A client can leave an owned child after its pane returns to a shell. The
+  # capacity view still ignores it (manual load is explicitly operator-owned),
+  # but idle must remain false until manual cleanup verifies every child gone.
+  if [[ "$scope" == all && $n -eq 0 ]]; then
+    while IFS= read -r repo; do
+      while IFS= read -r s; do
+        [[ -n "$s" ]] || continue
+        if manual_load "$repo" "$s" 2>/dev/null && [[ -n "$(manual_owned_pids "$MANUAL_TOKEN")" ]]; then
+          n=1
+          break 2
+        fi
+      done < <(manual_sessions_for_repo "$repo")
+    done < <(repo_names)
+  fi
   printf '%s' "$n"
 }
 
@@ -267,7 +320,7 @@ capacity_gate() {
     echo "[launch] MAX_PARALLEL_EPICS must be a positive integer, got '${MAX_PARALLEL_EPICS:-<unset>}' — fix etc/repos.conf" >&2
     exit 1
   fi
-  RUNNING="$(running_count)"
+  RUNNING="$(running_count pipeline)"
   if (( RUNNING >= MAX_PARALLEL_EPICS )); then
     # The bypass is here, inside the gate and under the caller's lock, so an
     # override is admitted against the same count every other launch is judged
@@ -291,13 +344,13 @@ if [[ $CHECK_CAPACITY -eq 1 ]]; then
   exit 0
 fi
 
-# --check-idle: the same count, against zero. update-claude.sh asks this
+# --check-idle: all active panes against zero. update-claude.sh asks this
 # before swapping the claude binary — every phase of a run is a fresh claude
 # process, so a swap under a live run hands its later phases a different CLI
 # than its earlier ones — and asking here means the one function that counts
 # running sessions for the cap is also the one that decides "idle".
 if [[ $CHECK_IDLE -eq 1 ]]; then
-  RUNNING="$(running_count)"
+  RUNNING="$(running_count all)"
   if (( RUNNING > 0 )); then
     echo "[launch] $RUNNING session(s) running — not idle" >&2
     exit 3
@@ -311,8 +364,7 @@ fi
 # a manual launch arriving over ssh has an environment cron never touched, so
 # the file is the only value the two can share. Resolved after the probes above
 # and before the session is created, so a refusal costs no worktree and no
-# session. An interactive session keeps an empty ENGINE: it runs claude by
-# construction, and the @engine tag describes pipeline routing.
+# session. Manual client selection is resolved separately below.
 if [[ -n "$MODE" && $HAVE_ENGINE -eq 0 ]]; then
   if ! resolve_host_default_engine; then
     echo "[launch] $HOST_DEFAULT_ENGINE_ERROR" >&2
@@ -354,13 +406,113 @@ else
   SESSION="$(full_name "$REPO" "$SESSION")"
 fi
 
+if [[ ! "$SESSION" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]]; then
+  echo "[launch] invalid session name '$SESSION' (use letters, digits, '-' or '_')" >&2
+  exit 1
+fi
+if [[ -z "$MODE" && "$SESSION" =~ ^${REPO}-epic-[0-9]+$ ]]; then
+  echo "[launch] '$SESSION' is reserved for pipeline sessions; choose a non-epic manual name" >&2
+  exit 1
+fi
+
+print_manual_cheatsheet() { # actual engine/worktree/branch are globals
+  local attach
+  attach="tmux attach-session -t =$SESSION"
+  cat <<EOF
+[launch] manual session details
+  session:  $SESSION
+  client:   $ENGINE
+  branch:   $MANUAL_BRANCH
+  worktree: $MANUAL_WORKTREE
+
+Connect/reconnect from the laptop:
+  ssh -t $(sq "$SSH_HOST") $(sq "$attach")
+Detach without stopping work: press Ctrl-b, then d
+List sessions:
+  ./toliki session list
+Restart this client in the same workspace:
+  ./toliki session restart $(sq "$SESSION")
+Stop this session and its owned processes (code is retained):
+  ./toliki session stop $(sq "$SESSION")
+Stop all proven Toliki manual sessions/processes (pipelines are untouched):
+  ./toliki session stop-manual
+After work is clean and merged, remove this workspace and local branch safely:
+  ./toliki session remove-workspace $(sq "$SESSION")
+
+Manual sessions are outside pipeline capacity and automation. Stopping never
+removes code; the worktree and branch remain until remove-workspace succeeds.
+EOF
+}
+
+prepare_manual_workspace() {
+  local load_rc branch worktree token legacy_engine
+  if manual_load "$REPO" "$SESSION"; then
+    if [[ $HAVE_ENGINE -eq 0 ]]; then ENGINE="$MANUAL_ENGINE"; fi
+    return 0
+  else
+    load_rc=$?
+  fi
+  if [[ $load_rc -eq 2 ]]; then
+    echo "[launch] $MANUAL_ERROR" >&2
+    return 1
+  fi
+
+  branch="$(manual_default_branch "$REPO" "$SESSION")"
+  worktree="$(manual_default_worktree "$REPO" "$SESSION")"
+  # Claude's former --worktree path predates durable Toliki metadata. Adopt a
+  # single registered worktree whose basename exactly matches the session;
+  # multiple or malformed candidates are ambiguity, never permission to reset.
+  if manual_find_legacy_worktree "$PROJECT" "$SESSION"; then
+    legacy_engine=claude
+    [[ $HAVE_ENGINE -eq 1 ]] || ENGINE="$legacy_engine"
+    token="legacy-$SESSION-$(date +%s)-$$-$RANDOM"
+    if ! manual_record "$PROJECT" "$SESSION" "$REPO" "$LEGACY_BRANCH" "$LEGACY_WORKTREE" "$legacy_engine" "$token"; then
+      git -C "$PROJECT" config --remove-section "toliki-manual.$SESSION" 2>/dev/null || true
+      echo "[launch] could not record ownership for existing Claude workspace '$LEGACY_WORKTREE'; leaving it untouched" >&2
+      return 1
+    fi
+    echo "[launch] adopted existing Claude workspace $LEGACY_WORKTREE on $LEGACY_BRANCH"
+    manual_load "$REPO" "$SESSION"
+    return
+  fi
+  if (( LEGACY_AMBIGUOUS == 1 )); then
+    echo "[launch] found worktree path(s) named '$SESSION' but could not prove they are the former Claude workspace; leaving them intact" >&2
+    return 1
+  fi
+  if [[ -e "$worktree" ]]; then
+    echo "[launch] '$worktree' already exists without recognizable manual ownership; leaving it untouched" >&2
+    return 1
+  fi
+  if git -C "$PROJECT" show-ref --verify --quiet "refs/heads/$branch"; then
+    echo "[launch] branch '$branch' already exists without recognizable manual ownership; leaving it untouched" >&2
+    return 1
+  fi
+  echo "[launch] fetching current origin/main for new manual workspace"
+  git -C "$PROJECT" fetch origin main
+  git -C "$PROJECT" show-ref --verify --quiet refs/remotes/origin/main || {
+    echo "[launch] origin/main is unavailable; no manual workspace created" >&2; return 1;
+  }
+  mkdir -p "$(dirname "$worktree")"
+  echo "[launch] creating manual worktree $worktree on $branch"
+  git -C "$PROJECT" worktree add -b "$branch" "$worktree" refs/remotes/origin/main
+  token="manual-$SESSION-$(date +%s)-$$-$RANDOM"
+  if ! manual_record "$PROJECT" "$SESSION" "$REPO" "$branch" "$worktree" "$ENGINE" "$token"; then
+    git -C "$PROJECT" worktree remove "$worktree" 2>/dev/null || true
+    git -C "$PROJECT" branch -D "$branch" 2>/dev/null || true
+    git -C "$PROJECT" config --remove-section "toliki-manual.$SESSION" 2>/dev/null || true
+    echo "[launch] could not record manual workspace ownership; rolled back the new workspace" >&2
+    return 1
+  fi
+  manual_load "$REPO" "$SESSION"
+}
+
 # An existing session is reported, never relaunched into (a derived or pool
 # name colliding with a live session must not clobber it).
 #
 # "=" pins the match to the exact name: a bare -t matches session-name
 # PREFIXES, so launching epic-26 while epic-263 is live would report "already
 # running" and start nothing at all.
-if tmux has-session -t "=$SESSION" 2>/dev/null; then
+if tmux has-session -t "=$SESSION" 2>/dev/null && [[ -n "$MODE" ]]; then
   current="$(tmux list-panes -t "$SESSION" -F '#{pane_current_command}' | head -n1)"
   case "$current" in
     bash|zsh|sh|dash)
@@ -369,6 +521,89 @@ if tmux has-session -t "=$SESSION" 2>/dev/null; then
       echo "[launch] session '$SESSION' already running (pane: $current)" ;;
   esac
   exit 0
+fi
+
+if [[ -z "$MODE" ]]; then
+  [[ $HAVE_ENGINE -eq 1 ]] || ENGINE=claude
+  command -v tmux >/dev/null 2>&1 || { echo "[launch] tmux is not installed or not on PATH" >&2; exit 1; }
+  command -v git >/dev/null 2>&1 || { echo "[launch] git is not installed or not on PATH" >&2; exit 1; }
+  if tmux has-session -t "=$SESSION" 2>/dev/null; then
+    pre_kind="$(tmux show-options -t "=$SESSION" -qv @toliki_kind 2>/dev/null || true)"
+    pre_pane="$(tmux list-panes -t "=$SESSION" -F '#{pane_current_command}' 2>/dev/null | head -n1 || true)"
+    case "$pre_kind" in
+      manual)
+        if ! manual_load "$REPO" "$SESSION"; then
+          echo "[launch] '$SESSION' is tagged manual but its durable workspace ownership is missing or ambiguous; leaving it untouched" >&2
+          exit 1
+        fi
+        ;;
+      '')
+        if ! manual_find_legacy_worktree "$PROJECT" "$SESSION"; then
+          echo "[launch] tmux session '$SESSION' already exists without provable manual ownership (pane: ${pre_pane:-unknown}); leaving it untouched" >&2
+          exit 1
+        fi
+        ;;
+      *)
+        echo "[launch] tmux session '$SESSION' is '$pre_kind', not manual; leaving it untouched" >&2
+        exit 1
+        ;;
+    esac
+  fi
+  # A retained workspace chooses its previous client before any mutation; a
+  # requested override is checked directly. This keeps missing-client failures
+  # ahead of workspace creation and, especially, ahead of restart's stop.
+  if [[ $HAVE_ENGINE -eq 0 ]] && manual_load "$REPO" "$SESSION"; then
+    ENGINE="$MANUAL_ENGINE"
+  fi
+  command -v "$ENGINE" >/dev/null 2>&1 || {
+    echo "[launch] interactive client '$ENGINE' is not installed or not on PATH; nothing was stopped or started" >&2
+    exit 1
+  }
+  # Preparing validates existing ownership and determines the inherited engine
+  # before restart is allowed to stop anything.
+  prepare_manual_workspace || exit 1
+  if tmux has-session -t "=$SESSION" 2>/dev/null; then
+    kind="$(tmux show-options -t "=$SESSION" -qv @toliki_kind 2>/dev/null || true)"
+    actual_engine="$(tmux show-options -t "=$SESSION" -qv @engine 2>/dev/null || true)"
+    # A recognized legacy Claude pane may be tagged now that its workspace was
+    # safely adopted. Anything else with this name remains untouchable.
+    pane="$(tmux list-panes -t "=$SESSION" -F '#{pane_current_command}' 2>/dev/null | head -n1 || true)"
+    if [[ -z "$kind" && "$MANUAL_ENGINE" == claude && \
+          ( "$pane" == claude || "$pane" == bash || "$pane" == zsh || "$pane" == sh || "$pane" == dash ) ]]; then
+      tmux set-option -t "=$SESSION" @toliki_kind manual &&
+        tmux set-option -t "=$SESSION" @engine claude &&
+        tmux set-option -t "=$SESSION" @worktree "$MANUAL_WORKTREE" &&
+        tmux set-option -t "=$SESSION" @branch "$MANUAL_BRANCH" || {
+          echo "[launch] could not tag recognized legacy session '$SESSION'; leaving it running" >&2; exit 1;
+        }
+      kind=manual actual_engine=claude
+    fi
+    if [[ "$kind" != manual || -z "$actual_engine" || "$actual_engine" != "$MANUAL_ENGINE" ]]; then
+      echo "[launch] tmux session '$SESSION' exists but is not a proven manual session; leaving it untouched" >&2
+      exit 1
+    fi
+    if [[ $RESTART -eq 0 ]]; then
+      if [[ $HAVE_ENGINE -eq 1 && "$ENGINE" != "$actual_engine" ]]; then
+        echo "[launch] '$SESSION' is already a $actual_engine manual session; requested $ENGINE was not applied. Use session restart to switch clients." >&2
+        ENGINE="$actual_engine"
+        print_manual_cheatsheet
+        exit 1
+      fi
+      ENGINE="$actual_engine"
+      case "$pane" in
+        bash|zsh|sh|dash|'') echo "[launch] session '$SESSION' exists but $actual_engine is stopped; no client or workspace was changed" ;;
+        *) echo "[launch] session '$SESSION' already running ($actual_engine); no client or workspace was changed" ;;
+      esac
+      print_manual_cheatsheet
+      exit 0
+    fi
+    "$HERE/manual-session.sh" stop --repo "$REPO" "$SESSION" || {
+      echo "[launch] could not stop '$SESSION'; restart aborted with workspace retained" >&2; exit 1;
+    }
+  elif [[ $RESTART -eq 1 ]]; then
+    # Idempotent restart of a stopped client is just a start in its workspace.
+    echo "[launch] '$SESSION' is stopped; starting it in its retained workspace"
+  fi
 fi
 
 # The slot budget is enforced HERE rather than in dispatch.sh because this is
@@ -393,23 +628,24 @@ fi
 # normal path; a box without it degrades to the advisory counting this had
 # before rather than refusing to launch anything.
 LAUNCH_LOCKED=0
-if command -v flock >/dev/null 2>&1; then
-  exec 8>"${TMPDIR:-/tmp}/harness-launch.lock"
-  if flock 8; then
-    LAUNCH_LOCKED=1
-  else
-    echo "[launch] could not take the launch lock — counting without it" >&2
+if [[ -n "$MODE" ]]; then
+  if command -v flock >/dev/null 2>&1; then
+    exec 8>"${TMPDIR:-/tmp}/harness-launch.lock"
+    if flock 8; then
+      LAUNCH_LOCKED=1
+    else
+      echo "[launch] could not take the launch lock — counting without it" >&2
+    fi
   fi
+  capacity_gate
+
+  echo "[launch] pulling latest main in $PROJECT"
+  git -C "$PROJECT" pull --rebase
 fi
-capacity_gate
 
-echo "[launch] pulling latest main in $PROJECT"
-git -C "$PROJECT" pull --rebase
-
-# Where the pane starts, and what it runs there. Interactive sessions start in
-# the clone and let claude make its own worktree; a pipeline run gets one made
-# here, because the thing it launches is a plain node process with no opinion
-# about git.
+# Where the pane starts, and what it runs there. Both lifecycles get worktrees;
+# pipeline reuse is scrubbed below, while manual reuse was validated above and
+# is never reset or cleaned.
 CWD="$PROJECT"
 if [[ -n "$MODE" ]]; then
   WT="${EPIC_WORKTREE_ROOT:-$HOME/.epic-worktrees}/$REPO/$SESSION"
@@ -439,19 +675,34 @@ if [[ -n "$MODE" ]]; then
     git -C "$PROJECT" worktree add --detach "$WT" HEAD
   fi
   CWD="$WT"
+else
+  CWD="$MANUAL_WORKTREE"
 fi
 
 echo "[launch] creating session '$SESSION' in $CWD"
 # 8>&- so a tmux server started by this call cannot inherit the launch lock and
 # hold it for the life of the host (the hazard dispatch guards with 9>&-).
-tmux new-session -d -s "$SESSION" -c "$CWD" 8>&-
+if ! tmux new-session -d -s "$SESSION" -c "$CWD" 8>&-; then
+  echo "[launch] tmux could not create session '$SESSION'; workspace retained at $CWD" >&2
+  exit 1
+fi
 (( LAUNCH_LOCKED == 0 )) || flock -u 8 2>/dev/null || true
 # Tag the session with its repo so `ls` can report it regardless of where the
 # pane's cwd later moves. If either tag fails, remove the new idle session:
 # leaving an untagged pipeline alive makes operator output lie about routing.
-if ! tmux set-option -t "$SESSION" @repo "$REPO" || \
-   ! tmux set-option -t "$SESSION" @engine "$ENGINE"; then
-  tmux kill-session -t "$SESSION" 2>/dev/null || true
+KIND="pipeline"
+[[ -n "$MODE" ]] || KIND="manual"
+set_session_tags() {
+  tmux set-option -t "=$SESSION" @repo "$REPO" || return 1
+  tmux set-option -t "=$SESSION" @engine "$ENGINE" || return 1
+  tmux set-option -t "=$SESSION" @toliki_kind "$KIND" || return 1
+  if [[ -z "$MODE" ]]; then
+    tmux set-option -t "=$SESSION" @worktree "$MANUAL_WORKTREE" || return 1
+    tmux set-option -t "=$SESSION" @branch "$MANUAL_BRANCH" || return 1
+  fi
+}
+if ! set_session_tags; then
+  tmux kill-session -t "=$SESSION" 2>/dev/null || true
   echo "[launch] could not tag session '$SESSION' — removed it before starting" >&2
   exit 1
 fi
@@ -471,13 +722,15 @@ if [[ -n "$MODE" ]]; then
   esac
   LINE="TZ=$(sq "$HOST_TIMEZONE") HOST_TIMEZONE=$(sq "$HOST_TIMEZONE") node $(sq "$SCRIPT") --issue $ISSUE --session $(sq "$SESSION") --engine $(sq "$ENGINE") --repo $(sq "$REPO")"
 else
-  # An interactive session. The name is threaded through --remote-control and
-  # --worktree so it's identifiable in the Desktop app and reusable across
-  # restarts; session name == worktree name is a deliberate invariant. The
-  # initial prompt (if any) is appended as a positional arg, quoted for the
-  # pane's shell. NOTE: positional, not `-p` — `-p` is print/non-interactive
-  # mode, which would run the prompt then exit and tear the session down.
-  LINE="TZ=$(sq "$HOST_TIMEZONE") HOST_TIMEZONE=$(sq "$HOST_TIMEZONE") claude --remote-control $SESSION --dangerously-skip-permissions --worktree $SESSION"
+  # The wrapper gives every descendant an unforgeable-per-workspace ownership
+  # token. It remains an interactive invocation: prompts are positional, never
+  # Claude -p or Codex exec. Authentication and consent UI stay visible.
+  LINE="TZ=$(sq "$HOST_TIMEZONE") HOST_TIMEZONE=$(sq "$HOST_TIMEZONE") TOLIKI_MANUAL_SESSION=$(sq "$SESSION") TOLIKI_MANUAL_OWNER=$(sq "$MANUAL_TOKEN")"
+  if [[ "$ENGINE" == claude ]]; then
+    LINE+=" claude --remote-control $(sq "$SESSION") --dangerously-skip-permissions"
+  else
+    LINE+=" codex"
+  fi
   if [[ $HAVE_MESSAGE -eq 1 && -n "$MESSAGE" ]]; then
     LINE+=" $(sq "$MESSAGE")"
   fi
@@ -486,4 +739,33 @@ fi
 # command) so the pane survives the process exiting: `ls` reports it as dead,
 # and capture-pane can still show the scrollback — which for a pipeline run is
 # the whole phase log and its final RESULT line.
-tmux send-keys -t "$SESSION" -- "$LINE" Enter
+if ! tmux send-keys -t "=$SESSION" -- "$LINE" Enter; then
+  tmux kill-session -t "=$SESSION" 2>/dev/null || true
+  echo "[launch] could not start $ENGINE in '$SESSION'; removed the tmux session and retained $CWD" >&2
+  exit 1
+fi
+if [[ -z "$MODE" ]]; then
+  started=0
+  for _ in {1..20}; do
+    current="$(tmux list-panes -t "=$SESSION" -F '#{pane_current_command}' 2>/dev/null | head -n1 || true)"
+    if [[ "$current" == "$ENGINE" || -n "$(manual_owned_pids "$MANUAL_TOKEN")" ]]; then started=1; break; fi
+    case "$current" in bash|zsh|sh|dash|'') sleep 0.1 ;; *) break ;; esac
+  done
+  if (( started == 0 )); then
+    failure_output="$(tmux capture-pane -p -t "=$SESSION" -S -40 2>/dev/null || true)"
+    tmux kill-session -t "=$SESSION" 2>/dev/null || true
+    echo "[launch] $ENGINE did not remain running in '$SESSION' (pane: ${current:-unknown}); no startup success is claimed" >&2
+    [[ -z "$failure_output" ]] || printf '%s\n' "$failure_output" | sed 's/^/[client] /' >&2
+    echo "[launch] the failed tmux pane was removed; workspace retained at $MANUAL_WORKTREE" >&2
+    exit 1
+  fi
+  # Persist an explicit client switch only once the new pane was created,
+  # tagged and started successfully.
+  if ! git -C "$PROJECT" config "toliki-manual.$SESSION.engine" "$ENGINE" || ! manual_load "$REPO" "$SESSION"; then
+    "$HERE/manual-session.sh" stop --repo "$REPO" "$SESSION" >/dev/null 2>&1 || true
+    echo "[launch] $ENGINE started but its durable client metadata could not be saved; stopped it and retained the workspace" >&2
+    exit 1
+  fi
+  echo "[launch] manual session ready"
+  print_manual_cheatsheet
+fi
