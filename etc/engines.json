@@ -1,7 +1,7 @@
 {
   "claude": {
     "task":               "claude/opus/high",
-    "architect":          "claude/fable/xhigh",
+    "architect":          "claude/fable/high",
     "code":               "claude/opus/high",
     "review":             "claude/opus/high",
     "final-review":       "claude/opus/high",
@@ -11,22 +11,12 @@
   },
   "codex": {
     "task":               "codex/gpt-5.6-sol/high",
-    "architect":          "codex/gpt-5.6-sol/xhigh",
-    "code":               "codex/gpt-5.6-sol/xhigh",
-    "review":             "codex/gpt-5.6-sol/xhigh",
-    "final-review":       "codex/gpt-5.6-sol/xhigh",
-    "fixes-after-review": "codex/gpt-5.6-sol/xhigh",
-    "fix-conflicts":      "codex/gpt-5.6-sol/xhigh",
-    "fix-ci":             "codex/gpt-5.6-sol/xhigh"
-  },
-  "codex+claude": {
-    "task":               "claude/opus/high",
-    "architect":          "claude/fable/xhigh",
-    "code":               "claude/opus/xhigh",
-    "review":             "codex/gpt-5.6-sol/xhigh",
-    "final-review":       "codex/gpt-5.6-sol/xhigh",
-    "fixes-after-review": "claude/opus/high",
-    "fix-conflicts":      "codex/gpt-5.6-sol/xhigh",
-    "fix-ci":             "claude/opus/high"
+    "architect":          "codex/gpt-6-astra/high",
+    "code":               "codex/gpt-5.6-sol/high",
+    "review":             "codex/gpt-5.6-sol/high",
+    "final-review":       "codex/gpt-5.6-sol/high",
+    "fixes-after-review": "codex/gpt-5.6-sol/high",
+    "fix-conflicts":      "codex/gpt-5.6-sol/high",
+    "fix-ci":             "codex/gpt-5.6-sol/high"
   }
 }

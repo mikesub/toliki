@@ -40,6 +40,8 @@ mkdir -p "$HARNESS" "$REPO/.git" "$TMP/bin" "$TMP/labels" "$TMP/blockers" "$TMP/
 cp -R "$ROOT/bin" "$ROOT/etc" "$HARNESS/"
 cp "$ROOT/toliki" "$HARNESS/"
 cp -R "$ROOT/operator" "$HARNESS/"
+# Custom mixed routing is a test fixture, not a required production preset.
+jq -s '.[0] + .[1]' "$ROOT/etc/engines.json" "$ROOT/tests/fixtures/mixed-engine.json" > "$TMP/engines-with-mixed.json"
 # dispatch resolves the shared hold CLI relative to its own copied harness.
 # During RED the module intentionally does not exist yet.
 mkdir -p "$HARNESS/workflows"
@@ -291,6 +293,8 @@ reset_state() {
 }
 
 assert_contains "the tracked config documents an empty-by-default defect allowlist" "$(cat "$ROOT/etc/repos.conf.template")" "DEFECT_FIX_REPOS=("
+assert_eq "only the two single-vendor presets ship" "claude codex" "$(jq -r 'keys | join(" ")' "$ROOT/etc/engines.json")"
+assert_eq "Codex architecture uses Astra at high" "codex/gpt-6-astra/high" "$(jq -r '.codex.architect' "$ROOT/etc/engines.json")"
 
 printf '\nhost config: reports, validates, updates, and reads back engine and capacity\n'
 ENGINE_CRON="$TMP/harness-dispatch"
@@ -299,7 +303,8 @@ cp "$HARNESS/etc/dispatch.cron" "$ENGINE_CRON"
 cp "$HARNESS/etc/repos.conf" "$CONFIG_REPOS"
 ENGINE_OUT="$(PATH="$TMP/bin:$PATH" EXEC_SSH_STDIN=1 DEFAULT_ENGINE_CRON="$ENGINE_CRON" CONFIG_REPOS_FILE="$CONFIG_REPOS" bash "$HARNESS/toliki" config show)"
 assert_contains "the current installed default is shown" "$ENGINE_OUT" "default: codex"
-assert_contains "every configured engine is shown" "$ENGINE_OUT" "available: claude codex codex+claude"
+assert_contains "every configured engine is shown" "$ENGINE_OUT" "available: claude codex"
+assert_not_contains "the removed mixed preset is not advertised" "$ENGINE_OUT" "codex+claude"
 assert_contains "the current concurrent run limit is shown" "$ENGINE_OUT" "max concurrent runs: 2"
 assert_contains "a bare report reminds the operator how to select an engine" "$ENGINE_OUT" "./toliki config set --engine <name>"
 assert_contains "a bare report reminds the operator how to set capacity" "$ENGINE_OUT" "./toliki config set --max <count>"
@@ -328,7 +333,7 @@ ENGINE_OUT="$(PATH="$TMP/bin:$PATH" EXEC_SSH_STDIN=1 DEFAULT_ENGINE_CRON="$ENGIN
 ENGINE_RC=$?
 set -e
 assert_rc "an unknown engine is rejected" 1 "$ENGINE_RC"
-assert_contains "the rejection lists valid choices" "$ENGINE_OUT" "available: claude codex codex+claude"
+assert_contains "the rejection lists valid choices" "$ENGINE_OUT" "available: claude codex"
 assert_eq "a rejected engine leaves the default unchanged" "EPIC_ENGINE=claude" "$(grep '^EPIC_ENGINE=' "$ENGINE_CRON")"
 set +e
 ENGINE_OUT="$(PATH="$TMP/bin:$PATH" EXEC_SSH_STDIN=1 DEFAULT_ENGINE_CRON="$ENGINE_CRON" CONFIG_REPOS_FILE="$CONFIG_REPOS" bash "$HARNESS/toliki" config set --max 0 2>&1)"
@@ -346,13 +351,14 @@ assert_rc "an ambiguous installed capacity is rejected" 1 "$ENGINE_RC"
 assert_contains "the ambiguity names the source file contract" "$ENGINE_OUT" "must contain exactly one MAX_PARALLEL_EPICS line, found 2"
 
 printf '\ndispatch hold: a Claude hold skips Claude and mixed engines but admits Codex\n'
+cp "$TMP/engines-with-mixed.json" "$HARNESS/etc/engines.json"
 reset_state
 READY_QUEUE='1\n2\n3'
 printf 'ready' > "$TMP/labels/1"
 printf 'ready,engine:claude' > "$TMP/labels/2"
 printf 'ready,engine:codex' > "$TMP/labels/3"
 printf '%s\n' '{"claude":{"holdUntil":"2099-01-01T00:00:00.000Z","reason":"session limit","fallback":false}}' > "$TMP/provider-hold.json"
-export EPIC_ENGINE=codex+claude
+export EPIC_ENGINE=test-mixed
 run_dispatch
 unset EPIC_ENGINE
 assert_rc "selective admission is a clean tick" 0 "$RUN_RC"
@@ -380,19 +386,19 @@ assert_eq "dry-run calls no launch command" "" "$(cat "$TMP/launch.log")"
 printf '\ndispatch hold: task admission uses only the task step vendor\n'
 reset_state
 READY_QUEUE='9\n10'
-printf 'ready,task,engine:codex+claude' > "$TMP/labels/9"
-printf 'ready,engine:codex+claude' > "$TMP/labels/10"
+printf 'ready,task,engine:test-mixed' > "$TMP/labels/9"
+printf 'ready,engine:test-mixed' > "$TMP/labels/10"
 printf '%s\n' '{"codex":{"holdUntil":"2099-01-01T00:00:00.000Z","reason":"usage limit","fallback":false}}' > "$TMP/provider-hold.json"
 run_dispatch --dry-run
 assert_rc "workflow-specific admission exits cleanly" 0 "$RUN_RC"
-assert_contains "the Claude task step remains launchable through a Codex hold" "$RUN_OUT" "#9 (testrepo): would launch --task 'testrepo-epic-9' with codex+claude"
+assert_contains "the Claude task step remains launchable through a Codex hold" "$RUN_OUT" "#9 (testrepo): would launch --task 'testrepo-epic-9' with test-mixed"
 assert_eq "the same engine's full epic vendor set is held" 1 "$(printf '%s\n' "$RUN_OUT" | grep -c '#10: held (codex quota until 2099-01-01 01:00:00 CET)' || true)"
 assert_not_contains "the held epic is not launchable" "$RUN_OUT" "would launch --epic 'testrepo-epic-10'"
 
 printf '\ndispatch hold: every matching vendor is named and both vendors stop all candidates\n'
 reset_state
 READY_QUEUE='6\n7\n8'
-printf 'ready,engine:codex+claude' > "$TMP/labels/6"
+printf 'ready,engine:test-mixed' > "$TMP/labels/6"
 printf 'ready,engine:claude' > "$TMP/labels/7"
 printf 'ready,engine:codex' > "$TMP/labels/8"
 printf '%s\n' '{"claude":{"holdUntil":"2099-01-01T00:00:00.000Z","reason":"session limit","fallback":false},"codex":{"holdUntil":"2099-01-02T00:00:00.000Z","reason":"usage limit","fallback":true}}' > "$TMP/provider-hold.json"
@@ -411,7 +417,7 @@ reset_state
 FIXER_QUEUE=44
 READY_QUEUE='45\n46'
 printf 'failed,needs-judgment,engine:claude' > "$TMP/labels/44"
-printf 'ready,engine:codex+claude' > "$TMP/labels/45"
+printf 'ready,engine:test-mixed' > "$TMP/labels/45"
 printf 'ready,engine:claude' > "$TMP/labels/46"
 printf '%s\n' '{"claude":{"holdUntil":"2099-01-01T00:00:00.000Z","reason":"session limit","fallback":false}}' > "$TMP/provider-hold.json"
 CAPACITY_RC=3
@@ -648,7 +654,7 @@ cp "$ROOT/etc/engines.json" "$HARNESS/etc/engines.json"
 
 printf '\ndispatch hold: vendor sets come from every step in the engine table\n'
 reset_state
-jq '. + {"future-mixed": .["codex+claude"]}' "$ROOT/etc/engines.json" > "$HARNESS/etc/engines.json"
+jq '. + {"future-mixed": .["test-mixed"]}' "$TMP/engines-with-mixed.json" > "$HARNESS/etc/engines.json"
 READY_QUEUE=16
 printf 'ready,engine:future-mixed' > "$TMP/labels/16"
 printf '%s\n' '{"claude":{"holdUntil":"2099-01-01T00:00:00.000Z","reason":"session limit","fallback":false}}' > "$TMP/provider-hold.json"

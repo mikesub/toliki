@@ -100,6 +100,9 @@ FIX_RUN="$ROOT/workflows/fix-run.mjs"
 CI_RUN="$ROOT/workflows/ci-run.mjs"
 DEFECT_RUN="$ROOT/workflows/defect-run.mjs"
 TMP="$(mktemp -d)"
+TEST_ENGINES="$TMP/engines.json"
+jq -s '.[0] + .[1]' "$ROOT/etc/engines.json" "$ROOT/tests/fixtures/mixed-engine.json" > "$TEST_ENGINES"
+export EPIC_ENGINES_FILE="$TEST_ENGINES"
 SUITE_STDERR="$TMP/suite.stderr"
 exec 3>&2 2>"$SUITE_STDERR"
 cleanup_suite() {
@@ -152,7 +155,7 @@ assert_verification_prompt() { # name prompt latest-verify-invocation
 export GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.com GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.com
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 # Same insulation for the engine knob: a dispatch host exports EPIC_ENGINE
-# (codex+claude on the cron), which would retier every run that names no engine.
+# (possibly set by the dispatch host), which would retier every run that names no engine.
 unset EPIC_ENGINE
 ORIGIN="$TMP/origin.git"
 git init -q --bare "$ORIGIN"
@@ -1833,8 +1836,8 @@ assert_contains "the task marker bytes survive in local recovery evidence" "$(gi
 scenario 'task-run: the task engine row is independently configured for every named engine'
 assert_eq "Claude task routing is explicit" "claude/opus/high" "$(jq -r '.claude.task' "$ROOT/etc/engines.json")"
 assert_eq "Codex task routing is explicit" "codex/gpt-5.6-sol/high" "$(jq -r '.codex.task' "$ROOT/etc/engines.json")"
-assert_eq "mixed task routing follows its implementation provider" "claude/opus/high" "$(jq -r '.["codex+claude"].task' "$ROOT/etc/engines.json")"
-assert_not_contains "task does not inherit the code row" "$(jq -r '.codex.task' "$ROOT/etc/engines.json")" "xhigh"
+assert_eq "mixed task routing follows its implementation provider" "claude/opus/high" "$(jq -r '.["test-mixed"].task' "$TEST_ENGINES")"
+assert_not_contains "task keeps its explicit high effort" "$(jq -r '.codex.task' "$ROOT/etc/engines.json")" "xhigh"
 
 scenario 'task-run: malformed output blocks after one process with no PR'
 TASK_BAD="$TMP/fixtures-task-bad"
@@ -2170,7 +2173,8 @@ assert_not_contains "nothing runs on the retired bookkeeping row" "$ARGV" "--mod
 assert_contains "code is chartered as coder (Write/Edit allowed)" "$ARGV" "Bash,Glob,Grep,Read,Edit,Write,"
 assert_contains "design runs the strong tier" "$ARGV" "--model fable"
 assert_contains "the default tier is pinned to opus" "$ARGV" "--model opus"
-assert_contains "every Claude phase runs at xhigh effort" "$ARGV" "--effort xhigh"
+assert_contains "Claude phases run at high effort" "$ARGV" "--effort high"
+assert_not_contains "no Claude phase uses the retired xhigh effort" "$ARGV" "--effort xhigh"
 assert_contains "architect and reviewer cannot write" "$ARGV" "--tools Glob,Grep,Read,"
 assert_contains "the reviewer charter reaches the model" "$ARGV" "Review code against project guidelines"
 assert_not_contains "no charter for a delivery-prose role is loaded at all" "$ARGV" "Write only the structured delivery prose"
@@ -2265,8 +2269,10 @@ assert_rc "exits 0" 0 "$RUN_RC"
 assert_eq "a fresh explicit Codex selection is snapshotted" "engine:codex," "$(gh_engine_labels)"
 assert_contains "RESULT says readyToMerge" "$RUN_OUT" '"readyToMerge":true'
 CODEX_ARGV="$(cat "$CODEX_LOG")"
-assert_contains "every phase runs at xhigh effort" "$CODEX_ARGV" 'model_reasoning_effort="xhigh"'
-assert_contains "every phase uses Sol" "$CODEX_ARGV" "--model gpt-5.6-sol"
+assert_contains "Codex phases run at high effort" "$CODEX_ARGV" 'model_reasoning_effort="high"'
+assert_not_contains "no Codex phase uses the retired xhigh effort" "$CODEX_ARGV" 'model_reasoning_effort="xhigh"'
+assert_contains "architecture uses Astra" "$CODEX_ARGV" "--model gpt-6-astra"
+assert_contains "implementation and review use Sol" "$CODEX_ARGV" "--model gpt-5.6-sol"
 assert_not_contains "no phase falls to a cheaper Codex model" "$CODEX_ARGV" "gpt-5.6-luna"
 assert_contains "hidden Codex fan-out is disabled" "$CODEX_ARGV" "--disable multi_agent --disable enable_fanout"
 assert_contains "Codex runs are ephemeral" "$CODEX_ARGV" "--ephemeral"
@@ -2279,8 +2285,8 @@ assert_eq "and there were review spawns to check" 2 "$CODEX_REVIEW_SPAWNS"
 assert_eq "no Claude process was spawned" 0 "$(wc -l < "$RUN_LOG" | tr -d ' ')"
 assert_eq "origin holds the squashed branch" 1 "$(origin_count epic/42-add-widget)"
 assert_eq "Codex tokens are parsed from its event stream" "1234 1000 300 234" "$(usage_log | jq -r 'select(.label=="architect:design") | "\(.tokens.total) \(.tokens.input) \(.tokens.cacheRead) \(.tokens.output)"')"
-# 700 fresh input at $4, 300 cached at $0.40, 234 output at $20, per 1M.
-assert_eq "Codex records are priced from the table" "0.0076" "$(usage_log | jq -r 'select(.label=="architect:design") | .costUsd')"
+# Astra: 700 fresh input at $10, 300 cached at $1, 234 output at $50, per 1M.
+assert_eq "Codex architecture is priced from the Astra table row" "0.019" "$(usage_log | jq -r 'select(.label=="architect:design") | .costUsd')"
 assert_eq "and say the figure was computed, not billed" "table" "$(usage_log | jq -r 'select(.label=="architect:design") | .costSource')"
 
 scenario 'epic-run: EPIC_ENGINE=codex routes every phase without a flag'
@@ -2341,11 +2347,11 @@ assert_eq "the applied pin is retained rather than guessed away" "engine:claude,
 scenario 'epic-run: an unknown EPIC_ENGINE is refused before any side effect'
 EPIC_ENGINE=future run_pipeline "$EPIC_RUN" "$BASE" --issue 42
 assert_rc "an unknown EPIC_ENGINE exits 1 (usage)" 1 "$RUN_RC"
-assert_contains "and names the allowed engines" "$RUN_OUT" '--engine must be one of claude, codex'
+assert_contains "and names the allowed engines" "$RUN_OUT" '--engine must be one of claude, codex, test-mixed'
 assert_eq "no branch was claimed" "" "$(origin_ref epic/42-add-widget)"
 
-scenario 'epic-run: codex+claude codes on Claude and reviews on Codex'
-run_pipeline "$EPIC_RUN" "$BASE" --issue 42 --engine codex+claude
+scenario 'epic-run: test-mixed codes on Claude and reviews on Codex'
+run_pipeline "$EPIC_RUN" "$BASE" --issue 42 --engine test-mixed
 assert_rc "exits 0" 0 "$RUN_RC"
 assert_contains "the run ships" "$RUN_OUT" '"readyToMerge":true'
 assert_contains "review went to Codex" "$(cat "$CODEX_LOG")" 'model_reasoning_effort="xhigh"'
@@ -3389,7 +3395,7 @@ assert_contains "the final status retains the matching stderr diagnosis" "$(cat 
 
 scenario 'provider quota: an in-flight mixed engine records only the vendor whose step failed'
 SEED_HOLD_RECORD='{"claude":{"holdUntil":"2099-01-01T00:00:00.000Z","reason":"EXISTING_CLAUDE_SENTINEL","fallback":false}}' \
-  CODEX_QUOTA_STDERR_ONLY=1 run_pipeline "$EPIC_RUN" "$BASE" --issue 42 --engine codex+claude
+  CODEX_QUOTA_STDERR_ONLY=1 run_pipeline "$EPIC_RUN" "$BASE" --issue 42 --engine test-mixed
 assert_rc "the mixed-engine quota becomes a successful hold" 0 "$RUN_RC"
 assert_eq "the mixed run reaches its Codex review step before holding" "review|codex" "$(result_json | jq -r '[.phase,.vendor] | join("|")' 2>/dev/null)"
 assert_eq "the mixed run records Codex beside the existing Claude hold" "claude,codex" "$(jq -r 'keys | sort | join(",")' "$HOLD_FILE" 2>/dev/null || true)"

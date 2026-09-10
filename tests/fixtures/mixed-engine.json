@@ -1,0 +1,12 @@
+{
+  "test-mixed": {
+    "task": "claude/opus/high",
+    "architect": "claude/fable/xhigh",
+    "code": "claude/opus/xhigh",
+    "review": "codex/gpt-5.6-sol/xhigh",
+    "final-review": "codex/gpt-5.6-sol/xhigh",
+    "fixes-after-review": "claude/opus/high",
+    "fix-conflicts": "codex/gpt-5.6-sol/xhigh",
+    "fix-ci": "claude/opus/high"
+  }
+}
