@@ -52,6 +52,13 @@ const load = async path => import(`${root}/workflows/prompts/${path}`)
 
 const REQUIREMENT = 'Deliver the widget, and never a bare #number.'
 const CHANGE_DIFF = 'diff --git a/src/widget.ts b/src/widget.ts\n+export const createWidget = () => {}'
+const RESUME_RECOVERY = {
+  branch: 'epic/42-widget', savedHead: 'saved1234', mainHead: 'main5678', mergeBase: 'base0000',
+  markedFiles: ['src/widget.ts'],
+  markerText: [{ file: 'src/widget.ts', text: '<<<<<<< HEAD\nmain widget\n||||||| parent\nbase widget\n=======\nsaved widget\n>>>>>>> recovery' }],
+  savedDiff: 'SAVED BRANCH DIFF', mainDiff: 'CURRENT MAIN DIFF', mainCommits: 'main5678 bound widget timeout',
+  mainIssueRecords: [{ issue: 7, title: 'Timeout', body: 'Bound the call.', captured: true }], omittedMainIssues: 0,
+}
 
 // Two findings with ONE title: indexes, never titles, are the identity.
 const ITEMS = [
@@ -142,6 +149,8 @@ const CASES = {
     (await load('epic/code-direct.mjs')).codeDirectPrompt('.epics/42-widget', REQUIREMENT),
   'epic-review': async () =>
     (await load('epic/review.mjs')).reviewPrompt(REQUIREMENT, CHANGE_DIFF),
+  'epic-review-recovered': async () =>
+    (await load('epic/review.mjs')).reviewPrompt(REQUIREMENT, CHANGE_DIFF, RESUME_RECOVERY),
   'epic-fix': async () =>
     (await load('epic/fix.mjs')).fixPrompt(ITEMS, REQUIREMENT, CHANGE_DIFF),
   'epic-red-retry': async () =>
@@ -150,12 +159,20 @@ const CASES = {
     (await load('epic/verify-retry.mjs')).verifyRetryPrompt({ tail: 'widget.test.ts expected 2 got 1' }),
   'epic-final-review': async () =>
     (await load('epic/final-review.mjs')).finalReviewPrompt(ITEMS, REQUIREMENT, 'REPAIR DELTA', CHANGE_DIFF),
+  'epic-final-review-recovered': async () =>
+    (await load('epic/final-review.mjs')).finalReviewPrompt(ITEMS, REQUIREMENT, 'REPAIR DELTA', CHANGE_DIFF, RESUME_RECOVERY),
   'epic-final-review-single': async () =>
     (await load('epic/final-review.mjs')).finalReviewPrompt(ITEMS.slice(0, 1), REQUIREMENT, 'REPAIR DELTA', CHANGE_DIFF),
   'epic-correction': async () =>
     (await load('epic/correction.mjs')).correctionPrompt(REQUIREMENT, BLOCKERS, 'REPAIR DELTA', '2 packages, 0 failures'),
   'epic-narrow-confirm': async () =>
     (await load('epic/narrow-confirm.mjs')).narrowConfirmPrompt(REQUIREMENT, BLOCKERS, VERDICTS, 'REPAIR DELTA', 'CORRECTION DELTA'),
+  'epic-narrow-confirm-recovered': async () =>
+    (await load('epic/narrow-confirm.mjs')).narrowConfirmPrompt(REQUIREMENT, BLOCKERS, VERDICTS, 'REPAIR DELTA', 'CORRECTION DELTA', RESUME_RECOVERY),
+  'shared-resume-conflict': async () =>
+    (await load('shared/resume-conflict.mjs')).resumeConflictPrompt(RESUME_RECOVERY, REQUIREMENT),
+  'shared-resume-conflict-task': async () =>
+    (await load('shared/resume-conflict.mjs')).resumeConflictPrompt(RESUME_RECOVERY, REQUIREMENT, { completeTask: true }),
 
   'conflict-resolve': async () =>
     (await load('conflict/resolve.mjs')).resolvePrompt(42, CONFLICT_PREP),
@@ -211,6 +228,11 @@ const CASES = {
 
   'shared-verification-retry': async () =>
     (await load('shared/verification-retry.mjs')).verificationRetryPrompt({ tail: 'widget.test.ts expected 2 got 1' }),
+  'shared-verification-evidence': async () =>
+    (await load('shared/verification-evidence.mjs')).verificationEvidencePrompt('Original judging brief',
+      { evidence: 'frontend — npm run verify: exit 0; duration 3600123 ms | 12 tests passed' }),
+  'shared-verification-uncaptured': async () =>
+    (await load('shared/verification-evidence.mjs')).verificationEvidencePrompt('Original judging brief', null),
 }
 
 const name = process.argv[2]
@@ -255,6 +277,9 @@ assert_not_contains "and never mentions a RED step it skipped" "$DIRECT" 'The ex
 REVIEW="$(render epic-review)"
 assert_contains "the reviewer judges the captured diff" "$REVIEW" 'export const createWidget'
 assert_contains "against the captured requirement" "$REVIEW" 'Deliver the widget'
+RECOVERED_REVIEW="$(render epic-review-recovered)"
+assert_contains "a recovered review gets current-main issue intent" "$RECOVERED_REVIEW" 'Issue #7: Timeout'
+assert_contains "a recovered review gets the same stopped bytes" "$RECOVERED_REVIEW" '||||||| parent'
 
 FIX="$(render epic-fix)"
 assert_contains "the repair numbers finding 1" "$FIX" '--- Finding 1 ---'
@@ -278,6 +303,7 @@ assert_contains "and its baseline" "$FINAL" 'Baseline containing the reported pr
 assert_not_contains "but never the fixer's explanation" "$FINAL" 'The caller normalizes missing lists'
 assert_contains "two findings ask for two verdicts" "$FINAL" 'Return exactly 2 verdicts'
 assert_contains "one finding asks for one" "$(render epic-final-review-single)" 'Return exactly 1 verdict,'
+assert_contains "recovery context survives final adjudication" "$(render epic-final-review-recovered)" 'Issue #7: Timeout'
 
 CORRECTION="$(render epic-correction)"
 assert_contains "the correction is told the tree was green" "$CORRECTION" 'GREEN on it (2 packages, 0 failures)'
@@ -288,6 +314,21 @@ assert_contains "bounded to that one blocker" "$CORRECTION" 'Address ONLY the 1 
 CONFIRM="$(render epic-narrow-confirm)"
 assert_contains "the narrow confirmation sees the correction delta" "$CONFIRM" '<correction-delta>'
 assert_contains "and what the final review already upheld" "$CONFIRM" 'item 1: upheld (confidence 88)'
+assert_contains "recovery context survives narrow confirmation" "$(render epic-narrow-confirm-recovered)" 'Issue #7: Timeout'
+
+RESUME_CONFLICT="$(render shared-resume-conflict)"
+assert_contains "resume recovery binds the saved SHA" "$RESUME_CONFLICT" 'saved branch head: saved1234'
+assert_contains "resume recovery binds the current main SHA" "$RESUME_CONFLICT" 'current main head: main5678'
+assert_contains "resume recovery carries saved-branch evidence" "$RESUME_CONFLICT" 'SAVED BRANCH DIFF'
+assert_contains "resume recovery carries current-main evidence" "$RESUME_CONFLICT" 'CURRENT MAIN DIFF'
+assert_contains "resume recovery carries exact marker bytes" "$RESUME_CONFLICT" '||||||| parent'
+assert_contains "resume recovery carries main-side issue intent" "$RESUME_CONFLICT" 'Issue #7: Timeout'
+assert_contains "epic recovery stays narrow" "$RESUME_CONFLICT" 'Touch only the unresolved files named above'
+RESUME_TASK="$(render shared-resume-conflict-task)"
+assert_contains "task recovery uses the ordinary primary process" "$RESUME_TASK" "ordinary primary tasker process"
+assert_contains "task recovery completes the requirement in the same call" "$RESUME_TASK" 'finish the complete requirement and self-review'
+assert_contains "unsafe task recovery returns the task schema blocker" "$RESUME_TASK" 'return blocked with the concrete unresolved condition'
+assert_not_contains "task recovery never asks for the epic-only declined status" "$RESUME_TASK" 'return declined'
 
 # ───────────────────────── conflict prompts ─────────────────────────
 section "conflict: one module, both of the step shapes"
@@ -370,6 +411,14 @@ section 'shared: one wording for every fixer verification retry'
 SHARED_RETRY="$(render shared-verification-retry)"
 assert_contains "it carries the captured diagnostics" "$SHARED_RETRY" 'widget.test.ts expected 2 got 1'
 assert_contains "and bounds itself at one" "$SHARED_RETRY" 'This is the one verification-driven repair retry in this run'
+
+section 'shared: independent checks receive measured verification evidence'
+SHARED_EVIDENCE="$(render shared-verification-evidence)"
+assert_contains "the judging brief is preserved" "$SHARED_EVIDENCE" 'Original judging brief'
+assert_contains "verification is explicitly bounded as captured evidence" "$SHARED_EVIDENCE" '<verification-evidence>'
+assert_contains "the command, exit, wall duration and summary survive verbatim" "$SHARED_EVIDENCE" 'npm run verify: exit 0; duration 3600123 ms | 12 tests passed'
+assert_contains "green is not presented as proof of requirement coverage" "$SHARED_EVIDENCE" 'A passing command is not proof of requirement coverage'
+assert_contains "missing evidence is explicit rather than a claimed pass" "$(render shared-verification-uncaptured)" '(verification evidence was not captured)'
 
 # ───────────────────────── the split itself ─────────────────────────
 section 'prompt modules build strings and nothing else'

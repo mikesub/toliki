@@ -138,6 +138,12 @@ assert_matches() { # name value extended-regex
     printf '%s\n' "$2" | tail -n 8 | sed 's/^/       | /'
   fi
 }
+assert_verification_prompt() { # name prompt latest-verify-invocation
+  local evidence
+  evidence="$(printf '%s\n' "$2" | sed -n '/^<verification-evidence>$/,/^<\/verification-evidence>$/p')"
+  assert_matches "$1 gets command, actual exit and measured duration" "$evidence" 'npm run verify: exit 0; duration [0-9]+ ms'
+  assert_contains "$1 gets the latest gate output, not an earlier green" "$evidence" "verify ok (invocation $3)"
+}
 
 # ───────────────────────── a throwaway project on a bare origin ─────────────────────────
 # One package declaring scripts.verify, .epics/ ignored, an AGENTS.md (the
@@ -193,6 +199,7 @@ fresh_clone() { # -> path; detached at origin/main, like launch.sh's worktree
 }
 origin_ref() { git -C "$ORIGIN" rev-parse -q --verify "refs/heads/$1" 2>/dev/null || true; }
 origin_count() { git -C "$ORIGIN" rev-list --count "main..$1" 2>/dev/null || echo '?'; }
+latest_recovery_ref() { git -C "$WT" for-each-ref --sort=-creatordate --count=1 --format='%(refname)' "refs/toliki/recovery/$1/"; }
 # Seed origin with a branch built by a helper clone: seed_branch <branch> <base> <script>
 # A counter, not $RANDOM: a suite this long draws the same number twice, and a
 # collided clone path fails the seed with the scenario's assertions still armed.
@@ -207,6 +214,15 @@ seed_branch() {
   (cd "$dir" && bash -c "$script")
   git -C "$dir" push -q origin "HEAD:refs/heads/$branch"
   rm -rf "$dir"
+}
+seed_conflicted_resume() {
+  seed_branch epic/42-add-widget main 'printf "export const items = [\"branch\"]\n" > frontend/src/index.ts; git add -A; git commit -qm "wip: first partial checkpoint"; printf "export const preserved = true\n" > frontend/src/preserved.ts; git add -A; git commit -qm "wip: second partial checkpoint"'
+  seed_branch main main 'printf "export const items = [\"main\"]\n" > frontend/src/index.ts; git add -A; git commit -qm "main changes widget items" -m "Closes #7"'
+}
+seed_clean_aggregate_resume() {
+  seed_branch main main 'printf "export const transient = \"base\"\n" > frontend/src/transient.ts; git add -A; git commit -qm "add transient fixture base"'
+  seed_branch epic/42-add-widget main 'printf "export const transient = \"branch\"\n" > frontend/src/transient.ts; git add -A; git commit -qm "wip: intermediate transient checkpoint"; printf "export const transient = \"base\"\n" > frontend/src/transient.ts; printf "{\"b\":1}\n" > frontend/package-lock.json; printf "export const preserved = true\n" > frontend/src/preserved.ts; git add -A; git commit -qm "wip: final lock checkpoint"'
+  seed_branch main main 'printf "export const transient = \"main\"\n" > frontend/src/transient.ts; git add -A; git commit -qm "land current transient choice"'
 }
 # A commit landing on the stub origin's main while a run is still going, the way
 # another PR merging does during an hour-long epic. Emitted as a bash snippet
@@ -267,6 +283,7 @@ case "${EPIC_STEP_LABEL:-}" in
   architect:design)                            key=design ;;
   architect:recover)                           key=recover ;;
   code:red|code:red:retry)                     key=red ;;
+  code:resume-recovery)                        key=resume-recovery ;;
   code:direct|code:direct:retry)                key=direct ;;
   code:green|code:green:retry)                 key=green ;;
   review:general)                              key=review-general ;;
@@ -657,6 +674,14 @@ printf '%s\n' "$*" >> "${STUB_NPM_LOG:-/dev/null}"
 case "$*" in
   ci) mkdir -p node_modules; exit 0 ;;
   "run verify")
+    if [[ "${STUB_VERIFY_DELAY:-}" == "1" ]]; then
+      printf 'runner reported duration 0 ms\n'
+      sleep 0.15
+    fi
+    if [[ "${STUB_VERIFY_LONG_SUMMARY:-}" == "1" ]]; then
+      node -e 'process.stdout.write("VERIFY_HEAD" + "x".repeat(20000) + "VERIFY_TAIL\n"); process.stderr.write("STDERR_HEAD" + "y".repeat(20000) + "STDERR_TAIL\n")'
+      exit 0
+    fi
     if [[ "${STUB_VERIFY_ANSI:-}" == "1" ]]; then
       printf '\033[2mTests\033[22m \033[1m\033[31m5 failed\033[39m\033[22m\r\033[32m15779 passed\033[39m\a\n'
       printf '\033[90mwidget.test.ts: expected 2 got 1\033[39m\n' >&2
@@ -695,7 +720,7 @@ case "$*" in
       printf 'FAIL src/widget.test.ts: missing export createWidget\n' >&2
       exit 1
     fi
-    printf 'verify ok\n'; exit 0 ;;
+    printf 'verify ok (invocation %s)\n' "$(grep -c '^run verify$' "${STUB_NPM_LOG:-/dev/null}")"; exit 0 ;;
 esac
 exit 0
 STUB
@@ -761,10 +786,13 @@ assert_eq "npm ci ran once for the lockfile-carrying package" "1" "$(grep -c '^c
 cat > "$TMP/verify-check.mjs" <<'NODE'
 const { runVerify } = await import(process.env.REPO_MODULE)
 process.chdir(process.env.VERIFY_DIR)
-const result = await runVerify(['.'], { tailLines: 40 })
+const result = await runVerify(JSON.parse(process.env.VERIFY_PACKAGES || '["."]'),
+  { tailLines: 40, timeoutMs: Number(process.env.VERIFY_TIMEOUT_MS) || 5000 })
 console.log(`GREEN=${result.green}`)
 console.log(`DETAIL=${result.detail}`)
 console.log(`TAIL=${JSON.stringify(result.tail)}`)
+console.log(`EVIDENCE=${result.evidence}`)
+console.log(`MS=${result.ms}`)
 NODE
 
 VERIFY_DIR="$TMP/verify-mixed"; mkdir -p "$VERIFY_DIR"
@@ -775,7 +803,8 @@ VERIFY_TAIL="$(printf '%s\n' "$VERIFY_OUT" | sed -n 's/^TAIL=//p')"
 VERIFY_STDOUT_FAILURE='VERIFY_STDOUT_ASSERTION expected 2 got 1'
 
 assert_eq "runVerify keeps the nonzero exit as the failure verdict" "false" "$VERIFY_GREEN"
-assert_eq "runVerify detail preserves independently bounded stdout and stderr" ". — fail: $VERIFY_STDOUT_FAILURE | verify stderr noise 43 | verify stderr noise 44 | verify stderr noise 45" "$VERIFY_DETAIL"
+assert_eq "runVerify detail preserves independently bounded stdout and stderr" ". — fail: $VERIFY_STDOUT_FAILURE | verify stderr noise 43 | verify stderr noise 44 | verify stderr noise 45" "$(printf '%s\n' "$VERIFY_DETAIL" | sed -E 's/ \([0-9]+ ms\)$//')"
+assert_matches "failed verification evidence includes actual exit and elapsed time" "$VERIFY_OUT" 'npm run verify: exit 1; duration [0-9]+ ms'
 assert_contains "runVerify tail preserves the stdout assertion past forty stderr lines" "$VERIFY_TAIL" "$VERIFY_STDOUT_FAILURE"
 assert_contains "runVerify tail keeps stderr represented" "$VERIFY_TAIL" "verify stderr noise 45"
 assert_not_contains "runVerify tail bounds stderr independently" "$VERIFY_TAIL" "verify stderr noise 05"
@@ -786,6 +815,34 @@ assert_contains "runVerify keeps readable text from colored verification output"
 assert_contains "runVerify normalizes carriage-return progress into readable lines" "$VERIFY_ANSI_OUT" '15779 passed'
 assert_not_contains "runVerify strips terminal escape bytes before diagnostics escape the transport" "$VERIFY_ANSI_OUT" $'\033'
 assert_not_contains "runVerify strips non-layout control bytes before GitHub Markdown" "$VERIFY_ANSI_OUT" $'\a'
+
+# The runner claims zero time, then keeps its child alive briefly. The harness
+# must measure the complete process lifetime itself, even for successful gates.
+VERIFY_SLOW_OUT="$(PATH="$TMP/bin:$PATH" REPO_MODULE="$ROOT/workflows/lib/repo.mjs" VERIFY_DIR="$VERIFY_DIR" STUB_VERIFY_DELAY=1 node "$TMP/verify-check.mjs")"
+VERIFY_MS="$(printf '%s\n' "$VERIFY_SLOW_OUT" | sed -n 's/^MS=//p')"
+assert_eq "command lifetime is measured independently of its output" true "$([[ "$VERIFY_MS" -ge 100 ]] && echo true || echo false)"
+assert_contains "measured duration reaches captured evidence" "$VERIFY_SLOW_OUT" "npm run verify: exit 0; duration $VERIFY_MS ms"
+assert_contains "the runner summary is retained as evidence, not treated as timing" "$VERIFY_SLOW_OUT" 'runner reported duration 0 ms'
+assert_contains "successful verification logs retain the measured duration" "$VERIFY_SLOW_OUT" "pass ($VERIFY_MS ms)"
+
+VERIFY_TIMEOUT_OUT="$(PATH="$TMP/bin:$PATH" REPO_MODULE="$ROOT/workflows/lib/repo.mjs" VERIFY_DIR="$VERIFY_DIR" STUB_VERIFY_DELAY=1 VERIFY_TIMEOUT_MS=25 node "$TMP/verify-check.mjs")"
+assert_contains "a timeout is still red" "$VERIFY_TIMEOUT_OUT" 'GREEN=false'
+assert_matches "a timeout is explicit in evidence instead of an exit-zero claim" "$VERIFY_TIMEOUT_OUT" 'npm run verify: timed out; duration [0-9]+ ms'
+
+VERIFY_SPAWN_OUT="$(PATH="$TMP/bin:$PATH" REPO_MODULE="$ROOT/workflows/lib/repo.mjs" VERIFY_DIR="$VERIFY_DIR" VERIFY_PACKAGES='["missing-directory"]' node "$TMP/verify-check.mjs")"
+assert_contains "a failed spawn stays red" "$VERIFY_SPAWN_OUT" 'GREEN=false'
+assert_matches "failed-spawn evidence cannot masquerade as a completed test" "$VERIFY_SPAWN_OUT" 'missing-directory — npm run verify: spawn failed; duration [0-9]+ ms'
+
+VERIFY_NONE_OUT="$(PATH="$TMP/bin:$PATH" REPO_MODULE="$ROOT/workflows/lib/repo.mjs" VERIFY_DIR="$VERIFY_DIR" VERIFY_PACKAGES='[]' node "$TMP/verify-check.mjs")"
+assert_contains "an empty package contract is explicit, not a fabricated test pass" "$VERIFY_NONE_OUT" 'no verification commands ran'
+assert_contains "no command means no command time" "$VERIFY_NONE_OUT" 'MS=0'
+
+VERIFY_LONG_OUT="$(PATH="$TMP/bin:$PATH" REPO_MODULE="$ROOT/workflows/lib/repo.mjs" VERIFY_DIR="$VERIFY_DIR" STUB_VERIFY_LONG_SUMMARY=1 node "$TMP/verify-check.mjs")"
+VERIFY_LONG_EVIDENCE="$(printf '%s\n' "$VERIFY_LONG_OUT" | sed -n 's/^EVIDENCE=//p')"
+assert_eq "long single-line output cannot bloat each judging prompt" true "$( [[ ${#VERIFY_LONG_EVIDENCE} -lt 2000 ]] && echo true || echo false )"
+assert_contains "summary truncation is explicit" "$VERIFY_LONG_EVIDENCE" '[truncated]'
+assert_matches "both ends of stdout remain useful" "$VERIFY_LONG_EVIDENCE" 'VERIFY_HEAD.*VERIFY_TAIL'
+assert_matches "stderr retains its own summary budget" "$VERIFY_LONG_EVIDENCE" 'STDERR_HEAD.*STDERR_TAIL'
 
 cat > "$TMP/hookless-git-env.mjs" <<'NODE'
 const { git } = await import(process.env.REPO_MODULE)
@@ -1137,6 +1194,10 @@ run_pipeline() { # script fixtures-dir args...   (scenario knobs via GH_* env)
   : > "$RUN_LOG"; : > "$CODEX_LOG"; : > "$GH_LOG"; : > "$NPM_LOG"
   WT="$(fresh_clone)"
   if [[ -d "$fixtures/worktree" ]]; then cp -R "$fixtures/worktree/." "$WT/"; fi
+  if [[ "${PREPARE_DIRTY_INDEX:-}" == "1" ]]; then
+    printf 'pin guard bytes\n' > "$WT/frontend/src/pin-guard.ts"
+    git -C "$WT" add frontend/src/pin-guard.ts
+  fi
   RUN_RC=0
   RUN_OUT="$(
     cd "$WT" && \
@@ -1720,6 +1781,55 @@ assert_contains "the candidate keeps its rationale" "$TASK_COMMIT" "Add the widg
 assert_contains "the candidate closes the source issue" "$TASK_COMMIT" "Closes #42"
 assert_contains "the issue record names the intentional review omission" "$(gh_comments)" "intentionally skipped architecture and independent semantic review"
 
+scenario 'task-run: conflicted interrupted work is integrated inside the ordinary primary tasker'
+seed_conflicted_resume
+TASK_RECOVERY="$TMP/fixtures-task-recovery"
+make_task_fixture "$TASK_RECOVERY"
+fixture_sh "$TASK_RECOVERY" task 'printf "export const items = [\"main\", \"branch\"]\n" > frontend/src/index.ts; printf "export const createWidget = () => ({})\n" > frontend/src/widget.ts; printf "test(\"widget\", () => {})\n" > frontend/src/widget.test.ts'
+GH_ISSUE_LABELS='ready,task,engine:claude' run_pipeline "$TASK_RUN" "$TASK_RECOVERY" --issue 42 --engine claude
+assert_rc "recovered task exits 0" 0 "$RUN_RC"
+assert_eq "recovery does not add a task process" 1 "$(calls task)"
+assert_contains "the primary tasker receives the exact marker bytes" "$(cat "$STATE_DIR/task.0.prompt")" '<<<<<<< HEAD'
+assert_contains "the primary tasker is told to finish the task after integration" "$(cat "$STATE_DIR/task.0.prompt")" "ordinary primary tasker process"
+assert_contains "the task candidate keeps main's intent" "$(git -C "$ORIGIN" show epic/42-add-widget:frontend/src/index.ts)" '"main"'
+assert_contains "the task candidate keeps the interrupted branch intent" "$(git -C "$ORIGIN" show epic/42-add-widget:frontend/src/index.ts)" '"branch"'
+assert_contains "the task candidate keeps the second checkpoint" "$(git -C "$ORIGIN" show epic/42-add-widget:frontend/src/preserved.ts)" 'preserved = true'
+assert_eq "the recovered task remains intentionally unreviewed" 0 "$(calls review-general)"
+
+scenario 'task-run: quota during recovery restores ready and snapshots all partial tasker edits'
+seed_conflicted_resume
+TASK_RECOVERY_QUOTA="$TMP/fixtures-task-recovery-quota"
+make_task_fixture "$TASK_RECOVERY_QUOTA"
+fixture_sh "$TASK_RECOVERY_QUOTA" task 'printf "export const items = [\"partially integrated\"]\n" > frontend/src/index.ts; printf "outside recovery edit\n" > frontend/src/outside.ts; rm README.md'
+fixture_error "$TASK_RECOVERY_QUOTA" task '{"type":"result","subtype":"success","is_error":true,"terminal_reason":"api_error","api_error_status":429,"result":"You have hit your usage limit; resets 7:50pm (UTC)","duration_ms":386,"num_turns":1,"total_cost_usd":0,"usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
+SAVED_TASK_RECOVERY_HEAD="$(origin_ref epic/42-add-widget)"
+GH_ISSUE_LABELS='ready,task,engine:claude' run_pipeline "$TASK_RUN" "$TASK_RECOVERY_QUOTA" --issue 42 --engine claude
+assert_rc "quota-held recovery exits 0" 0 "$RUN_RC"
+assert_eq "quota recovery still spends one task process" 1 "$(calls task)"
+assert_eq "quota restores the task queue and selector" "ready,task," "$(gh_labels)"
+assert_eq "quota keeps the exact engine pin" "engine:claude," "$(gh_engine_labels)"
+assert_eq "the original remote checkpoint chain stays untouched" "$SAVED_TASK_RECOVERY_HEAD" "$(origin_ref epic/42-add-widget)"
+assert_eq "the original local checkpoint chain is restored" "$SAVED_TASK_RECOVERY_HEAD" "$(git -C "$WT" rev-parse HEAD)"
+TASK_RECOVERY_REF="$(latest_recovery_ref 42-add-widget)"
+assert_contains "the snapshot uses a durable local-only recovery ref" "$TASK_RECOVERY_REF" 'refs/toliki/recovery/42-add-widget/'
+assert_contains "the snapshot keeps task edits outside conflict files" "$(git -C "$WT" show "$TASK_RECOVERY_REF:frontend/src/outside.ts")" 'outside recovery edit'
+if git -C "$WT" cat-file -e "$TASK_RECOVERY_REF:README.md" 2>/dev/null; then nok "the snapshot records a tasker deletion"; else ok "the snapshot records a tasker deletion"; fi
+assert_contains "the quota result reports the retained local evidence" "$RUN_OUT" "$TASK_RECOVERY_REF"
+
+scenario 'task-run: recovery blocks marker text introduced in another task-changed file'
+seed_conflicted_resume
+TASK_RECOVERY_MARKER="$TMP/fixtures-task-recovery-marker"
+make_task_fixture "$TASK_RECOVERY_MARKER"
+fixture_sh "$TASK_RECOVERY_MARKER" task 'printf "export const items = [\"main\", \"branch\"]\n" > frontend/src/index.ts; printf "<<<<<<< added by tasker\nunsafe\n" > frontend/src/new-marker.ts'
+SAVED_TASK_MARKER_HEAD="$(origin_ref epic/42-add-widget)"
+GH_ISSUE_LABELS='ready,task,engine:claude' run_pipeline "$TASK_RUN" "$TASK_RECOVERY_MARKER" --issue 42 --engine claude
+assert_rc "marker-bearing task recovery blocks" 3 "$RUN_RC"
+assert_eq "the marker check buys no extra task process" 1 "$(calls task)"
+assert_eq "marker-bearing recovery leaves the queue terminal" "failed,task," "$(gh_labels)"
+assert_eq "the original task checkpoint chain remains remote" "$SAVED_TASK_MARKER_HEAD" "$(origin_ref epic/42-add-widget)"
+TASK_MARKER_REF="$(latest_recovery_ref 42-add-widget)"
+assert_contains "the task marker bytes survive in local recovery evidence" "$(git -C "$WT" show "$TASK_MARKER_REF:frontend/src/new-marker.ts")" '<<<<<<< added by tasker'
+
 scenario 'task-run: the task engine row is independently configured for every named engine'
 assert_eq "Claude task routing is explicit" "claude/opus/high" "$(jq -r '.claude.task' "$ROOT/etc/engines.json")"
 assert_eq "Codex task routing is explicit" "codex/gpt-5.6-sol/high" "$(jq -r '.codex.task' "$ROOT/etc/engines.json")"
@@ -1923,6 +2033,8 @@ assert_eq "exactly one fresh fixer ran" 1 "$(calls triage)"
 assert_eq "and exactly one final review" 1 "$(calls finalreview)"
 assert_contains "the tally records the final review" "$RUN_OUT" "final review:"
 FINALREVIEW_PROMPT="$(cat "$STATE_DIR/finalreview.0.prompt")"
+assert_verification_prompt "the broad reviewer" "$(cat "$STATE_DIR/review-general.0.prompt")" 3
+assert_verification_prompt "the final reviewer" "$FINALREVIEW_PROMPT" 4
 assert_contains "the final review was handed the complete diff" "$FINALREVIEW_PROMPT" '<change-diff>'
 assert_contains "the complete diff includes the implementation" "$FINALREVIEW_PROMPT" 'frontend/src/widget.ts'
 assert_contains "the complete diff includes the regression test" "$FINALREVIEW_PROMPT" 'frontend/src/widget.test.ts'
@@ -2366,6 +2478,120 @@ assert_eq "the resumed branch still squashes to one commit" 1 "$(origin_count ep
 assert_contains "the leftover work is in the squashed tree" "$(git -C "$ORIGIN" ls-tree -r --name-only epic/42-add-widget)" "frontend/src/leftover.ts"
 assert_contains "and so is the new work" "$(git -C "$ORIGIN" ls-tree -r --name-only epic/42-add-widget)" "frontend/src/widget.ts"
 
+scenario 'resume conflict: a multi-checkpoint partial branch is integrated, verified and reviewed'
+seed_conflicted_resume
+CONFLICTED_RESUME="$TMP/fixtures-conflicted-resume"; cp -R "$BASE" "$CONFLICTED_RESUME"
+fixture "$CONFLICTED_RESUME" resume-recovery '{"status":"resolved","summary":"kept current main and the interrupted branch item"}'
+fixture_sh "$CONFLICTED_RESUME" resume-recovery 'printf "export const items = [\"main\", \"branch\"]\n" > frontend/src/index.ts'
+fixture "$CONFLICTED_RESUME" design '{"approach":"Continue integrated widget","rationale":"Preserve and finish the recovered partial work.","steps":["finish widget"],"files":["frontend/src/widget.ts — finish"],"contract":"createWidget(): Widget","tradeoffs":"Continue directly from the integrated tree.","verification":{"mode":"direct","rationale":"The branch already contains partial work.","evidence":["widget test passes"]}}'
+fixture "$CONFLICTED_RESUME" direct "{\"status\":\"continued recovered widget\",\"delivery\":$DELIVERY_BASE}"
+fixture_sh "$CONFLICTED_RESUME" direct 'printf "export const createWidget = () => ({})\n" > frontend/src/widget.ts; printf "test(\"widget\", () => {})\n" > frontend/src/widget.test.ts'
+GH_ISSUE_LABELS='ready,engine:claude' run_pipeline "$EPIC_RUN" "$CONFLICTED_RESUME" --issue 42 --engine claude
+assert_rc "the recovered epic ships" 0 "$RUN_RC"
+assert_eq "one bounded integration process runs" 1 "$(calls resume-recovery)"
+assert_eq "the preserved partial branch continues directly" 1 "$(calls direct)"
+assert_eq "the integrated tree receives the mandatory broad review" 1 "$(calls review-general)"
+assert_contains "the final candidate keeps main's intent" "$(git -C "$ORIGIN" show epic/42-add-widget:frontend/src/index.ts)" '"main"'
+assert_contains "the final candidate keeps the saved branch intent" "$(git -C "$ORIGIN" show epic/42-add-widget:frontend/src/index.ts)" '"branch"'
+assert_contains "the second saved checkpoint survives aggregation" "$(git -C "$ORIGIN" show epic/42-add-widget:frontend/src/preserved.ts)" 'preserved = true'
+RECOVERY_PROMPT="$(cat "$STATE_DIR/resume-recovery.0.prompt")"
+assert_contains "the recovery prompt pins the saved head" "$RECOVERY_PROMPT" 'saved branch head:'
+assert_contains "the recovery prompt pins the current main head" "$RECOVERY_PROMPT" 'current main head:'
+assert_contains "the recovery prompt carries the exact stopped marker bytes" "$RECOVERY_PROMPT" '<<<<<<< HEAD'
+assert_contains "the recovery prompt carries the saved branch diff" "$RECOVERY_PROMPT" '<saved-branch-diff>'
+assert_contains "the recovery prompt carries the current main diff" "$RECOVERY_PROMPT" '<current-main-diff>'
+assert_contains "the recovery prompt carries main-side issue intent" "$RECOVERY_PROMPT" 'Issue #7:'
+assert_contains "the broad reviewer receives the same main-side intent" "$(cat "$STATE_DIR/review-general.0.prompt")" 'Issue #7:'
+
+scenario 'resume conflict: a clean aggregate replay installs dependencies exactly once'
+seed_clean_aggregate_resume
+CLEAN_AGGREGATE="$TMP/fixtures-clean-aggregate"; cp -R "$BASE" "$CLEAN_AGGREGATE"
+fixture "$CLEAN_AGGREGATE" design '{"approach":"Continue clean aggregate","rationale":"Preserve and finish the recovered partial work.","steps":["finish widget"],"files":["frontend/src/widget.ts — finish"],"contract":"createWidget(): Widget","tradeoffs":"Continue directly.","verification":{"mode":"direct","rationale":"The branch contains partial work.","evidence":["widget test passes"]}}'
+fixture "$CLEAN_AGGREGATE" direct "{\"status\":\"continued clean aggregate\",\"delivery\":$DELIVERY_BASE}"
+fixture_sh "$CLEAN_AGGREGATE" direct 'printf "export const createWidget = () => ({})\n" > frontend/src/widget.ts; printf "test(\"widget\", () => {})\n" > frontend/src/widget.test.ts'
+GH_ISSUE_LABELS='ready,engine:claude' run_pipeline "$EPIC_RUN" "$CLEAN_AGGREGATE" --issue 42 --engine claude
+assert_rc "the clean aggregate recovery ships" 0 "$RUN_RC"
+assert_eq "the clean aggregate needs no recovery model" 0 "$(calls resume-recovery)"
+assert_eq "the changed lockfile is installed once after aggregate settlement" 1 "$(grep -c '^ci$' "$NPM_LOG" || true)"
+assert_contains "the aggregate keeps the final checkpoint lock intent" "$(git -C "$ORIGIN" show epic/42-add-widget:frontend/package-lock.json)" '"b":1'
+
+scenario 'resume conflict: cumulative main intent survives failure and a second recovery'
+seed_conflicted_resume
+RECOVERY_THEN_FAIL="$TMP/fixtures-recovery-then-fail"; cp -R "$BASE" "$RECOVERY_THEN_FAIL"
+fixture "$RECOVERY_THEN_FAIL" resume-recovery '{"status":"resolved","summary":"integrated both sides"}'
+fixture_sh "$RECOVERY_THEN_FAIL" resume-recovery 'printf "export const items = [\"main\", \"branch\"]\n" > frontend/src/index.ts'
+fixture "$RECOVERY_THEN_FAIL" design '{}'
+GH_ISSUE_LABELS='ready,engine:claude' run_pipeline "$EPIC_RUN" "$RECOVERY_THEN_FAIL" --issue 42 --engine claude
+assert_rc "the post-integration design failure blocks" 3 "$RUN_RC"
+FIRST_RECOVERY_METADATA="$(git -C "$ORIGIN" log --format=%B main..epic/42-add-widget)"
+assert_contains "the preserved aggregate carries pinned main metadata" "$FIRST_RECOVERY_METADATA" 'Toliki-Recovery-Main-Head:'
+FIRST_RECOVERY_MAIN="$(printf '%s\n' "$FIRST_RECOVERY_METADATA" | sed -n 's/^Toliki-Recovery-Main-Head: //p' | head -1)"
+FIRST_RECOVERY_BASE="$(printf '%s\n' "$FIRST_RECOVERY_METADATA" | sed -n 's/^Toliki-Recovery-Merge-Base: //p' | head -1)"
+
+seed_branch main main 'printf "export const items = [\"main\", \"newmain\"]\n" > frontend/src/index.ts; git add -A; git commit -qm "extend current main items" -m "Closes #8"'
+
+RECOVERY_RESUME="$TMP/fixtures-recovery-resume"; cp -R "$BASE" "$RECOVERY_RESUME"
+fixture "$RECOVERY_RESUME" resume-recovery '{"status":"resolved","summary":"integrated the later main change too"}'
+fixture_sh "$RECOVERY_RESUME" resume-recovery 'printf "export const items = [\"main\", \"newmain\", \"branch\"]\n" > frontend/src/index.ts'
+fixture "$RECOVERY_RESUME" design '{"approach":"Continue retained integration","rationale":"Preserve the integrated partial work.","steps":["finish widget"],"files":["frontend/src/widget.ts — finish"],"contract":"createWidget(): Widget","tradeoffs":"Continue directly.","verification":{"mode":"direct","rationale":"The branch contains partial work.","evidence":["widget test passes"]}}'
+fixture "$RECOVERY_RESUME" direct "{\"status\":\"continued retained integration\",\"delivery\":$DELIVERY_BASE}"
+fixture_sh "$RECOVERY_RESUME" direct 'printf "export const createWidget = () => ({})\n" > frontend/src/widget.ts; printf "test(\"widget\", () => {})\n" > frontend/src/widget.test.ts'
+GH_ISSUE_LABELS='ready,engine:claude' run_pipeline "$EPIC_RUN" "$RECOVERY_RESUME" --issue 42 --engine claude
+assert_rc "the preserved aggregate resumes and ships" 0 "$RUN_RC"
+assert_eq "the later main conflict gets one second bounded recovery" 1 "$(calls resume-recovery)"
+SECOND_RECOVERY_PROMPT="$(cat "$STATE_DIR/resume-recovery.0.prompt")"
+assert_contains "second recovery labels its operational replay base exactly" "$SECOND_RECOVERY_PROMPT" "current recovery merge base: $FIRST_RECOVERY_MAIN"
+assert_contains "second recovery labels its cumulative intent base exactly" "$SECOND_RECOVERY_PROMPT" "cumulative main-intent base: $FIRST_RECOVERY_BASE"
+assert_contains "the later broad reviewer retains first-recovery main intent" "$(cat "$STATE_DIR/review-general.0.prompt")" 'Issue #7:'
+assert_contains "the later broad reviewer also receives second-recovery main intent" "$(cat "$STATE_DIR/review-general.0.prompt")" 'Issue #8:'
+assert_contains "the later reviewer retains the cumulative intent provenance" "$(cat "$STATE_DIR/review-general.0.prompt")" "cumulative main-intent base: $FIRST_RECOVERY_BASE"
+
+scenario 'resume conflict: staged edits outside the stop are retained and terminally blocked'
+seed_conflicted_resume
+OUTSIDE_RECOVERY="$TMP/fixtures-outside-resume-recovery"; cp -R "$BASE" "$OUTSIDE_RECOVERY"
+fixture "$OUTSIDE_RECOVERY" resume-recovery '{"status":"resolved","summary":"resolved markers but exceeded the boundary"}'
+fixture_sh "$OUTSIDE_RECOVERY" resume-recovery 'printf "export const items = [\"main\", \"branch\"]\n" > frontend/src/index.ts; printf "export const preserved = \"changed and staged\"\n" > frontend/src/preserved.ts; git add frontend/src/preserved.ts'
+SAVED_OUTSIDE_HEAD="$(origin_ref epic/42-add-widget)"
+GH_ISSUE_LABELS='ready,engine:claude' run_pipeline "$EPIC_RUN" "$OUTSIDE_RECOVERY" --issue 42 --engine claude
+assert_rc "staged outside recovery blocks" 3 "$RUN_RC"
+assert_eq "outside recovery gets one bounded process" 1 "$(calls resume-recovery)"
+assert_eq "outside recovery is terminal instead of requeued" "failed," "$(gh_labels)"
+assert_eq "outside recovery restores the original local head" "$SAVED_OUTSIDE_HEAD" "$(git -C "$WT" rev-parse HEAD)"
+OUTSIDE_RECOVERY_REF="$(latest_recovery_ref 42-add-widget)"
+assert_contains "the staged outside bytes survive in local recovery evidence" "$(git -C "$WT" show "$OUTSIDE_RECOVERY_REF:frontend/src/preserved.ts")" 'changed and staged'
+
+scenario 'resume conflict: a builder-created commit is snapshotted before original history is restored'
+seed_conflicted_resume
+COMMITTED_RECOVERY="$TMP/fixtures-committed-resume-recovery"; cp -R "$BASE" "$COMMITTED_RECOVERY"
+fixture "$COMMITTED_RECOVERY" resume-recovery '{"status":"resolved"}'
+fixture_sh "$COMMITTED_RECOVERY" resume-recovery 'printf "export const items = [\"main\", \"branch\"]\n" > frontend/src/index.ts; git add -A; GIT_EDITOR=true git rebase --continue; printf "committed recovery bytes\n" > frontend/src/committed-recovery.ts; git add -A; git commit -qm "builder disobeyed recovery boundary"'
+SAVED_COMMITTED_HEAD="$(origin_ref epic/42-add-widget)"
+GH_ISSUE_LABELS='ready,engine:claude' run_pipeline "$EPIC_RUN" "$COMMITTED_RECOVERY" --issue 42 --engine claude
+assert_rc "committed malformed recovery blocks" 3 "$RUN_RC"
+assert_eq "committed recovery is never schema-respawned" 1 "$(calls resume-recovery)"
+assert_eq "committed recovery restores the original local chain" "$SAVED_COMMITTED_HEAD" "$(git -C "$WT" rev-parse HEAD)"
+assert_eq "committed recovery never overwrites the remote chain" "$SAVED_COMMITTED_HEAD" "$(origin_ref epic/42-add-widget)"
+COMMITTED_RECOVERY_REF="$(latest_recovery_ref 42-add-widget)"
+assert_contains "committed recovery bytes survive the reset" "$(git -C "$WT" show "$COMMITTED_RECOVERY_REF:frontend/src/committed-recovery.ts")" 'committed recovery bytes'
+
+scenario 'resume conflict: malformed recovery terminates failed without a queued retry loop'
+seed_conflicted_resume
+BAD_RECOVERY="$TMP/fixtures-bad-resume-recovery"; cp -R "$BASE" "$BAD_RECOVERY"
+fixture "$BAD_RECOVERY" resume-recovery '{"status":"resolved"}'
+fixture_sh "$BAD_RECOVERY" resume-recovery 'printf "export const items = [\"partially integrated\"]\n" > frontend/src/index.ts'
+SAVED_CONFLICTED_HEAD="$(origin_ref epic/42-add-widget)"
+GH_ISSUE_LABELS='ready,engine:claude' run_pipeline "$EPIC_RUN" "$BAD_RECOVERY" --issue 42 --engine claude
+assert_rc "malformed recovery blocks" 3 "$RUN_RC"
+assert_eq "malformed recovery is never schema-respawned" 1 "$(calls resume-recovery)"
+assert_eq "the issue leaves the ready queue" "failed," "$(gh_labels)"
+assert_contains "the result is terminal rather than skipped" "$RUN_OUT" '"outcome":"human-blocked"'
+assert_eq "the untouched remote keeps the original multi-checkpoint head" "$SAVED_CONFLICTED_HEAD" "$(origin_ref epic/42-add-widget)"
+assert_eq "the local branch is restored to the original multi-checkpoint head" "$SAVED_CONFLICTED_HEAD" "$(git -C "$WT" rev-parse HEAD)"
+BAD_RECOVERY_REF="$(latest_recovery_ref 42-add-widget)"
+assert_contains "partial resolver bytes are retained in a local recovery ref" "$(git -C "$WT" show "$BAD_RECOVERY_REF:frontend/src/index.ts")" 'partially integrated'
+assert_contains "the recovery snapshot is SHA-bound" "$(git -C "$WT" show -s --format=%B "$BAD_RECOVERY_REF")" "$SAVED_CONFLICTED_HEAD"
+assert_not_contains "the local recovery ref never enters the saved remote branch" "$(git -C "$ORIGIN" for-each-ref --format='%(refname)' refs/toliki/recovery/)" 'refs/toliki/recovery/'
+
 scenario 'resume: a branch with a code checkpoint skips architect, red and green'
 seed_branch epic/42-add-widget main 'printf "test(\"widget\", () => {})\n" > frontend/src/widget.test.ts && printf "export const createWidget = () => ({})\n" > frontend/src/widget.ts && git add -A && git commit -qm "wip(epic 42-add-widget): code checkpoint"'
 EPIC_ENGINE=codex GH_ISSUE_LABELS='ready,engine:claude' run_pipeline "$EPIC_RUN" "$BASE" --issue 42 --engine claude
@@ -2441,7 +2667,11 @@ assert_resume_engine_refusal() { # case initial-engine-labels expected-engine-la
   scenario "resume: $route_case engine routing is rejected before model work"
   seed_branch epic/42-add-widget main 'printf "test(\"widget\", () => {})\n" > frontend/src/widget.test.ts && printf "export const createWidget = () => ({})\n" > frontend/src/widget.ts && git add -A && git commit -qm "wip(epic 42-add-widget): code checkpoint"'
   before="$(origin_ref epic/42-add-widget)"
-  GH_ISSUE_LABELS="ready${initial:+,$initial}" run_pipeline "$EPIC_RUN" "$BASE" --issue 42 --engine claude
+  if [[ "$route_case" == mismatched ]]; then
+    PREPARE_DIRTY_INDEX=1 GH_ISSUE_LABELS="ready${initial:+,$initial}" run_pipeline "$EPIC_RUN" "$BASE" --issue 42 --engine claude
+  else
+    GH_ISSUE_LABELS="ready${initial:+,$initial}" run_pipeline "$EPIC_RUN" "$BASE" --issue 42 --engine claude
+  fi
   assert_rc "$route_case resume exits 3 (blocked)" 3 "$RUN_RC"
   assert_contains "$route_case resume names the engine gate" "$RUN_OUT" "engine"
   assert_eq "$route_case resume starts no model" 0 "$(wc -l < "$RUN_LOG" | tr -d ' ')"
@@ -2449,6 +2679,10 @@ assert_resume_engine_refusal() { # case initial-engine-labels expected-engine-la
   assert_eq "$route_case resume preserves the claimed branch" "$before" "$(origin_ref epic/42-add-widget)"
   assert_eq "$route_case resume keeps routing unchanged" "$expected" "$(gh_engine_labels)"
   assert_eq "$route_case resume follows the normal blocker path" "failed," "$(gh_labels)"
+  if [[ "$route_case" == mismatched ]]; then
+    assert_eq "mismatched pin leaves HEAD before the resume switch" "$(git -C "$ORIGIN" rev-parse main)" "$(git -C "$WT" rev-parse HEAD)"
+    assert_contains "mismatched pin leaves the staged worktree bytes untouched" "$(git -C "$WT" status --porcelain)" 'A  frontend/src/pin-guard.ts'
+  fi
 }
 assert_resume_engine_refusal "missing" "" ""
 assert_resume_engine_refusal "conflicting" "engine:claude,engine:codex" "engine:claude,engine:codex,"
@@ -2610,6 +2844,7 @@ assert_contains "the corrected code is what shipped" "$(git -C "$ORIGIN" show ep
 assert_eq "a blocker the correction cleared leaves no remaining work to file" 0 "$(grep -c '^TITLE: ' "$STATE_DIR/gh/issues-created" 2>/dev/null || echo 0)"
 assert_not_contains "and no deferred record is posted for a cleared batch" "$(gh_comments)" "deferred / not done"
 CONFIRM_PROMPT="$(cat "$STATE_DIR/narrowconfirm.0.prompt")"
+assert_verification_prompt "the epic narrow confirmer" "$CONFIRM_PROMPT" 5
 assert_contains "the confirmer receives the complete cumulative repair delta" "$CONFIRM_PROMPT" "<repair-delta>"
 assert_contains "the confirmer receives the exact correction delta" "$CONFIRM_PROMPT" "<correction-delta>"
 assert_contains "the correction delta carries the corrected bytes" "$CONFIRM_PROMPT" "guarded: true"
@@ -3899,6 +4134,7 @@ assert_contains "the skeptic is told to trace every out-of-block change" "$(cat 
 # checker judge the same bytes instead of each running their own git and gh.
 FIX_RESOLVE_PROMPT="$(cat "$STATE_DIR/fix-resolve.0.prompt")"
 FIX_CHECK_PROMPT="$(cat "$STATE_DIR/fix-check.0.prompt")"
+assert_verification_prompt "the conflict acceptance checker" "$FIX_CHECK_PROMPT" 1
 assert_contains "the resolver receives the captured PR side" "$FIX_RESOLVE_PROMPT" '<pr-side-diff>'
 assert_contains "the captured PR side carries the PR's own text" "$FIX_RESOLVE_PROMPT" 'pr-guard'
 assert_contains "the resolver receives the captured main side" "$FIX_RESOLVE_PROMPT" '<main-side-diff>'
@@ -4499,6 +4735,7 @@ assert_contains "the fixer receives the captured requirement issue" "$FIXPROMPT"
 assert_not_contains "the fixer is never told to fetch the issue itself" "$FIXPROMPT" 'gh issue view'
 assert_not_contains "nor to run git for the change under repair" "$FIXPROMPT" 'git diff origin/main...HEAD'
 CI_CHECK_PROMPT_0="$(cat "$STATE_DIR/ci-check.0.prompt")"
+assert_verification_prompt "the CI acceptance checker" "$CI_CHECK_PROMPT_0" 2
 assert_contains "the blind checker reads the same captured requirement" "$CI_CHECK_PROMPT_0" 'Build a widget.'
 assert_not_contains "and is never told to gather it itself" "$CI_CHECK_PROMPT_0" 'gh issue view'
 assert_contains "the audit names the orchestrator-derived file list" "$(gh_comments)" "Files: frontend/src/widget.ts"
@@ -4903,6 +5140,7 @@ assert_contains "the repaired audit folds a fresh pretty copy of the unchanged l
 assert_eq "one fixer and one skeptic ran" "1 1" "$(calls defect-fix) $(calls defect-check)"
 FIXPROMPT="$(cat "$STATE_DIR/defect-fix.0.prompt")"
 CHECKPROMPT="$(cat "$STATE_DIR/defect-check.0.prompt")"
+assert_verification_prompt "the defect acceptance checker" "$CHECKPROMPT" 1
 assert_contains "the fixer receives the durable named defect" "$FIXPROMPT" "Empty list still crashes"
 assert_contains "the fixer receives the pinned original requirement" "$FIXPROMPT" "Build a widget."
 assert_contains "the fixer is told to ignore non-defect deferrals" "$FIXPROMPT" "ignore non-defect"
@@ -5817,6 +6055,7 @@ assert_contains "and the successful verification evidence" "$CI_CORRECTION_PROMP
 assert_contains "the CI correction stays bounded to the captured failing checks" "$CI_CORRECTION_PROMPT" "Stay inside the captured failing checks"
 assert_contains "and may not weaken a gate to clear a blocker" "$CI_CORRECTION_PROMPT" "never weaken a test, assertion, type, lint rule or other gate"
 CI_CONFIRM_PROMPT="$(cat "$STATE_DIR/ci-confirm.0.prompt")"
+assert_verification_prompt "the CI narrow confirmer" "$CI_CONFIRM_PROMPT" 3
 assert_contains "the CI confirmer receives the complete cumulative delta" "$CI_CONFIRM_PROMPT" "<repair-delta>"
 assert_contains "and the exact correction delta" "$CI_CONFIRM_PROMPT" "<correction-delta>"
 assert_contains "which carries the correction's own new file" "$CI_CONFIRM_PROMPT" "widgetType"
@@ -5901,6 +6140,7 @@ assert_contains "the defect correction keeps the pinned requirement" "$DEFECT_CO
 assert_contains "and stays bound to the authenticated evidence" "$DEFECT_CORRECTION_PROMPT" "Stay bound to the authenticated evidence above"
 assert_contains "and may never reclassify a named defect" "$DEFECT_CORRECTION_PROMPT" "never reclassify or dismiss a named defect"
 DEFECT_CONFIRM_PROMPT="$(cat "$STATE_DIR/defect-confirm.0.prompt")"
+assert_verification_prompt "the defect narrow confirmer" "$DEFECT_CONFIRM_PROMPT" 2
 assert_contains "the defect confirmer receives the exact correction delta" "$DEFECT_CONFIRM_PROMPT" "<correction-delta>"
 assert_not_contains "and never the correction's own narrative" "$DEFECT_CONFIRM_PROMPT" "DEFECT_CORRECTION_NARRATIVE_SENTINEL"
 

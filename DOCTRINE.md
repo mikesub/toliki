@@ -135,6 +135,21 @@ don't get re-litigated from memory.
   two-invocation ceiling included. The standalone conflict, CI and defect fixers
   stay fully ephemeral for now — the same handle would fit their repair ladder,
   and extending it there is a separate change that has to argue its own case.
+- **Interrupted checkpoint chains get one bounded integration, not an eternal
+  queue refusal.** Replaying each historical checkpoint is useful until an
+  intermediate commit conflicts even though the branch's cumulative change is
+  still coherent. On that stop Toliki preserves the remote chain, binds both
+  sides to immutable SHAs, flattens only the local chain and gives the existing
+  builder conversation one diff3 integration opportunity. Epic keeps that call
+  path-narrow and then runs its ordinary verification and independent review;
+  task spends its ordinary primary tasker call on integration plus completion,
+  preserving its economy. Failure is terminal and keeps a local recovery ref
+  with the complete attempted tree. The aggregate's internal cumulative
+  main/base metadata survives later checkpoints and recoveries so reviewers can
+  recapture all relevant main intent; the final candidate squash drops that
+  metadata. This deliberately prefers
+  one inspectable recovery over either discarding partial work or repeatedly
+  launching a branch known to refuse at the same rebase.
 - **Repairs stay proportional.** Fix the named defect and add meaningful
   regression coverage. A review finding does not automatically require a new
   abstraction, lint rule or instruction to prevent an entire class of problems.

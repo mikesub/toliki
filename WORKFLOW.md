@@ -36,7 +36,7 @@ failure behavior.
 
 | Step | Owner | Primary LLM calls |
 | --- | --- | --- |
-| 1. Prepare | Shell/Node orchestrators | None |
+| 1. Prepare | Shell/Node orchestrators | None normally; one bounded `code` integration when an epic's interrupted checkpoint chain conflicts. Task folds the same integration into its ordinary primary tasker call |
 | 2. Architect | `architect` charter | Usually one; none when the resumed artifacts are all valid |
 | 3. Code | `coder` charter | One in direct mode, RED + GREEN in test-first mode; a completed checkpoint initially skips both. The implementing call also returns the delivery record the run is published from |
 | 4. Review | `reviewer` charter | One broad review, and the only broad review of the change |
@@ -83,12 +83,20 @@ The eight engine step keys and their charters are fixed in
 Git, GitHub, labels, dependency installation, verification, checkpointing,
 pushes, PR creation, and merging are always performed by deterministic code.
 An agent's report that one of those operations succeeded is never the gate.
+Every independent review, repair acceptance check and narrow confirmation also
+receives the latest orchestrator-run verification for the tree it judges: each
+package's command, exit status, measured wall duration and bounded output.
+Durations measure the command's full lifetime, including waits after assertions
+finish, and appear in verification logs and delivery evidence. Passing tests do
+not replace review of their coverage.
 
 The epic pipeline's and the three fixers' prompts are one module per model
 step under [`workflows/prompts/`](workflows/prompts): `prompts/epic/`,
 `prompts/conflict/`, `prompts/ci/`, `prompts/defect/`, and `prompts/shared/`
-for the verification retry every fixer appends. Task-run builds its own two
-prompts in [`workflows/task-run.mjs`](workflows/task-run.mjs). Each module exports a builder function taking that step's runtime
+for shared verification evidence, retry wording and interrupted-branch recovery.
+Task-run builds its ordinary and verification-retry prompts in
+[`workflows/task-run.mjs`](workflows/task-run.mjs) and uses the shared recovery
+prompt at a conflict stop. Each module exports a builder function taking that step's runtime
 arguments; the orchestrator imports it and keeps the capture, the execution and
 the control flow around it. Charters and schemas are unchanged by that split:
 the standing rules stay in `agents/*.md` and the shape of an answer stays in
@@ -134,7 +142,8 @@ omission.
 **Owner:** [`bin/dispatch.sh`](bin/dispatch.sh),
 [`bin/launch.sh`](bin/launch.sh), shared
 [`workflows/lib/issue-delivery.mjs`](workflows/lib/issue-delivery.mjs), and the
-epic/task entry points. **LLM calls:** none.
+epic/task entry points. **LLM calls:** none normally; one bounded integration
+for a conflicted epic resume, while task uses its ordinary primary call.
 
 1. Cron runs `dispatch.sh`, which checks repair queues first and then walks
    each repo's `ready` issues oldest-first.
@@ -166,9 +175,20 @@ epic/task entry points. **LLM calls:** none.
      push is the cross-host compare-and-swap lock; a rejected push means
      another run won.
    - **Resume:** find the local or remote `epic/<N>-*` branch, refuse a remote
-     claim-only branch owned by another run, checkpoint any dirty work,
-     and rebase the saved branch onto `origin/main`. A conflicting resume is
-     left for manual resolution.
+     claim-only branch owned by another run, prove the exact persisted engine
+     before changing the branch, checkpoint any dirty work, and rebase the
+     saved branch onto the captured `origin/main` SHA. When replaying several
+     checkpoints conflicts, abort that replay, capture both SHA-bound diffs and
+     current-main commit/issue intent, then flatten the saved chain to one
+     aggregate commit and replay it. If that still conflicts, capture the exact
+     diff3 marker bytes and allow one bounded integration.
+     Epic's recovery builder may edit only the stopped paths; task performs the
+     integration inside its ordinary primary tasker and may then finish the
+     task. Package discovery and `npm ci` wait until the integrated tree is
+     settled. A malformed, unsafe or unresolved integration restores the
+     original chain, retains the complete attempted tree under a local-only
+     `refs/toliki/recovery/<slug>/*` ref, and rests `failed` instead of staying
+     queued for the same refusal.
 11. On a resumed epic branch, it inspects checkpoint subjects to distinguish a
     completed code phase from preserved partial work. Completed code is not
     rebuilt later; partial work receives a direct continuation plan. A task
@@ -176,7 +196,8 @@ epic/task entry points. **LLM calls:** none.
     tasker process.
 12. It verifies the exact durable `engine:<name>` label. Only a newly won claim
     may create a missing route; a resume requires the existing singleton and
-    never rewrites a conflicting route.
+    never rewrites a conflicting route. For a resume this proof precedes the
+    switch, dirty checkpoint, history rewrite and model work.
 13. It ensures lifecycle labels exist, changes `ready` to `in-progress`, and
     self-assigns the issue. These two reporting writes are best effort after
     the branch claim is secure.
@@ -300,8 +321,13 @@ one.
    re-litigated each other.
 2. The orchestrator snapshots the shippable tree, Git/index/config metadata,
    and the complete change diff before the reviewer starts.
-3. The reviewer receives the original requirement and captured diff. It is
-   deliberately denied `.epics/` builder notes and does not see coder claims.
+3. The reviewer receives the original requirement and captured diff. For a
+   recovered interrupted branch it also receives the same immutable recovery
+   context, so current-main intent cannot disappear during integration. The
+   aggregate commit retains a cumulative pinned main-intent base until the
+   final squash, allowing later invocations and recoveries to recapture every
+   prior main context after an intervening failure. It is deliberately denied
+   `.epics/` builder notes and does not see coder claims.
 4. It checks requirement coverage, meaningful defects or regressions, and
    whether verification proves the changed behavior, across the whole diff.
 5. Each finding must include title, severity, confidence, location, concrete

@@ -12,7 +12,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from 'node:os'
 import { stripVTControlCharacters } from 'node:util'
 import path from 'node:path'
-import { sh, must } from './proc.mjs'
+import { run, sh, must } from './proc.mjs'
 
 const GIT_TIMEOUT_MS = 5 * 60 * 1000
 const NPM_CI_TIMEOUT_MS = 30 * 60 * 1000
@@ -43,6 +43,22 @@ const hooklessGitEnv = (source = process.env) => {
 export const git = (args, opts = {}) => {
   const { env = process.env, ...rest } = opts
   return sh('git', args, { timeoutMs: GIT_TIMEOUT_MS, ...rest, env: hooklessGitEnv(env) })
+}
+// Path lists need Git's raw NUL-delimited stdout. The ordinary sh() transport
+// trims human-readable command output; that would corrupt a legal path whose
+// first byte is whitespace. Keep this narrow companion beside git() so it gets
+// the same hook-neutralized environment and timeout.
+export async function gitRaw(args, opts = {}) {
+  const { env = process.env, ...rest } = opts
+  const r = await run('git', args, { timeoutMs: GIT_TIMEOUT_MS, ...rest, env: hooklessGitEnv(env) })
+  return {
+    ok: !r.spawnError && !r.timedOut && r.code === 0,
+    code: r.code,
+    out: String(r.stdout || ''),
+    err: String(r.stderr || '').trim(),
+    timedOut: r.timedOut,
+    spawnError: r.spawnError,
+  }
 }
 export async function gitOut(args, what = `git ${args[0]}`) {
   return must(await git(args), what)
@@ -125,36 +141,55 @@ export async function ensureDeps(packages, { pairs = [] } = {}) {
 // markup rather than useful evidence.
 // Structured failures retain bounded output and process status so test-first
 // can match its expected assertion without treating a timeout or spawn failure as RED.
+// Measure the whole command lifetime, not the test runner's self-reported time:
+// a test can finish its assertions while a leaked timer keeps its process alive.
+// Reviewers receive this same compact evidence; a green exit alone says nothing
+// about how long verification took or which behavior its checks cover.
 const plainDiagnostic = value => stripVTControlCharacters(String(value || ''))
   .replace(/\r\n?/gu, '\n')
   .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/gu, '')
+// A single minified/JSON diagnostic can fill the entire captured stream. Keep
+// the start and end of each summary line without multiplying that payload into
+// every reviewer prompt; detailed repair tails retain their existing contract.
+const summaryLines = lines => lines.slice(-3).map(line => line.length > 512
+  ? `${line.slice(0, 256)} …[truncated]… ${line.slice(-256)}` : line)
 
 export async function runVerify(packages, { timeoutMs = VERIFY_TIMEOUT_MS, tailLines = 40 } = {}) {
   const details = []
   const evidence = []
   const tails = []
   const failures = []
+  let ms = 0
   let green = true
   for (const pkg of packages) {
+    const started = performance.now()
     const r = await sh('npm', ['run', 'verify'], { cwd: pkg === '.' ? '.' : pkg, timeoutMs, stdoutCap: 256 * 1024 })
+    const elapsedMs = Math.round(performance.now() - started)
+    ms += elapsedMs
     const stdout = plainDiagnostic(r.out)
     const stderr = plainDiagnostic(r.err)
     const stdoutLines = stdout.split('\n').filter(l => l.trim())
     const stderrLines = stderr.split('\n').filter(l => l.trim())
-    const evidenceLines = [...stdoutLines.slice(-3), ...stderrLines.slice(-3)]
-    evidence.push(`${pkg} — ${evidenceLines.join(' | ') || (r.ok ? 'exit 0' : `exit ${r.code}`)}`)
-    if (r.ok) { details.push(`${pkg} — pass`); continue }
+    const evidenceLines = [...summaryLines(stdoutLines), ...summaryLines(stderrLines)]
+    const status = r.timedOut ? 'timed out' : r.spawnError ? 'spawn failed' :
+      r.code === null ? 'terminated without an exit code' : `exit ${r.code}`
+    evidence.push(`${pkg} — npm run verify: ${status}; duration ${elapsedMs} ms${evidenceLines.length ? ` | ${evidenceLines.join(' | ')}` : ''}`)
+    if (r.ok) { details.push(`${pkg} — pass (${elapsedMs} ms)`); continue }
     green = false
     const detailLines = [...stdoutLines.slice(-3), ...stderrLines.slice(-3)]
     const last = r.timedOut ? 'timed out' : (detailLines.join(' | ') || `exit ${r.code}`)
-    details.push(`${pkg} — fail: ${last}`)
+    details.push(`${pkg} — fail: ${last} (${elapsedMs} ms)`)
     const output = `${stdout}\n${stderr}`.trim()
     const stdoutTail = tailLines > 0 ? stdoutLines.slice(-tailLines) : []
     const stderrTail = tailLines > 0 ? stderrLines.slice(-tailLines) : []
     tails.push(`--- ${pkg}: npm run verify ${r.timedOut ? 'timed out' : `exited ${r.code}`} ---\n${[...stdoutTail, ...stderrTail].join('\n')}`)
     failures.push({ package: pkg, code: r.code, timedOut: r.timedOut, spawnError: !!r.spawnError, output })
   }
-  return { green, detail: details.join('; '), evidence: evidence.join('; '), tail: tails.join('\n'), failures }
+  return {
+    green, ms, detail: details.join('; '),
+    evidence: evidence.join('; ') || 'No packages declare scripts.verify; no verification commands ran.',
+    tail: tails.join('\n'), failures,
+  }
 }
 
 // ───────────────────────── git state ─────────────────────────

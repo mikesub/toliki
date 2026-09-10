@@ -3,11 +3,12 @@
 // the batch cleared and nothing else broke.
 
 import { confirmationContract, renderAcceptanceVerdicts, renderBlockerBatch } from '../../lib/repair-acceptance.mjs'
+import { resumeEvidencePrompt } from '../shared/resume-evidence.mjs'
 
-export const narrowConfirmPrompt = (requirement, batch, verdicts, changeDiff, correctionDelta) =>
+export const narrowConfirmPrompt = (requirement, batch, verdicts, changeDiff, correctionDelta, recovery = null) =>
 `Narrowly confirm a correction you did not write. A repair of this change was independently reviewed, that review returned the blockers below, and exactly one scoped correction was made over them. The correction's own explanation is deliberately withheld: judge the code.
 
-The original requirement — the only spec context you get:
+The original requirement to judge against:
 """
 ${requirement}
 """
@@ -28,4 +29,7 @@ ${changeDiff}
 ${correctionDelta}
 </correction-delta>
 
+${recovery ? `The recovered integration context below remains relevant only to proving that the correction preserved main behavior; it does not expand the correction's scope.
+${resumeEvidencePrompt(recovery)}
+` : ''}
 ${confirmationContract({ blockerCount: batch.length })}`

@@ -5,8 +5,10 @@
 // Issue mode (`--issue N`): preflight (closed? blocked_by?) → branch
 // epic/<N>-<slug> off origin/main and claim it by pushing the ref (atomic; a
 // run that loses the race skips), resuming an existing branch when one is left
-// over — and skipping completed code when that branch already carries a code
-// checkpoint (recovering its structured review plan and delivery record when needed) → checkpoint commits after code/fixes → squashed single-commit PR at
+// over — flattening a conflicted interrupted checkpoint chain for one bounded,
+// SHA-evidenced integration — and skipping completed code when that branch
+// already carries a code checkpoint (recovering its structured review plan and
+// delivery record when needed) → checkpoint commits after code/fixes → squashed single-commit PR at
 // ship + an append-only delivery summary on the source issue → merge gate labels
 // the issue ready-to-merge when the final review cleared every finding, or
 // ready-to-review when the PR is held; a hold made exclusively of concrete
@@ -47,6 +49,8 @@
 // plans skip artificial RED but still require green after implementation.
 // After fixes it must be green too. An agent's word that it ran a gate is
 // never the gate; a wrong answer is handed back once, then blocks the run.
+// Every independent review/confirmation receives that tree's captured command
+// status, measured wall duration and bounded verification output.
 //
 // ONE broad review, and it is the only broad look this change gets: the
 // architect-selected focused reviewer is gone, because a second pre-repair
@@ -129,9 +133,12 @@ import {
   readBack, terminalBudget, terminalSpend,
 } from './lib/github.mjs'
 import {
-  ISSUE_LIFECYCLE, prepareIssueDelivery, renderIssuePrBody, createIssueCandidate, handoffIssue,
+  ISSUE_LIFECYCLE, prepareIssueDelivery, finishIssuePreparation, renderIssuePrBody, createIssueCandidate, handoffIssue,
   preserveIssueWork, holdIssueForQuota, restIssueFailed,
 } from './lib/issue-delivery.mjs'
+import {
+  RESUME_RECOVERY_SCHEMA, abortResumeRecovery, resumeRecoveryProblem, settleResumeRecovery,
+} from './lib/resume-recovery.mjs'
 import { createBlockerIdentityRegistry } from './lib/blocker-identity.mjs'
 import {
   ACCEPTANCE_CONFIDENCE, CONFIRMATION_SCHEMA, CORRECTION_SCHEMA,
@@ -155,6 +162,8 @@ import { narrowConfirmPrompt } from './prompts/epic/narrow-confirm.mjs'
 import { redRetryPrompt } from './prompts/epic/red-retry.mjs'
 import { reviewPrompt } from './prompts/epic/review.mjs'
 import { verifyRetryPrompt } from './prompts/epic/verify-retry.mjs'
+import { verificationEvidencePrompt } from './prompts/shared/verification-evidence.mjs'
+import { resumeConflictPrompt } from './prompts/shared/resume-conflict.mjs'
 
 const USAGE = `Usage: epic-run.mjs (--issue <N> | --slug <slug>) [--session <name>] [--engine <name>] [--repo <key>]
 
@@ -767,7 +776,7 @@ async function preserveWork({ slug, phase }) {
 }
 
 // The blocker report: preserve the work, say where it is, flip the label to failed.
-async function postBlocker({ issue, slug, phase, reason, prUrl, candidate }) {
+async function postBlocker({ issue, slug, phase, reason, prUrl, candidate, skipPreserve = false }) {
   const branch = slug ? `epic/${slug}` : null
   let branchLine
   if (candidate?.missingSummary) {
@@ -780,12 +789,16 @@ async function postBlocker({ issue, slug, phase, reason, prUrl, candidate }) {
     // Checkpoint commits on the branch are durable; only uncommitted changes are at risk. The WIP
     // commit never carries "Closes #N" (unfinished work must not auto-close the issue on an accidental
     // merge) and `git add -A` respects .gitignore, so .epics/ stays out.
-    try {
-      await preserveWork({ slug, phase })
-    } catch (e) {
-      log(`blocked: could not preserve the work (${e && e.message || e})`)
+    if (!skipPreserve) {
+      try {
+        await preserveWork({ slug, phase })
+      } catch (e) {
+        log(`blocked: could not preserve the work (${e && e.message || e})`)
+      }
     }
-    branchLine = `- branch: ${branch} — re-running the epic pipeline on #${issue} (\`./toliki run epic ${issue}\`) resumes from it; delete the branch (locally AND on origin) to force a fresh build`
+    branchLine = skipPreserve
+      ? `- branch: ${branch} — recovery cleanup was not proved, so inspect this worktree and its reported local snapshot ref; the untouched remote branch remains the last durable checkpoint chain`
+      : `- branch: ${branch} — re-running the epic pipeline on #${issue} (\`./toliki run epic ${issue}\`) resumes from it; delete the branch (locally AND on origin) to force a fresh build`
   } else {
     branchLine = `- branch: none (blocked before branch creation; a re-run of the epic pipeline on #${issue} starts fresh)`
   }
@@ -813,24 +826,40 @@ let currentPhase = 'prepare'
 let blockerPosted = false
 let openPr = null
 let openCandidate = null
+let activeResumeRecovery = null
 async function holdForQuota(phase, failure) {
   if (!gitMode) return { error: 'quota holds require issue mode' }
   return holdIssueForQuota({ issue, slug, phase, failure })
 }
 
 async function fail(phase, reason, suppliedFailure = undefined) {
-  const failure = suppliedFailure === undefined ? takeAgentFailure() : suppliedFailure
-  if (failure?.kind === 'quota-exhausted') {
+  let failure = suppliedFailure === undefined ? takeAgentFailure() : suppliedFailure
+  let recoveryCleanupFailed = false
+  if (activeResumeRecovery) {
+    try {
+      const snapshot = await abortResumeRecovery(activeResumeRecovery, { preserveEdits: true, reason })
+      if (snapshot) log(`Prepare: incomplete recovery bytes retained locally at ${snapshot}; the original checkpoint chain is active again.`)
+      reason += snapshot
+        ? ` The original checkpoint chain was restored; recovery-process file snapshots are retained locally at ${snapshot}.`
+        : ' The original checkpoint chain was restored.'
+    } catch (error) {
+      recoveryCleanupFailed = true
+      reason += ` Recovery cleanup could not fully restore the saved branch (${error?.message || error}); inspect the worktree and untouched remote branch before retrying.`
+    }
+    activeResumeRecovery = null
+  }
+  if (failure?.kind === 'quota-exhausted' && !recoveryCleanupFailed) {
     const held = await holdForQuota(phase, failure)
     if (!held.error) return held
     reason = `${reason} Provider quota hold failed: ${held.error}.`
   }
+  if (recoveryCleanupFailed) failure = null
   reason = withAgentFailure(reason, failure)
   if (gitMode) {
     if (!blockerPosted) {
       blockerPosted = true
       try {
-        await postBlocker({ issue, slug, phase, reason, prUrl: openPr, candidate: openCandidate })
+        await postBlocker({ issue, slug, phase, reason, prUrl: openPr, candidate: openCandidate, skipPreserve: recoveryCleanupFailed })
       } catch (e) {
         log(`blocked: could not report on GitHub (${e && e.message || e})`)
       }
@@ -948,6 +977,9 @@ let codeDone = false
 // A resumed branch with preserved edits but no completed code checkpoint cannot recreate a clean
 // pre-RED baseline. Continue it directly; never discard work merely to replay the gate.
 let partialWork = false
+// Immutable integration context follows a recovered tree through broad review
+// and any later adjudication. It is separate from the source requirement.
+let resumeRecoveryEvidence = null
 // Discovered layout: which packages the verify gate runs in. Fail closed, like every other gate in this
 // file: an empty package list would make the verify gate a silent no-op — the run finishes "green"
 // having verified nothing.
@@ -971,7 +1003,7 @@ try {
   // ───────────────────────── Phase 0: Prepare (issue mode only) ─────────────────────────
   if (gitMode) {
     phase('Prepare')
-    const prep = await prepare(issue)
+    let prep = await prepare(issue)
     if (prep.refused) {
       log(`Prepare refused to start: ${prep.refused}`)
       return { skipped: true, issue, reason: prep.refused, outcome: 'skipped' }
@@ -980,15 +1012,43 @@ try {
       log(`Prepare: ${prep.note} — skipping to avoid duplicate work.`)
       return { skipped: true, issue, reason: prep.note, outcome: 'skipped' }
     }
-    const badLayout = applyDiscovery(prep.packages)
-    if (badLayout) return await fail('prepare', badLayout)
     slug = prep.slug
     requirement = prep.requirement
     requirementTitle = prep.requirementTitle
     requirementBody = prep.requirementBody
     codeDone = !!prep.codeDone
     partialWork = !!prep.partialWork
-    log(`Prepare: requirements written, branch epic/${slug} ${prep.resumed ? 'resumed and rebased onto origin/main' : 'created off origin/main'}${codeDone ? ' (a code checkpoint is on it)' : partialWork ? ' (partial coding work was preserved)' : ''}, deps checked (${prep.depLines.join('; ')}). Packages: ${pkgList(packages)}.`)
+    resumeRecoveryEvidence = prep.resumeRecovery || null
+    if (prep.resumeRecoveryError) {
+      activeResumeRecovery = prep.resumeRecovery
+      return await fail('prepare', `resume conflict recovery could not be prepared (${prep.resumeRecoveryError}); the original checkpoint chain remains on ${prep.branch}.`)
+    }
+    if (prep.resumeRecovery) {
+      const recovery = prep.resumeRecovery
+      if (recovery.integrated) {
+        log(`Prepare: the original multi-checkpoint replay conflicted, but its SHA-bound aggregate applied cleanly to ${recovery.mainHead}; verification and independent review still follow.`)
+      } else {
+        activeResumeRecovery = recovery
+        log(`Prepare: resume rebase conflicted in ${recovery.markedFiles.join(', ')} — starting the one bounded builder integration against captured heads ${recovery.savedHead} and ${recovery.mainHead}.`)
+        const resolved = await agent(resumeConflictPrompt(recovery, requirement), {
+          label: 'code:resume-recovery', phase: 'Prepare', step: 'code',
+          schema: RESUME_RECOVERY_SCHEMA, respawn: false, conversation: builder,
+        })
+        const problem = resumeRecoveryProblem(resolved)
+        if (problem) return await fail('prepare', problem)
+        const settleProblem = await settleResumeRecovery(recovery)
+        if (settleProblem) return await fail('prepare', settleProblem)
+        activeResumeRecovery = null
+        log(`Prepare: interrupted branch integrated onto captured main — ${resolved.summary}`)
+      }
+      if (prep.packages === null) prep = await finishIssuePreparation(prep)
+    }
+    const badLayout = applyDiscovery(prep.packages)
+    if (badLayout) return await fail('prepare', badLayout)
+    const resumeState = prep.resumeRecovery
+      ? 'resumed and integrated onto captured origin/main'
+      : prep.resumed ? 'resumed and rebased onto origin/main' : 'created off origin/main'
+    log(`Prepare: requirements written, branch epic/${slug} ${resumeState}${codeDone ? ' (a code checkpoint is on it)' : partialWork ? ' (partial coding work was preserved)' : ''}, deps checked (${prep.depLines.join('; ')}). Packages: ${pkgList(packages)}.`)
   }
 
   const dir = epicDir(slug)
@@ -1208,7 +1268,7 @@ try {
   // complete review in the PR body — the diff ships looking reviewed by an agent that never ran. The
   // runtime respawns a transient death once; after that, fail closed: review is the only gate between code
   // and an auto-opened PR, so a hole in it stops the run.
-  const reviewed = await agent(reviewPrompt(requirement, reviewDiff),
+  const reviewed = await agent(verificationEvidencePrompt(reviewPrompt(requirement, reviewDiff, resumeRecoveryEvidence), finalVerify),
     { label: 'review:general', phase: 'Review', step: 'review', schema: FINDINGS_SCHEMA },
   ).catch(() => null)
   if (!reviewed || !Array.isArray(reviewed.findings)) {
@@ -1326,7 +1386,7 @@ try {
         return await fail('final-review', 'The repair delta or complete change could not be captured — refusing to ask a final reviewer to judge incomplete evidence.')
       }
       repairDelta = repairDiff
-      const decided = await agent(finalReviewPrompt(items, requirement, repairDiff, finalDiff),
+      const decided = await agent(verificationEvidencePrompt(finalReviewPrompt(items, requirement, repairDiff, finalDiff, resumeRecoveryEvidence), finalVerify),
         { label: 'final-review', phase: 'Final review', step: 'final-review', schema: FINAL_REVIEW_SCHEMA })
       // Nothing verifies or reviews the tree again after this: a clearing
       // verdict on bytes this process itself changed would ship them unseen.
@@ -1501,7 +1561,7 @@ try {
         return { blocked: 'The corrected tree or its diff could not be captured — refusing to ask a confirmer to judge incomplete evidence.' }
       }
       const confirmedRaw = await agent(
-        narrowConfirmPrompt(requirement, batch, verdicts, confirmDiff, correctionDelta),
+        verificationEvidencePrompt(narrowConfirmPrompt(requirement, batch, verdicts, confirmDiff, correctionDelta, resumeRecoveryEvidence), finalVerify),
         { label: 'narrow-confirm', phase: 'Correction', step: 'final-review', schema: CONFIRMATION_SCHEMA })
       // Nothing reviews or verifies the tree again after this, so a clearing
       // verdict on bytes this process itself changed would ship them unseen.

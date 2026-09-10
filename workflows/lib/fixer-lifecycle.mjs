@@ -21,6 +21,8 @@
 // concrete implementation defect — ONE scoped correction inside this same
 // invocation, the orchestrator's full verify contract again, and ONE narrow
 // read-only confirmation. There is no second correction batch.
+// Both judging calls receive the latest orchestrator-run verification command,
+// status, measured wall duration and bounded output for the tree they examine.
 //
 // Semantic completion and operational relaunch are separate here, and the
 // difference is which terminal state the run comes to rest at. A semantic
@@ -54,6 +56,7 @@ import {
 } from './repair-acceptance.mjs'
 import { recordQuotaHold } from '../quota-hold.mjs'
 import { verificationRetryPrompt } from '../prompts/shared/verification-retry.mjs'
+import { verificationEvidencePrompt } from '../prompts/shared/verification-evidence.mjs'
 
 const message = error => error?.message || String(error)
 
@@ -411,12 +414,12 @@ export async function runFixerLifecycle(spec) {
     // the batch cleared and nothing else broke, and it never restarts a broad
     // review of work that was already accepted.
     const confirmRaw = await agent(
-      spec.check.confirm.prompt(ctx, prep, dispositions, {
+      verificationEvidencePrompt(spec.check.confirm.prompt(ctx, prep, dispositions, {
         blockers: accepted.blockers,
         verdicts: accepted.verdicts,
         cumulative: cumulativeAfter,
         correction: correctionDelta,
-      }),
+      }), reverified),
       spec.check.confirm.agent)
     if (!confirmRaw) return stop(quotaOrHuman('check', spec.check.confirm.noResult))
     const confirmed = validateConfirmation(confirmRaw, accepted.blockers)
@@ -540,7 +543,8 @@ export async function runFixerLifecycle(spec) {
           return fail('check', 'the complete repair delta could not be captured — refusing to check a repair on incomplete evidence.')
         }
 
-        const raw = await agent(spec.check.prompt(ctx, prep, dispositions, { cumulative }), spec.check.agent)
+        const raw = await agent(verificationEvidencePrompt(
+          spec.check.prompt(ctx, prep, dispositions, { cumulative }), verified), spec.check.agent)
         if (!raw) return fail('check', spec.check.noResult)
         const accepted = validateAcceptance(raw, dispositions.length)
         // Malformed, incomplete, duplicate, extra or low-confidence evidence

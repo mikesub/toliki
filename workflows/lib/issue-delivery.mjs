@@ -10,11 +10,22 @@ import {
 } from './github.mjs'
 import {
   git, gitOut, discoverPackages, ensureDeps, ensureEpicsIgnored, pushRejected,
-  slugify, epicDir, writeRequirements, readRequirements, initEpicMd, updateEpicMd,
+  slugify, epicDir, writeRequirements, readRequirements, initEpicMd, updateEpicMd, rebaseInProgress,
 } from './repo.mjs'
+import { loadResumeRecoveryEvidence, startResumeRecovery } from './resume-recovery.mjs'
 import { recordQuotaHold } from '../quota-hold.mjs'
 
 export const ISSUE_LIFECYCLE = ['in-progress', 'ready-to-merge', 'ready-to-review', 'failed', 'needs-defect-fix']
+
+// Package parsing and dependency installation must happen only after a resume
+// conflict is settled. package.json and lockfiles may themselves be unmerged;
+// reading either side of that stop would make the later verify gate describe a
+// tree that never became the candidate.
+export async function finishIssuePreparation(prep) {
+  const packages = discoverPackages('.')
+  const depLines = packages.length ? await ensureDeps(packages, { pairs: [[prep.worktreeBase, 'HEAD']] }) : []
+  return { ...prep, packages, depLines }
+}
 
 // The remote ref is the cross-host claim. Existing epic/<N>-* branches are
 // resumed so task deliveries remain visible to reap, fixers and PR discovery.
@@ -46,15 +57,22 @@ export async function prepareIssueDelivery({ issue, engine, lifecycle = ISSUE_LI
   let resumed = false
   let codeDone = false
   let partialWork = false
+  let resumeRecovery = null
+  let resumeRecoveryError = null
   if (branch) {
     slug = branch.slice('epic/'.length)
     let switched
     if (local.includes(branch)) {
+      // Route persistence is a prerequisite for adopting or changing an
+      // interrupted branch. Check it before switching, checkpointing a dirty
+      // local tree, flattening commits, or starting any writable process.
+      await verifyIssueEngine(issue, engine, { allowCreate: false })
       switched = await git(['switch', branch])
     } else {
       await gitOut(['fetch', 'origin', branch], `git fetch origin ${branch}`)
       const subjects = (await gitOut(['log', '--format=%s', 'origin/main..FETCH_HEAD'], 'git log')).split('\n').filter(Boolean)
       if (subjects.length && subjects.every(s => s.startsWith(`chore(epic ${issue}): claim`))) return { refused: 'claimed by another run' }
+      await verifyIssueEngine(issue, engine, { allowCreate: false })
       switched = await git(['switch', '-c', branch, '--track', `origin/${branch}`])
     }
     if (!switched.ok) {
@@ -69,16 +87,35 @@ export async function prepareIssueDelivery({ issue, engine, lifecycle = ISSUE_LI
         await gitOut(['commit', '-q', '-m', `wip(epic ${slug}): resume checkpoint`], 'git commit (resume checkpoint)')
       }
     }
-    const rebased = await git(['rebase', 'origin/main'])
-    if (!rebased.ok) {
-      await git(['rebase', '--abort'])
-      return { refused: `resume rebase onto origin/main conflicted — resolve manually on ${branch} or delete it for a fresh build` }
-    }
-    resumed = true
-    const subjects = (await gitOut(['log', '--format=%s', 'origin/main..HEAD'], 'git log')).split('\n')
+    const savedHead = await gitOut(['rev-parse', 'HEAD'], 'git rev-parse saved branch head')
+    const mainHead = await gitOut(['rev-parse', 'origin/main'], 'git rev-parse origin/main')
+    const subjects = (await gitOut(['log', '--format=%s', `${mainHead}..${savedHead}`], 'git log')).split('\n')
     const escaped = slug.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
     codeDone = subjects.some(s => new RegExp(`^wip\\(epic ${escaped}\\): (code|triage) checkpoint$`).test(s.trim()))
     partialWork = !codeDone && subjects.some(s => s.trim() && !s.startsWith(`chore(epic ${issue}): claim`))
+    // A prior invocation may already have integrated an interrupted chain and
+    // then checkpointed a later failure. Recover its reachable main-side
+    // review context before rebasing or starting another writable process.
+    const retainedRecovery = await loadResumeRecoveryEvidence({ issue, slug, branch, currentMainHead: mainHead, codeDone })
+
+    const rebased = await git(['rebase', mainHead])
+    if (!rebased.ok) {
+      const aborted = await git(['rebase', '--abort'])
+      if (!aborted.ok || await rebaseInProgress()) {
+        resumeRecoveryError = `the initial resume rebase conflicted and could not be aborted cleanly (${failureReason(aborted)})`
+        resumeRecovery = { issue, slug, branch, savedHead, mainHead, integrated: false, markedFiles: [] }
+      } else {
+        try {
+          resumeRecovery = await startResumeRecovery({ issue, slug, branch, savedHead, mainHead, codeDone, priorRecovery: retainedRecovery })
+        } catch (error) {
+          resumeRecoveryError = error?.message || String(error)
+          resumeRecovery = { issue, slug, branch, savedHead, mainHead, integrated: false, markedFiles: [] }
+        }
+      }
+    } else if (retainedRecovery) {
+      resumeRecovery = retainedRecovery
+    }
+    resumed = true
   } else {
     slug = slugify(issue, view.title)
     branch = `epic/${slug}`
@@ -89,9 +126,9 @@ export async function prepareIssueDelivery({ issue, engine, lifecycle = ISSUE_LI
       if (pushRejected(pushed)) return { refused: 'claimed by another run' }
       must(pushed, 'git push (claim)')
     }
+    await verifyIssueEngine(issue, engine, { allowCreate: true })
   }
 
-  await verifyIssueEngine(issue, engine, { allowCreate: !resumed })
   await ensureLabels(lifecycle)
   const swap = await editLabels(issue, { add: ['in-progress'], remove: ['ready', 'ready-to-merge', 'ready-to-review', 'failed', 'needs-defect-fix'] })
   if (!swap.ok) notes.push(`prepare: label swap failed: ${failureReason(swap)}`)
@@ -103,15 +140,18 @@ export async function prepareIssueDelivery({ issue, engine, lifecycle = ISSUE_LI
   writeRequirements(dir, issue, view.body)
   initEpicMd(dir, { title: view.title, slug, issue })
   for (const note of notes) updateEpicMd(dir, { log: note })
-  const packages = discoverPackages('.')
-  const depLines = packages.length ? await ensureDeps(packages, { pairs: [[base, 'HEAD']] }) : []
-  return {
+  const prepared = {
     slug, branch, resumed, codeDone, partialWork,
     requirement: readRequirements(dir),
     requirementTitle: String(view.title || ''),
     requirementBody: String(view.body || ''),
-    packages, depLines,
+    worktreeBase: base,
+    resumeRecovery,
+    resumeRecoveryError,
   }
+  return resumeRecovery && !resumeRecovery.integrated || resumeRecoveryError
+    ? { ...prepared, packages: null, depLines: [] }
+    : finishIssuePreparation(prepared)
 }
 
 export function renderIssuePrBody({ issue, prefix = 'Specification and run record', detail = '', legalMarker = '' }) {

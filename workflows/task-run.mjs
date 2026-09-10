@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 // task-run — explicitly opted-in lightweight issue delivery. One writable
-// tasker process implements and self-reviews the settled requirement; the
+// tasker process implements and self-reviews the settled requirement; when an
+// interrupted checkpoint chain conflicts, that same primary process first
+// integrates its captured diff3 stop and no extra task call is added. The
 // orchestrator alone claims, verifies, rebases, commits, pushes, opens the PR,
 // publishes evidence and hands the candidate to the ordinary merge worker.
 // There is no architect, RED step, independent review or correction.
@@ -27,14 +29,16 @@ import { initStatus, statusPhase, statusNote, statusFinish } from './lib/status.
 import { failureReason } from './lib/proc.mjs'
 import { comment, issueLabels, issueView, readBack, terminalSpend } from './lib/github.mjs'
 import {
-  ISSUE_LIFECYCLE, prepareIssueDelivery, renderIssuePrBody, createIssueCandidate,
+  ISSUE_LIFECYCLE, prepareIssueDelivery, finishIssuePreparation, renderIssuePrBody, createIssueCandidate,
   handoffIssue, preserveIssueWork, holdIssueForQuota, restIssueFailed,
   restIssueReadyToReview,
 } from './lib/issue-delivery.mjs'
+import { abortResumeRecovery, settleResumeRecovery } from './lib/resume-recovery.mjs'
 import {
   git, gitOut, pkgList, ensureDeps, runVerify, checkpoint, rebaseInProgress,
   epicDir, updateEpicMd,
 } from './lib/repo.mjs'
+import { resumeConflictPrompt } from './prompts/shared/resume-conflict.mjs'
 
 const USAGE = `Usage: task-run.mjs --issue <N> [--session <name>] [--engine <name>] [--repo <key>]
 
@@ -72,6 +76,7 @@ let currentPhase = 'prepare'
 let blockerPosted = false
 let openCandidate = null
 let finalVerify = null
+let activeResumeRecovery = null
 
 // The tasker charter holds the role's rules; this schema is the only place the
 // shape of its answer is described, so the charter and the prompts do not
@@ -182,16 +187,18 @@ async function publishDeliverySummary(candidate, result) {
   }
 }
 
-async function postBlocker(phaseName, reason) {
+async function postBlocker(phaseName, reason, { skipPreserve = false } = {}) {
   const branch = slug ? `epic/${slug}` : null
-  if (!openCandidate && slug) {
+  if (!openCandidate && slug && !skipPreserve) {
     try { await preserveIssueWork({ slug, phase: phaseName }) }
     catch (error) { log(`blocked: could not preserve the work (${error?.message || error})`) }
   }
   const location = openCandidate
     ? `- PR: ${openCandidate.prUrl} on ${openCandidate.branch}; candidate \`${openCandidate.prHead}\` is pushed but NOT queued for merge\n- next: inspect the evidence and labels by hand; do not rerun task-run while this PR is open`
     : branch
-      ? `- branch: ${branch} — re-running ./toliki run task ${issue} resumes it; delete the local and remote branch only to force a fresh build`
+      ? skipPreserve
+        ? `- branch: ${branch} — recovery cleanup was not proved, so inspect this worktree and its reported local snapshot ref; the untouched remote branch remains the last durable checkpoint chain`
+        : `- branch: ${branch} — re-running ./toliki run task ${issue} resumes it; delete the local and remote branch only to force a fresh build`
       : `- branch: none — re-running ./toliki run task ${issue} starts fresh`
   let body = `🤖 task-run blocked\n- phase: ${phaseName}\n- reason: ${reason}\n${location}\n`
   if (slug && existsSync(path.join(epicDir(slug), 'epic.md'))) {
@@ -205,16 +212,31 @@ async function postBlocker(phaseName, reason) {
 }
 
 async function fail(phaseName, reason, suppliedFailure) {
-  const failure = suppliedFailure === undefined ? takeAgentFailure() : suppliedFailure
-  if (failure?.kind === 'quota-exhausted') {
+  let failure = suppliedFailure === undefined ? takeAgentFailure() : suppliedFailure
+  let recoveryCleanupFailed = false
+  if (activeResumeRecovery) {
+    try {
+      const snapshot = await abortResumeRecovery(activeResumeRecovery, { preserveEdits: true, reason })
+      if (snapshot) log(`Prepare: incomplete recovery bytes retained locally at ${snapshot}; the original checkpoint chain is active again.`)
+      reason += snapshot
+        ? ` The original checkpoint chain was restored; recovery-process file snapshots are retained locally at ${snapshot}.`
+        : ' The original checkpoint chain was restored.'
+    } catch (error) {
+      recoveryCleanupFailed = true
+      reason += ` Recovery cleanup could not fully restore the saved branch (${error?.message || error}); inspect the worktree and untouched remote branch before retrying.`
+    }
+    activeResumeRecovery = null
+  }
+  if (failure?.kind === 'quota-exhausted' && !recoveryCleanupFailed) {
     const held = await holdIssueForQuota({ issue, slug, phase: phaseName, failure })
     if (!held.error) return held
     reason = `${reason} Provider quota hold failed: ${held.error}.`
   }
+  if (recoveryCleanupFailed) failure = null
   reason = withAgentFailure(reason, failure)
   if (!blockerPosted) {
     blockerPosted = true
-    try { await postBlocker(phaseName, reason) }
+    try { await postBlocker(phaseName, reason, { skipPreserve: recoveryCleanupFailed }) }
     catch (error) { log(`blocked: terminal reporting failed (${error?.message || error})`) }
   }
   return { blocked: true, issue, slug: slug || undefined, phase: phaseName, reason, prUrl: openCandidate?.prUrl, outcome: 'human-blocked' }
@@ -228,26 +250,56 @@ async function main() {
     if (!labels.includes('task')) {
       return { skipped: true, issue, reason: 'issue does not carry the persistent task selector label', outcome: 'skipped' }
     }
-    const prep = await prepareIssueDelivery({ issue, engine: ARGS.engine, lifecycle: ISSUE_LIFECYCLE })
+    let prep = await prepareIssueDelivery({ issue, engine: ARGS.engine, lifecycle: ISSUE_LIFECYCLE })
     if (prep.refused) return { skipped: true, issue, reason: prep.refused, outcome: 'skipped' }
     if (prep.alreadyExists) return { skipped: true, issue, reason: prep.note, outcome: 'skipped' }
     slug = prep.slug
+    if (prep.resumeRecoveryError) {
+      activeResumeRecovery = prep.resumeRecovery
+      return fail('prepare', `resume conflict recovery could not be prepared (${prep.resumeRecoveryError}); the original checkpoint chain remains on ${prep.branch}.`)
+    }
+    let implemented = null
+    if (prep.resumeRecovery && !prep.resumeRecovery.integrated) {
+      activeResumeRecovery = prep.resumeRecovery
+      log(`Prepare: resume rebase conflicted in ${prep.resumeRecovery.markedFiles.join(', ')} — the ordinary primary tasker will integrate captured heads ${prep.resumeRecovery.savedHead} and ${prep.resumeRecovery.mainHead} while completing the task.`)
+      currentPhase = 'task'
+      phase('Task')
+      implemented = await agent(resumeConflictPrompt(prep.resumeRecovery, prep.requirement, { completeTask: true }), {
+        label: 'task', phase: 'Task', step: 'task', schema: TASK_SCHEMA, respawn: false,
+        conversation: tasker,
+      })
+      if (!implemented) return fail('task', 'the recovery tasker failed or returned malformed output; the one-process contract forbids a respawn for runtime or schema failure.')
+      const recoveryProblem = resultProblem(implemented)
+      if (recoveryProblem) return fail('task', recoveryProblem)
+      if (implemented.status === 'blocked') {
+        return fail('task', `the recovery tasker could not complete safely: ${implemented.unresolved.map(String).join('; ')}`)
+      }
+      const settleProblem = await settleResumeRecovery(prep.resumeRecovery, { allowAdditionalEdits: true })
+      if (settleProblem) return fail('task', settleProblem)
+      activeResumeRecovery = null
+      prep = await finishIssuePreparation(prep)
+      updateEpicMd(epicDir(slug), { phase: 'task → recovered and implemented', log: `task recovery: ${implemented.summary}` })
+    } else if (prep.resumeRecovery?.integrated) {
+      log(`Prepare: the original multi-checkpoint replay conflicted, but its SHA-bound aggregate applied cleanly to ${prep.resumeRecovery.mainHead}; the ordinary primary tasker and verification still follow.`)
+    }
     if (!prep.packages.length) return fail('prepare', 'layout discovery found no package declaring an `npm run verify` script — refusing to build a change that nothing would verify.')
     log(`Prepare: branch ${prep.branch} ${prep.resumed ? 'resumed' : 'claimed'}; deps checked (${prep.depLines.join('; ')}). Packages: ${pkgList(prep.packages)}.`)
 
-    currentPhase = 'task'
-    phase('Task')
-    let implemented = await agent(prompt(prep), {
-      label: 'task', phase: 'Task', step: 'task', schema: TASK_SCHEMA, respawn: false,
-      conversation: tasker,
-    })
-    if (!implemented) return fail('task', 'the initial tasker process failed or returned malformed output; the one-process contract forbids a respawn for runtime or schema failure.')
-    const problem = resultProblem(implemented)
-    if (problem) return fail('task', problem)
-    if (implemented.status === 'blocked') {
-      return fail('task', `the tasker could not complete safely: ${implemented.unresolved.map(String).join('; ')}`)
+    if (!implemented) {
+      currentPhase = 'task'
+      phase('Task')
+      implemented = await agent(prompt(prep), {
+        label: 'task', phase: 'Task', step: 'task', schema: TASK_SCHEMA, respawn: false,
+        conversation: tasker,
+      })
+      if (!implemented) return fail('task', 'the initial tasker process failed or returned malformed output; the one-process contract forbids a respawn for runtime or schema failure.')
+      const problem = resultProblem(implemented)
+      if (problem) return fail('task', problem)
+      if (implemented.status === 'blocked') {
+        return fail('task', `the tasker could not complete safely: ${implemented.unresolved.map(String).join('; ')}`)
+      }
+      updateEpicMd(epicDir(slug), { phase: 'task → implemented', log: `task: ${implemented.summary}` })
     }
-    updateEpicMd(epicDir(slug), { phase: 'task → implemented', log: `task: ${implemented.summary}` })
 
     currentPhase = 'verify'
     phase('Verify')

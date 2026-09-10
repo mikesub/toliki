@@ -76,7 +76,9 @@ in the same change.
   vendor. Claude's reviewer charter withholds Bash, Edit and Write;
   Codex runs the same charters in its read-only sandbox. The orchestrator
   supplies every step's captured evidence — diffs, issue bodies, conflict sides,
-  CI logs, the review ledger — and also proves the worktree, index, Git
+  CI logs, the review ledger and each review/check's latest verification command,
+  exit status, measured wall duration and bounded output — and also proves the
+  worktree, index, Git
   configuration, hooks and ancestry metadata unchanged around review, the final
   review and the narrow confirmation. There is no delivery-prose step: the
   coding phase returns the record its change is published from. In epic-run and
@@ -135,8 +137,11 @@ than made launchable against a main without the code it describes.
   `workflows/ci-run.mjs` and `workflows/defect-run.mjs`
   are plain Node orchestrators. They must not name a vendor.
 - `workflows/lib/issue-delivery.mjs` owns the epic and task workflows' shared
-  claim, engine-pin, candidate, preservation, quota and terminal handoff
-  mechanics. Task-run adds no alternate transport path around those gates.
+  claim, engine-pin, interrupted-branch recovery preparation, candidate,
+  preservation, quota and terminal handoff mechanics. `lib/resume-recovery.mjs`
+  owns the one aggregate replay, its evidence/boundary checks and local-only
+  failure snapshot. Task-run adds no alternate transport path around those
+  gates.
 - `workflows/lib/fixer-lifecycle.mjs` owns the three fixers' shared argv/runtime
   setup, repair → verify → one diagnostics-driven repair retry when red → accept
   → correct → confirm → publish sequencing, the
@@ -399,7 +404,12 @@ than made launchable against a main without the code it describes.
   an unrelated failure or timeout is not RED evidence. Direct skips the RED
   agent, not verification. An interrupted partial implementation resumes with
   a direct continuation plan, preserving the existing tests and edits rather
-  than demanding a new clean RED baseline. Both paths finish with orchestrator-run
+  than demanding a new clean RED baseline. If its checkpoint chain conflicts
+  with current main, Toliki makes one SHA-bound aggregate recovery attempt
+  before that continuation; an unsafe or malformed attempt restores the chain,
+  retains the complete attempted tree under a local-only recovery ref and rests
+  failed rather than returning to the same ready-loop refusal. Both paths finish
+  with orchestrator-run
   `npm run verify`, as do fixes-after-review, with one bounded coding retry
   before a blocker. An agent's report that verify passed is never the gate.
   Gated by `tests/epic-run.test.sh`.
@@ -407,8 +417,11 @@ than made launchable against a main without the code it describes.
   the only broad review of the change: the architect-selected focused reviewer
   was removed because a second pre-repair opinion bought less than one
   exhaustive acceptance check after the repair. Reviewers stay blind to builder
-  notes; the final review receives the original requirement too. Every finding
-  needs a complete verdict: missing or ambiguous evidence cannot become a
+  notes; the final review receives the original requirement too. Reviewers of a
+  recovered tree also receive its captured main-side integration intent; pinned
+  cumulative aggregate metadata lets later invocations and recoveries recapture
+  every prior main context. Every finding needs a complete verdict: missing or
+  ambiguous evidence cannot become a
   disproof or merge clearance. A resumed code checkpoint keeps its structured
   plan, or reconstructs it read-only when the local artifact is missing,
   without replaying code.
