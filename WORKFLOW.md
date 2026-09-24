@@ -24,6 +24,10 @@ Issue runs deliver a PR or stop with a quota hold, skip, blocker or error;
 manual slug mode publishes nothing. A run never merges its own PR, and there
 is no separate delivery-prose model step.
 
+For human-led local work, the separate [Codex epic skills](skills/epic/README.md)
+use Markdown handovers and local worktrees. The human selects each phase;
+this path has no issue queue, host session or PR publication.
+
 Within one epic/task invocation, compatible writable calls share builder
 context. Judging calls remain fresh and read-only; standalone fixer calls
 remain ephemeral. The conversation contract is in
@@ -248,6 +252,7 @@ are navigation, not extra gates.
 | Contract | Authoritative home |
 | --- | --- |
 | Work slicing, issue relationships and filing | [ISSUE-TRACKING.md](skills/spec/ISSUE-TRACKING.md) |
+| Local human-led epic skills and workspace mechanics | [EPIC-CONTRACT.md](skills/epic/EPIC-CONTRACT.md), [workspace.mjs](skills/epic/scripts/workspace.mjs) |
 | Laptop CLI, registry and host boundary | [operator/lib.sh](operator/lib.sh) and the selected `operator/<command>.sh` |
 | Host configuration values/validation | [repos.conf.template](etc/repos.conf.template), [etc/lib.sh](etc/lib.sh); installed default format in [dispatch.cron](etc/dispatch.cron) |
 | Pipeline admission; manual session/worktree creation | [launch.sh](bin/launch.sh), [manual-session.sh](bin/manual-session.sh) |
