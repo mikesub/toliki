@@ -1,9 +1,9 @@
 ---
-name: ship
+name: t-ship
 description: Ship a local epic as one verified commit fast-forwarded onto local main, archive its handovers, and safely clean up its worktree and branch. Never pushes or opens a PR.
 ---
 
-Read the [shared contract](../EPIC-CONTRACT.md). Run `status` with the requested
+Read the [shared contract](EPIC-CONTRACT.md). Run `status` with the requested
 title, and inspect the actual changes, spec, verification and review evidence.
 The user's invocation authorizes local commit, integration, release and safe
 cleanup; do not ask for routine permission again. Installation, publishing and
@@ -30,7 +30,7 @@ Prepare one commit on the epic branch:
    again after it and resolve missing/stale review before release.
 4. Run the documented full command through `verify` on the final commit even
    on resume. If it fails, preserve the workspace and report the failure for the
-   human to return to code. Any later amendment requires another verification.
+   human to return to t-code. Any later amendment requires another verification.
 
 Write `ship.md` with the commit, verification result, review status, any explicit
 acceptance of missing/stale review, outstanding accepted trade-offs, and the

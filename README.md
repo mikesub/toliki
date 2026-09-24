@@ -74,16 +74,18 @@ default and must contain exactly one assignment.
 gh repo clone mikesub/toliki
 cd toliki
 ./toliki setup
-./toliki session list
 ```
 
-Setup wires `/spec` and `spec-explorer` into both supported clients and seeds
-the laptop registry. Node and Codex are required for Codex agent registration.
-Re-run setup after an older installation is updated, then start a fresh client
-session. [operator/setup.sh](operator/setup.sh) owns registration and migration;
-[wire-claude-content.sh](etc/wire-claude-content.sh) owns shared content links.
-Project-local copies can shadow those shared skills/agents; never copy them
-into target repositories. Pipeline charters stay internal.
+Setup links the [local epic skills](skills/epic/README.md) (`t-spec`,
+`t-architect`, `t-code`, `t-review`, `t-ship`) into Claude Code
+(`~/.claude/skills`) and Codex (`~/.agents/skills`); they need Node. While there
+is no host, the GitHub-filing `/spec`, `spec-explorer` and the project triage
+skill are parked: setup prunes links an older setup made for them and neither
+seeds nor checks the host registry. Re-run setup after an update, then start a
+fresh client session. [operator/setup.sh](operator/setup.sh) owns setup;
+[wire-local-skills.sh](etc/wire-local-skills.sh) owns the shared links.
+Project-local copies can shadow those shared skills; never copy them into
+target repositories. Pipeline charters stay internal.
 
 ### Operating commands
 
@@ -155,8 +157,9 @@ A pipeline pane contains its phase log and final `RESULT` line; inspect with
 read-only tmux commands. It is not an interactive agent. Manual panes run
 Claude or Codex directly; SSH/tmux reconnects to either, while Claude also
 retains its Remote Control integration.
-[The project triage skill](.agents/skills/toliki/SKILL.md) collects stuck work
-using read-only probes.
+[The project triage skill](skills/toliki/SKILL.md) collects stuck work using
+read-only probes. It is parked outside the skill directories agents discover
+until there is a host again.
 
 ## Reading order
 

@@ -1,24 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# `./toliki setup` — laptop-side setup: seeds the machine-local registry and
-# exposes /spec and spec-explorer to Claude and Codex. Codex's role uses the
-# real charter path because its loader rejects a final symlink. The VM-side
-# Claude equivalent is inside bin/provision.sh (which also rebuilds the box).
+# `./toliki setup` — laptop-side setup: exposes the local epic skills
+# (t-spec … t-ship) to Claude Code and Codex. While there is no host, the
+# GitHub-filing /spec, spec-explorer and the host registry are parked: setup
+# neither wires nor seeds them. The VM-side Claude equivalent is inside
+# bin/provision.sh (which also rebuilds the box).
 #
 # The one operator command that deliberately does NOT source operator/lib.sh:
-# that file loads etc/repos.conf, and seeding etc/repos.conf is this script's
-# job. It must run on a laptop that has no registry yet.
+# that file loads etc/repos.conf, and local setup needs no registry.
 #
 # Idempotent: re-run any time; a healthy machine reports zero changes and
 # exits 0. Refuses rather than clobbers: anything at a target path that isn't
 # ours is reported as a manual step and left alone.
 #
-# Selected Claude content and the Codex skill use individual links so content
-# from other sources can coexist; Codex's role points at the shared charter
-# through its user configuration. Pipeline entry points and charters stay
-# private to the harness: host scripts launch pipelines, and the engine reads
-# its charters directly from this checkout.
+# Each skill is an individual link so content from other sources can coexist.
+# Pipeline entry points and charters stay private to the harness: host scripts
+# launch pipelines, and the engine reads its charters directly from this
+# checkout.
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -28,11 +27,12 @@ Usage: ./toliki setup
 
 Prepares this laptop to drive the harness. Idempotent — re-run it any time.
 
-  - checks for the claude and codex CLIs and gh authentication
-  - seeds etc/repos.conf from etc/repos.conf.template (machine-local, never
-    tracked) and reports whether it still holds the template placeholders
-  - exposes /spec and spec-explorer to Claude and to Codex
-  - reports the SSH_HOST every other ./toliki command dials
+  - checks for the claude and codex CLIs and node
+  - links the local epic skills (t-spec, t-architect, t-code, t-review,
+    t-ship) into ~/.claude/skills and ~/.agents/skills
+  - prunes links an older setup made for the parked /spec and spec-explorer
+
+It does not touch etc/repos.conf or the host while there is no host.
 
 It reports what it changed, what it warns about, and the steps only you can do;
 it exits non-zero while any of those steps is left.
@@ -61,7 +61,6 @@ ok()      { printf '  ok       %s\n' "$*"; }
 changed() { printf '  CHANGED  %s\n' "$*"; CHANGES+=("$*"); }
 warn()    { printf '  warn     %s\n' "$*"; WARNINGS+=("$*"); }
 blocked() { printf '  BLOCKED  %s\n' "$*"; BLOCKERS+=("$*"); }
-note()    { printf '           %s\n' "$*"; }
 
 # ---------------------------------------------------------- prerequisites --
 
@@ -76,26 +75,10 @@ if command -v codex >/dev/null 2>&1; then
 else
   warn "codex CLI not found on PATH — install it before using the harness"
 fi
-if gh auth status >/dev/null 2>&1; then
-  ok "gh authenticated"
+if command -v node >/dev/null 2>&1; then
+  ok "node $(node --version 2>/dev/null || echo '?')"
 else
-  warn "gh is not authenticated — /spec files issues via gh; run: gh auth login"
-fi
-
-# ------------------------------------------- machine-local registry (conf) --
-
-say "machine-local registry (etc/repos.conf)"
-CONF="$ROOT/etc/repos.conf"
-if [[ ! -f "$CONF" ]]; then
-  cp "$ROOT/etc/repos.conf.template" "$CONF"
-  changed "seeded etc/repos.conf from etc/repos.conf.template"
-fi
-# The template's placeholder registry parses fine but launches nothing real;
-# treat it as "not configured yet" rather than as done.
-if grep -q "myapp=" "$CONF"; then
-  blocked "etc/repos.conf still carries the template placeholders — edit it (your repos, origins, SSH_HOST)"
-else
-  ok "etc/repos.conf configured"
+  warn "node not found on PATH — the local epic skills run their helper with node"
 fi
 
 # ---------------------------------------------------------- ~/.claude wiring --
@@ -107,18 +90,6 @@ wire_claude_content "$ROOT"
 
 say "Codex wiring"
 wire_codex_content "$ROOT"
-
-# -------------------------------------------------------------------- ssh --
-
-say "ssh"
-# Informational only: the ./toliki commands dial SSH_HOST from etc/repos.conf,
-# and whether it resolves is a fact about ~/.ssh/config this script shouldn't
-# try to manage.
-if [[ -f "$CONF" ]] && SSH_HOST="$(bash -c 'source "$1"; printf "%s" "${SSH_HOST:-}"' _ "$CONF" 2>/dev/null)" && [[ -n "$SSH_HOST" ]]; then
-  note "./toliki will ssh to '$SSH_HOST' — make sure it resolves (e.g. a Host block in ~/.ssh/config)"
-else
-  note "SSH_HOST not set yet; every ./toliki command but setup needs it (see etc/repos.conf.template)"
-fi
 
 # ---------------------------------------------------------------- summary --
 

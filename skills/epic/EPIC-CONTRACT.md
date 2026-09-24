@@ -1,10 +1,11 @@
 # Shared local epic contract
 
-Read this file from the skill's own Toliki directory. All five skills use this
-contract and `scripts/workspace.mjs`; do not copy either into target projects.
-The helper imports Toliki's existing process primitives to bound verification
-and clean up process groups. Keep the script at its Toliki path and run commands
-with the target repository as the working directory.
+All five skills use this contract and `scripts/workspace.mjs`. Each skill
+directory links both, so reach them through the invoked skill's own directory,
+whether the harness loaded it from this checkout or through an installed link.
+Never copy either into target projects. The helper imports Toliki's process
+primitives to bound verification and clean up process groups. Run it with the
+target repository as the working directory.
 
 ## Human-owned transitions
 
@@ -14,7 +15,8 @@ Resolve missing requirements with the human, and record decisions in the owning
 document before handing over. Do not invent requirements or expand into rare
 edge cases without the user's agreement. Project instructions still apply.
 
-Each skill acts directly in its Codex session. Subagents are optional when the
+Each skill acts directly in the current agent session, whichever harness runs
+it. Subagents are optional when the
 user authorizes parallel work; they do not replace the human's phase decisions.
 Independent reviewers need a fresh context without the builder conversation.
 
@@ -22,8 +24,9 @@ Independent reviewers need a fresh context without the builder conversation.
 
 `<title>` is a short lowercase hyphenated directory name, such as
 `saved-searches`. It identifies branch `epic/<title>` and worktree
-`$HOME/.epics/<repo>/<title>`, where `<repo>` is the main checkout's basename.
-Use explicit working directories for all tools. Never modify the main checkout's
+`<main>.worktrees/<title>` beside the main checkout: `~/code/app` keeps its
+epics under `~/code/app.worktrees/`. Use explicit working directories for all
+tools. Never modify the main checkout's
 product code while working on an epic.
 
 The helper discovers the checkout holding local `main`. `start` branches from
@@ -68,7 +71,8 @@ its own review files. It must not read architecture or coding narratives.
 
 ## Commands
 
-Here `<helper>` is the absolute path to this bundle's `scripts/workspace.mjs`.
+Here `<helper>` is the absolute path of `scripts/workspace.mjs` in the invoked
+skill's directory.
 All commands print JSON; errors exit nonzero. Commands take an optional title
 except `start`, which requires it. Run them with the target repository as cwd.
 

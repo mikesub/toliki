@@ -7,7 +7,6 @@ import {
 } from 'node:fs'
 import { createHash, randomUUID } from 'node:crypto'
 import { execFileSync, spawnSync } from 'node:child_process'
-import { homedir } from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { run, terminateAll } from '../../../workflows/lib/proc.mjs'
@@ -112,9 +111,7 @@ function ignoreArtifacts(main, title) {
   if (!gitOK(main, ['check-ignore', '--no-index', '-q', `.epics/${title}/spec.md`])) fail('Project ignore rules override the local .epics exclusion.')
 }
 
-// worktreeRoot is an explicit test seam; the CLI always uses the documented
-// home path. Tests never repurpose HOME or create real user worktrees.
-export function start(cwd, title, { worktreeRoot = path.join(homedir(), '.epics') } = {}) {
+export function start(cwd, title) {
   titleName(title)
   const repo = repository(cwd)
   if (repo.root !== repo.main) fail('Start from the main checkout.')
@@ -122,11 +119,10 @@ export function start(cwd, title, { worktreeRoot = path.join(homedir(), '.epics'
   if (gitOK(repo.main, ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`])) {
     fail(`${branch} already exists; use status to locate and resume it.`)
   }
-  // Existing parent chains are resolved once; created repo/title paths cannot
-  // be symlinks. A collision never authorizes removing another workspace.
-  if (!stat(worktreeRoot)) mkdirSync(worktreeRoot, { recursive: true })
-  directory(worktreeRoot)
-  const parent = directory(path.join(realpathSync(worktreeRoot), path.basename(repo.main)))
+  // Worktrees sit beside the real main path, outside the project's own tree
+  // and tooling. The sibling and title paths cannot be symlinks, and a
+  // collision never authorizes removing another workspace.
+  const parent = directory(`${repo.main}.worktrees`)
   const worktree = path.join(parent, title)
   if (stat(worktree)) fail(`Worktree path already exists: ${worktree}`)
   ignoreArtifacts(repo.main, title)
@@ -387,7 +383,9 @@ async function cli(args) {
   console.log(JSON.stringify(result, null, 2))
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+// Installed skills reach this file through symlinks, while Node reports the
+// module's real path; compare real paths or the CLI would silently do nothing.
+if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) {
   cli(process.argv.slice(2)).catch(error => {
     console.error(error.message)
     process.exitCode = 1

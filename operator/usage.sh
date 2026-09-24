@@ -3,7 +3,7 @@ set -euo pipefail
 
 # `./toliki usage` — the token, time and outcome report, read-only: the report
 # script only reads the host's ~/epic-usage.jsonl. The host loads its OWN
-# registry first, the way .agents/skills/toliki/scripts/host-clock.sh does: the
+# registry first, the way skills/toliki/scripts/host-clock.sh does: the
 # lifetime view renders timestamps for a human, and etc/lib.sh clears any
 # inherited HOST_TIMEZONE before reading repos.conf, so this laptop's zone can
 # never decide how the host's runs are dated.

@@ -36,7 +36,7 @@ Usage: $0 [-h]
 Provisions this Ubuntu host for the coding-agent harness: system packages,
 node 24, gh, docker (+ build-cache GC), supabase CLI, Claude Code, Codex CLI,
 Bun, clones of the control repo and every repo in etc/repos.conf, and the
-~/.claude wiring (/spec and spec-explorer symlinks). Safe to re-run;
+~/.claude wiring (local epic skill symlinks). Safe to re-run;
 reports state and exits non-zero while any manual step is outstanding.
 EOF
 }
@@ -558,7 +558,7 @@ fi
 
 say "~/.claude wiring"
 # Host launchers execute pipeline scripts directly, and the engine reads its
-# charters from the control clone. Only /spec and its spec-explorer are useful as
+# charters from the control clone. Only the local epic skills are published as
 # user-level content, matching laptop-side operator/setup.sh exactly.
 wire_claude_content "$HOST_CONTROL_DIR"
 

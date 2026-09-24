@@ -24,7 +24,7 @@ Issue runs deliver a PR or stop with a quota hold, skip, blocker or error;
 manual slug mode publishes nothing. A run never merges its own PR, and there
 is no separate delivery-prose model step.
 
-For human-led local work, the separate [Codex epic skills](skills/epic/README.md)
+For human-led local work, the separate [local epic skills](skills/epic/README.md)
 use Markdown handovers and local worktrees. The human selects each phase;
 this path has no issue queue, host session or PR publication.
 
@@ -275,7 +275,7 @@ are navigation, not extra gates.
 | Provider quota admission holds | [quota-hold.mjs](workflows/quota-hold.mjs) |
 | Usage records / report semantics / model pricing | [usage.mjs](workflows/lib/usage.mjs) / [usage-report.mjs](workflows/usage-report.mjs) / [prices.mjs](workflows/lib/prices.mjs) |
 | Operator time formatting | [etc/lib.sh](etc/lib.sh), [time.mjs](workflows/lib/time.mjs) |
-| Setup and shared-content registration | [operator/setup.sh](operator/setup.sh), [provision.sh](bin/provision.sh), [wire-claude-content.sh](etc/wire-claude-content.sh) |
+| Setup and shared-content registration | [operator/setup.sh](operator/setup.sh), [provision.sh](bin/provision.sh), [wire-local-skills.sh](etc/wire-local-skills.sh) |
 | Merge, mechanical conflict resolution and cleanup | [merge-worker.sh](bin/merge-worker.sh), [merge-autoresolve.sh](bin/merge-autoresolve.sh), [reap.sh](bin/reap.sh) |
 
 A change to behavior updates its owner and only the affected map or rationale.

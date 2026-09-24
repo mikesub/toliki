@@ -6,7 +6,7 @@
 # rather than more entry points at the root.
 #
 # operator/setup.sh is the one exception that does NOT source this file: it
-# seeds etc/repos.conf, so it has to work before a registry exists.
+# wires only local skills, so it has to work without a registry.
 
 # Same refusal as etc/lib.sh, one level earlier: without BASH_SOURCE this file
 # cannot locate the repo root, and a guess would resolve the registry — and so

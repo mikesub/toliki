@@ -1,11 +1,11 @@
 ---
-name: code
+name: t-code
 description: Implement a local epic spec or repair selected review findings in its isolated worktree, run project verification, and write .epics/title/code.md without committing or shipping.
 ---
 
-Read the [shared contract](../EPIC-CONTRACT.md). Locate the workspace with
+Read the [shared contract](EPIC-CONTRACT.md). Locate the workspace with
 `status`; read `spec.md`, applicable project instructions, and `architecture.md`
-when present. A user invoking code authorizes implementation of the settled
+when present. A user invoking t-code authorizes implementation of the settled
 scope; a separate architecture document is optional. Resolve material open
 decisions before dependent work, while continuing independent work when useful.
 For a prewritten spec without a workspace, use `start` from main and preserve/
@@ -40,4 +40,4 @@ Update `code.md` with the scope completed, key decisions, changed files, the
 actual verification command/result and snapshot from the helper, repair
 dispositions when applicable, deviations and outstanding work. Keep human
 decisions distinguishable from your proposals. Report that handover and stop;
-do not invoke review, stage, commit, or ship.
+do not invoke t-review, stage, commit, or t-ship.

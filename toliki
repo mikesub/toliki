@@ -8,8 +8,8 @@ set -euo pipefail
 # This file only navigates. Each command group is an implementation in
 # operator/<concern>.sh with its own `--help`, so a group can be read, changed
 # and tested on its own, and adding one never grows this dispatcher beyond a
-# line. Nothing here loads the registry: `setup` has to work on a laptop that
-# has no etc/repos.conf yet, and each group sources operator/lib.sh itself.
+# line. Nothing here loads the registry: `setup` needs none, and each other
+# group sources operator/lib.sh itself.
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OPERATOR="$ROOT/operator"
@@ -21,8 +21,8 @@ toliki — the laptop-side operator CLI for the harness.
 Usage: ./toliki <command> [args]
 
 Getting set up
-  setup                    Wire this laptop: /spec and spec-explorer for Claude
-                           and Codex, seed the machine-local etc/repos.conf.
+  setup                    Wire this laptop: the local epic skills (t-spec …
+                           t-ship) for Claude Code and Codex.
   sync                     Pull/rebase this checkout and the host's checkout.
 
 Host settings

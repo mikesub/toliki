@@ -1,9 +1,9 @@
 ---
-name: architect
+name: t-architect
 description: Explore a local epic spec and propose a proportional implementation design in .epics/title/architecture.md for human discussion before coding.
 ---
 
-Read the [shared contract](../EPIC-CONTRACT.md), locate the workspace with
+Read the [shared contract](EPIC-CONTRACT.md), locate the workspace with
 `status`, and read its `spec.md` completely. If the user brings a prewritten
 spec without a workspace, use `start` from main and preserve/copy that spec as
 the contract describes. Read the project's applicable instructions.
@@ -29,4 +29,4 @@ unannounced architectural interpretation.
 
 Present the design, discuss it, and update the architecture with agreed changes.
 Record which choices were agreed and which remain proposals. Stop after the
-handover; do not implement or launch code.
+handover; do not implement or launch t-code.

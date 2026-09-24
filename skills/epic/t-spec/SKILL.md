@@ -1,10 +1,10 @@
 ---
-name: spec
+name: t-spec
 description: Discuss and refine a local feature specification with the human, saving the handover in .epics/title/spec.md for separate architecture, coding, and review sessions. Does not file GitHub issues.
 ---
 
-Read the [shared contract](../EPIC-CONTRACT.md) before acting. This is the local
-spec skill in the Codex epic bundle; the user chooses every later phase.
+Read the [shared contract](EPIC-CONTRACT.md) before acting. This is the first
+skill of the local epic workflow; the user chooses every later phase.
 
 Understand the problem and intended scope. Inspect the relevant existing code
 read-only so requirements describe real behavior and constraints. Ask concrete
@@ -28,4 +28,4 @@ conversation. Do not repeat the project's standing instructions.
 Present the result for the human to inspect and discuss. Apply requested
 refinements to `spec.md`. Report the spec and worktree paths and any remaining
 decisions. Do not design, implement, or invoke another skill. The human can open
-that worktree in a new Codex session for architect or code when ready.
+that worktree in a new agent session for t-architect or t-code when ready.

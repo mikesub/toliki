@@ -15,13 +15,13 @@ surface is exactly the harness AGENTS.md's safe list: `gh` reads,
 ## 0. Setup
 
 Run laptop-side commands from the Toliki repository root (the checkout that
-contains this skill at `.agents/skills/toliki/SKILL.md`). The laptop's
+contains this skill at `skills/toliki/SKILL.md`). The laptop's
 machine-local `etc/repos.conf` is the connection and repository map; the host's
 independent registry is authoritative for its clock. Read both through the
 skill's helper:
 
 ```
-bash .agents/skills/toliki/scripts/host-clock.sh
+bash skills/toliki/scripts/host-clock.sh
 ```
 
 Every `REPO_ORIGINS` entry gets checked, always. `SSH_HOST` is the ssh
@@ -38,7 +38,7 @@ report them as that host clock. Canonical UTC deadlines from machine interfaces
 must be converted with the host checkout's `human_ts` before presenting them:
 
 ```
-bash .agents/skills/toliki/scripts/host-clock.sh --human-ts '<UTC instant>'
+bash skills/toliki/scripts/host-clock.sh --human-ts '<UTC instant>'
 ```
 
 GitHub's own `updatedAt` values and comment dates are not harness timestamps:

@@ -1,9 +1,9 @@
 ---
-name: review
+name: t-review
 description: Independently review a local epic's complete code change against its spec, writing findings in .epics/title/review.md without fixing code or running verification.
 ---
 
-Read the [shared contract](../EPIC-CONTRACT.md). Use a fresh Codex context for
+Read the [shared contract](EPIC-CONTRACT.md). Use a fresh agent session for
 independence. If this session built or designed the change, tell the human to
 open a fresh review session rather than presenting a self-review as independent.
 

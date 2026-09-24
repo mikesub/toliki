@@ -138,7 +138,8 @@ run_cli help sync
 assert_contains "sync help says it only pulls" "$OUT" "Pull and rebase"
 assert_contains "and points elsewhere for provisioning" "$OUT" "bin/provision.sh"
 run_cli help setup
-assert_contains "setup help says what it wires" "$OUT" "etc/repos.conf"
+assert_contains "setup help says what it wires" "$OUT" "t-spec"
+assert_contains "and where" "$OUT" "~/.agents/skills"
 
 run_cli frobnicate
 assert_rc "an unknown command is refused" 1 "$RC"
@@ -301,7 +302,7 @@ assert_rc "sync takes no arguments" 1 "$RC"
 assert_eq "and does nothing when refused" "" "$GIT_RAN"
 
 # ───────────────────────── a laptop with no registry yet ─────────────────────────
-# setup seeds etc/repos.conf, so it must work before one exists — which is why
+# setup needs no registry, so it must work before one exists — which is why
 # the dispatcher loads nothing itself and operator/setup.sh skips operator/lib.sh.
 printf '\nno registry: setup is still reachable, everything else refuses clearly\n'
 FRESH="$TMP/fresh"

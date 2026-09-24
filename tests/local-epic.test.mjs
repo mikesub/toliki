@@ -56,7 +56,7 @@ function fixture() {
   put(main, 'app.cjs', 'module.exports = 1;\n')
   put(main, 'verify.cjs', 'require("node:assert/strict").equal(require("./app.cjs"), 1);\n')
   commit(main, 'Create fixture')
-  const state = start(main, 'saved-searches', { worktreeRoot: path.join(root, 'worktrees') })
+  const state = start(main, 'saved-searches')
   put(state.artifacts, 'spec.md', '# Saved searches\nReturn two.\n')
   return { ...state, root, command: 'node verify.cjs' }
 }
@@ -84,6 +84,7 @@ test('start excludes handovers, preserves dirty main, and detects a fresh worksp
   assert.equal(git(f.worktree, 'status', '--porcelain'), '')
   assert.equal(git(f.main, 'status', '--porcelain'), '?? unrelated.txt')
   assert.match(readFileSync(path.join(f.main, '.git/info/exclude'), 'utf8'), /\/\.epics\//)
+  assert.equal(f.worktree, path.join(`${f.main}.worktrees`, 'saved-searches'))
   const current = status(f.worktree)
   assert.equal(current.title, 'saved-searches')
   assert.equal(current.main, f.main)
@@ -107,19 +108,33 @@ test('CLI infers the epic title and propagates verification failures', () => {
 test('start refuses existing branches and foreign paths without removing them', () => {
   const f = fixture()
   assert.throws(() => start(f.main, f.title), /already exists/)
-  const worktreeRoot = path.join(f.root, 'collision-root')
-  const collision = path.join(worktreeRoot, path.basename(f.main), 'another-epic')
+  const collision = path.join(`${f.main}.worktrees`, 'another-epic')
   put(collision, 'mine.txt', 'User data')
-  assert.throws(() => start(f.main, 'another-epic', { worktreeRoot }), /already exists/)
+  assert.throws(() => start(f.main, 'another-epic'), /already exists/)
   assert.equal(readFileSync(path.join(collision, 'mine.txt'), 'utf8'), 'User data')
   assert.throws(() => start(f.main, '../outside'), /hyphenated/)
+})
+
+test('start never writes through a linked worktrees directory beside main', () => {
+  const root = path.join(temporary, `linked-sibling-${next++}`)
+  const main = path.join(root, 'app')
+  const foreign = path.join(root, 'foreign')
+  mkdirSync(main, { recursive: true })
+  mkdirSync(foreign)
+  git(main, 'init', '-b', 'main')
+  put(main, 'app.cjs', 'module.exports = 1;\n')
+  commit(main, 'Create fixture')
+  symlinkSync(foreign, `${main}.worktrees`)
+  assert.throws(() => start(main, 'saved-searches'), /Not a regular directory/)
+  assert.deepEqual(readdirSync(foreign), [])
+  assert.equal(git(main, 'branch', '--list', 'epic/saved-searches'), '')
 })
 
 test('tracked handovers and a foreign ownership record are refused', () => {
   const f = fixture()
   put(f.main, '.epics/old/spec.md', 'Tracked requirements')
   git(f.main, 'add', '-f', '.epics/old/spec.md')
-  assert.throws(() => start(f.main, 'another-epic', { worktreeRoot: path.join(f.root, 'other') }), /Tracked .epics/)
+  assert.throws(() => start(f.main, 'another-epic'), /Tracked .epics/)
   const file = path.join(f.artifacts, '.workspace.json')
   const state = JSON.parse(readFileSync(file))
   put(f.artifacts, '.workspace.json', JSON.stringify({ ...state, main: f.root }))
@@ -395,4 +410,26 @@ test('cleanup refuses symlinked archive directories', async () => {
   assert.throws(() => cleanup(f.main, f.title), /Not a regular directory/)
   assert.deepEqual(readdirSync(foreign), [])
   assert.ok(existsSync(f.worktree))
+})
+
+test('each installed skill reaches the shared contract and helper through its own directory', () => {
+  const bundle = fileURLToPath(new URL('../skills/epic/', import.meta.url))
+  const skills = readdirSync(bundle).filter(name => existsSync(path.join(bundle, name, 'SKILL.md'))).sort()
+  assert.deepEqual(skills, ['t-architect', 't-code', 't-review', 't-ship', 't-spec'])
+  // Harnesses load skills through links such as ~/.claude/skills/t-spec.
+  const installed = path.join(temporary, 'installed-skills')
+  mkdirSync(installed)
+  const f = fixture()
+  for (const name of skills) {
+    const text = readFileSync(path.join(bundle, name, 'SKILL.md'), 'utf8')
+    assert.match(text, new RegExp(`^---\\nname: ${name}\\n`))
+    assert.match(text, /\]\(EPIC-CONTRACT\.md\)/)
+    assert.doesNotMatch(text, /codex|claude/i, `${name} names no specific harness`)
+    symlinkSync(path.join(bundle, name), path.join(installed, name))
+    assert.equal(readFileSync(path.join(installed, name, 'EPIC-CONTRACT.md'), 'utf8'), readFileSync(path.join(bundle, 'EPIC-CONTRACT.md'), 'utf8'))
+    const helper = path.join(installed, name, 'scripts', 'workspace.mjs')
+    const current = JSON.parse(execFileSync(process.execPath, [helper, 'status'], { cwd: f.worktree, encoding: 'utf8' }))
+    assert.equal(current.title, f.title)
+  }
+  assert.doesNotMatch(readFileSync(path.join(bundle, 'EPIC-CONTRACT.md'), 'utf8'), /codex|claude/i)
 })

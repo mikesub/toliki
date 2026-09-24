@@ -134,11 +134,11 @@ assert_matches "ts uses the human timestamp shape" "$LIB_OUT" '^[0-9]{4}-[0-9]{2
 assert_contains "the registry template documents HOST_TIMEZONE" "$(cat "$ROOT/etc/repos.conf.template")" "HOST_TIMEZONE"
 
 # ───────────────────────── operator skill host clock ─────────────────────────
-OPERATOR_CLOCK="$ROOT/.agents/skills/toliki/scripts/host-clock.sh"
+OPERATOR_CLOCK="$ROOT/skills/toliki/scripts/host-clock.sh"
 assert_file "the operator skill has a deterministic host-clock helper" "$OPERATOR_CLOCK"
-OPERATOR_SKILL_TEXT="$(cat "$ROOT/.agents/skills/toliki/SKILL.md")"
+OPERATOR_SKILL_TEXT="$(cat "$ROOT/skills/toliki/SKILL.md")"
 assert_contains "operator setup invokes the host-clock helper" "$OPERATOR_SKILL_TEXT" \
-  "bash .agents/skills/toliki/scripts/host-clock.sh"
+  "bash skills/toliki/scripts/host-clock.sh"
 assert_contains "operator UTC conversion invokes the host-clock helper" "$OPERATOR_SKILL_TEXT" \
   "host-clock.sh --human-ts '<UTC instant>'"
 assert_contains "operator triage reads the active vendor map" "$OPERATOR_SKILL_TEXT" \
@@ -156,9 +156,9 @@ if [[ -f "$OPERATOR_CLOCK" ]]; then
   OPERATOR_LOCAL="$TMP/operator-local"
   OPERATOR_HOST="$TMP/operator-host"
   OPERATOR_BIN="$TMP/operator-bin"
-  mkdir -p "$OPERATOR_LOCAL/.agents/skills/toliki/scripts" "$OPERATOR_LOCAL/etc" \
+  mkdir -p "$OPERATOR_LOCAL/skills/toliki/scripts" "$OPERATOR_LOCAL/etc" \
     "$OPERATOR_HOST/etc" "$OPERATOR_BIN"
-  cp "$OPERATOR_CLOCK" "$OPERATOR_LOCAL/.agents/skills/toliki/scripts/host-clock.sh"
+  cp "$OPERATOR_CLOCK" "$OPERATOR_LOCAL/skills/toliki/scripts/host-clock.sh"
   cp "$ROOT/etc/lib.sh" "$ROOT/etc/engines.json" "$OPERATOR_LOCAL/etc/"
   cp "$ROOT/etc/lib.sh" "$ROOT/etc/engines.json" "$OPERATOR_HOST/etc/"
   cat > "$OPERATOR_LOCAL/etc/repos.conf" <<CONF
@@ -187,9 +187,9 @@ CONF
 shift
 bash -c "$1"
 STUB
-  chmod +x "$OPERATOR_BIN/ssh" "$OPERATOR_LOCAL/.agents/skills/toliki/scripts/host-clock.sh"
+  chmod +x "$OPERATOR_BIN/ssh" "$OPERATOR_LOCAL/skills/toliki/scripts/host-clock.sh"
 
-  OPERATOR_OUT="$(PATH="$OPERATOR_BIN:$PATH" bash "$OPERATOR_LOCAL/.agents/skills/toliki/scripts/host-clock.sh" 2>&1)"
+  OPERATOR_OUT="$(PATH="$OPERATOR_BIN:$PATH" bash "$OPERATOR_LOCAL/skills/toliki/scripts/host-clock.sh" 2>&1)"
   assert_contains "operator setup keeps the laptop SSH destination" "$OPERATOR_OUT" "SSH_HOST=stub-host"
   assert_contains "operator setup keeps laptop repository origins" "$OPERATOR_OUT" "testrepo=owner/testrepo"
   assert_contains "operator setup reads HOST_TIMEZONE from the host registry" "$OPERATOR_OUT" "HOST_TIMEZONE=Europe/Amsterdam"
@@ -197,7 +197,7 @@ STUB
 
   OPERATOR_OUT="$(
     PATH="$OPERATOR_BIN:$PATH" \
-      bash "$OPERATOR_LOCAL/.agents/skills/toliki/scripts/host-clock.sh" --human-ts 2026-09-05T12:31:14Z 2>&1
+      bash "$OPERATOR_LOCAL/skills/toliki/scripts/host-clock.sh" --human-ts 2026-09-05T12:31:14Z 2>&1
   )"
   assert_eq "operator UTC conversion runs in the host registry zone" "2026-09-05 14:31:14 CEST" "$OPERATOR_OUT"
 fi

@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Laptop-side route discovery plus host-side clock lookup/conversion. The two
 # registries are deliberately loaded by processes on the machines they govern.
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 source "$ROOT/etc/lib.sh"
 
 REMOTE_LIB="$(sq "$HOST_CONTROL_DIR/etc/lib.sh")"
