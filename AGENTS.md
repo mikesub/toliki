@@ -53,7 +53,9 @@ any affected map/rationale, not a duplicate narrative in every document.
    needs both pass and stop cases. Never weaken or delete tests to get green.
    Use Bash 3.2-compatible laptop scripts, no npm dependencies, explicit schemas
    and guarded/idempotent writes (`--force-with-lease`, not an unguarded push).
-6. Run relevant suites; run all suites for a broad change: `./test.sh`.
+6. Run relevant suites; run all active suites for a broad change: `./test.sh`.
+   While there is no host, pipeline/host suites are parked in `test.sh`; name
+   one to run it when touching that code (`./test.sh tests/epic-run.test.sh`).
    Tests must use fake executables first on `PATH` and `mktemp` repositories,
    never the real registry, host, GitHub or tmux. Route engine fixtures by
    `EPIC_STEP_LABEL`, not prompt wording. Do not stub with zsh functions:

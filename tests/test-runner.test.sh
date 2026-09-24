@@ -97,6 +97,25 @@ RUNNER_JOBS=invalid run_runner "$PASS_FILE"
 assert_rc "an invalid worker count is refused" 2 "$RUN_RC"
 assert_contains "the refusal names TEST_JOBS" "$(cat "$RUN_ERR")" "TEST_JOBS must be a positive integer"
 
+printf '\na default run skips parked suites, an explicit one still runs\n'
+COPY="$TEST_TMP/copy"
+mkdir -p "$COPY/tests"
+cp "$RUNNER" "$COPY/test.sh"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$COPY/tests/local-epic.test.sh"
+printf '#!/usr/bin/env bash\ntouch "%s/parked-ran"\n' "$COPY" > "$COPY/tests/epic-run.test.sh"
+RUN_RC=0
+RUN_OUT="$(cd "$TEST_TMP" && bash "$COPY/test.sh" 2>&1)" || RUN_RC=$?
+assert_rc "the default run exits zero" 0 "$RUN_RC"
+assert_contains "the default run covers an active suite" "$RUN_OUT" "tests/local-epic.test.sh OK"
+assert_contains "the default run reports what it parked" "$RUN_OUT" "1 pipeline/host suite(s) parked"
+assert_not_contains "the default run never names a parked suite" "$RUN_OUT" "epic-run"
+if [[ -e "$COPY/parked-ran" ]]; then nok "the default run executed a parked suite"; else ok; fi
+RUN_RC=0
+RUN_OUT="$(cd "$TEST_TMP" && bash "$COPY/test.sh" tests/epic-run.test.sh 2>&1)" || RUN_RC=$?
+assert_rc "an explicitly named parked suite runs" 0 "$RUN_RC"
+assert_contains "and reports its result" "$RUN_OUT" "tests/epic-run.test.sh OK"
+if [[ -e "$COPY/parked-ran" ]]; then ok; else nok "the named parked suite did not execute"; fi
+
 if [[ $FAIL -eq 0 ]]; then
   printf '%s OK\n' "${BASH_SOURCE[0]}"
   exit 0

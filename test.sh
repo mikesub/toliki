@@ -4,10 +4,34 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
+# Pipeline and host suites are parked while there is no host: a plain run
+# covers the local epic workflow (its skills, helper and wiring) and this
+# runner. Name a parked suite to run it anyway.
+PARKED_TESTS="dispatch-engine engine-codex epic-run launch-epic manual-session
+  merge-autoresolve merge-worker operator-cli provision-agent-clis
+  reap-worktree timezone update-claude usage-report workflow-prompts"
+
+is_parked() {
+  local name
+  for name in $PARKED_TESTS; do
+    [[ "$1" != "tests/$name.test.sh" ]] || return 0
+  done
+  return 1
+}
+
 if [[ $# -gt 0 ]]; then
   TEST_FILES=("$@")
 else
-  TEST_FILES=(tests/*.test.sh)
+  TEST_FILES=()
+  PARKED=0
+  for test_file in tests/*.test.sh; do
+    if is_parked "$test_file"; then
+      PARKED=$((PARKED + 1))
+    else
+      TEST_FILES+=("$test_file")
+    fi
+  done
+  printf '%d pipeline/host suite(s) parked; see PARKED_TESTS in test.sh\n' "$PARKED"
 fi
 
 # Suites are hermetic and own separate temporary directories, so run a bounded
