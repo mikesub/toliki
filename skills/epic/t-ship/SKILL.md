@@ -3,23 +3,23 @@ name: t-ship
 description: Ship a local epic as one verified commit fast-forwarded onto local main, archive its handovers, and safely clean up its worktree and branch. Never pushes or opens a PR.
 ---
 
-Read the [shared contract](EPIC-CONTRACT.md). Locate the epic's worktree and
-read `spec.md`, `code.md`, `review.md` and any `ship.md`. The user's invocation
-authorizes the commit, rebase, fast-forward of main and safe cleanup; do not
-ask for routine permission. Never publish or deploy, and do not launch
-reviewers or coders.
+Read the [shared contract](EPIC-CONTRACT.md). The user's invocation authorizes
+the commit, rebase, fast-forward of main and safe cleanup; do not ask for
+routine permission. Never publish or deploy, and do not launch reviewers or
+coders.
 
-If `ship.md`, in the worktree or its archive, records a commit that main already
-contains (`git -C <main> merge-base --is-ancestor <commit> main`), the epic has
-landed: go to step 5. If there is no change and no such commit, report that
-there is nothing to ship. If a rebase is in progress, continue with step 3.
+If `ship.md`, in the worktree or under `<main>/.epics/<title>/releases/`,
+records a commit that main already contains (`git -C <main> merge-base
+--is-ancestor <commit> main`), the epic has landed: go to step 5. Otherwise
+locate the worktree and read `spec.md`, `code.md` and `review.md`. If there is
+no change, report that there is nothing to ship. If a rebase is in progress,
+continue with step 3.
 
 1. Review. Compare the current change key with `review.md`'s and handle a
    missing or stale review as the contract requires. List the review's open
    findings and unmet requirements and any open decisions in the handovers;
    each needs the human's explicit acceptance, and `code.md` dispositions
-   never clear a finding. Record acceptances in `ship.md` with the change key
-   they cover.
+   never clear a finding.
 2. Commit. If `git -C <worktree> status --porcelain --untracked-files=all`
    lists untracked files, stop and ask the human to stage, move or ignore
    them. Commit every tracked edit, which is exactly what the fingerprint
@@ -30,11 +30,9 @@ there is nothing to ship. If a rebase is in progress, continue with step 3.
    `git -C <worktree> reset --soft "$(git -C <worktree> merge-base main HEAD)"`
    and `commit -a`. Title: imperative, at most 72 characters; body: why, key
    decisions, accepted exclusions.
-3. Rebase. If `git -C <worktree> merge-base --is-ancestor main HEAD` fails,
-   rebase as the contract describes. Resolve conflicts preserving both sides'
-   intent, then `git -C <worktree> rebase --continue`; if intent is unclear,
-   `git -C <worktree> rebase --abort` and ask. After a completed rebase,
-   reinstall dependencies as the contract describes.
+3. Rebase. Finish a rebase in progress; otherwise rebase only if `git -C
+   <worktree> merge-base --is-ancestor main HEAD` fails. Follow the contract,
+   preserving both sides' intent in conflicts.
 4. Land. Check the contract's landing gate, running the full verification on
    the clean worktree, even on resume. If verification fails, keep everything
    and report it for t-code; if the change key no longer matches, return to

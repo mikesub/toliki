@@ -25,9 +25,8 @@ beside the main checkout, one subdirectory per repository: `~/code/app` keeps
 its epics under `~/code/worktrees/app/<title>`. Here `<main>` is the checkout
 that has local `main` checked out (find it with `git worktree list`) and
 `<worktree>` is the epic's worktree; `<repo>` is the main checkout's directory
-name (`app` here). Use explicit paths or `git -C` for every
-command; never change the main checkout's product code while working on an
-epic.
+name (`app` here). Use explicit paths or `git -C` for every command; never
+change the main checkout's product code while working on an epic.
 
 Create a new epic from main:
 
@@ -72,12 +71,13 @@ git -C <worktree> diff --binary --no-color --no-ext-diff --no-textconv --src-pre
 ```
 
 `e69de29bb2d1d6434b8b29ae775ad8c2e48c5391` is the hash of empty input: the
-command failed or there is no change. Never record or accept it. Committing
+command failed or there is no change. Never record or accept it as a change key;
+only a baseline run before the first change legitimately shows it. Committing
 keeps the fingerprint, a rebase keeps it only when main changed none of the
 epic's files, and any edit changes it. The spec hash is `git -C <worktree>
 hash-object .epics/<title>/spec.md`. Record both as one line, the change key
-`change <fingerprint> spec <spec-hash>`, with the verification in `code.md`
-and with the review in `review.md`.
+`change <fingerprint> spec <spec-hash>`, with the verification in `code.md` and
+with the review in `review.md`.
 
 ## Verification
 
@@ -85,19 +85,19 @@ The full verification command is `package.json`'s `scripts.verify` or the
 project's documented full check; when neither names exactly one command, agree
 it with the human and record it in `spec.md`. Every full verification run uses
 exactly that command, never a narrower one or a stub.
+
 Run it in the worktree, compute the fingerprint immediately before and after,
 and report the command, exit status and fingerprint. Green means exit status 0
 with the same fingerprint before and after; a claim without a run, a timeout or
-an interruption is not green.
-A failure that already exists on main still blocks shipping: fix it in this
-epic with a spec change, or land a fix first.
+an interruption is not green. A failure that already exists on main still
+blocks shipping: fix it in this epic with a spec change, or land a fix first.
 
 ## Handover ownership
 
 | File | Owner and purpose |
 | --- | --- |
 | `spec.md` | spec: requirements, clarifications, accepted scope and deferrals |
-| `architecture.md` | architect: optional design, units, contracts, open decisions |
+| `architecture.md` | architect: optional design, files or modules, contracts, open decisions |
 | `code.md` | code: implementation, verification, repair dispositions, outstanding work |
 | `review.md` | review: findings, unmet requirements, and the reviewed change key |
 | `ship.md` | ship: acceptances with the change key each covers, the landed commit and its verification, the confirmed reproducible paths |
@@ -150,21 +150,25 @@ After main contains the commit (`git -C <main> merge-base --is-ancestor
 anything. `git worktree remove` refuses untracked files but deletes ignored ones
 without asking, so:
 
-1. List every ignored file with `git -C <worktree> ls-files --others --ignored
-   --exclude-standard`; `status --ignored` hides the files inside ignored
-   directories. Outside `.epics/<title>/`, a file is reproducible only when it
-   lies under a path that a documented project command recreates, such as
-   installed dependencies or build output. Propose those paths with their
-   commands, have the human confirm them, and record the decision in
-   `ship.md`. Every other ignored file is preserved.
-2. Archive the handovers: `mkdir -p <main>/.epics/<title>/releases/<commit>`,
-   `cp -R <worktree>/.epics/<title>/. <main>/.epics/<title>/releases/<commit>`,
-   and confirm `diff -r <worktree>/.epics/<title>
-   <main>/.epics/<title>/releases/<commit>` exits 0.
-3. Copy each preserved file to `<main>/.epics/<title>/preserved/<commit>/<path>`
-   and confirm each copy with `cmp`.
+1. List ignored paths with `git -C <worktree> ls-files --others --ignored
+   --exclude-standard --directory`. Outside `.epics/`, a path is reproducible
+   only when a documented project command recreates it, such as installed
+   dependencies or build output. Propose those paths with their commands, have
+   the human confirm them, and record the decision in `ship.md`.
+2. Every other ignored path is preserved. List its files with the same command
+   without `--directory`, since a directory entry hides the files inside it,
+   and copy each to `<main>/.epics/<title>/preserved/<commit>/<path>`,
+   confirming each copy with `cmp`.
+3. Archive the handovers and confirm the copy is complete:
 
-Only then remove the worktree with `git -C <main> worktree remove <worktree>`
-and the branch with `git -C <main> branch -d epic/<title>`. Never pass
-`--force` or `-D`; when Git refuses, report why and leave the resources. If
-cleanup stops, main keeps the commit; report which resources remain.
+   ```sh
+   mkdir -p <main>/.epics/<title>/releases/<commit>
+   cp -R <worktree>/.epics/<title>/. <main>/.epics/<title>/releases/<commit>
+   diff -r <worktree>/.epics/<title> <main>/.epics/<title>/releases/<commit>
+   ```
+
+Only then, running from `<main>` because the worktree directory disappears,
+remove the worktree with `git -C <main> worktree remove <worktree>` and the
+branch with `git -C <main> branch -d epic/<title>`. Never pass `--force` or
+`-D`; when Git refuses, report why and leave the resources. If cleanup stops,
+main keeps the commit; report which resources remain.

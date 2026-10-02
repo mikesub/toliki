@@ -382,7 +382,7 @@ fi
 C="$BUNDLE/EPIC-CONTRACT.md"
 missing=""
 for phrase in 'each new file when you create it' 'If design or implementation exposes' \
-  'A failure that already exists on main still blocks shipping' \
+  'A failure that already exists on main still' \
   'Whichever phase is invoked first with a spec but' '`<repo>` is the main checkout'; do
   grep -qF -- "$phrase" "$C" || missing="$missing [$phrase]"
 done
@@ -390,7 +390,7 @@ grep -qF '`spec.md` changes the human explicitly approves' "$BUNDLE/t-architect/
 grep -qF 'unstaged edits plus staged new files' "$BUNDLE/t-review/SKILL.md" || missing="$missing [review change]"
 grep -qF 't-spec creates the worktree' "$BUNDLE/README.md" || missing="$missing [README creates]"
 for stale in 'relying on that baseline' 'prewritten spec' 'release' 'Installing' 'existing local spec' 'Ignored files never block'; do
-  if grep -qF -- "$stale" "$BUNDLE"/t-*/SKILL.md; then missing="$missing [stale: $stale]"; fi
+  if grep -qwF -- "$stale" "$BUNDLE"/t-*/SKILL.md; then missing="$missing [stale: $stale]"; fi
 done
 if [[ -z "$missing" ]]; then
   ok_test "the change, baselines and phase rules are each stated once and defined"
@@ -398,13 +398,13 @@ else
   nok "wording drifted:$missing"
 fi
 
-# t-ship's steps: resume a rebase in step 3, abort on unclear intent, find a
-# landed epic's ship.md in the archive, and report preserved files; the
+# t-ship's steps: resume a rebase in step 3, find a landed epic's ship.md in
+# the archive before needing the worktree, and report preserved files; the
 # reviewer's focused tests never count as the full verification.
 missing=""
 S="$BUNDLE/t-ship/SKILL.md"
-for phrase in 'If a rebase is in progress, continue with step 3' 'rebase --abort` and ask' \
-  'in the worktree or its archive' 'archive and preserved paths'; do
+for phrase in 'If a rebase is in progress,' 'Finish a rebase in progress' \
+  'under `<main>/.epics/<title>/releases/`' 'archive and preserved paths'; do
   grep -qF -- "$phrase" "$S" || missing="$missing [t-ship: $phrase]"
 done
 grep -qF -- '--abort` when a conflict' "$BUNDLE/EPIC-CONTRACT.md" || missing="$missing [contract abort]"
@@ -430,6 +430,39 @@ else
   nok "rebase --abort did not restore the epic commit"
 fi
 
+# Mid-rebase, HEAD already descends from main, so the ancestry check alone
+# would skip finishing the rebase; t-ship checks for a rebase in progress first.
+new_landing midrebase
+main="$TMP/midrebase/main" wt="$TMP/midrebase/wt"
+printf 'main\n' >"$main/app.txt"
+git -C "$main" commit -qam 'main moves'
+git -C "$wt" rebase --no-autostash main >/dev/null 2>&1 || true
+if git -C "$wt" status | grep -q 'rebase in progress' && git -C "$wt" merge-base --is-ancestor main HEAD; then
+  ok_test "mid-rebase the ancestry check passes, so a rebase in progress needs its own check"
+else
+  nok "mid-rebase ancestry did not behave as t-ship step 3 assumes"
+fi
+git -C "$wt" rebase --abort
+
+# Follow-up fixes: the landed check needs no worktree, the baseline's empty hash
+# is not a change key, cleanup proposes collapsed paths and runs from main, and
+# the design row no longer names units.
+missing=""
+S="$BUNDLE/t-ship/SKILL.md" C="$BUNDLE/EPIC-CONTRACT.md"
+landed_line="$(grep -n 'the epic has landed' "$S" | cut -d: -f1)"
+locate_line="$(grep -n 'locate the worktree' "$S" | cut -d: -f1)"
+[[ -n "$landed_line" && -n "$locate_line" && "$landed_line" -le "$locate_line" ]] || missing="$missing [landed before locate]"
+grep -qF 'only a baseline run before the first change' "$C" || missing="$missing [contract baseline]"
+grep -qF 'baseline (its' "$BUNDLE/t-code/SKILL.md" || missing="$missing [t-code baseline]"
+grep -qF -- '--exclude-standard --directory`' "$C" || missing="$missing [collapsed proposal]"
+grep -qF 'running from `<main>`' "$C" || missing="$missing [cleanup cwd]"
+grep -F '`architecture.md`' "$C" | grep -qw units && missing="$missing [architecture units]"
+if [[ -z "$missing" ]]; then
+  ok_test "resume, baseline and cleanup follow-ups hold"
+else
+  nok "follow-up drifted:$missing"
+fi
+
 # Cleanup: the contract lists ignored files uncollapsed, and t-ship no longer
 # claims that ignored files block worktree removal.
 IGNORED='ls-files --others --ignored'
@@ -450,10 +483,16 @@ printf 'spec\n' >"$wt/.epics/demo/spec.md"
 printf 'hidden\n' >"$wt/.epics/demo/.draft"
 printf 'nested\n' >"$wt/.epics/demo/notes/a.md"
 listed="$(git -C "$wt" ls-files --others --ignored --exclude-standard)"
+collapsed="$(git -C "$wt" ls-files --others --ignored --exclude-standard --directory)"
 if [[ "$(git -C "$wt" status --ignored --short)" != *notes.md* && "$listed" == *.vscode/notes.md* ]]; then
   ok_test "the ignored listing names a file that status --ignored hides"
 else
   nok "the ignored listing missed .vscode/notes.md"
+fi
+if [[ "$collapsed" == *'.vscode/'* && "$collapsed" != *notes.md* ]]; then
+  ok_test "the --directory listing proposes .vscode/ as one path to decide on"
+else
+  nok "the --directory listing did not collapse .vscode/"
 fi
 
 archive="$main/.epics/demo/releases/c1"

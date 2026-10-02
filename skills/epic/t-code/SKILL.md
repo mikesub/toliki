@@ -11,14 +11,16 @@ before dependent work, while continuing independent work when useful.
 
 Inspect `git -C <worktree> status`, the change and the handovers to resume
 without overwriting existing work. Install dependencies as the project
-documents; ask before copying ignored local settings such as `.env`. Before
-your first change to this epic, run the full verification; report any failure
-and agree with the human how to proceed.
+documents; ask before copying ignored local settings such as `.env`. Before your
+first change to this epic, run the full verification as a baseline (its
+fingerprint is the empty hash, never a change key); report any failure and agree
+with the human how to proceed.
 
-Implement the requested scope directly. Follow an agreed architecture, and
-raise meaningful deviations for discussion. Add regression coverage for changed
-behavior and run focused checks during development. Never weaken tests to make
-the result pass or refactor unrelated code.
+Implement the requested scope directly, staging each new file when you create
+it. Follow an agreed architecture, and raise meaningful deviations for
+discussion. Add regression coverage for changed behavior and run focused checks
+during development. Never weaken tests to make the result pass or refactor
+unrelated code.
 
 If the user authorizes parallel coders, give them independent units with
 exclusive file ownership and complete briefs. Wait for every coder to finish
@@ -35,10 +37,10 @@ human. Record each finding's change or evidence for a dispute; do not rewrite
 the review or declare your own repairs independently accepted.
 
 When the work is done, check `git -C <worktree> status --untracked-files=all`:
-stage new files that belong to the change and ask the human about every other
-untracked file. Then run the full verification as the contract describes.
+stage any new file that belongs to the change and ask the human about every
+other untracked file. Then run the full verification as the contract describes.
 Update `code.md` with the scope completed, key decisions, changed files, the
-verification command, its exit status, the change key, repair
-dispositions when applicable, deviations and outstanding work. Keep human
-decisions distinguishable from your proposals. Report that handover and stop;
-do not invoke t-review, commit, or t-ship.
+verification command, its exit status, the change key, repair dispositions when
+applicable, deviations and outstanding work. Keep human decisions
+distinguishable from your proposals. Report that handover and stop; do not
+invoke t-review, commit, or t-ship.

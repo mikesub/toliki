@@ -23,7 +23,7 @@ concrete defects that matter; avoid style findings and speculative hardening.
 Run the tests that exercise the change yourself; do not rely on the coder's
 account. They are not the full verification and never make the change green;
 the full verification is t-ship's gate. Never edit code, tests, the index or
-Git history; your review document is the only permitted write.
+Git history.
 
 Write only `review.md`. Start it with the change key you computed before
 reading, then a brief scope statement, the tests you ran and their results, and
