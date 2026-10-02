@@ -21,7 +21,7 @@ that ties verification and review to exact code. It never chooses the next
 skill. In this repo every skill directory links the contract; `./setup.sh`
 installs each skill as a self-contained copy that carries its own.
 
-t-spec can create the worktree while discussing requirements. Continue in that
+t-spec creates the worktree while discussing requirements. Continue in that
 worktree with a new agent session when useful; keep the coding session for
 repairs if you prefer. Changes to the agreement belong in the handover files
 before another session takes over.

@@ -28,7 +28,7 @@ what happens next. See the [skills overview](skills/epic/README.md) and the
   project's full verification command, and records the result with a
   fingerprint of the exact change it tested.
 - **t-review** runs in a fresh session, reads only the spec and the code
-  (never the coder's notes), runs verification itself, and records the
+  (never the coder's notes), runs the relevant tests itself, and records the
   fingerprint of the change it reviewed.
 - **t-ship** makes one commit, re-verifies it, and fast-forwards local `main`
   (`--ff-only`) only when the review's fingerprint still matches the change,
@@ -36,12 +36,16 @@ what happens next. See the [skills overview](skills/epic/README.md) and the
   removes the worktree and branch with Git's own safety checks (no `--force`,
   `branch -d` only).
 
-The change fingerprint is `git diff --binary <base> | git hash-object --stdin`:
-it survives committing and a clean rebase but changes with any edit, so ship
-can tell whether the reviewed code is the code it is about to land.
+The change fingerprint hashes `git diff --binary` against the merge base with
+main (the [contract](skills/epic/EPIC-CONTRACT.md) gives the exact command):
+it survives committing, and a rebase when main changed none of the epic's
+files, but changes with any edit, so ship can tell whether the reviewed code is
+the code it is about to land.
 
 Handovers live in the worktree's `.epics/<title>/` (excluded from Git) and are
-archived under the main checkout's `.epics/<title>/releases/<commit>/`.
+archived under the main checkout's `.epics/<title>/releases/<commit>/`. Other
+ignored files in the worktree are copied to `.epics/<title>/preserved/<commit>/`
+unless you confirm a project command recreates them.
 Everything stays local: nothing is pushed, and no issue or PR is created.
 
 ## What it expects
@@ -50,7 +54,8 @@ Everything stays local: nothing is pushed, and no issue or PR is created.
 - Target repositories with a local `main` branch checked out in the main
   checkout.
 - A documented full verification command per project, ideally
-  `package.json`'s `scripts.verify`.
+  `package.json`'s `scripts.verify`; otherwise t-spec agrees one with you and
+  records it in the spec.
 
 ## Setup
 

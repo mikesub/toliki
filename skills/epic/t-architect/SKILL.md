@@ -4,21 +4,18 @@ description: Explore a local epic spec and propose a proportional implementation
 ---
 
 Read the [shared contract](EPIC-CONTRACT.md), locate the epic's worktree, and
-read its `spec.md` completely. If the user brings a prewritten spec without a
-worktree, create one from main and preserve/copy that spec as the contract
-describes. Read the project's applicable instructions.
+read its `spec.md` completely. Read the project's applicable instructions.
 
-Explore the relevant code read-only. Note `git status` before you start and
-confirm it is unchanged when you finish: write only `architecture.md`. If
+Explore the relevant code read-only. Note `git -C <worktree> status` before you
+start and confirm it is unchanged when you finish: write only
+`architecture.md`, plus `spec.md` changes the human explicitly approves. If
 anything else changed, report it and stop without reverting someone else's
 edits.
 
 Propose one approach with enough precision for implementation:
 
 - The approach and existing patterns it follows, cited as `file:line`.
-- Implementation units: goals, owned files, dependencies, and contracts between
-  units. Default to one unit; split when independent files enable useful parallel
-  work. A file has one owner.
+- Files or modules to change and the contracts between them.
 - Tests that demonstrate the requirements and integration.
 - Trade-offs, risks, assumptions and decisions still requiring the human.
 

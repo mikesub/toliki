@@ -7,15 +7,13 @@ Read the [shared contract](EPIC-CONTRACT.md). Locate the epic's worktree; read
 `spec.md`, applicable project instructions, and `architecture.md` when present.
 A user invoking t-code authorizes implementation of the settled scope; a
 separate architecture document is optional. Resolve material open decisions
-before dependent work, while continuing independent work when useful. For a
-prewritten spec without a worktree, create one from main and preserve/copy the
-spec as described in the contract.
+before dependent work, while continuing independent work when useful.
 
-Inspect the current diff and handovers to resume without overwriting existing
-work. Install dependencies as the project documents. Discover the full
-verification command and run it before implementation; discuss pre-existing
-failures with the human before relying on that baseline. Ignored local settings
-are not copied automatically.
+Inspect `git -C <worktree> status`, the change and the handovers to resume
+without overwriting existing work. Install dependencies as the project
+documents; ask before copying ignored local settings such as `.env`. Before
+your first change to this epic, run the full verification; report any failure
+and agree with the human how to proceed.
 
 Implement the requested scope directly. Follow an agreed architecture, and
 raise meaningful deviations for discussion. Add regression coverage for changed
@@ -36,11 +34,11 @@ For review repairs, read `review.md` and implement the findings selected by the
 human. Record each finding's change or evidence for a dispute; do not rewrite
 the review or declare your own repairs independently accepted.
 
-When the work is done, stage the intended change (`git add` exactly the
-intended paths, then check `git status` for stray files), run the full
-verification once more, and compute the change fingerprint and spec hash.
+When the work is done, check `git -C <worktree> status --untracked-files=all`:
+stage new files that belong to the change and ask the human about every other
+untracked file. Then run the full verification as the contract describes.
 Update `code.md` with the scope completed, key decisions, changed files, the
-verification command, its exit status, fingerprint and spec hash, repair
+verification command, its exit status, the change key, repair
 dispositions when applicable, deviations and outstanding work. Keep human
 decisions distinguishable from your proposals. Report that handover and stop;
 do not invoke t-review, commit, or t-ship.

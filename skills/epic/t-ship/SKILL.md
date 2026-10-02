@@ -4,48 +4,44 @@ description: Ship a local epic as one verified commit fast-forwarded onto local 
 ---
 
 Read the [shared contract](EPIC-CONTRACT.md). Locate the epic's worktree and
-inspect the actual change, spec, `code.md` and `review.md`. The user's
-invocation authorizes local commit, integration, release and safe cleanup; do
-not ask for routine permission again. Installation and publishing are outside
-this skill.
+read `spec.md`, `code.md`, `review.md` and any `ship.md`. The user's invocation
+authorizes the commit, rebase, fast-forward of main and safe cleanup; do not
+ask for routine permission. Never publish or deploy, and do not launch
+reviewers or coders.
 
-Check scope and review findings before committing. Resolve outstanding human
-decisions from the recorded evidence and conversation; do not silently clear
-findings based on a coder's claim. Compare the current fingerprint and spec
-hash with those the review recorded, and surface a missing or stale review as
-the contract requires. The human can choose another review or explicitly accept
-the current unreviewed state. Do not launch reviewers or coders yourself.
+If `ship.md`, in the worktree or its archive, records a commit that main already
+contains (`git -C <main> merge-base --is-ancestor <commit> main`), the epic has
+landed: go to step 5. If there is no change and no such commit, report that
+there is nothing to ship. If a rebase is in progress, continue with step 3.
 
-Prepare one commit on the epic branch:
+1. Review. Compare the current change key with `review.md`'s and handle a
+   missing or stale review as the contract requires. List the review's open
+   findings and unmet requirements and any open decisions in the handovers;
+   each needs the human's explicit acceptance, and `code.md` dispositions
+   never clear a finding. Record acceptances in `ship.md` with the change key
+   they cover.
+2. Commit. If `git -C <worktree> status --porcelain --untracked-files=all`
+   lists untracked files, stop and ask the human to stage, move or ignore
+   them. Commit every tracked edit, which is exactly what the fingerprint
+   covers: `git -C <worktree> commit -a` with no epic commit, `commit -a
+   --amend` with one. With several, show `git -C <worktree> log --oneline
+   main..HEAD`; stop if a commit holds unrelated work, otherwise ask to squash
+   and, with consent, run
+   `git -C <worktree> reset --soft "$(git -C <worktree> merge-base main HEAD)"`
+   and `commit -a`. Title: imperative, at most 72 characters; body: why, key
+   decisions, accepted exclusions.
+3. Rebase. If `git -C <worktree> merge-base --is-ancestor main HEAD` fails,
+   rebase as the contract describes. Resolve conflicts preserving both sides'
+   intent, then `git -C <worktree> rebase --continue`; if intent is unclear,
+   `git -C <worktree> rebase --abort` and ask. After a completed rebase,
+   reinstall dependencies as the contract describes.
+4. Land. Check the contract's landing gate, running the full verification on
+   the clean worktree, even on resume. If verification fails, keep everything
+   and report it for t-code; if the change key no longer matches, return to
+   step 1. Record the commit and its verification in `ship.md`, then
+   fast-forward main with the contract's command; if Git refuses, report why
+   and stop.
+5. Archive the handovers and clean up as the contract describes.
 
-1. Inspect staged, unstaged, and untracked changes. Include only the intended
-   change, never handover artifacts. If no epic commit exists, commit the
-   staged change. If exactly one exists, fold intended new changes into it with
-   `git commit --amend`. More than one existing commit needs an explicit
-   history decision; do not silently discard or squash unrelated work.
-2. Use an imperative title of at most 72 characters and a body explaining why,
-   key decisions and accepted exclusions. Keep transcripts in the handovers.
-3. If main is no longer an ancestor, rebase onto local main. Preserve both
-   sides' intent in conflicts; ask about unresolved intent. Resume an
-   interrupted rebase explicitly. A rebase that changes the fingerprint makes
-   the review stale; resolve that before release.
-4. With a clean worktree, run the full verification command on the final
-   commit, even on resume. If it fails, preserve the workspace and report the
-   failure for the human to return to t-code. Any later amendment requires
-   another verification.
-
-Write `ship.md` with the commit, verification result, review status, any
-explicit acceptance of a missing/stale review, outstanding accepted trade-offs,
-and the archive location. Fast-forward main to the verified commit from the
-main checkout as the contract describes; if Git refuses, report why and stop.
-
-Then archive the handovers and clean up as the contract describes. Before
-deleting any extra ignored files that block cleanup, establish whether they are
-reproducible outputs or user data; preserve the latter. Never force cleanup. If
-cleanup stops, report that release succeeded, the reason, and exactly which
-resources were removed or retained. On a later cleanup-only request, confirm
-main already contains the commit; do not recommit or re-release.
-
-Report the main commit, verification and review outcome, archive path, and what
-cleanup removed or retained. Archived handovers and the commit on main remain
-recoverable after worktree and branch removal.
+Report the commit on main, verification, review status and acceptances, the
+archive and preserved paths, and what cleanup removed or kept.
