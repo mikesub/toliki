@@ -13,11 +13,11 @@ use decisions already made instead of asking for them again. Keep ordinary
 changes small and separate requirements from implementation design.
 
 Choose a filesystem title with the user when it is not clear from the request.
-Use the shared helper's `start` from main for a new epic, or `status` for an
-existing one. Write in the returned worktree's handover directory, even when
-this discussion is happening in a session opened in main. If starting from an
-existing local spec, preserve the source and copy it only when the destination
-does not already exist.
+Create the epic's worktree and excluded handover directory from main as the
+contract describes, or locate an existing one to resume. Write in that
+worktree's handover directory, even when this discussion is happening in a
+session opened in main. If starting from an existing local spec, preserve the
+source and copy it only when the destination does not already exist.
 
 Write or refine `spec.md` with the goal, observable requirements, acceptance
 criteria, relevant constraints, non-goals, accepted trade-offs, and clarifications.

@@ -2,179 +2,81 @@
 
 # toliki
 
-A self-hosted coding-agent harness that turns settled GitHub issues into
-verified pull requests and merges eligible ones unattended. A VPS runs plain
-Node pipelines in tmux; cron admits work, checks delivery and reaps completed
-sessions. Claude Code and Codex are supported.
-
-You write specifications with `/spec`. An ordinary issue gets the independently
-reviewed epic workflow; a human may explicitly choose the cheaper, self-reviewed
-task workflow. Deterministic code owns Git/GitHub operations and the project's
-verification gate. Models supply implementation and judgment.
-
-## The loop
+Five agent skills for a human-led coding workflow on your own machine. You
+drive each feature ("epic") through phases yourself — spec, optional
+architecture, code, independent review, ship — and the agent does the Git work
+with plain `git` commands the skills spell out. Works in any agent harness that
+loads `SKILL.md` skills; setup wires Claude Code and Codex.
 
 ```text
-/spec -> ready issue -> dispatch -> epic or task -> open PR
-                                                   |
-                                      merge worker + fresh checks
-                                                   |
-                                                  main
+t-spec -> [t-architect] -> t-code -> t-review -> t-ship
+                             ^           |
+                             +- repairs -+
 ```
 
-Conflicts and failing CI can enter bounded fixer runs; unresolved judgment
-holds for a human. [WORKFLOW.md](WORKFLOW.md) maps the phases, labels and
-contract owners. [DOCTRINE.md](DOCTRINE.md) explains the trade-offs.
-Neither setup nor this overview redefines those contracts.
+No skill starts the next one. You read each handover, discuss it, and choose
+what happens next. See the [skills overview](skills/epic/README.md) and the
+[shared contract](skills/epic/EPIC-CONTRACT.md) for the exact rules.
+
+## How an epic runs
+
+- **t-spec** agrees requirements with you and creates branch `epic/<title>`
+  in a worktree at `worktrees/<repo>/<title>`, in a shared folder beside the
+  main checkout (`~/code/app` -> `~/code/worktrees/app/<title>`).
+- **t-architect** (optional) proposes a design for discussion.
+- **t-code** implements in that worktree, stages the change, runs the
+  project's full verification command, and records the result with a
+  fingerprint of the exact change it tested.
+- **t-review** runs in a fresh session, reads only the spec and the code
+  (never the coder's notes), runs verification itself, and records the
+  fingerprint of the change it reviewed.
+- **t-ship** makes one commit, re-verifies it, and fast-forwards local `main`
+  (`--ff-only`) only when the review's fingerprint still matches the change,
+  or you explicitly accept unreviewed code. It then archives the handovers and
+  removes the worktree and branch with Git's own safety checks (no `--force`,
+  `branch -d` only).
+
+The change fingerprint is `git diff --binary <base> | git hash-object --stdin`:
+it survives committing and a clean rebase but changes with any edit, so ship
+can tell whether the reviewed code is the code it is about to land.
+
+Handovers live in the worktree's `.epics/<title>/` (excluded from Git) and are
+archived under the main checkout's `.epics/<title>/releases/<commit>/`.
+Everything stays local: nothing is pushed, and no issue or PR is created.
 
 ## What it expects
 
-- An Ubuntu VPS you can SSH into.
-- Authenticated `gh` and the agent CLIs you intend to use on that host.
-- Projects whose `package.json` declares `scripts.verify`: the project's
-  complete verification contract.
-- Settled issue requirements; pipeline sessions have no steering channel.
+- Git. The skills run no scripts of their own.
+- Target repositories with a local `main` branch checked out in the main
+  checkout.
+- A documented full verification command per project, ideally
+  `package.json`'s `scripts.verify`.
 
 ## Setup
-
-The commands below change the host and its queues. Agent authorization rules
-are in [AGENTS.md](AGENTS.md#live-host-safety).
-
-### On the VPS
-
-```bash
-sudo apt-get update && sudo apt-get install -y git gh
-gh auth login
-gh repo clone mikesub/toliki /home/ubuntu/toliki
-cd /home/ubuntu/toliki
-cp etc/repos.conf.template etc/repos.conf   # initial setup only; edit your registry
-bin/provision.sh
-```
-
-[repos.conf.template](etc/repos.conf.template) documents the configuration
-values. The actual `etc/repos.conf` is machine-local and must never be committed
-or overwritten during an update. Set `HOST_TIMEZONE` there before provisioning
-when UTC is not the desired host clock.
-
-[provision.sh](bin/provision.sh) is repeatable and reports the interactive steps
-it cannot perform: authentication, per-clone workspace trust and
-bypass-permissions consent. It does not accept consent or upgrade an already
-installed agent CLI on your behalf.
-
-Turn on autonomous work only after provisioning is green: install
-[dispatch.cron](etc/dispatch.cron) using the instructions at its top. Install
-all three pipeline cron lines or none. Its `PATH` must reach `node`, `claude`
-and `codex`, plus `bun` if any project's verify script uses it. The installed
-cron file—not an SSH caller's environment—owns the host's `EPIC_ENGINE`
-default and must contain exactly one assignment.
-
-### On the laptop
 
 ```bash
 gh repo clone mikesub/toliki
 cd toliki
-./toliki setup
+./setup.sh
 ```
 
-Setup links the [local epic skills](skills/epic/README.md) (`t-spec`,
-`t-architect`, `t-code`, `t-review`, `t-ship`) into Claude Code
-(`~/.claude/skills`) and Codex (`~/.agents/skills`); they need Node. While there
-is no host, the GitHub-filing `/spec`, `spec-explorer` and the project triage
-skill are parked: setup prunes links an older setup made for them and neither
-seeds nor checks the host registry. Re-run setup after an update, then start a
-fresh client session. [operator/setup.sh](operator/setup.sh) owns setup;
-[wire-local-skills.sh](etc/wire-local-skills.sh) owns the shared links.
-Project-local copies can shadow those shared skills; never copy them into
-target repositories. Pipeline charters stay internal.
+[setup.sh](setup.sh) installs each skill as a self-contained copy of this
+checkout's **committed** `HEAD` into `~/.claude/skills` and `~/.agents/skills`.
+Uncommitted edits are never installed, so you can develop the skills here and
+release them when ready: commit, re-run `./setup.sh`, and start a fresh agent
+session. Each copy carries a `.toliki-install` marker naming its commit; setup
+overwrites only marked copies, removes marked copies of skills that no longer
+exist, and refuses to touch anything else. Never copy the skills into target
+repositories.
 
-### Operating commands
+## Developing
 
-`./toliki` runs on the laptop; its implementations live in `operator/`.
-Everything in `bin/` runs on the host. Use `./toliki help` or a command's
-`--help` for its current options.
-
-```bash
-./toliki config show
-./toliki config set --engine codex --max 3
-./toliki session list|start|stop|restart|stop-manual|remove-workspace|stop-all
-./toliki run epic|task|fix|ci|defect <issue>
-./toliki route next <engine>
-./toliki usage [days] [engine]
-./toliki sync
-```
-
-Engines are named tables in [engines.json](etc/engines.json). Manual `run`
-accepts an optional `--engine`: omission inherits; specifying it persists the
-issue route. The exact pin and admission contracts are linked from
-[Prepare](WORKFLOW.md#1-prepare).
-Manual pipeline launches can explicitly override capacity with
-`--over-capacity` and bypass a provider hold; automatic dispatch cannot.
-
-`session start [name] --engine claude|codex` opens the actual interactive
-client over tmux (Claude is the independent default). Toliki creates a local
-`manual/<session>` branch and retained worktree from current `origin/main` on
-first use; stop/start and restart preserve dirty files, commits, and the chosen
-client. Manual sessions neither enter pipeline automation nor consume
-`MAX_PARALLEL_EPICS`, though they keep the host non-idle for CLI updates.
-Every successful start prints exact attach, detach, stop, batch-manual-stop and
-safe workspace-removal commands. `session stop-manual` never touches pipelines
-or unrelated tmux; `session stop-all` retains its older host-wide meaning.
-Workspace removal is deliberately separate from process stopping and refuses
-dirty, untracked, unmerged, active, or ambiguously-owned work.
-
-Autonomous defect repair is opt-in through `DEFECT_FIX_REPOS` in the host
-registry. Every entry must name a registered repo; an empty list disables its
-automatic admission without removing the explicit manual command.
-
-### Host traps
-
-Read this before adding a repo or changing host configuration:
-
-- Add both `REPOS` and `REPO_ORIGINS` entries, re-run provisioning, and accept
-  workspace trust when the interactive client asks in a new manual worktree.
-  Login and consent prompts remain visible in the tmux pane; Toliki does not
-  accept them automatically.
-- Accept bypass-permissions consent once by hand on the host. Provisioning
-  detects it but must never set it; a waiting consent dialog can look stalled.
-- Enable GitHub's automatic deletion of merged branches for every registered
-  repo. Retained remote refs prevent worktree collection and leak disk.
-- Re-run provisioning after changing `HOST_TIMEZONE`. Existing panes keep
-  their launched zone; new panes receive the registry value.
-- Claude model aliases depend on the installed CLI. Use the idle-host
-  [CLI updater](bin/update-claude.sh), not an upgrade during active runs.
-- Docker GC changes require a full daemon restart, not reload; check effective
-  policy with `docker buildx inspect`. Unknown keys may be silently ignored.
-  Provisioning owns the installation and readback.
-
-### Inspecting work
-
-`./toliki session list` shows live sessions; `./toliki usage` shows model cost
-and issue-lifetime outcomes. The source issue holds the specification, immutable
-candidate delivery summary and later status/fixer history. The PR holds the
-diff and checks.
-
-A pipeline pane contains its phase log and final `RESULT` line; inspect with
-read-only tmux commands. It is not an interactive agent. Manual panes run
-Claude or Codex directly; SSH/tmux reconnects to either, while Claude also
-retains its Remote Control integration.
-[The project triage skill](skills/toliki/SKILL.md) collects stuck work using
-read-only probes. It is parked outside the skill directories agents discover
-until there is a host again.
-
-## Reading order
-
-- [AGENTS.md](AGENTS.md): short maintenance, testing and live-host safety rules;
-  `CLAUDE.md` is only its pointer.
-- [WORKFLOW.md](WORKFLOW.md): flow map and authoritative contract-owner index.
-- [DOCTRINE.md](DOCTRINE.md): design rationale and rejected alternatives.
-- [Issue tracking](skills/spec/ISSUE-TRACKING.md): work slicing and filing.
-- The relevant source owner and its tests: exact behavior, schema, ordering and
-  local incident notes. Do not synchronize copied manuals in several places.
+[AGENTS.md](AGENTS.md) has the maintenance rules; `CLAUDE.md` only points to
+it. `./test.sh` runs every suite; they are hermetic and use temporary
+repositories and homes.
 
 ## Caveats
 
-This is a personal setup shared as-is, not a hosted product. Agent sessions can
-run with permission bypass on your VPS; git worktrees are not a security
-boundary. Read the doctrine before pointing it at a project you care about.
-
-If a fix benefits more than your local setup, a PR is welcome.
+This is a personal setup shared as-is. Git worktrees are not a security
+boundary, and the agents run whatever your harness permits. If a fix benefits
+more than your local setup, a PR is welcome.

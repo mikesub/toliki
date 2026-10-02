@@ -3,15 +3,15 @@ name: t-architect
 description: Explore a local epic spec and propose a proportional implementation design in .epics/title/architecture.md for human discussion before coding.
 ---
 
-Read the [shared contract](EPIC-CONTRACT.md), locate the workspace with
-`status`, and read its `spec.md` completely. If the user brings a prewritten
-spec without a workspace, use `start` from main and preserve/copy that spec as
-the contract describes. Read the project's applicable instructions.
+Read the [shared contract](EPIC-CONTRACT.md), locate the epic's worktree, and
+read its `spec.md` completely. If the user brings a prewritten spec without a
+worktree, create one from main and preserve/copy that spec as the contract
+describes. Read the project's applicable instructions.
 
-Explore the relevant code read-only. Capture `snapshot` before and after your
-work and require the source, spec, HEAD, staged entries, configuration and Git
-metadata to match. Write only `architecture.md`; if inspection changes protected state,
-report the violation and stop without reverting someone else's edits.
+Explore the relevant code read-only. Note `git status` before you start and
+confirm it is unchanged when you finish: write only `architecture.md`. If
+anything else changed, report it and stop without reverting someone else's
+edits.
 
 Propose one approach with enough precision for implementation:
 

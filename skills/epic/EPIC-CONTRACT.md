@@ -1,11 +1,8 @@
 # Shared local epic contract
 
-All five skills use this contract and `scripts/workspace.mjs`. Each skill
-directory links both, so reach them through the invoked skill's own directory,
-whether the harness loaded it from this checkout or through an installed link.
-Never copy either into target projects. The helper imports Toliki's process
-primitives to bound verification and clean up process groups. Run it with the
-target repository as the working directory.
+All five skills follow this contract. Each skill directory carries a copy, so
+read it from the invoked skill's own directory. Never copy skills or this
+contract into target projects.
 
 ## Human-owned transitions
 
@@ -16,35 +13,74 @@ document before handing over. Do not invent requirements or expand into rare
 edge cases without the user's agreement. Project instructions still apply.
 
 Each skill acts directly in the current agent session, whichever harness runs
-it. Subagents are optional when the
-user authorizes parallel work; they do not replace the human's phase decisions.
-Independent reviewers need a fresh context without the builder conversation.
+it. Subagents are optional when the user authorizes parallel work; they do not
+replace the human's phase decisions. Independent reviewers need a fresh context
+without the builder conversation.
 
-## Workspace identity
+## Workspace
 
-`<title>` is a short lowercase hyphenated directory name, such as
-`saved-searches`. It identifies branch `epic/<title>` and worktree
-`<main>.worktrees/<title>` beside the main checkout: `~/code/app` keeps its
-epics under `~/code/app.worktrees/`. Use explicit working directories for all
-tools. Never modify the main checkout's
-product code while working on an epic.
+`<title>` is a short lowercase hyphenated name, such as `saved-searches`. It
+names branch `epic/<title>` and a worktree in a shared `worktrees/` directory
+beside the main checkout, one subdirectory per repository: `~/code/app` keeps
+its epics under `~/code/worktrees/app/<title>`. Here `<main>` is the checkout
+that has local `main` checked out (find it with `git worktree list`) and
+`<worktree>` is the epic's worktree. Use explicit paths or `git -C` for every
+command; never change the main checkout's product code while working on an
+epic.
 
-The helper discovers the checkout holding local `main`. `start` branches from
-that main, establishes `/.epics/` in Git's local exclude file, and creates an
-ownership record in the new workspace. It preserves existing work and refuses
-branch/path collisions, tracked `.epics/` files, and foreign worktrees. It does
-not install dependencies or copy ignored settings. A newly created workspace
-does not imply that requirements are settled.
+Create a new epic from main:
 
-Run `status` to locate an existing workspace; infer the title from the current
-`epic/<title>` branch, or take it from the user's title/spec path. A title passed
-from main is required when it cannot be inferred. Check the existing artifacts
-and actual changes to resume; a commit or architecture file proves no phase
-complete. Finish an interrupted rebase explicitly before other work.
+```sh
+git -C <main> worktree add -b epic/<title> <main>/../worktrees/<repo>/<title> main
+```
 
-Once created, the worktree's `.epics/<title>/` is the authoritative handover
-directory. If the user supplies an existing spec, copy it there once, preserving
-the source; never overwrite a refined worktree spec on resume.
+If the branch or path already exists, do not create or remove anything: it is
+an existing epic to resume, or a collision to raise with the human. Creating
+does not install dependencies or copy ignored local settings, and does not mean
+the requirements are settled.
+
+Handovers live in `<worktree>/.epics/<title>/` and must never be committed.
+Ensure `/.epics/` is a line in the file `git -C <main> rev-parse
+--git-path info/exclude` names, relative to `<main>` (create it if missing; it
+applies to every worktree), and confirm `git -C <worktree> check-ignore -q
+.epics/<title>/spec.md` succeeds. If the user brings an existing spec, copy it
+to `spec.md` once, preserving the source; never overwrite a refined worktree
+spec on resume.
+
+To resume, locate the worktree through `git worktree list` (branch
+`epic/<title>`) and read the existing handovers and actual changes; a commit or
+handover file alone proves no phase complete. Finish an interrupted rebase
+before other work.
+
+## The change and its fingerprint
+
+The change is everything between the base and the worktree, committed or not.
+The base is `git -C <worktree> merge-base main HEAD`. Review the whole change
+with `git -C <worktree> diff <base>`, never only `git diff HEAD`, which loses
+changes once committed. Every intended new file must be staged (`git add`),
+so the diff includes it; untracked files are not part of the change.
+
+The change fingerprint identifies exactly what was verified or reviewed:
+
+```sh
+git -C <worktree> diff --binary <base> | git hash-object --stdin
+```
+
+Committing or a clean rebase that leaves the change identical keeps the
+fingerprint; any edit to the change alters it. The spec is identified by `git
+hash-object <worktree>/.epics/<title>/spec.md`. Record both with the
+verification in `code.md` and with the review in `review.md`.
+
+## Verification
+
+Discover the project's full verification command from `scripts.verify` or its
+documented full checks; never substitute a narrower command or a stub to pass.
+Run it in the worktree and report the actual command, exit status and the
+fingerprint it ran against. Only an exit status of 0 from that full command on
+an unchanged fingerprint is green. A claim without a run, a timeout, an
+interruption, or a run during which the change was edited is not green.
+Baseline failures can be discussed during coding, but shipping requires a
+passing run on the final commit.
 
 ## Handover ownership
 
@@ -53,93 +89,41 @@ the source; never overwrite a refined worktree spec on resume.
 | `spec.md` | spec: requirements, clarifications, accepted scope and deferrals |
 | `architecture.md` | architect: optional design, units, contracts, open decisions |
 | `code.md` | code: implementation, verification, repair dispositions, outstanding work |
-| `review.md` | review: findings, unmet requirements, and reviewed snapshot |
+| `review.md` | review: findings, unmet requirements, and the reviewed fingerprint and spec hash |
 | `ship.md` | ship: final commit, release decisions, verification and cleanup outcome |
 
 Every handover distinguishes completed work from proposals, open questions, and
 human decisions. Update the owning document as discussion resolves it. Other
 skills may read allowed inputs but must not silently rewrite another role's
 conclusions. If implementation exposes a requirements change, discuss it and
-have the human return to spec or explicitly authorize the spec update.
-
-The helper owns hidden JSON records beside these Markdown documents:
-workspace identity, actual verification, review snapshots and the release
-receipt. They record facts, not approval or workflow status; never edit them by
-hand. `verification.log` contains bounded stdout/stderr tails. Review may read
-only `spec.md` and this mechanical evidence from the handover directory, plus
-its own review files. It must not read architecture or coding narratives.
-
-## Commands
-
-Here `<helper>` is the absolute path of `scripts/workspace.mjs` in the invoked
-skill's directory.
-All commands print JSON; errors exit nonzero. Commands take an optional title
-except `start`, which requires it. Run them with the target repository as cwd.
-
-```sh
-node <helper> start <title>
-node <helper> status <title>
-node <helper> snapshot <title>
-node <helper> verify <title> -- 'the project verification command'
-node <helper> review-start <title>
-node <helper> review-finish <title>
-node <helper> release <title>
-node <helper> cleanup <title>
-```
-
-`start`, `release`, and `cleanup` run from main. The other commands locate the
-registered epic worktree; they do not rely on the caller having changed cwd.
-Use the returned path for subsequent file reads and edits. `status` reports the
-base for reviewing the entire change, including changes already committed.
-
-`snapshot` hashes tracked and untracked file contents, paths, executable bits,
-and symlink targets, plus the spec. It also records HEAD, the staged entries,
-Git configuration, hooks and ancestry metadata for read-only integrity checks.
-Commit creation alone does not change the content fingerprint. Unreadable
-evidence is an error.
-
-`verify` executes the supplied command through Bash, with a 30-minute timeout
-and process-group cleanup. It records the command, actual exit, duration, output
-tails, and before/after snapshots. A nonzero exit, interruption, timeout, or
-change to the tested code/spec is not green. Discover the command from the
-project's `scripts.verify` or documented full checks; do not substitute a stub
-or a narrower command just to pass. Baseline failures can be discussed during
-coding, but shipping requires a passing full verification.
-
-`review-start` captures the read-only baseline and invalidates any older sealed
-review. After the reviewer writes `review.md`, `review-finish` checks content
-and Git integrity and seals that report against the snapshot. It does not judge
-the findings. A changed spec, source tree, or report makes the seal stale.
+have the human return to spec or explicitly authorize the spec update. Review
+may read only `spec.md` and its own earlier review from the handover directory,
+never the architecture or coding narratives.
 
 ## Shipping and preservation
 
-Only ship stages, commits, rebases, fast-forwards main, or removes the workspace.
-Until then preserve the existing index and branch; never stash, reset or clean
-to make a gate pass. Everything remains local: no push, PR, issue or host action.
+Only ship commits, rebases, fast-forwards main, or removes the workspace. Until
+then preserve the existing branch and changes; never stash, reset or clean to
+make a check pass. Everything remains local: no push, PR, or issue.
 
-Shipping checks findings and human decisions from their evidence. A current
-review is not automatically a positive review. If review is missing or stale,
-tell the human what changed and let them choose review or explicit acceptance
-of the unreviewed state. Only that explicit choice permits
-`release <title> --accept-unreviewed`; record it in `ship.md`. Do not ask again
-for a choice already made for the same code and spec.
+A review is current only when its recorded fingerprint and spec match the
+change now. A current review is not automatically a positive one. If review is
+missing or stale, tell the human what changed and let them choose another
+review or explicit acceptance of the unreviewed state; record that choice in
+`ship.md`. Do not ask again for a choice already made for the same change.
 
-Release requires clean main and epic checkouts, exactly one commit above main,
-and successful verification bound to the current HEAD, main, contents and spec.
-It fast-forwards to the checked commit SHA. Rebase, amendments, interruptions,
-and failed checks require fresh verification; never infer green from ancestry.
+Main advances only by `git -C <main> merge --ff-only <commit>` to the exact
+commit that just passed full verification with a clean worktree, and only with
+exactly one epic commit above main. Rebase, amendments, interruptions and
+failed checks require fresh verification; never infer green from ancestry.
 
-The helper records the release candidate before fast-forwarding, so interruption
-after the merge cannot lose the cleanup handoff. A receipt alone is not proof
-of landing: cleanup also requires positive proof that main contains the epic
-commit. It archives the entire handover directory under
-`.epics/<title>/releases/<commit>/` in main and verifies the copy before removing
-the worktree and deleting its branch with an expected old SHA. It never forces
-removal. Extra ignored files outside this epic's handover directory cause it to
-stop and list them, with a wholly ignored directory as one entry: preserve
-local settings and user data, and remove only
-outputs you have established are disposable. Never delete an occupied or
-foreign path to get cleanup through. If cleanup stops, report which resources
-remain. Failures before removal retain the workspace; a branch that advances
-during removal is preserved even if its worktree has already been removed.
-The release remains complete, and archived handovers are retained.
+After main contains the commit (`git -C <main> merge-base --is-ancestor
+<commit> main`), archive the entire handover directory to
+`<main>/.epics/<title>/releases/<commit>/` and confirm the copy is complete
+before removing anything. Then remove the worktree with `git -C <main> worktree
+remove <worktree>` and the branch with `git -C <main> branch -d epic/<title>`.
+Never pass `--force` or `-D`; when Git refuses, report why and leave the
+resources. Before removal, list ignored files in the worktree (`git -C
+<worktree> status --ignored --short`): preserve anything that is not a
+reproducible output or this epic's handovers, and ask about anything unclear.
+If cleanup stops, the release remains complete; report which resources remain.

@@ -1,43 +1,40 @@
 ---
 name: t-review
-description: Independently review a local epic's complete code change against its spec, writing findings in .epics/title/review.md without fixing code or running verification.
+description: Independently review a local epic's complete code change against its spec, writing findings in .epics/title/review.md without fixing code.
 ---
 
 Read the [shared contract](EPIC-CONTRACT.md). Use a fresh agent session for
 independence. If this session built or designed the change, tell the human to
 open a fresh review session rather than presenting a self-review as independent.
 
-Locate the workspace with `status`, then run `review-start`. Read `spec.md` and
-the mechanically captured verification evidence. Do not read `architecture.md`,
+Locate the epic's worktree and compute the base, the change fingerprint and
+the spec hash before reading. Read `spec.md`. Do not read `architecture.md`,
 `code.md`, `ship.md`, builder reports or the builder conversation. Read the
 project's own instructions and source as needed.
 
-Review the whole change against the base returned by the helper: `git diff
-<base>` includes committed and uncommitted changes. Also list and read new files
-with `git ls-files --others --exclude-standard`. Do not use only `git diff HEAD`,
-which loses changes after a commit. A failed or incomplete evidence capture
-cannot produce a clean review.
+Review the whole change: `git diff <base>` includes committed and staged
+changes. Also check `git status` for untracked files that look like part of the
+change but are not staged, and report them. Establish behavior from code,
+including what removed code used to provide. Assess requirements coverage,
+bugs, regressions, error handling, security, and whether tests prove the
+claimed behavior. Report concrete defects that matter; avoid style findings and
+speculative hardening.
 
-Establish behavior from code, including what removed code used to provide.
-Assess requirements coverage, bugs, regressions, error handling, security, and
-whether tests prove the claimed behavior. Report concrete defects that matter;
-avoid style findings and speculative hardening. Verification results are
-evidence with a particular snapshot, not proof of completeness.
+Run the project's full verification command yourself and report its exit
+status; do not rely on the coder's account of it. Verification is evidence for
+one fingerprint, not proof of completeness. Never edit code, tests, the index
+or Git history; your review document is the only permitted write.
 
-Write only `review.md`, with the content/spec fingerprints returned by
-`review-start`, a brief scope statement, and stable finding IDs. For each
-finding include severity, `file:line`, the triggering condition and consequence,
-and a concrete fix or test that would expose it. List unmet requirements and
-verification gaps explicitly. If there are no qualifying defects, say so; a
-missing or failed verification must still be disclosed. On a requested repair
-review, you may read your prior review and compare its findings against current
-code, without relying on the coder's dispositions.
+Write only `review.md`, with the fingerprint and spec hash, a brief scope
+statement, the verification result, and stable finding IDs. For each finding
+include severity, `file:line`, the triggering condition and consequence, and a
+concrete fix or test that would expose it. List unmet requirements and
+verification gaps explicitly. If there are no qualifying defects, say so; a failed verification
+must still be disclosed. On a requested repair review, you may read your prior
+review and compare its findings against current code, without relying on the
+coder's dispositions.
 
-Run `review-finish` after writing the report. If it fails, report that the
-read-only check failed and stop; do not seal or claim a valid review. Do not run
-tests, builds, installs, or commands that modify project/Git state. The helper's
-review records and your review document are the only permitted writes.
-
-Present the findings for discussion and stop. If discussion changes the report,
-run `review-finish` again to bind the revised report to the unchanged inspected
-code. Do not implement findings or launch another skill.
+Recompute both after writing. If either changed during the review, report
+that the change moved under you and that the review does not apply to the
+current code. Present the findings for discussion and stop. Do not
+implement findings or launch another skill.
