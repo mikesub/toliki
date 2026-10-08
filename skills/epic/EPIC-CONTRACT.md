@@ -12,6 +12,15 @@ Resolve missing requirements with the human, and record decisions in the owning
 document before handing over. Do not invent requirements or expand into rare
 edge cases without the user's agreement. Project instructions still apply.
 
+Ask the human one question at a time and wait for the answer before the next,
+since an answer can settle or change later questions. When the harness offers a
+tool that asks the user a question with selectable answers, ask through it
+rather than in prose: give the context needed to decide, put your proposed
+answer first marked as recommended, add the realistic alternatives, and leave
+room for an answer in the human's own words. Without such a tool, ask the same
+way in plain text. Questions are for decisions the human owns, not for routine
+permission or for presenting a handover to discuss.
+
 Each skill acts directly in the current agent session, whichever harness runs
 it. Subagents are optional when the user authorizes parallel work; they do not
 replace the human's phase decisions. A reviewer is a fresh session that has not

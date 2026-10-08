@@ -7,8 +7,8 @@ Read the [shared contract](EPIC-CONTRACT.md) before acting. This is the first
 skill of the local epic workflow; the user chooses every later phase.
 
 Understand the problem and intended scope. Inspect the relevant existing code
-read-only so requirements describe real behavior and constraints. Ask concrete
-questions about unresolved requirements, with proposed answers where helpful;
+read-only so requirements describe real behavior and constraints. Ask about
+unresolved requirements as the contract describes, each with a proposed answer;
 use decisions already made instead of asking for them again. Keep the scope of
 ordinary features small and separate requirements from implementation design.
 
